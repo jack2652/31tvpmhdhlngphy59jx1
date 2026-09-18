@@ -112,6 +112,7 @@ detect_system() {
 # 安装系统软件包，自动选择 apt / dnf / yum / apk / zypper
 pkg_install() {
   [ "$#" -gt 0 ] || return 0
+  local status=0
   case "$PKG_MANAGER" in
     apt)
       run_root apt-get update -qq && run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
@@ -125,6 +126,17 @@ pkg_install() {
       return 1
       ;;
   esac
+  status=$?
+  # 被 OOM Killer 干掉时给出针对性提示，避免误判成「软件源挂了」
+  if is_oom_status "$status"; then
+    warn "包管理器进程被系统强制结束（Killed）——内存不足（OOM），不是软件源或网络问题"
+    printf '        当前内存：%s\n' "$(memory_summary)"
+    oom_advice
+    if [ "$PKG_MANAGER" = "apk" ]; then
+      warn "apk 被中断可能留下半装状态，内存恢复后先执行：apk fix"
+    fi
+  fi
+  return "$status"
 }
 
 # ---------- Python 与依赖 ----------
@@ -244,7 +256,7 @@ install_build_deps() {
 
 ensure_deps() {
   [ -x "$VENV_PIP" ] || { fail "缺少虚拟环境，请先执行第 1 项"; return 1; }
-  local target="$PROJECT_DIR" stamp
+  local target="$PROJECT_DIR" stamp pip_status=0
   # 依赖指纹：pyproject.toml 内容 + Python 版本，任一变化就重装
   stamp="$(cksum "$PYPROJECT" 2>/dev/null | awk '{print $1}')-$(python_version_of "$VENV_PY")"
   if [ -f "$DEPS_STAMP" ] && [ "$(cat "$DEPS_STAMP" 2>/dev/null)" = "$stamp" ] \
@@ -253,10 +265,30 @@ ensure_deps() {
     return 0
   fi
   info "安装项目依赖：pip install -e ."
-  if ! "$VENV_PIP" install -e "$target" --disable-pip-version-check; then
+  # 应用在跑时会一起占内存，小内存机器上容易把 pip 挤到被 OOM 杀掉
+  if app_running; then
+    warn "检测到应用正在运行：安装依赖时内存占用会翻倍，若被 Killed 请先执行 ./run.sh 3 停掉应用"
+  fi
+  "$VENV_PIP" install -e "$target" --disable-pip-version-check || pip_status=$?
+  if [ "$pip_status" -ne 0 ]; then
+    # 内存不足导致的中断重试也没用，直接给出可操作的结论，不去装编译工具白费时间
+    if is_oom_status "$pip_status"; then
+      fail "依赖安装被系统强制结束（Killed）——内存不足（OOM），不是网络或代码问题"
+      printf '        当前内存：%s\n' "$(memory_summary)"
+      oom_advice
+      return 1
+    fi
     warn "依赖安装失败，补齐编译依赖后重试一次"
     install_build_deps || true
-    if ! "$VENV_PIP" install -e "$target" --disable-pip-version-check; then
+    pip_status=0
+    "$VENV_PIP" install -e "$target" --disable-pip-version-check || pip_status=$?
+    if [ "$pip_status" -ne 0 ]; then
+      if is_oom_status "$pip_status"; then
+        fail "重试仍被系统强制结束（Killed）——内存不足（OOM），不是网络或代码问题"
+        printf '        当前内存：%s\n' "$(memory_summary)"
+        oom_advice
+        return 1
+      fi
       fail "依赖安装失败。可尝试：设置 PIP_INDEX_URL 换国内镜像、检查网络/代理，或先安装编译工具后重试"
       return 1
     fi
@@ -502,6 +534,89 @@ human_size() {
   else
     printf '%dB' "$bytes"
   fi
+}
+
+# ---------- 内存探测：小内存机器上「安装依赖被 Killed」几乎都是内存不足（OOM） ----------
+# 退出码 137 = 128 + 9，即进程收到 SIGKILL；在容器里通常由内存超限触发
+is_oom_status() {
+  [ "${1:-0}" = "137" ]
+}
+
+# 可用内存（MB），优先 MemAvailable，取不到时退回 MemFree；无法读取时输出空
+mem_available_mb() {
+  local kb
+  kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)"
+  [ -n "$kb" ] || kb="$(awk '/^MemFree:/ {print $2}' /proc/meminfo 2>/dev/null)"
+  case "$kb" in
+    '' | *[!0-9]*) printf '' ;;
+    *) printf '%d' $((kb / 1024)) ;;
+  esac
+}
+
+# 物理内存总量（MB）
+mem_total_mb() {
+  local kb
+  kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+  case "$kb" in
+    '' | *[!0-9]*) printf '' ;;
+    *) printf '%d' $((kb / 1024)) ;;
+  esac
+}
+
+# Swap 总量（MB），0 表示没有交换空间
+mem_swap_mb() {
+  local kb
+  kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+  case "$kb" in
+    '' | *[!0-9]*) printf '' ;;
+    *) printf '%d' $((kb / 1024)) ;;
+  esac
+}
+
+# cgroup（LXC / Docker）内存上限（MB）；未限制时输出空
+cgroup_mem_limit_mb() {
+  local value=""
+  if [ -r /sys/fs/cgroup/memory.max ]; then
+    value="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
+  elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    value="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
+  fi
+  case "$value" in
+    '' | max | *[!0-9]*) printf '' ;;
+    *)
+      # 极大的数字表示「不限制」，避免换算成天文数字
+      if [ "$value" -ge 1152921504606846976 ] 2>/dev/null; then
+        printf ''
+      else
+        printf '%d' $((value / 1048576))
+      fi
+      ;;
+  esac
+}
+
+# 一行内存概况：可用 / 总量 / Swap / 容器上限
+memory_summary() {
+  local avail total swap limit text
+  avail="$(mem_available_mb)"; total="$(mem_total_mb)"
+  swap="$(mem_swap_mb)"; limit="$(cgroup_mem_limit_mb)"
+  text="可用 ${avail:-未知}M / 总 ${total:-未知}M，Swap ${swap:-未知}M"
+  [ -n "$limit" ] && text="$text，容器内存上限 ${limit}M"
+  printf '%s' "$text"
+}
+
+# 内存不足（OOM）时的处理建议，供安装依赖、装系统包两处复用
+oom_advice() {
+  printf '        处理办法（按推荐顺序任选一条）：\n'
+  printf '          1) 先停掉正在运行的应用再重试安装（安装时内存占用会翻倍）：./run.sh 3\n'
+  printf '          2) 临时加 1G Swap（装完依赖即可保留或删除）：\n'
+  printf '             fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile\n'
+  printf '             没有 fallocate 时改用：dd if=/dev/zero of=/swapfile bs=1M count=1024\n'
+  printf '             （LXC 容器可能禁止 swapon，此时改用第 3 条）\n'
+  printf '          3) 调大容器/主机内存上限到 1G 以上，或换一台内存充足的机器安装\n'
+  printf '          4) 内存无法增加时改成分步安装，降低单次峰值：\n'
+  printf '             .venv/bin/pip install --no-cache-dir pandas\n'
+  printf '             .venv/bin/pip install --no-cache-dir -e .\n'
+  printf '        确认是否 OOM：dmesg | tail -20，或 cat /sys/fs/cgroup/memory.events\n'
 }
 
 # SQLite 文件（含 WAL/SHM）实际占用字节数
@@ -931,8 +1046,28 @@ action_service() {
 # 环境自检：把「装不上 / 起不来 / 取不到数」的常见原因一次性列出来
 action_doctor() {
   local problems=0 port="" host="" avail_kb="" avail="" db_path="" db_size="" limit="" proxy=""
+  local mem_avail="" mem_total="" mem_swap=""
   section "环境自检"
   printf '  系统：%s（架构 %s，包管理器 %s）\n' "$OS_NAME" "$ARCH" "${PKG_MANAGER:-未知}"
+  # 内存与 Swap：小内存 LXC 上「装依赖被 Killed」的根因就在这里
+  printf '  内存：%s\n' "$(memory_summary)"
+  mem_avail="$(mem_available_mb)"; mem_total="$(mem_total_mb)"; mem_swap="$(mem_swap_mb)"
+  case "$mem_avail" in
+    '' | *[!0-9]*) ;;
+    *)
+      if [ "$mem_avail" -lt 300 ]; then
+        printf '  [注意] 可用内存不足 300M：安装依赖时容易被 OOM 杀掉，先 ./run.sh 3 停应用，或临时加 1G Swap\n'
+      fi
+      ;;
+  esac
+  case "$mem_total:$mem_swap" in
+    *[!0-9:]* | :* | *:) ;;
+    *)
+      if [ "$mem_swap" = "0" ] && [ "$mem_total" -lt 800 ]; then
+        printf '  [注意] 内存只有 %sM 且没有 Swap：装系统包与 pip 依赖都可能被杀，建议临时挂载 1G Swap\n' "$mem_total"
+      fi
+      ;;
+  esac
   if has_cmd python3; then
     printf '  [通过] 系统 Python：%s（%s）\n' "$(command -v python3)" "$(python_version_of "$(command -v python3)")"
   else

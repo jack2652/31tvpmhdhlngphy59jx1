@@ -90,6 +90,33 @@ cp .env.example .env
 
 也可以直接使用 `.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000`。可通过 `HOST` 和 `PORT` 环境变量覆盖 `python -m app` 的默认值。
 
+## 常见问题
+
+### 安装依赖时提示 `Killed`（内存不足 / OOM）
+
+菜单第 1 项或 `pip install` 中途出现 `Killed`（退出码 137），含义是进程被系统的 OOM Killer 杀掉了：
+内存不够用，**不是**网络、软件源或代码问题。脚本检测到这种情况会直接打印当前内存和下面的处理办法：
+
+1. 先停掉正在运行的应用再装：`./run.sh 3`（应用本身常驻 150-250M，装依赖时内存占用会翻倍）；
+2. 临时加 1G Swap，装完可保留也可删除：
+
+   ```bash
+   fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+   ```
+
+   没有 `fallocate` 的镜像（busybox）改用 `dd if=/dev/zero of=/swapfile bs=1M count=1024`；
+   非特权 LXC 容器可能禁止 `swapon`，那就走第 3 条。
+3. 调大容器/主机内存上限到 1G 以上（建模机磁盘 512M 也建议内存 ≥ 1G）；
+4. 内存实在加不上时分步安装，降低单次峰值：
+
+   ```bash
+   .venv/bin/pip install --no-cache-dir pandas
+   .venv/bin/pip install --no-cache-dir -e .
+   ```
+
+确认是否 OOM：`dmesg | tail -20`，或 `cat /sys/fs/cgroup/memory.events`（出现 `oom_kill` 计数即可确认）。
+Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半装状态的软件包再重试。
+
 ## 配置
 
 | 变量 | 默认值 | 说明 |
