@@ -1,0 +1,79 @@
+# ============================================================
+# Option Scope .gitignore
+# 规则说明：只忽略「本机生成、可重建、含敏感信息」的文件；
+# 源码（app/、tests/）、文档（README.md、verification.md）、
+# pyproject.toml、run.sh、.env.example 都必须纳入版本管理。
+# ============================================================
+
+# ---------- Python 运行环境与构建产物 ----------
+# 虚拟环境：体积大且每台机器都要重建
+.venv/
+venv/
+env/
+# 字节码与编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+# pip install -e . 生成的安装元数据与打包产物
+option_scope.egg-info/
+*.egg-info/
+*.egg
+*.whl
+.eggs/
+build/
+dist/
+
+# ---------- 测试与静态检查缓存 ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# ---------- 本地配置与密钥 ----------
+# 只忽略本地配置；下一行的 ! 是反向规则，保住模板文件 .env.example，请勿删除
+.env
+.env.*
+!.env.example
+
+# ---------- 运行期数据（应用与 run.sh 生成） ----------
+# 进程 PID、依赖指纹等运行状态
+.run/
+# 日志（应用日志、看门狗日志、压缩后的 .1 轮转文件）
+logs/
+*.log
+# SQLite 数据库本体及 WAL / SHM 附属文件
+data/*.db
+data/*.db-wal
+data/*.db-shm
+*.sqlite3
+# 菜单「数据库工具 → 备份数据库」生成的备份
+backup/
+
+# ---------- AI 工作留痕 ----------
+# .codex 只存放本机的 AI 过程产物（操作日志、审查报告、测试记录、上下文快照与浏览器截图），
+# 全部不纳入版本管理；确需分享某个记录时可临时用 `git add -f .codex/xxx.md` 指定文件。
+.codex/
+# 兜底规则：验证记录统一写到 .codex/verification.md，万一在根目录或其他层级再生成同名文件
+# （不带斜杠表示匹配任意层级），同样不纳入版本管理
+verification.md
+
+# ---------- 编辑器与系统垃圾文件 ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 本地临时文件 ----------
+*.tmp
+*.bak
+.cache/
+.ipynb_checkpoints/

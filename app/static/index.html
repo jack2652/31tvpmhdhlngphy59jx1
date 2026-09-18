@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Option Scope | 美股期权快照</title>
+  <script>/* 首屏主题引导：默认黑夜模式，仅在本地存有白天偏好时切换到白天，避免刷新闪烁。 */document.documentElement.dataset.theme = localStorage.getItem("option-scope-theme") === "light" ? "light" : "dark";</script>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Ctext x='16' y='22' font-size='14' text-anchor='middle' fill='%234ade80' font-family='sans-serif'%3EOS%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark">OS</span><div><strong>OPTION SCOPE</strong><small>美股期权快照</small></div></div>
+    <div class="top-actions">
+      <div class="top-meta"><span class="live-dot"></span><span id="market-state">等待数据</span><span class="divider"></span><span id="clock">--:--:--</span></div>
+      <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false">白天</button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="toolbar panel">
+      <div class="control symbol-control"><label for="symbol-input">标的</label><div class="input-wrap"><span>$</span><input id="symbol-input" value="__DEFAULT_SYMBOL__" maxlength="10" autocomplete="off"><button id="load-button" type="button">载入</button></div></div>
+      <div class="control"><label for="expiration-select">到期日</label><select id="expiration-select" disabled><option>先载入标的</option></select></div>
+      <div class="toolbar-actions"><button id="refresh-button" class="secondary" type="button" disabled>刷新快照</button><span id="refresh-note" class="refresh-note">每 60 秒自动更新</span></div>
+    </section>
+
+    <section class="headline-grid">
+      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol">__DEFAULT_SYMBOL__</span><span id="quote-price">--</span></div><div class="quote-sub"><span id="quote-change">涨跌 --</span><span id="quote-currency">USD</span><span id="quote-market">--</span></div></article>
+      <article class="metric panel"><div class="eyebrow">合约总数</div><strong id="total-count">--</strong><span>当前到期日</span></article>
+      <article class="metric call-metric panel"><div class="eyebrow">看涨成交量</div><strong id="call-volume">--</strong><span id="call-interest">未平仓 --</span></article>
+      <article class="metric put-metric panel"><div class="eyebrow">看跌成交量</div><strong id="put-volume">--</strong><span id="put-interest">未平仓 --</span></article>
+    </section>
+
+    <section class="detail-group panel" id="analysis-detail">
+      <div class="detail-header" id="detail-header">
+        <button class="detail-toggle" id="detail-toggle" type="button" aria-expanded="false" aria-controls="detail-body">
+          <span class="detail-caret" aria-hidden="true"></span>
+          <span class="detail-text"><span class="eyebrow">ANALYSIS DETAIL</span><span class="detail-title">趋势通道 · 交易计划 · 压力位/支撑位</span><span class="detail-hint" id="detail-hint">默认折叠，点击展开这四张面板的明细表</span></span>
+        </button>
+        <div class="detail-modes" id="detail-modes" hidden>
+          <span class="detail-modes-label">基准价</span>
+          <div class="detail-segmented" role="group" aria-label="压力位/支撑位的计算基准">
+            <button class="detail-seg" id="basis-live" type="button" data-basis="live" aria-pressed="true" title="按当前时段的实时价（盘中为最新成交价）重算压力位与支撑位">实时价</button>
+            <button class="detail-seg" id="basis-close" type="button" data-basis="close" aria-pressed="false" title="按盘后价重算（沿用原口径，盘后数据缺失时回退盘前价）">盘后价</button>
+          </div>
+        </div>
+        <span class="detail-action" id="detail-action">展开</span>
+      </div>
+      <div class="detail-body" id="detail-body" hidden>
+        <section class="plan-grid">
+          <article class="panel plan-panel">
+            <div class="analysis-heading"><div><span class="eyebrow">TREND CHANNEL</span><h2>趋势通道</h2><p id="trend-note">等待数据</p></div></div>
+            <div class="trend-body" id="trend-body"></div>
+          </article>
+          <article class="panel plan-panel levels-panel-support">
+            <div class="analysis-heading"><div><span class="eyebrow">ENTRY</span><h2>推荐买入价位</h2><p>现价下方最近的 <span id="buy-count">5</span> 个支撑</p></div></div>
+            <div class="levels" id="buy-levels"></div>
+          </article>
+          <article class="panel plan-panel levels-panel-support">
+            <div class="analysis-heading"><div><span class="eyebrow">ADD</span><h2>加仓价位</h2><p>更深一档的 5 个支撑</p></div></div>
+            <div class="levels" id="add-levels"></div>
+          </article>
+          <article class="panel plan-panel levels-panel-resistance">
+            <div class="analysis-heading"><div><span class="eyebrow">EXIT</span><h2>卖出价位</h2><p>现价上方最近的 5 个压力</p></div></div>
+            <div class="levels" id="sell-levels"></div>
+          </article>
+        </section>
+
+        <section class="levels-grid">
+          <article class="panel levels-panel levels-panel-support">
+            <div class="analysis-heading"><div><span class="eyebrow">SUPPORT</span><h2>支撑位</h2><p id="support-note">等待数据</p></div></div>
+            <div class="levels" id="support-levels"></div>
+          </article>
+          <article class="panel levels-panel levels-panel-resistance">
+            <div class="analysis-heading"><div><span class="eyebrow">RESISTANCE</span><h2>压力位</h2><p id="resistance-note">等待数据</p></div></div>
+            <div class="levels" id="resistance-levels"></div>
+          </article>
+        </section>
+
+      </div>
+    </section>
+
+    <section class="detail-group panel" id="chart-group">
+      <div class="detail-header" id="chart-header">
+        <button class="detail-toggle" id="chart-toggle" type="button" aria-expanded="true" aria-controls="chart-fold">
+          <span class="detail-caret" aria-hidden="true"></span>
+          <span class="detail-text"><span class="eyebrow">CHARTS</span><span class="detail-title">Gamma 敞口 · 压力位/支撑位 · 成交量分布 · 持仓量分布</span><span class="detail-hint">默认展开，点击收起这四张图表</span></span>
+        </button>
+        <span class="detail-action" id="chart-action">收起</span>
+      </div>
+      <div class="detail-body chart-fold" id="chart-fold">
+        <section class="analysis-grid">
+          <article class="analysis-panel panel">
+            <div class="analysis-heading"><div><span class="eyebrow">GAMMA EXPOSURE</span><h2>Gamma 敞口</h2><p>基于 Black-Scholes 的估算 GEX，正值代表看涨支撑，负值代表看跌压力</p></div><div class="wall-badges"><span id="net-gex">净 Gamma --</span><span id="gamma-flip">零 Gamma --</span><span id="call-wall">看涨墙 --</span><span id="put-wall">看跌墙 --</span><span id="gamma-scope">Gamma 范围 --</span></div></div>
+            <div id="gex-chart" class="chart" aria-label="Gamma 敞口图"></div>
+          </article>
+          <article class="analysis-panel panel">
+            <div class="analysis-heading"><div><span class="eyebrow">KEY LEVELS</span><h2>压力位 / 支撑位</h2><p>柱高为综合强度，压力位向上、支撑位向下</p></div><div class="wall-badges"><span id="levels-basis">基准 --</span></div></div>
+            <div id="levels-chart" class="chart" aria-label="压力位/支撑位柱状图"></div>
+            <div class="chart-legend"><span><i class="legend-dot call"></i>压力位（向上）</span><span><i class="legend-dot put"></i>支撑位（向下）</span></div>
+          </article>
+          <article class="analysis-panel panel">
+            <div class="analysis-heading"><div><span class="eyebrow">VOLUME DISTRIBUTION</span><h2>成交量分布</h2><p>看涨向上、看跌向下</p></div></div>
+            <div id="volume-chart" class="chart" aria-label="成交量分布图"></div>
+            <div class="chart-legend"><span><i class="legend-dot call"></i>看涨（向上）</span><span><i class="legend-dot put"></i>看跌（向下）</span><span class="legend-scope" id="volume-scope"></span></div>
+            <div class="chart-summary" id="volume-summary"></div>
+          </article>
+          <article class="analysis-panel panel">
+            <div class="analysis-heading"><div><span class="eyebrow">OPEN INTEREST</span><h2>持仓量分布</h2><p>按执行价汇总未平仓合约</p></div></div>
+            <div id="oi-chart" class="chart" aria-label="持仓量分布图"></div>
+            <div class="chart-legend"><span><i class="legend-dot call"></i>看涨（向上）</span><span><i class="legend-dot put"></i>看跌（向下）</span><span class="legend-scope" id="oi-scope"></span></div>
+            <div class="chart-summary" id="oi-summary"></div>
+          </article>
+        </section>
+      </div>
+    </section>
+
+    <section class="data-panel panel">
+      <div class="detail-header" id="chain-header">
+        <button class="detail-toggle" id="chain-toggle" type="button" aria-expanded="true" aria-controls="chain-fold" aria-label="期权链明细"><span class="detail-caret" aria-hidden="true"></span></button>
+        <div class="detail-text"><span class="eyebrow">期权链</span><h1 id="chain-title">选择到期日查看期权链</h1></div>
+        <div class="panel-status"><span id="data-source">尚未加载</span><span class="divider"></span><span id="fetched-at">快照时间 --</span></div>
+        <span class="detail-action" id="chain-action">收起</span>
+      </div>
+      <div id="error-box" class="error-box" role="alert" hidden></div>
+      <div class="chain-fold" id="chain-fold">
+        <div class="chain-toolbar"><label class="chain-filter">类型<select id="chain-type-filter" aria-label="按类型筛选期权链"><option value="all">全部</option><option value="call">看涨</option><option value="put">看跌</option></select></label></div>
+        <div class="table-wrap"><table><thead><tr><th class="num">行权价</th><th class="num">成交量</th><th class="num">未平仓</th><th class="num">Gamma</th><th class="num" title="Gamma × 未平仓 × 100 × 现价² × 0.01，即现价每变动 1% 的美元敞口；看涨为正、看跌为负">GEX</th><th class="num" title="按该到期日近 ATM 合约价格反解得到的估计值，用于 Gamma 敞口估算">IV（估）</th><th>价内</th></tr></thead><tbody id="chain-body"><tr><td colspan="7" class="empty">输入标的并载入数据</td></tr></tbody></table></div>
+        <div class="chain-legend"><span id="chain-heat-note">行权价绿=看涨、红=看跌 · 底色：按该列本屏最强值归一</span></div>
+      </div>
+    </section>
+
+    <footer><span>数据源：Yahoo Finance（yfinance）</span><span>这是行情快照，不是逐笔实时成交</span><span id="last-status">系统就绪</span></footer>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
