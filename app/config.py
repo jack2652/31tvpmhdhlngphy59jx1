@@ -56,6 +56,8 @@ class Settings:
     extremes_max_age_seconds: int = 86400
     # SQLite 文件体积上限（MB），0 表示不限制；超过后按阶梯清理历史数据
     database_max_mb: int = 0
+    # 页面与 API 的访问密钥；留空表示不启用访问保护，run.sh 会自动生成 16 位密钥
+    access_key: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -74,4 +76,5 @@ class Settings:
             history_max_age_seconds=_positive_int("HISTORY_MAX_AGE_SECONDS", 3600),
             extremes_max_age_seconds=_positive_int("EXTREMES_MAX_AGE_SECONDS", 86400),
             database_max_mb=_size_mb("DATABASE_MAX_MB", 0),
+            access_key=os.getenv("ACCESS_KEY", "").strip(),
         )

@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="option-scope-access-required" content="__ACCESS_KEY_REQUIRED__">
   <title>Option Scope | 美股期权快照</title>
   <script>/* 首屏主题引导：默认黑夜模式，仅在本地存有白天偏好时切换到白天，避免刷新闪烁。 */document.documentElement.dataset.theme = localStorage.getItem("option-scope-theme") === "light" ? "light" : "dark";</script>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Ctext x='16' y='22' font-size='14' text-anchor='middle' fill='%234ade80' font-family='sans-serif'%3EOS%3C/text%3E%3C/svg%3E">
@@ -16,6 +17,12 @@
       <button id="theme-toggle" class="theme-toggle" type="button" aria-pressed="false">白天</button>
     </div>
   </header>
+
+  <section class="access-denied-view" id="access-denied-view" hidden>
+    <h1>403 Forbidden</h1>
+    <hr>
+    <div class="access-denied-server">nginx</div>
+  </section>
 
   <main class="shell">
     <section class="toolbar panel">

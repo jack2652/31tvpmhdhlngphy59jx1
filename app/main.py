@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import create_router
+from app.api import create_router, install_access_guard
 from app.config import Settings
 from app.db import Database
 from app.providers.market import MarketDataProvider
@@ -41,6 +41,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Option Scope", version="0.1.0", lifespan=lifespan)
+install_access_guard(app, settings)
 app.include_router(create_router(database, snapshots, provider, settings))
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -50,7 +51,9 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 def index():
     # 默认标的取自 DEFAULT_SYMBOLS 的第一项，避免页面写死的默认值与服务端配置不一致。
     page = (static_dir / "index.html").read_text(encoding="utf-8")
-    return HTMLResponse(page.replace("__DEFAULT_SYMBOL__", settings.default_symbols[0]))
+    page = page.replace("__DEFAULT_SYMBOL__", settings.default_symbols[0])
+    page = page.replace("__ACCESS_KEY_REQUIRED__", "true" if settings.access_key else "false")
+    return HTMLResponse(page)
 
 
 @app.get("/health", include_in_schema=False)

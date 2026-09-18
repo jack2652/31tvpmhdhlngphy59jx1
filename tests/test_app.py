@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api import create_router
+from app.api import create_router, install_access_guard
 from app.config import Settings
 from app.db import NO_FLOOR, Database, iso, parse_sessions, utc_now
 from app.levels import absorption_levels, build_levels, chip_peaks, fibonacci_levels, merge_candidates, price_extremes, touch_probability, trend_channel
@@ -490,8 +490,8 @@ def test_chain_type_filter_select():
     assert 'state.chainFilter = event.target.value; renderChainTable();' in source
     # 归一基准跟着当前显示的行走
     assert 'const shown = state.chainFilter === "all" ? rows : rows.filter((row) => row.contract_type === state.chainFilter);' in source
-    # 筛选框属于表格工具条：整块放在折叠区里（收起时随内容一起隐藏），并右对齐
-    assert ".chain-toolbar{display:flex;justify-content:flex-end;padding:12px 18px 0}" in styles
+    # 筛选框属于表格工具条：整块放在折叠区里（收起时随内容一起隐藏），并与表格左侧对齐
+    assert ".chain-toolbar{display:flex;justify-content:flex-start;padding:12px 18px 10px}" in styles
     assert html.index('id="chain-fold"') < html.index('id="chain-type-filter"') < html.index('id="chain-body"')
     # 旧的标题行工具条（.panel-tools）已随结构改造删除，避免两条规则各说一套
     assert ".panel-tools" not in styles and ".panel-tools" not in html
@@ -1600,7 +1600,7 @@ def test_chain_header_matches_other_fold_groups():
     assert ".top-meta,.panel-status,footer{display:flex;align-items:center;gap:10px" in styles
     # 旧的标题行工具条规则已删除，筛选改由折叠区内的 .chain-toolbar 承载
     assert ".panel-tools" not in styles and ".panel-tools" not in page
-    assert ".chain-toolbar{display:flex;justify-content:flex-end;padding:12px 18px 0}" in styles
+    assert ".chain-toolbar{display:flex;justify-content:flex-start;padding:12px 18px 10px}" in styles
 
 
 def test_default_symbol_defaults_to_qqq(monkeypatch):
@@ -1800,3 +1800,82 @@ def test_scheduler_survives_cleanup_failure(tmp_path: Path, monkeypatch):
     # 启动清理失败不影响刷新：调度协程仍然存活，且启动时的刷新照常执行
     assert asyncio.run(scenario()) is True
     assert calls == [("QQQ",)]
+
+
+def test_access_key_guard_blocks_pages_and_api_without_key(tmp_path: Path):
+    """配置访问密钥后，页面和 API 都必须携带正确 key，静态资源和健康检查保持可用。"""
+    settings = Settings(
+        database_path=tmp_path / "options.db",
+        proxy_url=None,
+        default_symbols=("QQQ",),
+        refresh_interval_seconds=60,
+        raw_retention_days=30,
+        cleanup_interval_seconds=86400,
+        scheduler_enabled=False,
+        access_key="abc123",
+    )
+    guarded_app = FastAPI()
+    install_access_guard(guarded_app, settings)
+
+    @guarded_app.get("/")
+    def page() -> dict[str, str]:
+        return {"page": "ok"}
+
+    @guarded_app.get("/api/ping")
+    def ping() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @guarded_app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    with TestClient(guarded_app) as client:
+        forbidden_page = client.get("/")
+        assert forbidden_page.status_code == 403
+        assert "403 Forbidden" in forbidden_page.text
+        assert "?key=" not in forbidden_page.text
+        assert "访问" not in forbidden_page.text
+        assert client.get("/", headers={"X-Access-Key": "abc123"}).status_code == 200
+        assert client.get("/?key=abc123").status_code == 200
+        assert client.get("/?key=wrong").status_code == 403
+        assert client.get("/", headers={"X-Access-Key": "wrong"}).status_code == 403
+        forbidden_api = client.get("/api/ping")
+        assert forbidden_api.status_code == 403
+        assert forbidden_api.json() == {"detail": "403 Forbidden"}
+        assert client.get("/api/ping", headers={"X-Access-Key": "abc123"}).status_code == 200
+        assert client.get("/api/ping", headers={"X-Access-Key": "wrong"}).status_code == 403
+        assert client.get("/api/ping?key=abc123").status_code == 200
+        assert client.get("/api/ping?key=wrong").status_code == 403
+        assert client.get("/health").status_code == 200
+
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert '<h1>403 Forbidden</h1>' in page
+    assert "access-denied-message" not in page
+
+
+def test_access_key_guard_disabled_when_not_configured(tmp_path: Path):
+    """ACCESS_KEY 留空时维持旧部署行为，不对页面和 API 做拦截。"""
+    settings = Settings(
+        database_path=tmp_path / "options.db",
+        proxy_url=None,
+        default_symbols=("QQQ",),
+        refresh_interval_seconds=60,
+        raw_retention_days=30,
+        cleanup_interval_seconds=86400,
+        scheduler_enabled=False,
+    )
+    unguarded_app = FastAPI()
+    install_access_guard(unguarded_app, settings)
+
+    @unguarded_app.get("/api/ping")
+    def ping() -> dict[str, str]:
+        return {"status": "ok"}
+
+    with TestClient(unguarded_app) as client:
+        assert client.get("/api/ping").status_code == 200
+
+
+def test_access_key_from_env(monkeypatch):
+    """ACCESS_KEY 会去除首尾空白并写入配置对象。"""
+    monkeypatch.setenv("ACCESS_KEY", " abc123 ")
+    assert Settings.from_env().access_key == "abc123"

@@ -1,4 +1,4 @@
-const state = { symbol: "QQQ", expiration: null, timer: null, analysisReady: false, loadId: 0, refreshing: false, refreshInFlight: null, analysisRefreshSymbol: null, chainFetchedAt: null, levelsKey: "", levelsPayload: null, chainFilter: "all", chainRows: [], chainSpot: null, levelBasisMode: "live", lastQuote: null };
+const state = { symbol: "QQQ", expiration: null, timer: null, analysisReady: false, loadId: 0, refreshing: false, refreshInFlight: null, analysisRefreshSymbol: null, chainFetchedAt: null, levelsKey: "", levelsPayload: null, chainFilter: "all", chainRows: [], chainSpot: null, levelBasisMode: "live", lastQuote: null, accessKey: "" };
 const GAMMA_MIN_MINUTES = 30;
 // 自动刷新间隔（秒）：页面提示文案与定时器共用同一个值。
 const AUTO_REFRESH_SECONDS = 60;
@@ -21,6 +21,7 @@ const $ = (id) => document.getElementById(id);
 
 // 主题：默认黑夜模式，用户可在右上角切换到白天；偏好写入 localStorage，刷新后保持。
 const THEME_KEY = "option-scope-theme";
+const ACCESS_KEY_STORAGE = "option-scope-access-key";
 // 按钮文案展示当前生效的主题名称。
 const THEME_LABELS = { light: "白天", dark: "黑夜" };
 
@@ -133,18 +134,53 @@ function parsePageQuery(search) {
   const params = new URLSearchParams(search || "");
   const symbol = (params.get("symbol") || "").trim().toUpperCase();
   const expiration = (params.get("expiration") || "").trim();
+  const key = (params.get("key") || "").trim();
   return {
     symbol: /^[A-Z0-9][A-Z0-9.-]{0,9}$/.test(symbol) ? symbol : "",
     expiration: /^\d{4}-\d{2}-\d{2}$/.test(expiration) ? expiration : "",
+    key,
   };
 }
 
 function buildPageQuery(symbol, expiration, pathname) {
   const params = new URLSearchParams();
+  if (state.accessKey) params.set("key", state.accessKey);
   if (symbol) params.set("symbol", symbol);
   if (expiration) params.set("expiration", expiration);
   const query = params.toString();
   return query ? `${pathname}?${query}` : pathname;
+}
+
+function accessKeyRequired() {
+  const meta = document.querySelector('meta[name="option-scope-access-required"]');
+  return meta?.content === "true";
+}
+
+function readStoredAccessKey() {
+  try { return (localStorage.getItem(ACCESS_KEY_STORAGE) || "").trim(); } catch (error) { return ""; }
+}
+
+function rememberAccessKey(key) {
+  try { localStorage.setItem(ACCESS_KEY_STORAGE, key); return true; } catch (error) { return false; }
+}
+
+function initializeAccessKey() {
+  const queryKey = parsePageQuery(location.search).key;
+  if (queryKey) {
+    // 首次带 key 访问时写入 localStorage；写入失败说明浏览器不允许持久化，按密钥丢失处理。
+    state.accessKey = rememberAccessKey(queryKey) ? queryKey : "";
+    return state.accessKey;
+  }
+  state.accessKey = readStoredAccessKey();
+  return state.accessKey;
+}
+
+function showAccessDenied() {
+  if (state.timer) clearInterval(state.timer);
+  state.timer = null;
+  document.body.classList.add("access-denied-page");
+  const view = $("access-denied-view");
+  if (view) view.hidden = false;
 }
 
 function syncPageQuery() {
@@ -1020,7 +1056,26 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   renderDistributionSummary($("oi-summary"), expirationRows, spot, "open_interest", "总持仓量");
 }
 
-async function request(path, options) { const response = await fetch(path, options); const body = await response.json().catch(() => ({})); if (!response.ok) throw new Error(body.detail || `请求失败 (${response.status})`); return body; }
+async function request(path, options = {}) {
+  // 每次请求都重新读取 localStorage，确保用户在别处清空存储后立即触发 403，而不是继续使用内存里的旧值。
+  const accessKey = readStoredAccessKey();
+  if (accessKeyRequired() && !accessKey) {
+    const message = "403 Forbidden";
+    showAccessDenied();
+    throw new Error(message);
+  }
+  const headers = new Headers(options.headers || {});
+  if (accessKey) headers.set("X-Access-Key", accessKey);
+  const response = await fetch(path, { ...options, headers });
+  const body = await response.json().catch(() => ({}));
+  if (response.status === 403) {
+    const message = body.detail || "403 Forbidden";
+    showAccessDenied();
+    throw new Error(message);
+  }
+  if (!response.ok) throw new Error(body.detail || `请求失败 (${response.status})`);
+  return body;
+}
 
 // 现价按时段动态取值：盘前显示盘前价，盘后/夜盘显示盘后价，盘中与休市显示常规价。
 // 对应时段没有数据时回退常规价，避免整块行情空掉。
@@ -1523,10 +1578,15 @@ window.addEventListener("resize", () => {
   clearTimeout(chartResizeTimer);
   chartResizeTimer = setTimeout(redrawChartsIfResized, 200);
 });
-// 没有到期日（仅现货标的）也要走刷新链路：后端会返回 quote_only，只更新现货卡片。
-setInterval(() => refresh(true), AUTO_REFRESH_SECONDS * 1000);
 const initialQuery = parsePageQuery(location.search);
+const initialAccessKey = initializeAccessKey();
 // 页面默认标的由服务端按 DEFAULT_SYMBOLS 注入到输入框，这里只在注入缺失时兜底。
 state.symbol = initialQuery.symbol || $("symbol-input").value.trim().toUpperCase() || "QQQ";
 $("symbol-input").value = state.symbol;
-loadSymbol();
+if (accessKeyRequired() && !initialAccessKey) {
+  showAccessDenied();
+} else {
+  // 没有到期日（仅现货标的）也要走刷新链路：后端会返回 quote_only，只更新现货卡片。
+  state.timer = setInterval(() => refresh(true), AUTO_REFRESH_SECONDS * 1000);
+  loadSymbol();
+}

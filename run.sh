@@ -307,13 +307,52 @@ ensure_deps() {
   ok "依赖安装完成"
 }
 
+# 生成 16 位小写字母 + 数字访问密钥；优先 Python，其次 OpenSSL，最后直接用系统随机源。
+generate_access_key() {
+  local key=""
+  if has_cmd python3; then
+    key="$("$(command -v python3)" - <<'PY'
+import secrets
+import string
+
+alphabet = string.ascii_lowercase + string.digits
+print("".join(secrets.choice(alphabet) for _ in range(16)))
+PY
+)"
+  elif has_cmd openssl; then
+    key="$(openssl rand -hex 8)"
+  else
+    key="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | dd bs=16 count=1 2>/dev/null | tr -d '\n')"
+  fi
+  case "$key" in
+    '' | *[!a-z0-9]*) return 1 ;;
+  esac
+  [ "${#key}" -eq 16 ] || return 1
+  printf '%s' "$key"
+}
+
 ensure_env_file() {
-  if [ -f "$ENV_FILE" ]; then
+  if [ ! -f "$ENV_FILE" ]; then
+    [ -f "$ENV_EXAMPLE" ] || { fail "缺少模板文件 $ENV_EXAMPLE"; return 1; }
+    cp "$ENV_EXAMPLE" "$ENV_FILE" || return 1
+    ok "已由 .env.example 生成 $ENV_FILE"
+  else
     ok "配置文件已存在：$ENV_FILE（跳过生成）"
+  fi
+
+  # 旧版 .env 没有 ACCESS_KEY，或用户误留空时自动补齐，避免升级后把访问保护静默关掉。
+  local access_key=""
+  access_key="$(read_env_value ACCESS_KEY "")"
+  if [ -n "$access_key" ]; then
+    info "访问密钥已配置（网址需要携带 ?key=...）"
     return 0
   fi
-  [ -f "$ENV_EXAMPLE" ] || { fail "缺少模板文件 $ENV_EXAMPLE"; return 1; }
-  cp "$ENV_EXAMPLE" "$ENV_FILE" && ok "已由 .env.example 生成 $ENV_FILE"
+  access_key="$(generate_access_key)" || {
+    fail "无法生成访问密钥，请确认系统存在 python3、openssl 或可用的 /dev/urandom"
+    return 1
+  }
+  write_env_value ACCESS_KEY "$access_key" || return 1
+  ok "已生成访问密钥 ACCESS_KEY=$access_key"
 }
 
 # 读取 .env 中的配置项（取最后一次出现的值），不存在时返回默认值
@@ -495,12 +534,21 @@ local_ip() {
 
 # 打印访问地址（监听 0.0.0.0 时同时给出内网地址）
 show_access_url() {
-  local port host
+  local port host access_key
   port="$(app_port)"
   host="$(read_env_value HOST 0.0.0.0)"
-  printf '  本机访问：http://127.0.0.1:%s\n' "$port"
+  access_key="$(read_env_value ACCESS_KEY "")"
+  if [ -n "$access_key" ]; then
+    printf '  本机访问：http://127.0.0.1:%s/?key=%s\n' "$port" "$access_key"
+  else
+    printf '  本机访问：http://127.0.0.1:%s\n' "$port"
+  fi
   if [ "$host" != "127.0.0.1" ] && [ "$host" != "localhost" ]; then
-    printf '  局域网访问：http://%s:%s\n' "$(local_ip)" "$port"
+    if [ -n "$access_key" ]; then
+      printf '  局域网访问：http://%s:%s/?key=%s\n' "$(local_ip)" "$port" "$access_key"
+    else
+      printf '  局域网访问：http://%s:%s\n' "$(local_ip)" "$port"
+    fi
   fi
 }
 
@@ -1054,7 +1102,7 @@ action_service() {
 
 # 环境自检：把「装不上 / 起不来 / 取不到数」的常见原因一次性列出来
 action_doctor() {
-  local problems=0 port="" host="" avail_kb="" avail="" db_path="" db_size="" limit="" proxy=""
+  local problems=0 port="" host="" avail_kb="" avail="" db_path="" db_size="" limit="" proxy="" access_key=""
   local mem_avail="" mem_total="" mem_swap=""
   section "环境自检"
   printf '  系统：%s（架构 %s，包管理器 %s）\n' "$OS_NAME" "$ARCH" "${PKG_MANAGER:-未知}"
@@ -1108,6 +1156,13 @@ action_doctor() {
   else
     printf '  [注意] 缺少 %s，首次启动会由 .env.example 自动生成\n' "$ENV_FILE"
     port="$(app_port)"
+  fi
+  access_key="$(read_env_value ACCESS_KEY "")"
+  if [ -n "$access_key" ]; then
+    printf '  [通过] 访问密钥：已配置（页面和 API 必须携带 ?key= 或 X-Access-Key）\n'
+  else
+    printf '  [问题] ACCESS_KEY 为空：访问保护未启用，请执行菜单第 1 或第 2 项自动生成\n'
+    problems=$((problems + 1))
   fi
   if app_running && health_ok; then
     printf '  [通过] 端口 %s：本项目服务正在监听且健康\n' "$port"
@@ -1173,6 +1228,7 @@ Option Scope 运维脚本用法：
   ./run.sh                    打开交互菜单
   ./run.sh 2                  直接执行第 2 项（适合脚本、计划任务调用）
   ./run.sh start|stop|restart|status|doctor|install|config|db
+  ./run.sh update             更新应用：停止 → 拉取最新源码 → 依赖检查 → 重启（菜单第 9 项）
   ./run.sh help               显示本帮助
 从零安装（当前目录下没有源码时先自动拉取，再继续执行）：
   bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
@@ -1190,6 +1246,7 @@ show_menu() {
   printf '  6) 修改配置（.env 交互式编辑）\n'
   printf '  7) 数据库工具（清理 / 备份 / 统计）\n'
   printf '  8) 环境自检（doctor）\n'
+  printf '  9) 更新应用（停止 → 拉取最新源码 → 依赖检查 → 重启）\n'
   printf '  0) 退出\n'
   printf '%s=========================================================%s\n' "$C_BOLD" "$C_RESET"
 }
@@ -1198,7 +1255,7 @@ menu_loop() {
   local choice=""
   while true; do
     show_menu
-    printf '请选择操作 [0-8]：'
+    printf '请选择操作 [0-9]：'
     if ! read -r choice; then
       printf '\n'
       break
@@ -1212,6 +1269,7 @@ menu_loop() {
       6) action_config ;;
       7) action_database ;;
       8) action_doctor ;;
+      9) action_update ;;
       0 | q | quit | exit) break ;;
       "") ;;
       *) warn "无效选择：$choice" ;;
@@ -1342,6 +1400,136 @@ bootstrap_if_needed() {
   exec bash "$target/run.sh" "$@"
 }
 
+# ---------- 更新应用：停止 → 取最新源码 → 用新代码重启 ----------
+# 源码优先走 git（只动有变化的文件，且能看出更新前后的版本号）；没有 git 或用户确认覆盖时，
+# 下载分支压缩包后按顶层条目覆盖。无论哪条路径，运行期数据都保留：
+# .env（配置）、data/（数据库）、logs/（日志）、.run/（PID）、.venv/（虚拟环境）。
+# git 仓库当前版本号（短哈希）；不是仓库时输出空
+source_revision() {
+  local target="$1"
+  if [ -d "$target/.git" ] && has_cmd git; then
+    git -C "$target" rev-parse --short HEAD 2>/dev/null
+  fi
+}
+
+# 顶层条目是否属于「运行期数据」——这类内容永远不覆盖。
+# 注意：模式必须直接写在 case 里；若放进变量再用 for 遍历，shell 会把 `.env.*`
+# 这类通配符按当前目录展开成实际文件名，导致匹配失效。
+is_runtime_entry() {
+  local name="$1"
+  case "$name" in
+    # .env.example 是随代码走的模板，必须跟着更新，不能当成用户的 .env 跳过
+    .env.example) return 1 ;;
+    .env | .env.* | data | logs | .run | .venv | .git | backup) return 0 ;;
+  esac
+  return 1
+}
+
+# 下载分支压缩包并按顶层条目覆盖源码；运行期数据一律跳过
+overlay_archive() {
+  local target="$1" tmp="" src="" entry name
+  has_cmd curl || { fail "缺少 curl，无法下载源码包"; return 1; }
+  has_cmd tar || { fail "缺少 tar，无法解压源码包"; return 1; }
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/us_stocks_update.XXXXXX")" || return 1
+  info "下载最新源码：$ARCHIVE_URL"
+  if ! curl -LfsS "$ARCHIVE_URL" | tar -xz -C "$tmp"; then
+    fail "源码包下载或解压失败，请检查网络或代理"
+    rm -rf "$tmp"
+    return 1
+  fi
+  src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  if [ -z "$src" ] || [ ! -f "$src/run.sh" ] || [ ! -d "$src/app" ]; then
+    fail "源码包内容异常（缺少 run.sh 或 app）"
+    rm -rf "$tmp"
+    return 1
+  fi
+  # 逐个顶层条目覆盖。写成三段通配是为了带上点开头的文件（.gitignore、.env.example 等），
+  # 单写 "$src"/* 时 shell 不匹配隐藏文件，这些文件永远更新不到。
+  for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+    [ -e "$entry" ] || continue
+    name="$(basename "$entry")"
+    if is_runtime_entry "$name"; then
+      info "保留运行期内容：$name"
+      continue
+    fi
+    rm -rf "${target:?}/$name"
+    if ! cp -a "$entry" "$target/$name"; then
+      fail "覆盖 $name 失败"
+      rm -rf "$tmp"
+      return 1
+    fi
+  done
+  rm -rf "$tmp"
+  ok "源码已覆盖更新（.env / data / logs / .venv 均未改动）"
+  return 0
+}
+
+# 本地有未提交修改时，只有交互确认才允许覆盖，避免把服务器上的改动冲掉
+confirm_overwrite() {
+  local answer=""
+  if [ ! -t 0 ]; then
+    fail "检测到本地未提交的修改，非交互场景不自动覆盖"
+    fail "请先处理这些修改（提交或备份），再执行更新"
+    return 1
+  fi
+  printf '  用远端源码覆盖当前工作区？本地未提交的修改会丢失。输入 y 覆盖：'
+  read -r answer || answer=""
+  case "$answer" in
+    y | Y | yes | YES) return 0 ;;
+    *) info "已取消覆盖，保留现有源码"; return 1 ;;
+  esac
+}
+
+# 取最新源码：git 优先，失败或非仓库时退回压缩包覆盖
+update_source() {
+  local target="$PROJECT_DIR"
+  if [ -d "$target/.git" ] && has_cmd git; then
+    if git -C "$target" diff --quiet 2>/dev/null && git -C "$target" diff --cached --quiet 2>/dev/null; then
+      info "git 拉取最新源码：$GIT_REMOTE_URL"
+      if git -C "$target" pull --ff-only --quiet; then
+        ok "源码已更新到最新版本"
+        return 0
+      fi
+      warn "git 拉取失败（网络不可达或远端有冲突）"
+    else
+      warn "检测到本地未提交的修改，跳过 git 拉取"
+    fi
+    confirm_overwrite || return 1
+  fi
+  overlay_archive "$target"
+}
+
+action_update() {
+  section "更新应用"
+  local before="" after="" rc=0
+  before="$(source_revision "$PROJECT_DIR")"
+  # 1) 先停服务：避免更新源码时新旧代码混跑
+  stop_app
+  # 2) 取最新源码；失败就用现有版本把服务拉回来，不让应用一直停着
+  if ! update_source; then
+    warn "源码未更新，改为用现有源码重启"
+    start_app
+    return 1
+  fi
+  after="$(source_revision "$PROJECT_DIR")"
+  if [ -n "$before" ] && [ -n "$after" ]; then
+    if [ "$before" = "$after" ]; then
+      info "代码已是最新版本（$after）"
+    else
+      ok "版本：$before → $after"
+    fi
+  fi
+  # 3) 交给目录里那份（可能刚更新过的）脚本启动：依赖指纹变了会自动重装
+  info "用更新后的代码启动应用"
+  bash "$PROJECT_DIR/run.sh" start
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "更新完成，但启动失败（退出码 $rc）：请查看 ./run.sh status 与日志"
+    return "$rc"
+  fi
+  return 0
+}
+
 main() {
   local cmd="${1:-}"
   if [ "$cmd" = "__watchdog" ]; then
@@ -1362,6 +1550,7 @@ main() {
     6 | config) action_config ;;
     7 | db | database) action_database ;;
     8 | doctor | check) action_doctor ;;
+    9 | update | upgrade) action_update ;;
     restart) restart_app ;;
     log | logs) tail_log "$APP_LOG" "${2:-50}" ;;
     -h | --help | help) usage ;;
@@ -1378,12 +1567,17 @@ cleanup_database() {
   section "清理历史数据"
   if app_running; then
     info "服务正在运行，调用 POST /api/cleanup"
-    "$(runtime_python)" - "$(app_port)" <<'PY'
+    "$(runtime_python)" - "$(app_port)" "$(read_env_value ACCESS_KEY "")" <<'PY'
 import json
 import sys
 import urllib.request
 
-request = urllib.request.Request("http://127.0.0.1:%s/api/cleanup" % sys.argv[1], method="POST")
+headers = {"X-Access-Key": sys.argv[2]} if sys.argv[2] else {}
+request = urllib.request.Request(
+    "http://127.0.0.1:%s/api/cleanup" % sys.argv[1],
+    headers=headers,
+    method="POST",
+)
 try:
     with urllib.request.urlopen(request, timeout=120) as response:
         print(json.dumps(json.load(response), ensure_ascii=False, indent=2))

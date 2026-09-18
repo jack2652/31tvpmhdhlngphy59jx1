@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from app.config import Settings
 from app.db import Database, iso, parse_sessions
@@ -16,6 +17,39 @@ from app.levels import build_levels
 from app.providers.market import ProviderError, MarketDataProvider
 from app.services.history import HistoryService
 from app.services.snapshots import SnapshotService, active_expirations
+
+
+_FORBIDDEN_PAGE = """<!doctype html>
+<html lang="en">
+<head><title>403 Forbidden</title></head>
+<body>
+<center><h1>403 Forbidden</h1></center>
+<hr>
+<center>nginx</center>
+</body>
+</html>
+"""
+
+
+def install_access_guard(app: FastAPI, settings: Settings) -> None:
+    """为页面和 API 安装统一访问密钥校验；空密钥保持旧部署兼容。"""
+    expected = settings.access_key.strip()
+    if not expected:
+        return
+    expected_bytes = expected.encode("utf-8")
+
+    @app.middleware("http")
+    async def access_guard(request: Request, call_next):
+        path = request.url.path
+        # 静态资源和健康检查不携带密钥：前者是页面首屏依赖，后者供看门狗判断进程状态。
+        if path == "/health" or path.startswith("/static/"):
+            return await call_next(request)
+        provided = request.query_params.get("key") or request.headers.get("X-Access-Key") or ""
+        if not provided or not secrets.compare_digest(provided.encode("utf-8"), expected_bytes):
+            if path == "/api" or path.startswith("/api/"):
+                return JSONResponse(status_code=403, content={"detail": "403 Forbidden"})
+            return HTMLResponse(_FORBIDDEN_PAGE, status_code=403)
+        return await call_next(request)
 
 
 def create_router(database: Database, snapshots: SnapshotService, provider: MarketDataProvider, settings: Settings) -> APIRouter:

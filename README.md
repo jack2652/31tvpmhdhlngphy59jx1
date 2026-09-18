@@ -84,7 +84,12 @@ cp .env.example .env
 .venv/bin/python -m app
 ```
 
-服务默认监听 `0.0.0.0:8000`，本机打开 <http://127.0.0.1:8000>，局域网使用运行主机的实际 IP。
+服务默认监听 `0.0.0.0:8000`。新版启动脚本会生成 `ACCESS_KEY`，本机访问
+`http://127.0.0.1:8000/?key=你的访问密钥`，局域网地址把主机名换成运行主机的实际 IP。
+首次带 `?key=` 打开后，浏览器会把它写入 `localStorage`，后续 AJAX 请求自动从本地存储读取并校验；
+本地存储被清空或密钥错误时页面会显示 403。手动启动时需要自行在 `.env` 填写 `ACCESS_KEY`，
+留空表示不启用访问保护，适合只在本机临时调试。URL 中的密钥会进入浏览器历史记录，
+请避免在公开截图或聊天中直接分享完整地址。
 
 应用会自动读取项目根目录下的 `.env`；也可以直接在启动命令前导出环境变量。
 
@@ -124,6 +129,7 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 | `DATABASE_PATH` | `data/options.db` | SQLite 文件路径 |
 | `HOST` | `0.0.0.0` | `python -m app` 的监听地址 |
 | `PORT` | `8000` | `python -m app` 的监听端口 |
+| `ACCESS_KEY` | 空 | 页面与 API 访问密钥；`run.sh` 首次启动自动生成 16 位小写字母 + 数字 |
 | `MARKET_PROXY` | 空 | 上游行情接口使用的代理地址，例如 `http://127.0.0.1:7890` |
 | `DEFAULT_SYMBOLS` | `QQQ` | 后台定时刷新的逗号分隔标的；也是页面未带 `?symbol=` 时的默认标的 |
 | `REFRESH_INTERVAL_SECONDS` | `60` | 定时刷新间隔 |
@@ -169,6 +175,9 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 - `GET /api/status/{symbol}`
 - `POST /api/cleanup`
 - `GET /health`
+
+配置 `ACCESS_KEY` 后，所有页面和 `/api/*` 请求都必须携带正确的 `?key=` 或 `X-Access-Key` 请求头；
+只有 `/static/*` 与 `/health` 例外，分别用于加载页面资源和本机看门狗健康检查。
 
 ## 本地验证
 
