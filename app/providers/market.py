@@ -11,7 +11,7 @@ import logging
 import math
 import re
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 
@@ -315,3 +315,65 @@ class MarketDataProvider:
             if row.get("gamma") is None:
                 row["gamma"] = self.estimate_gamma(quote.get("price"), row.get("strike"), row.get("implied_volatility"), expiration)
         return quote, rows, fetched_at
+
+
+class HybridMarketDataProvider:
+    """按交易时段路由期权链，现货与历史行情仍由主行情适配器提供。"""
+
+    name = "hybrid"
+
+    def __init__(
+        self,
+        regular_provider: Any,
+        delayed_provider: Any,
+        now_factory: Callable[[], datetime] | None = None,
+    ):
+        self.regular_provider = regular_provider
+        self.delayed_provider = delayed_provider
+        self._now_factory = now_factory or (lambda: datetime.now(MARKET_TIMEZONE))
+
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        return MarketDataProvider.normalize_symbol(symbol)
+
+    def uses_delayed_options(self) -> bool:
+        moment = self._now_factory()
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=MARKET_TIMEZONE)
+        moment = moment.astimezone(MARKET_TIMEZONE)
+        return moment.weekday() >= 5 or session_of(moment) != "regular"
+
+    def expirations(self, symbol: str) -> list[str]:
+        provider = self.delayed_provider if self.uses_delayed_options() else self.regular_provider
+        return provider.expirations(symbol)
+
+    def quote(self, symbol: str) -> dict[str, Any]:
+        return self.regular_provider.quote(symbol)
+
+    def history(self, symbol: str, period: str = "6mo") -> list[dict[str, Any]]:
+        return self.regular_provider.history(symbol, period)
+
+    def chain(self, symbol: str, expiration: str) -> list[dict[str, Any]]:
+        provider = self.delayed_provider if self.uses_delayed_options() else self.regular_provider
+        return provider.chain(symbol, expiration)
+
+    def fetch(self, symbol: str, expiration: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+        if not self.uses_delayed_options():
+            return self.regular_provider.fetch(symbol, expiration)
+
+        try:
+            quote = self.regular_provider.quote(symbol)
+        except ProviderError as exc:
+            logger.warning("非盘中主行情请求失败，改用 Cboe 标的延迟价：%s", exc)
+            quote = self.delayed_provider.quote(symbol)
+        rows = self.delayed_provider.chain(symbol, expiration)
+        if quote.get("price") is None:
+            delayed_quote = self.delayed_provider.quote(symbol)
+            delayed_quote["sessions"] = quote.get("sessions") or delayed_quote.get("sessions", {})
+            quote = delayed_quote
+        for row in rows:
+            if row.get("gamma") is None:
+                row["gamma"] = MarketDataProvider.estimate_gamma(
+                    quote.get("price"), row.get("strike"), row.get("implied_volatility"), expiration
+                )
+        return quote, rows, datetime.now(timezone.utc).isoformat()

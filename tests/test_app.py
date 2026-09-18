@@ -16,13 +16,16 @@ from app.config import Settings
 from app.db import NO_FLOOR, Database, iso, parse_sessions, utc_now
 from app.levels import absorption_levels, build_levels, chip_peaks, fibonacci_levels, merge_candidates, price_extremes, touch_probability, trend_channel
 from app.providers import market
+from app.providers import cboe
 from app.providers.market import (
     ProviderError,
+    HybridMarketDataProvider,
     MarketDataProvider,
     current_session_state,
     safe_value,
     summarize_extended_hours,
 )
+from app.providers.cboe import CboeOptionsProvider, parse_occ_option
 from app.services.history import HistoryService
 from app.gamma import (
     annotate_model_greeks,
@@ -116,6 +119,148 @@ def test_safe_value_and_symbol_validation():
     assert MarketDataProvider.normalize_symbol("BF-B") == "BF-B"
     with pytest.raises(ValueError):
         MarketDataProvider.normalize_symbol("AAPL/")
+
+
+def test_parse_occ_option_and_map_cboe_chain():
+    assert parse_occ_option("QQQ261218C00599780") == {
+        "root": "QQQ",
+        "expiration": "2026-12-18",
+        "contract_type": "call",
+        "strike": 599.78,
+    }
+    payload = {
+        "data": {
+            "current_price": 600.0,
+            "prev_day_close": 598.0,
+            "options": [
+                {
+                    "option": "QQQ261218C00600000", "bid": 12.3, "ask": 12.5,
+                    "last_trade_price": 12.4, "volume": 12.0, "open_interest": 345.0,
+                    "iv": 0.31, "gamma": 0.02, "percent_change": 1.5,
+                },
+                {
+                    "option": "QQQ261218P00600000", "bid": 11.3, "ask": 11.5,
+                    "last_trade_price": 11.4, "volume": 8.0, "open_interest": 123.0,
+                    "iv": 0.29, "gamma": 0.018, "percent_change": -1.5,
+                },
+                {"option": "QQQ270115C00600000", "open_interest": 999},
+            ],
+        }
+    }
+    provider = CboeOptionsProvider(request_json=lambda _: payload)
+    rows = provider.chain("QQQ", "2026-12-18")
+    assert provider.expirations("QQQ") == ["2026-12-18", "2027-01-15"]
+    assert [row["contract_type"] for row in rows] == ["call", "put"]
+    assert rows[0]["open_interest"] == 345
+    assert rows[0]["in_the_money"] is True
+    assert rows[1]["in_the_money"] is True
+    assert rows[0]["provider"] == "cboe-delayed"
+
+
+def test_cboe_provider_forwards_market_proxy(monkeypatch):
+    observed: dict[str, object] = {}
+    payload = {
+        "data": {
+            "options": [{"option": "QQQ261218C00600000", "open_interest": 1}],
+        }
+    }
+
+    def fake_download(url, timeout=15.0, proxy=None):
+        observed.update({"url": url, "timeout": timeout, "proxy": proxy})
+        return payload
+
+    monkeypatch.setattr(cboe, "download_json", fake_download)
+    provider = CboeOptionsProvider(proxy=" http://127.0.0.1:7890 ", timeout=9.0)
+    assert provider.expirations("QQQ") == ["2026-12-18"]
+    assert observed == {
+        "url": "https://cdn.cboe.com/api/global/delayed_quotes/options/QQQ.json",
+        "timeout": 9.0,
+        "proxy": "http://127.0.0.1:7890",
+    }
+
+
+def test_hybrid_provider_routes_options_by_market_session():
+    calls: list[str] = []
+
+    class Primary:
+        def expirations(self, symbol):
+            calls.append("primary-expirations")
+            return ["2026-12-18"]
+
+        def quote(self, symbol):
+            calls.append("primary-quote")
+            return sample_quote(symbol)
+
+        def chain(self, symbol, expiration):
+            calls.append("primary-chain")
+            return sample_rows(symbol, expiration)
+
+        def fetch(self, symbol, expiration):
+            calls.append("primary-fetch")
+            return sample_quote(symbol), sample_rows(symbol, expiration), iso()
+
+        def history(self, symbol, period="6mo"):
+            return sample_bars()
+
+    class Delayed(Primary):
+        def expirations(self, symbol):
+            calls.append("delayed-expirations")
+            return ["2026-12-18"]
+
+        def chain(self, symbol, expiration):
+            calls.append("delayed-chain")
+            return sample_rows(symbol, expiration)
+
+        def quote(self, symbol):
+            calls.append("delayed-quote")
+            return sample_quote(symbol)
+
+    eastern = ZoneInfo("America/New_York")
+    provider = HybridMarketDataProvider(
+        Primary(), Delayed(), now_factory=lambda: datetime(2026, 9, 18, 8, 0, tzinfo=eastern)
+    )
+    provider.expirations("QQQ")
+    provider.fetch("QQQ", "2026-12-18")
+    assert "delayed-expirations" in calls and "delayed-chain" in calls
+    assert "primary-fetch" not in calls
+    assert "primary-quote" in calls
+
+    calls.clear()
+    provider._now_factory = lambda: datetime(2026, 9, 18, 10, 0, tzinfo=eastern)
+    provider.expirations("QQQ")
+    provider.fetch("QQQ", "2026-12-18")
+    assert "primary-expirations" in calls and "primary-fetch" in calls
+    assert "delayed-chain" not in calls
+
+
+def test_nonregular_cboe_failure_keeps_cached_chain(tmp_path: Path):
+    """盘外免费源故障时不覆盖已有快照，页面仍可读取旧期权链。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote(), sample_rows(), iso())
+
+    class Primary:
+        def normalize_symbol(self, symbol):
+            return MarketDataProvider.normalize_symbol(symbol)
+
+        def quote(self, symbol):
+            return sample_quote(symbol)
+
+        def history(self, symbol, period="6mo"):
+            return sample_bars()
+
+    class BrokenDelayed:
+        def expirations(self, symbol):
+            raise ProviderError("Cboe 请求失败")
+
+    eastern = ZoneInfo("America/New_York")
+    provider = HybridMarketDataProvider(
+        Primary(), BrokenDelayed(), now_factory=lambda: datetime(2026, 9, 18, 8, 0, tzinfo=eastern)
+    )
+    service = SnapshotService(database, provider)
+    with pytest.raises(ProviderError):
+        service.refresh("AAPL", "2026-12-18")
+    cached = database.latest_chain("AAPL", "2026-12-18")
+    assert cached["data"] and cached["data"][0]["open_interest"] == 500
 
 
 def test_market_provider_passes_proxy_to_ticker_factory():

@@ -13,14 +13,16 @@ from fastapi.staticfiles import StaticFiles
 from app.api import create_router, install_access_guard
 from app.config import Settings
 from app.db import Database
-from app.providers.market import MarketDataProvider
+from app.providers.market import HybridMarketDataProvider, MarketDataProvider
+from app.providers.cboe import CboeOptionsProvider
 from app.services.scheduler import Scheduler
 from app.services.snapshots import SnapshotService
 
 
 settings = Settings.from_env()
 database = Database(settings.database_path)
-provider = MarketDataProvider(proxy=settings.proxy_url)
+regular_provider = MarketDataProvider(proxy=settings.proxy_url)
+provider = HybridMarketDataProvider(regular_provider, CboeOptionsProvider(proxy=settings.proxy_url))
 snapshots = SnapshotService(database, provider)
 scheduler = Scheduler(settings, snapshots, database)
 
