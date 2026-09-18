@@ -397,8 +397,11 @@ def test_theme_defaults_to_dark_with_light_override():
     assert ":root{color-scheme:dark;" in styles
     assert ':root[data-theme="light"]{color-scheme:light;' in styles
     assert "--bg:#0b1118" in styles and "--bg:#f2f5f9" in styles
-    # 首屏引导脚本：默认黑夜，只有本地存过白天偏好时才切白天，避免刷新闪烁。
-    assert 'localStorage.getItem("option-scope-theme") === "light" ? "light" : "dark"' in html
+    # 首屏引导脚本：默认黑夜，只有本地存过白天偏好时才切白天，避免刷新闪烁；
+    # 浏览器禁用本地存储时必须静默回退，不能抛出异常导致整段脚本中断。
+    assert 'var theme="dark";' in html
+    assert 'if(localStorage.getItem("option-scope-theme")==="light")theme="light";' in html
+    assert "catch(error){}document.documentElement.dataset.theme=theme;" in html
     assert 'id="theme-toggle"' in html
     # 顶栏切换按钮与主题逻辑。
     assert 'const THEME_KEY = "option-scope-theme";' in source
@@ -1879,3 +1882,19 @@ def test_access_key_from_env(monkeypatch):
     """ACCESS_KEY 会去除首尾空白并写入配置对象。"""
     monkeypatch.setenv("ACCESS_KEY", " abc123 ")
     assert Settings.from_env().access_key == "abc123"
+
+
+def test_access_key_supports_browsers_with_disabled_storage():
+    """浏览器禁用 localStorage/sessionStorage 时仍使用 URL key，不能让 URL 重写或 AJAX 丢凭证。"""
+    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "function currentAccessKey()" in source
+    assert "sessionStorage.getItem(ACCESS_KEY_STORAGE)" in source
+    assert "const accessKey = currentAccessKey();" in source
+    assert "state.storageAvailable = storageWritable();" in source
+    assert "function withAccessKey(path, accessKey)" in source
+    assert "fetch(withAccessKey(path, accessKey)" in source
+    # URL key 存在时必须无条件写回内存，storage 写入失败也不能把它置空。
+    assert "state.accessKey = queryKey;" in source
+    # 首屏主题脚本也不能因为存储被禁用而抛错。
+    assert "catch(error){}document.documentElement.dataset.theme=theme;" in page

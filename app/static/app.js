@@ -1,4 +1,4 @@
-const state = { symbol: "QQQ", expiration: null, timer: null, analysisReady: false, loadId: 0, refreshing: false, refreshInFlight: null, analysisRefreshSymbol: null, chainFetchedAt: null, levelsKey: "", levelsPayload: null, chainFilter: "all", chainRows: [], chainSpot: null, levelBasisMode: "live", lastQuote: null, accessKey: "" };
+const state = { symbol: "QQQ", expiration: null, timer: null, analysisReady: false, loadId: 0, refreshing: false, refreshInFlight: null, analysisRefreshSymbol: null, chainFetchedAt: null, levelsKey: "", levelsPayload: null, chainFilter: "all", chainRows: [], chainSpot: null, levelBasisMode: "live", lastQuote: null, accessKey: "", storageAvailable: false };
 const GAMMA_MIN_MINUTES = 30;
 // 自动刷新间隔（秒）：页面提示文案与定时器共用同一个值。
 const AUTO_REFRESH_SECONDS = 60;
@@ -157,19 +157,55 @@ function accessKeyRequired() {
 }
 
 function readStoredAccessKey() {
-  try { return (localStorage.getItem(ACCESS_KEY_STORAGE) || "").trim(); } catch (error) { return ""; }
+  try {
+    const value = (localStorage.getItem(ACCESS_KEY_STORAGE) || "").trim();
+    if (value) return value;
+  } catch (error) { /* 隐私模式或浏览器策略可能禁用 localStorage，继续尝试 sessionStorage。 */ }
+  try { return (sessionStorage.getItem(ACCESS_KEY_STORAGE) || "").trim(); } catch (error) { return ""; }
+}
+
+// 存储探测只判断浏览器是否允许写入，不依赖 key 是否已经存在；探测失败时页面改用内存值。
+function storageWritable() {
+  const probe = `${ACCESS_KEY_STORAGE}-probe`;
+  try {
+    localStorage.setItem(probe, "1");
+    localStorage.removeItem(probe);
+    return true;
+  } catch (error) { /* 继续尝试会话存储。 */ }
+  try {
+    sessionStorage.setItem(probe, "1");
+    sessionStorage.removeItem(probe);
+    return true;
+  } catch (error) { return false; }
 }
 
 function rememberAccessKey(key) {
-  try { localStorage.setItem(ACCESS_KEY_STORAGE, key); return true; } catch (error) { return false; }
+  let remembered = false;
+  try { localStorage.setItem(ACCESS_KEY_STORAGE, key); remembered = true; } catch (error) { /* 忽略并回退。 */ }
+  try { sessionStorage.setItem(ACCESS_KEY_STORAGE, key); remembered = true; } catch (error) { /* 忽略并回退。 */ }
+  return remembered;
+}
+
+function currentAccessKey() {
+  // URL 是入口凭证：即使浏览器完全禁用本地存储，也必须优先使用它，不能被内存状态覆盖。
+  const queryKey = parsePageQuery(location.search).key;
+  if (queryKey) { state.accessKey = queryKey; return queryKey; }
+  const stored = readStoredAccessKey();
+  if (stored) { state.accessKey = stored; return stored; }
+  // 存储完全不可用时允许当前页面继续使用内存里的 key；刷新后 URL 仍会带着它重新初始化。
+  if (!state.storageAvailable && state.accessKey) return state.accessKey;
+  return "";
 }
 
 function initializeAccessKey() {
   const queryKey = parsePageQuery(location.search).key;
+  state.storageAvailable = storageWritable();
   if (queryKey) {
-    // 首次带 key 访问时写入 localStorage；写入失败说明浏览器不允许持久化，按密钥丢失处理。
-    state.accessKey = rememberAccessKey(queryKey) ? queryKey : "";
-    return state.accessKey;
+    // 先尝试持久化；哪怕写入失败也保留 URL 里的 key，避免后续导航或刷新丢掉访问凭证。
+    rememberAccessKey(queryKey);
+    state.storageAvailable = state.storageAvailable || readStoredAccessKey() === queryKey;
+    state.accessKey = queryKey;
+    return queryKey;
   }
   state.accessKey = readStoredAccessKey();
   return state.accessKey;
@@ -1056,9 +1092,17 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   renderDistributionSummary($("oi-summary"), expirationRows, spot, "open_interest", "总持仓量");
 }
 
+// 所有 AJAX 请求都优先把 key 放进 URL 查询参数，避免浏览器存储策略影响鉴权。
+function withAccessKey(path, accessKey) {
+  if (!accessKey) return path;
+  const url = new URL(path, location.origin);
+  if (!url.searchParams.has("key")) url.searchParams.set("key", accessKey);
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
 async function request(path, options = {}) {
-  // 每次请求都重新读取 localStorage，确保用户在别处清空存储后立即触发 403，而不是继续使用内存里的旧值。
-  const accessKey = readStoredAccessKey();
+  // URL key、localStorage/sessionStorage 和内存回退按优先级逐层读取，兼容禁用存储的浏览器。
+  const accessKey = currentAccessKey();
   if (accessKeyRequired() && !accessKey) {
     const message = "403 Forbidden";
     showAccessDenied();
@@ -1066,7 +1110,7 @@ async function request(path, options = {}) {
   }
   const headers = new Headers(options.headers || {});
   if (accessKey) headers.set("X-Access-Key", accessKey);
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(withAccessKey(path, accessKey), { ...options, headers });
   const body = await response.json().catch(() => ({}));
   if (response.status === 403) {
     const message = body.detail || "403 Forbidden";
