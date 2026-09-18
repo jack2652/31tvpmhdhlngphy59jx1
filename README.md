@@ -1,5 +1,24 @@
 # Option Scope
 
+## 一键安装（推荐）
+
+在任意一台 Ubuntu / Debian / CentOS / RHEL / Rocky / Alma / Alpine 机器上，直接执行这一行（无需事先下载源码、无需手动上传部署）：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
+```
+
+脚本会先把仓库克隆到当前目录下的 `us_stocks/`（该目录已是仓库时改跑 `git pull` 更新到最新源码），然后切换进去打开交互菜单：第 1 项装环境、第 2 项启动（后台运行 + 看门狗守护）。
+
+| 需求 | 命令 |
+| --- | --- |
+| 打开交互菜单（默认） | `bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)` |
+| 装完环境直接启动 | `bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh) 2` |
+| 换安装目录 | `INSTALL_DIR=/opt/us_stocks bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)` |
+| 换远端（镜像 / SSH） | `GIT_REMOTE_URL=git@github.com:jack2652/31tvpmhdhlngphy59jx1.git bash <(curl -Ls <脚本地址>)` |
+
+几点说明：默认安装目录是执行命令时所在目录下的 `us_stocks/`（用 `INSTALL_DIR` 可改成 `/opt/...` 这类路径）；重复执行同一条命令等同于「升级到最新源码」，`.env` 配置与 `data/` 数据库都在忽略名单里，不会被动到；机器上没装 git 时脚本会先用系统包管理器装，装不上则退化为下载源码压缩包（这种安装方式后续不能自动增量更新）；`pip` 依赖只在 `pyproject.toml` 变化时才重装，日常拉新代码几乎不花时间。
+
 一个可快速部署的美股期权快照分析工具。后端使用 FastAPI，数据源使用 `yfinance`，快照落盘到 SQLite，前端是无需 Node 构建的原生 HTML/CSS/JavaScript。
 
 ## 能做什么
@@ -86,6 +105,9 @@ cp .env.example .env
 | `DATABASE_MAX_MB` | `0` | SQLite 体积上限，纯数字按 MB 解释，也支持 `300M`、`1G`；`0` 表示不限制 |
 | `HISTORY_MAX_AGE_SECONDS` | `3600` | 日线历史（斐波那契/筹码分布/承接位）的回源间隔 |
 | `SCHEDULER_ENABLED` | `true` | 是否启用后台刷新和清理 |
+
+表中「默认值」是环境变量缺失时代码的回退值；`.env.example` 面向小磁盘环境，
+已经把 `DATABASE_MAX_MB` 预设为 `256M`、`RAW_RETENTION_DAYS` 预设为 `7`，改成 `0` / 更大的天数即可放宽。
 
 ### 小磁盘部署（LXC / 512M 磁盘）
 

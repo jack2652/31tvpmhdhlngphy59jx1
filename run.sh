@@ -11,6 +11,11 @@
 #   ./run.sh status|stop    直接查看状态 / 停止应用
 #   ./run.sh __watchdog     内部使用：看门狗主循环
 #
+# 从零安装（无需事先下载源码，会自动克隆/更新到最新版本）：
+#   bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
+#   bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh) 2   直接安装并启动
+#   INSTALL_DIR=/opt/us_stocks bash <(curl -Ls .../run.sh)    自定义安装目录（默认 ./us_stocks）
+#
 # 说明：脚本自身幂等，重复执行安全；所有路径都基于脚本所在目录，可在任意工作目录调用。
 set -u
 set -o pipefail
@@ -1025,6 +1030,8 @@ Option Scope 运维脚本用法：
   ./run.sh 2                  直接执行第 2 项（适合脚本、计划任务调用）
   ./run.sh start|stop|restart|status|doctor|install|config|db
   ./run.sh help               显示本帮助
+从零安装（当前目录下没有源码时先自动拉取，再继续执行）：
+  bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
 说明：脚本幂等，已就绪的步骤会自动跳过；路径全部基于脚本所在目录。
 TXT
 }
@@ -1077,6 +1084,120 @@ action_stop() {
   stop_app
 }
 
+# ---------- 引导安装：curl | bash 场景 ----------
+# 通过 `bash <(curl -Ls <脚本地址>)` 或 `curl -Ls <脚本地址> | bash` 运行时，脚本自身并不在项目目录里
+# （BASH_SOURCE 指向 /dev/fd/*），PROJECT_DIR 会解析成 /dev，所有路径都会失效。
+# 因此这里先把仓库下载到本地，再切换到真实目录把后续流程交给同一份脚本继续执行。
+GIT_REMOTE_URL="${GIT_REMOTE_URL:-https://github.com/jack2652/31tvpmhdhlngphy59jx1.git}"
+ARCHIVE_URL="${ARCHIVE_URL:-https://codeload.github.com/jack2652/31tvpmhdhlngphy59jx1/tar.gz/refs/heads/main}"
+
+# 判断当前脚本是否就运行在完整源码目录里
+in_project_checkout() {
+  # shellcheck disable=SC2153
+  [ -f "$PROJECT_DIR/pyproject.toml" ] && [ -d "$PROJECT_DIR/app" ]
+}
+
+# 自动更新源码需要 git；缺失时尝试用系统包管理器装上，装不上则退化为压缩包下载
+ensure_git() {
+  if has_cmd git; then
+    ok "git 已就绪：$(git --version 2>/dev/null)"
+    return 0
+  fi
+  warn "未找到 git，尝试自动安装"
+  pkg_install git || true
+  if has_cmd git; then
+    ok "git 安装完成"
+    return 0
+  fi
+  warn "自动安装 git 失败，改用源码压缩包方式（后续无法自动增量更新）"
+  return 1
+}
+
+# 没有 git 时的兜底：直接下载分支源码包并解压
+download_archive() {
+  local target="$1" tmp="" extracted=""
+  has_cmd curl || { fail "缺少 curl，无法下载源码包"; return 1; }
+  has_cmd tar || { fail "缺少 tar，无法解压源码包"; return 1; }
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/us_stocks.XXXXXX")" || return 1
+  info "下载源码压缩包：$ARCHIVE_URL"
+  if ! curl -LfsS "$ARCHIVE_URL" | tar -xz -C "$tmp"; then
+    fail "源码包下载或解压失败，请检查网络或代理"
+    rm -rf "$tmp"
+    return 1
+  fi
+  extracted="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  if [ -z "$extracted" ]; then
+    fail "源码包内容异常（未找到解压目录）"
+    rm -rf "$tmp"
+    return 1
+  fi
+  mkdir -p "$(dirname "$target")"
+  if ! mv "$extracted" "$target"; then
+    fail "移动到 $target 失败"
+    rm -rf "$tmp"
+    return 1
+  fi
+  rm -rf "$tmp"
+  return 0
+}
+
+bootstrap_if_needed() {
+  if in_project_checkout; then
+    return 0
+  fi
+  # 引导只允许发生一次：目标目录内容异常时再次 exec 会无限套娃，这里直接报错退出
+  if [ "${OPTION_SCOPE_BOOTSTRAP_DONE:-0}" = "1" ]; then
+    fail "引导安装后仍未进入完整源码目录，请手动检查安装目录后重试"
+    return 1
+  fi
+  section "首次安装：获取最新源码"
+  local target="${INSTALL_DIR:-$PWD/us_stocks}"
+  case "$target" in
+    /*) ;;
+    *) target="$PWD/$target" ;;
+  esac
+  info "脚本来自 ${BASH_SOURCE[0]}，安装目录：$target"
+  if [ -d "$target/.git" ]; then
+    info "检测到已存在的仓库，更新到最新版本"
+    if has_cmd git && git -C "$target" pull --ff-only --quiet 2>/dev/null; then
+      ok "源码已更新到最新版本"
+    else
+      warn "自动更新失败（缺少 git 或存在本地修改），继续使用现有源码：$target"
+    fi
+  elif [ -e "$target" ]; then
+    fail "目标目录已存在且不是 git 仓库：$target"
+    fail "请换一个安装目录，例如：INSTALL_DIR=/opt/us_stocks bash <(curl -Ls <脚本地址>)"
+    return 1
+  else
+    if ensure_git; then
+      info "克隆源码：$GIT_REMOTE_URL"
+      if ! git clone --depth 1 --quiet "$GIT_REMOTE_URL" "$target"; then
+        fail "克隆失败，请检查网络或代理设置"
+        return 1
+      fi
+    else
+      download_archive "$target" || return 1
+    fi
+    ok "源码已下载到 $target"
+  fi
+  # 内容校验：缺文件就报错，避免 exec 出去以后又回到引导逻辑里空转
+  if [ ! -f "$target/pyproject.toml" ] || [ ! -d "$target/app" ] || [ ! -f "$target/run.sh" ]; then
+    fail "源码不完整（缺少 run.sh / pyproject.toml / app）：$target"
+    return 1
+  fi
+  if [ ! -x "$target/run.sh" ]; then
+    chmod +x "$target/run.sh" 2>/dev/null || true
+  fi
+  cd "$target" || { fail "无法进入目录：$target"; return 1; }
+  info "切换到项目目录，继续执行脚本"
+  export OPTION_SCOPE_BOOTSTRAP_DONE=1
+  # 用 `curl | bash` 时标准输入是管道，菜单读不到按键；能打开终端就重新接回 /dev/tty
+  if [ ! -t 0 ] && (exec </dev/tty) 2>/dev/null; then
+    exec bash "$target/run.sh" "$@" </dev/tty
+  fi
+  exec bash "$target/run.sh" "$@"
+}
+
 main() {
   local cmd="${1:-}"
   if [ "$cmd" = "__watchdog" ]; then
@@ -1085,6 +1206,8 @@ main() {
   fi
   init_privilege
   detect_system
+  # 不在源码目录里（curl | bash 场景）时先拉取源码，再切换过去继续执行
+  bootstrap_if_needed "$@" || return 1
   case "$cmd" in
     "") menu_loop ;;
     1 | install) action_install ;;
