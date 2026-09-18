@@ -13,12 +13,12 @@ from app.config import Settings
 from app.db import Database, iso, parse_sessions
 from app.gamma import annotate_model_greeks, find_zero_gamma
 from app.levels import build_levels
-from app.providers.yahoo import ProviderError, YahooProvider
+from app.providers.market import ProviderError, MarketDataProvider
 from app.services.history import HistoryService
 from app.services.snapshots import SnapshotService, active_expirations
 
 
-def create_router(database: Database, snapshots: SnapshotService, provider: YahooProvider, settings: Settings) -> APIRouter:
+def create_router(database: Database, snapshots: SnapshotService, provider: MarketDataProvider, settings: Settings) -> APIRouter:
     router = APIRouter(prefix="/api")
     history = HistoryService(
         database, provider, settings.history_max_age_seconds, settings.extremes_max_age_seconds
@@ -46,7 +46,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Yaho
         """本地还没有快照时先返回占位结构，前端据此显示「后台刷新中」。"""
         return {
             "symbol": symbol_name, "price": None, "change_percent": None, "currency": "USD",
-            "market_state": None, "sessions": {}, "provider": "yfinance", "source": "pending",
+            "market_state": None, "sessions": {}, "provider": "upstream", "source": "pending",
         }
 
     @router.get("/quote/{stock_symbol}")
@@ -60,7 +60,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Yaho
         try:
             fresh = provider.quote(normalized)
             if fresh.get("price") is not None:
-                return quote_response(fresh, "yfinance")
+                return quote_response(fresh, "upstream")
             if cached and cached.get("price") is not None:
                 return quote_response(cached, "sqlite")
             return pending_quote(normalized)
@@ -74,7 +74,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Yaho
     @router.get("/expirations/{stock_symbol}")
     def expirations(stock_symbol: str, refresh: bool = Query(default=False)) -> dict[str, Any]:
         normalized = symbol(stock_symbol)
-        # 已过期的到期日不再下发给前端：这类历史合约无法再从 Yahoo 刷新，会让页面一直停在旧快照。
+        # 已过期的到期日不再下发给前端：这类历史合约无法再从上游刷新，会让页面一直停在旧快照。
         cached = active_expirations(database.latest_expirations(normalized))
         if cached and not refresh:
             return {"symbol": normalized, "expirations": cached, "source": "sqlite"}
@@ -86,7 +86,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Yaho
             if cached:
                 return {"symbol": normalized, "expirations": cached, "source": "sqlite", "warning": str(exc)}
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"symbol": normalized, "expirations": active_expirations(values), "source": "yfinance"}
+        return {"symbol": normalized, "expirations": active_expirations(values), "source": "upstream"}
 
     @router.get("/chain/{stock_symbol}")
     def chain(stock_symbol: str, expiration: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict[str, Any]:
@@ -134,7 +134,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Yaho
 
     @router.post("/refresh/{stock_symbol}")
     def refresh(stock_symbol: str, expiration: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"), max_age: int = Query(default=60, ge=0, le=3600)) -> dict[str, Any]:
-        """刷新一次快照；本地快照在 max_age 秒内时直接复用（skipped=True），不再请求 yfinance。"""
+        """刷新一次快照；本地快照在 max_age 秒内时直接复用（skipped=True），不再请求上游接口。"""
         normalized = symbol(stock_symbol)
         try:
             return snapshots.refresh(normalized, expiration, max_age_seconds=max_age)

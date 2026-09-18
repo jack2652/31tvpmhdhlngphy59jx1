@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "option-scope"
 version = "0.1.0"
-description = "基于 yfinance 的本地美股期权快照分析工具"
+description = "本地美股期权快照分析工具"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115,<1",

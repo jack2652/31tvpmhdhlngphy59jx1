@@ -2,7 +2,7 @@ const state = { symbol: "QQQ", expiration: null, timer: null, analysisReady: fal
 const GAMMA_MIN_MINUTES = 30;
 // 自动刷新间隔（秒）：页面提示文案与定时器共用同一个值。
 const AUTO_REFRESH_SECONDS = 60;
-// 本地快照新鲜期（秒）：SQLite 里的快照比它更新时直接复用，不再请求 yfinance。
+// 本地快照新鲜期（秒）：SQLite 里的快照比它更新时直接复用，不再请求上游接口。
 const SNAPSHOT_FRESH_SECONDS = 60;
 // 压力位/支撑位各展示的条数。
 const LEVEL_COUNT = 10;
@@ -15,7 +15,7 @@ const PLAN_COUNT = 5;
 const HEAT_HOT_LEVEL = { call: 68, put: 80 };
 // 期权链筛选下拉框的取值与中文标签。
 const CHAIN_FILTERS = { all: "全部", call: "看涨", put: "看跌" };
-// 时段标签：数据源给的是 Yahoo 的 marketState 口径（PRE/REGULAR/POST/CLOSED），夜盘由本地时钟补充。
+// 时段标签：数据源给的是上游的 marketState 口径（PRE/REGULAR/POST/CLOSED），夜盘由本地时钟补充。
 const MARKET_STATE_LABELS = { PRE: "盘前", REGULAR: "正常交易", POST: "盘后", OVERNIGHT: "夜盘", CLOSED: "休市" };
 const $ = (id) => document.getElementById(id);
 
@@ -583,7 +583,7 @@ function activeBasis(quote) {
   return Number.isFinite(price) && price > 0 ? { price, label: "实时" } : levelBasis(quote, quote?.price);
 }
 
-// 切换基准价口径：同步开关的按下状态，再用已有快照重算压力位/支撑位（不额外请求 yfinance）。
+// 切换基准价口径：同步开关的按下状态，再用已有快照重算压力位/支撑位（不额外请求上游接口）。
 // 支撑位/压力位表、交易计划与压力位/支撑位柱状图都由这一次重绘一起更新。
 function applyBasisMode(mode) {
   state.levelBasisMode = mode === "close" ? "close" : "live";
@@ -649,7 +649,7 @@ function renderLevels(points, spot) {
   }
   const openInterest = points.reduce((sum, point) => sum + point.callOi + point.putOi, 0);
   const volume = points.reduce((sum, point) => sum + point.callVolume + point.putVolume, 0);
-  // 未平仓量合计不足成交量 20% 时视为持仓数据不完整（Yahoo 盘前会整链返回 0），改用成交量口径。
+  // 未平仓量合计不足成交量 20% 时视为持仓数据不完整（上游盘前会整链返回 0），改用成交量口径。
   const byGex = openInterest > 0 && openInterest >= volume * 0.2;
   const callValue = byGex ? (point) => Math.max(point.callGex, 0) : (point) => point.callVolume;
   const putValue = byGex ? (point) => Math.max(-point.putGex, 0) : (point) => point.putVolume;
@@ -1144,9 +1144,9 @@ function renderChain(payload, quote, analysisPayload) {
   $("chain-title").textContent = `${payload.symbol} · ${payload.expiration}`;
   // 期权链始终从 SQLite 读取，这里按快照新鲜度标注来源，避免刚抓完还显示“缓存”造成误解。
   const snapshotAge = payload.fetched_at ? (Date.now() - new Date(payload.fetched_at).getTime()) / 1000 : null;
-  // Yahoo 在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
+  // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
   const oiFallback = payload.oi_fallback || {};
-  $("data-source").textContent = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < 180 ? "Yahoo Finance 新快照" : "SQLite 缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
+  $("data-source").textContent = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < 180 ? "上游新快照" : "SQLite 缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
   $("fetched-at").textContent = `快照时间 ${formatTime(payload.fetched_at)}`;
   $("total-count").textContent = formatNumber(rows.length);
   const calls = rows.filter((row) => row.contract_type === "call"); const puts = rows.filter((row) => row.contract_type === "put");
@@ -1185,7 +1185,7 @@ function isCurrentLoad(loadId, expiration) {
   return state.loadId === loadId && (!expiration || state.expiration === expiration);
 }
 
-// 快照仍在新鲜期内时不再请求 yfinance，只把本地缓存的状态回显给用户。
+// 快照仍在新鲜期内时不再请求上游接口，只把本地缓存的状态回显给用户。
 function isSnapshotFresh(snapshot) {
   const age = snapshotAgeSeconds(snapshot?.fetchedAt);
   return Boolean(snapshot?.shown) && age !== null && age < SNAPSHOT_FRESH_SECONDS;
@@ -1303,8 +1303,8 @@ async function refreshInBackground(loadId) {
   if (state.refreshInFlight === symbol) return;
   state.refreshInFlight = symbol;
   try {
-    $("last-status").textContent = "正在请求 Yahoo 快照…";
-    // max_age 交给后端再兜底一次：本地快照仍在新鲜期内时后端会直接返回 skipped，不再打 yfinance。
+    $("last-status").textContent = "正在请求上游快照…";
+    // max_age 交给后端再兜底一次：本地快照仍在新鲜期内时后端会直接返回 skipped，不再打上游接口。
     const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });
     if (expiration) params.set("expiration", expiration);
     const refreshResult = await request(`/api/refresh/${encodedSymbol}?${params}`, { method: "POST" });
@@ -1390,7 +1390,7 @@ async function loadQuoteOnly(loadId) {
   state.expiration = null;
   showPending(symbol + " 没有挂牌期权（或可用期限已全部到期），仅显示现货行情");
   applyExpirations([], null, "无期权到期日");
-  $("data-source").textContent = "Yahoo Finance 无期权数据";
+  $("data-source").textContent = "上游无期权数据";
   $("last-status").textContent = "该标的没有期权合约，仅显示现货行情";
 }
 
@@ -1408,9 +1408,9 @@ async function loadChain(options = {}) {
   // 即使本地还没有到期日也要往下走：首次加载某个标的时后端需要回源才能拿到期限列表，
   // 提前 return 会让页面永远停在没有数据的状态。
   const snapshot = await renderSnapshot(loadId);
-  if (!snapshot.shown) showPending("正在后台获取 yfinance 快照…");
+  if (!snapshot.shown) showPending("正在后台获取上游快照…");
   if (options.refresh === false) return;
-  // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求 yfinance。
+  // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求上游接口。
   if (isSnapshotFresh(snapshot)) { showFreshStatus(snapshot); return; }
   await refreshInBackground(loadId);
 }
@@ -1480,7 +1480,7 @@ function navigateToSymbol() {
 }
 
 // 手动点击与 60 秒定时刷新共用入口：先读 SQLite（renderSnapshot 只读本地缓存），
-// 快照仍在新鲜期内就直接复用，只有确认过期才请求 yfinance；整段流程互斥，连点与定时器不会叠加请求。
+// 快照仍在新鲜期内就直接复用，只有确认过期才请求上游接口；整段流程互斥，连点与定时器不会叠加请求。
 async function refresh(silent = false) {
   if (state.refreshing) return;
   state.refreshing = true;

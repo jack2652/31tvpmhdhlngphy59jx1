@@ -1,6 +1,6 @@
 """日线历史行情服务：SQLite 缓存 + 新鲜期控制。
 
-斐波那契回撤、筹码分布和承接位都需要日线 OHLCV；Yahoo 的最后一根日线在盘中也会变化，
+斐波那契回撤、筹码分布和承接位都需要日线 OHLCV；上游的最后一根日线在盘中也会变化，
 因此按 max_age_seconds（默认 1 小时）控制回源频率，新鲜期内直接复用 SQLite。
 回源失败时退回本地旧缓存并标注 warning，保证压力位/支撑位面板仍能给出期权口径的结果。
 """
@@ -13,7 +13,7 @@ from typing import Any
 
 from app.db import Database, iso
 from app.levels import price_extremes
-from app.providers.yahoo import ProviderError, YahooProvider
+from app.providers.market import ProviderError, MarketDataProvider
 from app.services.snapshots import snapshot_age_seconds
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ class HistoryService:
     def __init__(
         self,
         database: Database,
-        provider: YahooProvider,
+        provider: MarketDataProvider,
         max_age_seconds: int = 3600,
         extremes_max_age_seconds: int = 86400,
     ):
@@ -65,7 +65,7 @@ class HistoryService:
                 return self._result(normalized, cached, "sqlite" if cached else "none", str(exc))
             fetched_at = iso()
             self.database.write_history(normalized, bars, fetched_at)
-            return self._result(normalized, {"bars": bars, "fetched_at": fetched_at}, "yfinance", None)
+            return self._result(normalized, {"bars": bars, "fetched_at": fetched_at}, "upstream", None)
 
     def extremes(self, symbol: str) -> dict[str, Any]:
         """返回 {symbol, extremes, fetched_at, source, warning}：52 周与历史最高/最低价。
@@ -91,7 +91,7 @@ class HistoryService:
                 return self._extremes_result(normalized, cached, "sqlite" if cached else "none", str(exc))
             fetched_at = iso()
             self.database.write_extremes(normalized, computed, fetched_at)
-            return self._extremes_result(normalized, {"extremes": computed, "fetched_at": fetched_at}, "yfinance", None)
+            return self._extremes_result(normalized, {"extremes": computed, "fetched_at": fetched_at}, "upstream", None)
 
     @staticmethod
     def _extremes_result(symbol: str, cached: dict[str, Any] | None, source: str, warning: str | None) -> dict[str, Any]:

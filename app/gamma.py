@@ -17,7 +17,7 @@ SCAN_STEPS = 161
 BISECTION_STEPS = 40
 MAX_ACTIONABLE_DISTANCE = 0.08
 RISK_FREE = 0.005
-# 隐含波动率估计参数：Yahoo 的 IV 字段在盘前/收盘后常是占位值（1e-5、1/32 之类），
+# 隐含波动率估计参数：上游的 IV 字段在盘前/收盘后常是占位值（1e-5、1/32 之类），
 # 因此改用合约价格反解，样本只取近 ATM 且价格可信的合约。
 IV_MIN = 0.03
 IV_MAX = 5.0

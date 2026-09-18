@@ -65,7 +65,7 @@ class Settings:
             raise ValueError("DEFAULT_SYMBOLS 至少需要一个标的")
         return cls(
             database_path=Path(os.getenv("DATABASE_PATH", "data/options.db")),
-            proxy_url=os.getenv("YFINANCE_PROXY", "").strip() or None,
+            proxy_url=os.getenv("MARKET_PROXY", "").strip() or None,
             default_symbols=symbols,
             refresh_interval_seconds=_positive_int("REFRESH_INTERVAL_SECONDS", 60),
             raw_retention_days=_positive_int("RAW_RETENTION_DAYS", 30),

@@ -13,14 +13,14 @@ from fastapi.staticfiles import StaticFiles
 from app.api import create_router
 from app.config import Settings
 from app.db import Database
-from app.providers.yahoo import YahooProvider
+from app.providers.market import MarketDataProvider
 from app.services.scheduler import Scheduler
 from app.services.snapshots import SnapshotService
 
 
 settings = Settings.from_env()
 database = Database(settings.database_path)
-provider = YahooProvider(proxy=settings.proxy_url)
+provider = MarketDataProvider(proxy=settings.proxy_url)
 snapshots = SnapshotService(database, provider)
 scheduler = Scheduler(settings, snapshots, database)
 

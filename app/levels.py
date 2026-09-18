@@ -319,7 +319,7 @@ def option_levels(points: list[dict[str, float]], spot: float) -> tuple[list[Lev
     """
     open_interest = sum(point["callOi"] + point["putOi"] for point in points)
     volume = sum(point["callVolume"] + point["putVolume"] for point in points)
-    # 未平仓量合计不足成交量 20% 时视为持仓数据不完整（Yahoo 盘前会整链返回 0），改用成交量口径。
+    # 未平仓量合计不足成交量 20% 时视为持仓数据不完整（上游盘前会整链返回 0），改用成交量口径。
     by_gex = open_interest > 0 and open_interest >= volume * 0.2
     result: dict[str, list[Level]] = {"call": [], "put": []}
     for side in ("call", "put"):

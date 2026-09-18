@@ -9,7 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.db import Database, iso, parse_sessions
-from app.providers.yahoo import ProviderError, YahooProvider
+from app.providers.market import ProviderError, MarketDataProvider
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +45,9 @@ def active_expirations(values: list[str]) -> list[str]:
 
 
 class SnapshotService:
-    def __init__(self, database: Database, provider: YahooProvider | None = None):
+    def __init__(self, database: Database, provider: MarketDataProvider | None = None):
         self.database = database
-        self.provider = provider or YahooProvider()
+        self.provider = provider or MarketDataProvider()
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -58,7 +58,7 @@ class SnapshotService:
     def refresh(self, symbol: str, expiration: str | None = None, max_age_seconds: int = 0) -> dict[str, Any]:
         """抓取一次快照。
 
-        max_age_seconds 大于 0 时先读本地快照：仍在新鲜期内直接返回 skipped 结果，不再请求 yfinance，
+        max_age_seconds 大于 0 时先读本地快照：仍在新鲜期内直接返回 skipped 结果，不再请求上游接口，
         避免定时刷新与手动刷新对同一份数据反复打接口。
         """
         normalized = self.provider.normalize_symbol(symbol)
@@ -86,7 +86,7 @@ class SnapshotService:
         target = expiration or (cached_expirations[0] if cached_expirations else None)
         if not target:
             # 完全没有缓存的到期日（例如压根不支持期权的标的）：退化为按现货快照判断新鲜度，
-            # 否则每次定时刷新都会重新打一次 yfinance。
+            # 否则每次定时刷新都会重新打一次上游接口。
             quote = self.database.latest_quote(symbol) or {}
             age = snapshot_age_seconds(quote.get("fetched_at"))
             if age is None or age >= max_age_seconds:
@@ -114,7 +114,7 @@ class SnapshotService:
         }
 
     def _fetch_and_store(self, normalized: str, expiration: str | None) -> dict[str, Any]:
-        """请求 yfinance 并写入 SQLite，失败时记录刷新日志后抛出。"""
+        """请求上游接口并写入 SQLite，失败时记录刷新日志后抛出。"""
         run_id = self.database.start_run(normalized)
         try:
             expirations = self.provider.expirations(normalized)

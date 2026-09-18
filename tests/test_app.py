@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -14,9 +15,10 @@ from app.api import create_router
 from app.config import Settings
 from app.db import NO_FLOOR, Database, iso, parse_sessions, utc_now
 from app.levels import absorption_levels, build_levels, chip_peaks, fibonacci_levels, merge_candidates, price_extremes, touch_probability, trend_channel
-from app.providers.yahoo import (
+from app.providers import market
+from app.providers.market import (
     ProviderError,
-    YahooProvider,
+    MarketDataProvider,
     current_session_state,
     safe_value,
     summarize_extended_hours,
@@ -87,7 +89,7 @@ def sample_option_rows(spot: float, expiration: str = "2026-12-18") -> list[dict
 
 class FakeProvider:
     def normalize_symbol(self, symbol: str) -> str:
-        return YahooProvider.normalize_symbol(symbol)
+        return MarketDataProvider.normalize_symbol(symbol)
 
     def expirations(self, symbol: str) -> list[str]:
         return ["2026-12-18", "2027-01-15"]
@@ -110,41 +112,44 @@ def test_safe_value_and_symbol_validation():
     assert safe_value(np.int64(4)) == 4
     assert safe_value(pd.NA) is None
     assert safe_value(pd.NaT) is None
-    assert YahooProvider.normalize_symbol(" brk.b ") == "BRK.B"
-    assert YahooProvider.normalize_symbol("BF-B") == "BF-B"
+    assert MarketDataProvider.normalize_symbol(" brk.b ") == "BRK.B"
+    assert MarketDataProvider.normalize_symbol("BF-B") == "BF-B"
     with pytest.raises(ValueError):
-        YahooProvider.normalize_symbol("AAPL/")
+        MarketDataProvider.normalize_symbol("AAPL/")
 
 
-def test_yahoo_provider_passes_proxy_to_ticker_factory():
+def test_market_provider_passes_proxy_to_ticker_factory():
     calls = {}
 
     def ticker_factory(symbol: str, *, proxy: str | None = None):
         calls.update(symbol=symbol, proxy=proxy)
         return object()
 
-    provider = YahooProvider(ticker_factory=ticker_factory, proxy=" http://127.0.0.1:7890 ")
+    provider = MarketDataProvider(ticker_factory=ticker_factory, proxy=" http://127.0.0.1:7890 ")
     provider._ticker("aapl")
     assert calls == {"symbol": "AAPL", "proxy": "http://127.0.0.1:7890"}
 
 
-def test_yahoo_provider_sets_yfinance_global_proxy(monkeypatch):
-    """默认工厂路径应写入 yfinance 1.x 全局配置，替代已弃用的 set_config。"""
-    import yfinance as yf
+def test_market_provider_sets_upstream_global_proxy(monkeypatch):
+    """默认工厂路径应把代理写进上游 SDK 的全局配置。"""
+    fake_config = SimpleNamespace(network=SimpleNamespace(proxy=None))
+    fake_sdk = SimpleNamespace(config=fake_config, Ticker=lambda symbol, **kwargs: object())
+    monkeypatch.setattr(market, "load_upstream_sdk", lambda: fake_sdk)
 
-    monkeypatch.setattr(yf.config.network, "proxy", None)
-    YahooProvider(proxy="http://127.0.0.1:7890")
-    assert yf.config.network.proxy == "http://127.0.0.1:7890"
+    provider = MarketDataProvider(proxy="http://127.0.0.1:7890")
+
+    assert fake_config.network.proxy == "http://127.0.0.1:7890"
+    assert provider.proxy == "http://127.0.0.1:7890"
 
 
-def test_yahoo_provider_uses_history_when_fast_info_is_empty():
+def test_market_provider_uses_history_when_fast_info_is_empty():
     class FakeTicker:
         fast_info = {"last_price": None, "previous_close": None, "currency": "USD"}
 
         def history(self, **kwargs):
             return pd.DataFrame({"Close": [100.0, 102.5]})
 
-    provider = YahooProvider(ticker_factory=lambda symbol: FakeTicker())
+    provider = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker())
     quote = provider.quote("AAPL")
     assert quote["price"] == 102.5
     assert quote["change_percent"] == pytest.approx(2.5)
@@ -196,7 +201,7 @@ def test_current_session_state_falls_back_to_eastern_clock():
     assert current_session_state(datetime(2026, 9, 18, 19, 58, tzinfo=eastern), datetime(2026, 9, 18, 19, 55, tzinfo=eastern)) == "POST"
 
 
-def test_yahoo_provider_quote_includes_extended_sessions():
+def test_market_provider_quote_includes_extended_sessions():
     class FakeTicker:
         fast_info = {"last_price": 102.5, "previous_close": 100.0, "currency": "USD"}
 
@@ -204,12 +209,12 @@ def test_yahoo_provider_quote_includes_extended_sessions():
             assert kwargs["prepost"] is True
             return extended_hours_frame()
 
-    quote = YahooProvider(ticker_factory=lambda symbol: FakeTicker()).quote("AAPL")
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("AAPL")
     assert quote["sessions"]["pre"]["price"] == 102.0
     assert quote["sessions"]["pre"]["change_percent"] == pytest.approx(2.0)
 
 
-def test_yahoo_provider_quote_survives_extended_hours_failure(monkeypatch):
+def test_market_provider_quote_survives_extended_hours_failure(monkeypatch):
     """盘前盘后是附加信息，被限流时只记日志，行情快照本身仍要成功。"""
     def broken_history(**kwargs):
         raise RuntimeError("Too Many Requests. Rate limited.")
@@ -218,14 +223,14 @@ def test_yahoo_provider_quote_survives_extended_hours_failure(monkeypatch):
         fast_info = {"last_price": 102.5, "previous_close": 100.0, "currency": "USD"}
         history = staticmethod(broken_history)
 
-    quote = YahooProvider(ticker_factory=lambda symbol: FakeTicker()).quote("AAPL")
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("AAPL")
     assert quote["price"] == 102.5
     assert quote["sessions"] == {}
     assert quote["market_state"] is None
 
 
 def test_estimate_gamma_from_option_inputs():
-    gamma = YahooProvider.estimate_gamma(100, 100, 0.2, "2099-12-18")
+    gamma = MarketDataProvider.estimate_gamma(100, 100, 0.2, "2099-12-18")
     assert gamma is not None
     assert gamma > 0
 
@@ -924,8 +929,8 @@ def test_analysis_panels_share_selected_expiration():
     assert 'maxPoint(points, "putOi")' in source
 
 
-def test_refresh_skips_yfinance_when_snapshot_is_fresh(tmp_path: Path):
-    """本地快照仍在新鲜期内时，刷新接口复用 SQLite 并返回 skipped，不请求 yfinance。"""
+def test_refresh_skips_upstream_when_snapshot_is_fresh(tmp_path: Path):
+    """本地快照仍在新鲜期内时，刷新接口复用 SQLite 并返回 skipped，不请求上游接口。"""
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso())
 
@@ -965,9 +970,9 @@ def test_refresh_requests_provider_after_fresh_window(tmp_path: Path):
     assert fresh["skipped"] is True
 
 
-def test_refresh_button_reads_sqlite_before_hitting_yfinance():
+def test_refresh_button_reads_sqlite_before_hitting_upstream():
     source = Path("app/static/app.js").read_text(encoding="utf-8")
-    # 刷新入口先读 SQLite 判断新鲜度，只有过期才请求 yfinance，并用 state.refreshing 拦截连点。
+    # 刷新入口先读 SQLite 判断新鲜度，只有过期才请求上游接口，并用 state.refreshing 拦截连点。
     assert "if (state.refreshing) return;" in source
     assert "function isSnapshotFresh(snapshot)" in source
     assert "age !== null && age < SNAPSHOT_FRESH_SECONDS" in source
@@ -1005,7 +1010,7 @@ def test_symbol_without_expirations_falls_back_to_quote_only(tmp_path: Path):
     # 现货仍然要落库：现货卡片与盘前盘后都依赖它。
     assert database.latest_quote("SPCX")["price"] == 200.5
     assert database.latest_expirations("SPCX") == []
-    # 仅现货的快照同样有新鲜期，定时刷新不再重复打 yfinance。
+    # 仅现货的快照同样有新鲜期，定时刷新不再重复打上游接口。
     skipped = service.refresh("SPCX", None, max_age_seconds=60)
     assert skipped["skipped"] is True
     assert skipped["quote_only"] is True
@@ -1238,7 +1243,7 @@ def test_levels_endpoint_combines_factors(tmp_path: Path):
         assert payload["expiration"] == "2026-12-18"
         assert payload["spot"] == pytest.approx(200.5)
         assert payload["history"]["bars"] == len(sample_bars())
-        assert payload["history"]["source"] == "yfinance"
+        assert payload["history"]["source"] == "upstream"
         for side in ("resistance", "support"):
             assert 0 < len(payload[side]) <= 10
             for item in payload[side]:
@@ -1423,7 +1428,7 @@ def test_trend_channel_renders_extremes_rows():
 
 
 def test_history_service_caches_history(tmp_path: Path):
-    """日线历史：新鲜期内复用 SQLite，只有过期才回源 yfinance。"""
+    """日线历史：新鲜期内复用 SQLite，只有过期才回源上游接口。"""
     database = Database(tmp_path / "options.db")
     calls = {"count": 0}
 
@@ -1435,7 +1440,7 @@ def test_history_service_caches_history(tmp_path: Path):
     service = HistoryService(database, CountingProvider(), max_age_seconds=3600)
     first = service.bars("aapl")
     second = service.bars("AAPL")
-    assert first["source"] == "yfinance"
+    assert first["source"] == "upstream"
     assert second["source"] == "sqlite"
     assert calls["count"] == 1
     assert len(second["bars"]) == len(sample_bars())
@@ -1454,7 +1459,7 @@ def test_history_service_caches_extremes_separately(tmp_path: Path):
     service = HistoryService(database, PeriodProvider(), max_age_seconds=3600, extremes_max_age_seconds=86400)
     first = service.extremes("aapl")
     second = service.extremes("AAPL")
-    assert first["source"] == "yfinance" and first["extremes"]["week52"]["high"]
+    assert first["source"] == "upstream" and first["extremes"]["week52"]["high"]
     assert second["source"] == "sqlite"
     assert periods == ["max"]
     # 日线历史走自己的周期，不会顺手把极值缓存顶掉
@@ -1536,7 +1541,7 @@ def test_basis_price_switch_defaults_to_live():
     # 默认实时价：state 初始值 + 分析渲染改用 activeBasis。
     assert "levelBasisMode: \"live\"" in source
     assert "}, activeBasis(quote));" in source
-    # 切换时用最近一次快照重算压力位/支撑位（不重新请求 yfinance），并同步按钮的按下状态。
+    # 切换时用最近一次快照重算压力位/支撑位（不重新请求上游接口），并同步按钮的按下状态。
     assert "function applyBasisMode(mode)" in source
     assert 'state.levelBasisMode = mode === "close" ? "close" : "live";' in source
     assert "loadFactorLevels(last.points || [], basis.price);" in source

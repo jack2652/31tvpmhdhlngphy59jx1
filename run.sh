@@ -254,13 +254,22 @@ install_build_deps() {
   esac
 }
 
+# 运行依赖是否可导入：通过项目自己的行情入口验证，顺带确认上游 SDK 已装好。
+# 用子 shell 切到项目目录，保证脚本在任意工作目录调用都能导入 app 包。
+deps_importable() {
+  (
+    cd "$PROJECT_DIR" || exit 1
+    "$VENV_PY" -c 'import fastapi, uvicorn, pandas, dotenv, app.providers.market as market; market.load_upstream_sdk()'
+  ) >/dev/null 2>&1
+}
+
 ensure_deps() {
   [ -x "$VENV_PIP" ] || { fail "缺少虚拟环境，请先执行第 1 项"; return 1; }
   local target="$PROJECT_DIR" stamp pip_status=0
   # 依赖指纹：pyproject.toml 内容 + Python 版本，任一变化就重装
   stamp="$(cksum "$PYPROJECT" 2>/dev/null | awk '{print $1}')-$(python_version_of "$VENV_PY")"
   if [ -f "$DEPS_STAMP" ] && [ "$(cat "$DEPS_STAMP" 2>/dev/null)" = "$stamp" ] \
-     && "$VENV_PY" -c 'import fastapi, uvicorn, pandas, yfinance, dotenv' >/dev/null 2>&1; then
+     && deps_importable; then
     ok "依赖已安装且与当前代码匹配（跳过安装）"
     return 0
   fi
@@ -957,7 +966,7 @@ action_config() {
   ask_env_value REFRESH_INTERVAL_SECONDS "后台刷新间隔（秒）"
   ask_env_value RAW_RETENTION_DAYS "历史数据保留天数"
   ask_env_value DATABASE_MAX_MB "SQLite 体积上限（512 / 512M / 1G，0 表示不限制）"
-  ask_env_value YFINANCE_PROXY "yfinance 代理地址（留空表示不使用代理）"
+  ask_env_value MARKET_PROXY "上游行情接口的代理地址（留空表示不使用代理）"
   ask_env_value SCHEDULER_ENABLED "是否启用后台刷新（true/false）"
   printf '\n'
   port="$(read_env_value PORT 8000)"
@@ -1076,7 +1085,7 @@ action_doctor() {
   fi
   if [ -x "$VENV_PY" ]; then
     printf '  [通过] 虚拟环境：%s（Python %s）\n' "$VENV_DIR" "$(python_version_of "$VENV_PY")"
-    if "$VENV_PY" -c 'import fastapi, uvicorn, yfinance, pandas, dotenv' >/dev/null 2>&1; then
+    if deps_importable; then
       printf '  [通过] 运行依赖导入正常\n'
     else
       printf '  [问题] 依赖不完整或损坏，请执行菜单第 1 项重装\n'
@@ -1128,7 +1137,7 @@ action_doctor() {
     limit="$(read_env_value DATABASE_MAX_MB 0)"
     printf '  数据库：%s / 上限 %sMB\n' "$(human_size "$db_size")" "$limit"
   fi
-  proxy="$(read_env_value YFINANCE_PROXY "")"
+  proxy="$(read_env_value MARKET_PROXY "")"
   if [ -n "$proxy" ]; then
     if "$(runtime_python)" - "$proxy" <<'PY' >/dev/null 2>&1
 import socket
@@ -1145,7 +1154,7 @@ PY
     then
       printf '  [通过] 代理可连接：%s\n' "$proxy"
     else
-      printf '  [注意] 代理无法连接：%s（yfinance 取数会失败，请确认代理已启动）\n' "$proxy"
+      printf '  [注意] 代理无法连接：%s（行情取数会失败，请确认代理已启动）\n' "$proxy"
     fi
   fi
   printf '\n'

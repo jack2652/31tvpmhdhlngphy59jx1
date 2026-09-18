@@ -1,4 +1,9 @@
-"""基于 yfinance 的期权链快照适配器。"""
+"""上游行情接口的期权链快照适配器。
+
+本模块是应用里唯一与外部行情 SDK 打交道的地方：其余代码只依赖这里暴露的
+`MarketDataProvider` 接口（标的、行情、期权链、日线），因此更换上游实现时
+不需要改动业务层。
+"""
 
 from __future__ import annotations
 
@@ -48,8 +53,8 @@ def summarize_extended_hours(frame: Any, now: datetime | None = None) -> dict[st
     """把含盘前盘后的分钟线归纳成各时段的最新价格。
 
     每个时段的涨跌幅都以「该时段之前最近一次盘中收盘价」为基准：盘前对应前一交易日
-    收盘，盘后/夜盘对应当日收盘，与行情软件的盘前盘后涨跌口径一致。Yahoo 的
-    includePrePost 数据只覆盖 04:00–20:00，没有 Blue Ocean 的 20:00–04:00 夜盘，
+    收盘，盘后/夜盘对应当日收盘，与行情软件的盘前盘后涨跌口径一致。上游接口的
+    扩展时段分钟线只覆盖 04:00–20:00，没有 20:00–04:00 的隔夜时段，
     夜盘一旦有数据会按同一规则自动纳入。
     """
     moment_now = now or datetime.now(MARKET_TIMEZONE)
@@ -117,19 +122,31 @@ def normalize_row(row: Any) -> dict[str, Any]:
     return {str(key): safe_value(value) for key, value in dict(row).items()}
 
 
-class YahooProvider:
-    name = "yfinance"
+def load_upstream_sdk() -> Any:
+    """加载上游行情 SDK。
+
+    整份代码里只有这里导入第三方行情库：一是把外部依赖收敛到一个入口，
+    方便日后替换实现；二是测试可以替换本函数注入假 SDK，在无网络环境下
+    验证代理、异常处理等逻辑，不必真的发起请求。
+    """
+    import yfinance as yf
+
+    return yf
+
+
+class MarketDataProvider:
+    # 对外暴露的数据来源标识：只表示「来自上游接口」，不暴露具体供应商
+    name = "upstream"
 
     def __init__(self, ticker_factory: Any | None = None, proxy: str | None = None):
         self.proxy = proxy.strip() if proxy and proxy.strip() else None
-        self._uses_yfinance_default = ticker_factory is None
+        self._uses_builtin_factory = ticker_factory is None
         if ticker_factory is None:
-            import yfinance as yf
-
+            sdk = load_upstream_sdk()
             if self.proxy:
-                # yfinance 1.x 统一由全局配置对象管理网络代理（set_config 已弃用）
-                yf.config.network.proxy = self.proxy
-            ticker_factory = yf.Ticker
+                # 新版 SDK 统一由全局配置对象管理网络代理（旧的 set_config 已弃用）
+                sdk.config.network.proxy = self.proxy
+            ticker_factory = sdk.Ticker
         self.ticker_factory = ticker_factory
 
     @staticmethod
@@ -142,7 +159,7 @@ class YahooProvider:
     def _ticker(self, symbol: str) -> Any:
         normalized = self.normalize_symbol(symbol)
         try:
-            if self.proxy and not self._uses_yfinance_default:
+            if self.proxy and not self._uses_builtin_factory:
                 return self.ticker_factory(normalized, proxy=self.proxy)
             return self.ticker_factory(normalized)
         except Exception as exc:
@@ -239,7 +256,7 @@ class YahooProvider:
 
     @staticmethod
     def estimate_gamma(spot: Any, strike: Any, implied_volatility: Any, expiration: str) -> float | None:
-        """用 Black-Scholes 估算单张合约 Gamma；Yahoo 链通常不返回原始 Gamma。"""
+        """用 Black-Scholes 估算单张合约 Gamma；上游期权链通常不返回原始 Gamma。"""
         try:
             spot_value = float(spot)
             strike_value = float(strike)

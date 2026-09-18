@@ -165,7 +165,7 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     quote["symbol"], fetched_at, quote.get("price"), quote.get("change_percent"),
-                    quote.get("currency"), quote.get("market_state"), quote.get("provider", "yfinance"),
+                    quote.get("currency"), quote.get("market_state"), quote.get("provider", "upstream"),
                     json.dumps(quote.get("sessions") or {}, ensure_ascii=True),
                 ),
             )
@@ -179,7 +179,7 @@ class Database:
                         row["symbol"], row["expiration"], fetched_at, row["contract_symbol"], row["contract_type"],
                         row.get("strike"), row.get("last_price"), row.get("bid"), row.get("ask"), row.get("volume"),
                         row.get("open_interest"), row.get("implied_volatility"), row.get("gamma"), int(bool(row.get("in_the_money"))),
-                        row.get("change_percent"), row.get("provider", "yfinance"),
+                        row.get("change_percent"), row.get("provider", "upstream"),
                     )
                     for row in option_rows
                 ],
