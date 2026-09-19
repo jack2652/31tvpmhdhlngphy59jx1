@@ -218,6 +218,8 @@ body{font-size:14px}
 @media(max-width:500px){
   .level-factor-row,.level-plan-row{font-size:12px;line-height:1.35;padding-block:6px}
   .level-factor-row.level-head,.level-plan-row.level-head{font-size:10px;line-height:1.25}
+  .level-factor-row.level-head,.level-plan-row.level-head{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(4.4em,1fr) minmax(0,1.7fr)}
+  .level-factor-row.level-head>span:nth-child(3),.level-plan-row.level-head>span:nth-child(3){white-space:nowrap;letter-spacing:0}
   .level-factor-row .level-factors,.level-plan-row .level-factors{font-size:12px}
   .level-factor-row .level-strike,.level-plan-row .level-strike{white-space:normal;overflow-wrap:anywhere;line-height:1.2}
   .level-factor-row .level-gap,.level-factor-row .level-prob,.level-plan-row .level-gap,.level-plan-row .level-prob{white-space:nowrap}

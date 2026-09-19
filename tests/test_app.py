@@ -1306,6 +1306,7 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert ".trend-meta{font-size:14px" in styles
     assert ".level-factor-row .level-strike,.level-plan-row .level-strike{white-space:normal;overflow-wrap:anywhere;line-height:1.2}" in styles
     assert ".level-factor-row .level-gap,.level-factor-row .level-prob,.level-plan-row .level-gap,.level-plan-row .level-prob{white-space:nowrap}" in styles
+    assert ".level-factor-row.level-head>span:nth-child(3),.level-plan-row.level-head>span:nth-child(3){white-space:nowrap;letter-spacing:0}" in styles
 
 
 def test_fibonacci_levels_follow_swing_leg():
