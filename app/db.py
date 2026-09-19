@@ -71,7 +71,9 @@ class Database:
                     market_state TEXT,
                     provider TEXT NOT NULL,
                     raw_json TEXT,
-                    sessions_json TEXT
+                    sessions_json TEXT,
+                    today_open REAL,
+                    previous_close REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_quote_symbol_time
                     ON quote_snapshots(symbol, fetched_at DESC);
@@ -131,6 +133,12 @@ class Database:
                     payload TEXT NOT NULL,
                     fetched_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS beta_snapshots (
+                    symbol TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL
+                );
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(option_snapshots)")}
@@ -139,6 +147,10 @@ class Database:
             quote_columns = {row[1] for row in connection.execute("PRAGMA table_info(quote_snapshots)")}
             if "sessions_json" not in quote_columns:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN sessions_json TEXT")
+            if "today_open" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN today_open REAL")
+            if "previous_close" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN previous_close REAL")
 
     def start_run(self, symbol: str) -> int:
         with self.connect() as connection:
@@ -161,12 +173,13 @@ class Database:
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO quote_snapshots
-                (symbol, fetched_at, price, change_percent, currency, market_state, provider, sessions_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol, fetched_at, price, change_percent, currency, market_state, provider, sessions_json, today_open, previous_close)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     quote["symbol"], fetched_at, quote.get("price"), quote.get("change_percent"),
                     quote.get("currency"), quote.get("market_state"), quote.get("provider", "upstream"),
                     json.dumps(quote.get("sessions") or {}, ensure_ascii=True),
+                    quote.get("today_open"), quote.get("previous_close"),
                 ),
             )
             connection.executemany(
@@ -270,6 +283,30 @@ class Database:
         if not isinstance(payload, dict):
             return None
         return {"extremes": payload, "fetched_at": str(row["fetched_at"])}
+
+    def write_beta(self, symbol: str, payload: dict[str, Any], fetched_at: str) -> None:
+        """写入按标的缓存的 Beta 结果，避免每次趋势面板刷新都请求两年行情。"""
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO beta_snapshots(symbol, payload, fetched_at) VALUES (?, ?, ?)",
+                (symbol, json.dumps(payload, ensure_ascii=False), fetched_at),
+            )
+
+    def latest_beta(self, symbol: str) -> dict[str, Any] | None:
+        """返回 Beta 缓存；缓存损坏时按无缓存处理。"""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload, fetched_at FROM beta_snapshots WHERE symbol=?", (symbol,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return {"beta": payload, "fetched_at": str(row["fetched_at"])}
 
     def latest_expirations(self, symbol: str) -> list[str]:
         with self.connect() as connection:

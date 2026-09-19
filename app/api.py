@@ -16,7 +16,7 @@ from app.gamma import annotate_model_greeks, find_zero_gamma
 from app.levels import build_levels
 from app.providers.market import ProviderError, MarketDataProvider
 from app.services.history import HistoryService
-from app.services.snapshots import SnapshotService, active_expirations
+from app.services.snapshots import SnapshotService, active_expirations, market_today
 
 
 _FORBIDDEN_PAGE = """<!doctype html>
@@ -50,6 +50,36 @@ def install_access_guard(app: FastAPI, settings: Settings) -> None:
                 return JSONResponse(status_code=403, content={"detail": "403 Forbidden"})
             return HTMLResponse(_FORBIDDEN_PAGE, status_code=403)
         return await call_next(request)
+
+
+def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict[str, Any]:
+    """整理趋势面板的今开/昨收；非交易时段缺少当日 K 线时回退最近交易日。"""
+    valid = []
+    for bar in bars:
+        try:
+            day = str(bar.get("date"))[:10]
+            opening = float(bar.get("open")) if bar.get("open") is not None else None
+            close = float(bar.get("close")) if bar.get("close") is not None else None
+        except (TypeError, ValueError):
+            continue
+        valid.append({"date": day, "open": opening, "close": close})
+    valid.sort(key=lambda item: item["date"])
+    latest = valid[-1] if valid else {}
+    previous = valid[-2] if len(valid) > 1 else {}
+    latest_is_today = latest.get("date") == market_today().isoformat()
+    today_open = latest.get("open")
+    previous_close = previous.get("close") if latest_is_today else latest.get("close")
+    if today_open is None:
+        today_open = quote.get("today_open")
+    if previous_close is None:
+        previous_close = quote.get("previous_close")
+    return {
+        "today_open": today_open,
+        "previous_close": previous_close,
+        "today_open_date": latest.get("date"),
+        "previous_close_date": previous.get("date") if latest_is_today else latest.get("date"),
+        "market_state": quote.get("market_state"),
+    }
 
 
 def create_router(database: Database, snapshots: SnapshotService, provider: MarketDataProvider, settings: Settings) -> APIRouter:
@@ -183,19 +213,31 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         expiration: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         spot: float | None = Query(default=None, gt=0),
     ) -> dict[str, Any]:
-        """压力位/支撑位：斐波那契回撤 + 筹码密集 + 承接位 + 所选到期日期权持仓综合。
+        """压力位/支撑位：技术面与近 45 天多期限期权持仓综合。
 
         `spot` 是前端传入的基准价（默认取盘后价，避免用盘前冲高/盘中回落的假突破当基准）；
         缺省时退回快照里的常规价。
         """
         normalized = symbol(stock_symbol)
         quote = database.latest_quote(normalized) or {}
-        chain = database.latest_chain(normalized, expiration)
+        # 价位接口使用跨期限链；选中的远期期限若不在 45 天窗口内，额外并入，避免切换期限后期权因子消失。
+        profile = database.latest_chains(normalized, horizon_days=45)
+        selected_chain = database.latest_chain(normalized, expiration)
+        option_rows = list(profile.get("data") or [])
+        seen = {(str(row.get("expiration")), str(row.get("contract_symbol"))) for row in option_rows}
+        for row in selected_chain.get("data") or []:
+            key = (str(row.get("expiration")), str(row.get("contract_symbol")))
+            if key not in seen:
+                option_rows.append(row)
+                seen.add(key)
+        option_expirations = sorted({str(row.get("expiration")) for row in option_rows if row.get("expiration")})
+        fetched_values = [value for value in (profile.get("fetched_at"), selected_chain.get("fetched_at")) if value]
         history_payload = history.bars(normalized)
         extremes_payload = history.extremes(normalized)
+        beta_payload = history.beta(normalized)
         computed = build_levels(
             history_payload.get("bars") or [],
-            chain.get("data") or [],
+            option_rows,
             spot if spot is not None else quote.get("price"),
             expiration,
             extremes_payload.get("extremes"),
@@ -203,7 +245,10 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         bars = list(history_payload.get("bars") or [])
         return {
             "symbol": normalized,
-            "chain_fetched_at": chain.get("fetched_at"),
+            "chain_fetched_at": max(fetched_values) if fetched_values else None,
+            "options_fetched_at": max(fetched_values) if fetched_values else None,
+            "options_expirations": option_expirations,
+            "options_horizon_days": 45,
             "generated_at": iso(),
             "history": {
                 "bars": len(bars),
@@ -216,6 +261,13 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 "extremes_fetched_at": extremes_payload.get("fetched_at"),
                 "extremes_source": extremes_payload.get("source"),
                 "extremes_warning": extremes_payload.get("warning"),
+            },
+            "trend_market": trend_market_data(bars, quote),
+            "beta": beta_payload.get("beta"),
+            "beta_meta": {
+                "fetched_at": beta_payload.get("fetched_at"),
+                "source": beta_payload.get("source"),
+                "warning": beta_payload.get("warning"),
             },
             **computed,
         }

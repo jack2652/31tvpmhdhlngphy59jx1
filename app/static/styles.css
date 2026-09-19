@@ -1,4 +1,4 @@
-/* 全局涨跌配色：绿涨红跌（美式行情惯例）。--up 用于上涨/看涨/Call/压力位（绿），--down 用于下跌/看跌/Put/支撑位（红）。 */
+/* 全局涨跌配色：绿涨红跌；支撑/压力区间按操作提示使用绿/红，距现价仍按涨跌方向着色。 */
 :root{color-scheme:dark;--bg:#0b1118;--panel:#101923;--line:#253543;--text:#e8eef3;--muted:#81909c;--up:#19bd83;--down:#f04d68;--amber:#e7b45c;--blue:#69b7ff;--on-blue:#06111c;--topbar:#0d151e;--field:#0b141d;--field-line:#3b5263;--axis:#344654;--grid:#20313e;--crosshair:#9caeba;--zero-line:#9baab4;--gex:#ff7c45;--net:#5478ff;--table-head:#0d161f;--row-line:#1c2a35;--muted-2:#6c7a87;--halo:#0b1118;--tooltip-bg:#fbfcfe;--tooltip-line:#cbd5df;--tooltip-text:#1d2a35;--tooltip-title:#152330;--tooltip-muted:#63717d;--tooltip-shadow:0 5px 18px rgba(0,0,0,.28);--tag-bg:#05090d;--tag-line:#465868;--tag-text:#f3f7fa;--error-line:#773a47;--error-bg:#291922;--error-text:#ffb2bc;--heat-floor:10;--heat-gain:68;--heat-tone-up:#34e0a1;--heat-tone-down:#ff8fa0;--heat-ink:#06211a;--plain-bg:#fff;--plain-text:#000;--plain-rule:#ccc}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.topbar{height:66px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 34px;background:var(--topbar)}.brand{display:flex;align-items:center;gap:11px;letter-spacing:.12em}.brand-mark{display:grid;place-items:center;width:30px;height:30px;border:1px solid var(--blue);color:var(--blue);font-size:10px;font-weight:800}.brand strong,.brand small{display:block}.brand strong{font-size:13px}.brand small{color:var(--muted);font-size:9px;letter-spacing:.2em}.top-meta,.panel-status,footer{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:11px}.live-dot{width:7px;height:7px;background:var(--up);border-radius:50%;box-shadow:0 0 10px var(--up)}.divider{height:14px;border-left:1px solid var(--line)}.shell{max-width:1500px;margin:0 auto;padding:26px 34px 36px}.panel{border:1px solid var(--line);background:var(--panel)}.toolbar{display:flex;align-items:end;gap:20px;padding:16px 18px;margin-bottom:16px}.control label{display:block;color:var(--muted);font-size:10px;letter-spacing:.13em;text-transform:uppercase;margin-bottom:7px}.input-wrap{display:flex;align-items:center;border:1px solid var(--field-line);background:var(--field);height:38px}.input-wrap span{padding:0 10px;color:var(--blue)}input,select{height:36px;border:0;background:transparent;color:var(--text);font:inherit;outline:0}input{width:90px;text-transform:uppercase}select{border:1px solid var(--field-line);background:var(--field);padding:0 34px 0 10px;min-width:185px}.input-wrap button,.toolbar-actions button{height:38px;border:0;background:var(--blue);color:var(--on-blue);padding:0 17px;font-weight:700;cursor:pointer}.toolbar-actions{margin-left:auto;display:flex;align-items:center;gap:12px}.toolbar-actions .secondary{border:1px solid var(--field-line);background:transparent;color:var(--text)}button:disabled,select:disabled{opacity:.45;cursor:not-allowed}.refresh-note{color:var(--muted);font-size:11px}.headline-grid{display:grid;grid-template-columns:minmax(240px,2fr) repeat(3,1fr);gap:12px;margin-bottom:16px}.quote,.metric{min-height:126px;padding:18px}.eyebrow{color:var(--muted);font-size:10px;letter-spacing:.14em}.quote-line{display:flex;align-items:baseline;justify-content:space-between;margin-top:15px}.quote-line span:first-child{font-size:24px;font-weight:700;letter-spacing:.04em}.quote-line span:last-child{font-size:27px;font-variant-numeric:tabular-nums}.quote-sub{display:flex;gap:14px;margin-top:8px;color:var(--muted);font-size:11px}.quote-sub span:first-child{color:var(--up)}.metric{display:flex;flex-direction:column;justify-content:space-between}.metric strong{font-size:29px;font-variant-numeric:tabular-nums}.metric span:last-child{color:var(--muted);font-size:11px}.call-metric strong{color:var(--up)}.put-metric strong{color:var(--down)}.analysis-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}.analysis-panel{min-width:0;overflow:hidden}.analysis-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:16px 18px 8px}.analysis-heading h2{margin:4px 0 0;font-size:16px}.analysis-heading p{margin:3px 0 0;color:var(--muted);font-size:11px}.wall-badges{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.wall-badges span{border:1px solid var(--line);padding:4px 8px;color:var(--muted);font-size:11px;white-space:nowrap}.chart{height:350px;padding:2px 14px 12px}.chart svg{display:block;width:100%;height:100%;overflow:visible}.chart-empty{height:100%;display:grid;place-items:center;color:var(--muted)}.chart-label{fill:var(--muted);font-size:10px}.chart-axis{stroke:var(--axis);stroke-width:1}.chart-grid{stroke:var(--grid);stroke-width:1;stroke-dasharray:2 4}.chart-call{fill:var(--up)}.chart-put{fill:var(--down)}.chart-gex{fill:var(--gex)}.chart-zero{stroke:var(--zero-line);stroke-width:1.2}.chart-wall{stroke:var(--amber);stroke-width:1.4;stroke-dasharray:4 3}.data-panel{overflow:hidden}h1{margin:5px 0 0;font-size:18px;letter-spacing:.01em}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;min-width:820px}th,td{padding:11px 14px;border-bottom:1px solid var(--row-line);text-align:left;white-space:nowrap}th{color:var(--muted);font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;background:var(--table-head);position:sticky;top:0}td{font-variant-numeric:tabular-nums}td:first-child{font-weight:650;color:var(--blue)}.num{text-align:right}.type-call{color:var(--up)}.type-put{color:var(--down)}.itm{color:var(--amber)}/* 期权链热力底色：深浅 = 该列在本屏的相对强弱，颜色沿用看涨绿 / 看跌红（color-mix 走主题令牌，白天黑夜自动适配）。 */.chain-heat{background-color:color-mix(in srgb,var(--heat-tone) calc((var(--heat-floor) + var(--heat-gain) * var(--heat) / 100) * 1%),transparent)}.chain-call .chain-heat{--heat-tone:var(--heat-tone-up)}.chain-put .chain-heat{--heat-tone:var(--heat-tone-down)}/* 热点格（相对强度 ≥65）：底色已经很亮，文字换深色墨色，亮底深字比亮底浅字清楚得多。 */.chain-heat-hot{font-weight:600;color:var(--heat-ink)}/* 类型列并入行权价：行权价文字按看涨绿/看跌红取色（需盖过 td:first-child 的蓝色强调），并保持加粗。 */#chain-body td.type-call{color:var(--up)}#chain-body td.type-put{color:var(--down)}#chain-body td.chain-strike{font-weight:650}/* 期权链工具条：类型筛选与数据来源状态同排，且按中线对齐（下拉框 30px、状态文字 17px、按底边对齐会让状态文字低 6px），窄屏自动换行。 */.chain-filter{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;white-space:nowrap}.chain-filter select{min-width:0;height:30px;padding:0 26px 0 8px;font-size:12px;background:var(--field);border:1px solid var(--field-line);color:var(--text)}.chain-legend{padding:10px 18px 12px;color:var(--muted);font-size:11px}.empty{text-align:center;color:var(--muted);padding:44px}.error-box{margin:14px 18px 0;padding:10px 12px;border:1px solid var(--error-line);background:var(--error-bg);color:var(--error-text)}footer{justify-content:space-between;margin-top:14px;padding:0 2px}@media(max-width:900px){.topbar{padding:0 16px}.top-meta{display:none}.shell{padding:16px}.toolbar{align-items:stretch;flex-wrap:wrap}.toolbar-actions{margin-left:0;width:100%;justify-content:space-between}.headline-grid{grid-template-columns:1fr 1fr}.quote{grid-column:1/-1}.analysis-grid{grid-template-columns:1fr}.panel-status{width:100%;justify-content:space-between}footer{align-items:start;flex-direction:column;gap:5px}}@media(max-width:500px){.headline-grid{grid-template-columns:1fr}.quote{grid-column:auto}.toolbar{gap:12px}.control,.control select{width:100%}.input-wrap{width:100%}input{flex:1}.chart{height:330px}.analysis-heading{flex-direction:column}.wall-badges{justify-content:flex-start}.wall-badges span{white-space:normal}}
 :root[data-theme="light"]{color-scheme:light;--bg:#f2f5f9;--panel:#ffffff;--line:#d7dfe9;--text:#16202b;--muted:#5c6b7a;--up:#0f9d6a;--down:#d92b4b;--amber:#a9751a;--blue:#1f6feb;--on-blue:#ffffff;--topbar:#ffffff;--field:#f7f9fc;--field-line:#c3ceda;--axis:#b9c4d0;--grid:#e4eaf1;--crosshair:#93a3b4;--zero-line:#8b98a5;--gex:#f97316;--net:#3b5bdb;--table-head:#f2f5f9;--row-line:#e6ecf3;--muted-2:#7b8794;--halo:#ffffff;--tooltip-bg:#ffffff;--tooltip-line:#cfd8e3;--tooltip-text:#16202b;--tooltip-title:#0f1720;--tooltip-muted:#5c6b7a;--tooltip-shadow:0 6px 20px rgba(15,23,42,.16);--tag-bg:#1c2733;--tag-line:#3a4a5a;--tag-text:#f3f7fa;--error-line:#e6a9b4;--error-bg:#fdeef1;--error-text:#a1162f;--heat-floor:12;--heat-gain:70;--heat-tone-up:#0f9d6a;--heat-tone-down:#d92b4b;--heat-ink:#0b241b}
 /* 图表悬停提示和十字光标 */
@@ -27,32 +27,70 @@
 .chart-tag rect{fill:var(--tag-bg);stroke:var(--tag-line);stroke-width:1}
 .chart-tag text{fill:var(--tag-text);font-size:10px;font-weight:700}
 /* 压力位/支撑位面板：现价上下各 5 条，颜色沿用「绿涨红跌」的全局口径。 */
-.levels-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.analysis-levels-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.plan-grid,.levels-grid{display:contents}
 .levels-panel{min-width:0}
 .levels{padding:0 18px 14px}
-.level-row{display:grid;grid-template-columns:1fr 1fr 1.6fr;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid var(--row-line);font-variant-numeric:tabular-nums}
+.level-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1.6fr);gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid var(--row-line);font-variant-numeric:tabular-nums}
 .level-row:last-child{border-bottom:0}
 .level-row span:not(:first-child){text-align:right}
 .level-head{color:var(--muted);font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:2px 0 5px}
 .level-head span{color:var(--muted)}
-.level-strike{font-weight:650;color:var(--text)}
-.levels-panel-resistance .level-strike{color:var(--up)}
-.levels-panel-support .level-strike{color:var(--down)}
+.level-strike{font-weight:650;color:var(--text);white-space:normal;overflow-wrap:anywhere;line-height:1.25}
+.levels-panel-resistance .level-strike{color:var(--down)}
+.levels-panel-support .level-strike{color:var(--up)}
 .level-gap.up{color:var(--up)}
 .level-gap.down{color:var(--down)}
 .level-value{color:var(--text)}
-/* 多因子结果多一列「到达概率」，四列布局；单因子回退表仍是三列。 */
-.level-factor-row{grid-template-columns:1fr 1fr 1fr 1.6fr}
-/* 交易计划的三张价位表：价位 / 距现价 / 到达概率 / 综合依据。桌面下计划面板是四栏窄面板，
-   综合依据单独占一行（三列 + 整行），避免因子文字被挤成多行；≤1100px 面板变宽后回到一行四列。 */
-.level-plan-row{grid-template-columns:1fr 1fr 1fr}
-.level-plan-row>span:last-child{grid-column:1 / -1}
-@media(max-width:1100px){.level-plan-row{grid-template-columns:1fr 1fr 1fr 1.6fr}.level-plan-row>span:last-child{grid-column:auto}}
+.level-value{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;white-space:nowrap}
+.level-strong{font-weight:650}
+.level-strong-support,.level-reinforced-support{--level-color:var(--up)}
+.level-strong-resistance,.level-reinforced-resistance{--level-color:var(--down)}
+.level-strong,.level-reinforced{background:color-mix(in srgb,var(--level-color) var(--level-fill),transparent);box-shadow:inset var(--level-edge) 0 0 color-mix(in srgb,var(--level-color) var(--level-edge-fill),transparent)}
+.level-strength-1{--level-fill:8%;--level-edge:2px;--level-edge-fill:42%}
+.level-strength-2{--level-fill:13%;--level-edge:2px;--level-edge-fill:58%}
+.level-strength-3{--level-fill:19%;--level-edge:3px;--level-edge-fill:72%}
+.level-strength-4{--level-fill:26%;--level-edge:3px;--level-edge-fill:86%}
+.level-strength-5{--level-fill:34%;--level-edge:4px;--level-edge-fill:100%}
+.level-reinforced .level-strike{font-weight:750}
+.level-strong .level-strike{font-weight:800}
+.level-strong-support .level-strike{color:var(--up)}
+.level-strong-resistance .level-strike{color:var(--down)}
+.level-strength-badge{display:inline-block;padding:1px 5px;border:1px solid currentColor;border-radius:2px;font-size:10px;font-weight:750;line-height:1.35;white-space:nowrap}
+.level-strength-badge-support{color:var(--up);background:var(--strong-up-badge)}
+.level-strength-badge-resistance{color:var(--down);background:var(--strong-down-badge)}
+.level-factors{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:0;flex-wrap:wrap;text-align:right}
+.level-factor-text{min-width:0;text-align:center!important}
+/* 多因子结果多一列「到达概率」；外侧的价位区间/综合依据更宽，中间百分比列更紧凑。 */
+.level-factor-row,.level-plan-row{grid-template-columns:minmax(0,1.25fr) minmax(0,.85fr) minmax(0,.85fr) minmax(0,1.35fr);column-gap:0}
+.level-factor-row>span,.level-plan-row>span{min-width:0;padding-inline:8px;text-align:center!important}
+.level-factor-row>span+span,.level-plan-row>span+span{border-left:1px solid var(--row-line)}
+.level-factor-row .level-factors,.level-plan-row .level-factors{padding-inline:0;gap:4px;justify-content:center;text-align:center}
+/* 强化徽标单独一行，综合依据放在下一行；两行都在综合依据列内居中。 */
+.level-strong .level-factors{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;flex-wrap:nowrap;text-align:center}
+.level-strong .level-strength-badge{position:static;transform:none}
+.level-strong .level-factor-text{width:auto;min-width:0;max-width:100%;text-align:center!important}
+.level-strong .level-factors{font-size:12px;gap:2px}
+.level-strong .level-strength-badge{padding-inline:3px;font-size:10px}
+.level-note-row{display:grid;grid-template-columns:minmax(0,1fr);padding:2px 8px 6px;border-bottom:1px solid var(--row-line);background:transparent;color:var(--muted);font-size:11px;font-weight:400;line-height:1.35;text-align:center;white-space:normal;overflow-wrap:anywhere}
+.level-note-row span{min-width:0}
+.level-note-content{display:inline;max-width:100%;min-width:0}
+.level-note-strength{display:inline;padding:0;border:0;border-radius:0;background:transparent;font-size:inherit;font-weight:650;line-height:inherit;white-space:nowrap}
+.level-note-strength-support{color:var(--up)}
+.level-note-strength-resistance{color:var(--down)}
+.level-note-divider{color:var(--muted);font-weight:400}
+.level-factor-row .level-strike{white-space:nowrap;overflow-wrap:normal}
+/* 交易计划的价位表：表头与数据行始终使用同一列比例。 */
+.level-plan-row>span:last-child{grid-column:auto}
+.level-plan-row.level-head>span:last-child{grid-column:auto}
+.level-plan-row .level-strike{white-space:nowrap;overflow-wrap:normal}
 .level-prob{color:var(--text)}
 /* 多因子合成结果的第三列：组成该价位的因子标签（斐波那契 / 筹码密集 / 承接位 / 期权持仓）。 */
-.level-factors{color:var(--muted);font-size:11px;line-height:1.4}
+.level-factors{color:var(--muted);font-size:12px;line-height:1.4}
 .levels-empty{padding:16px 0;color:var(--muted);font-size:11px}
-@media(max-width:900px){.levels-grid{grid-template-columns:1fr}}
+@media(max-width:900px){.analysis-levels-grid{grid-template-columns:1fr}}
+/* 手机屏幕给价位区间和依据列留出最低空间，避免四等分后区间文字溢出。 */
+@media(max-width:500px){.level-factor-row,.level-plan-row{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.7fr);column-gap:8px}.level-factor-row>span,.level-plan-row>span{padding-inline:0}.level-factor-row>span+span,.level-plan-row>span+span{border-left:0}.level-strong .level-factors{display:flex;justify-content:center}.level-strong .level-strength-badge{position:static;transform:none}.level-strong .level-factor-text{width:auto}}
 /* 顶栏右侧：行情状态与主题切换按钮同排；按钮在窄屏仍可见。 */
 .top-actions{display:flex;align-items:center;gap:14px}
 .theme-toggle{border:1px solid var(--field-line);background:transparent;color:var(--text);border-radius:999px;padding:5px 13px;font:inherit;font-size:12px;line-height:1;letter-spacing:.04em;cursor:pointer}
@@ -61,19 +99,55 @@
 .data-panel table th,.data-panel table td{text-align:center}
 /* 压力位/支撑位柱状图的基准价竖线（沿用零 Gamma 的琥珀色虚线）。 */
 .chart-level-basis{stroke:var(--amber);stroke-width:1.4;stroke-dasharray:4 3;pointer-events:none}
-/* 交易计划：趋势通道 + 推荐买入 / 加仓 / 卖出价位，四栏并排；窄屏依次两栏、单栏。 */
-.plan-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+/* 交易计划与支撑/压力位共用三列网格，桌面端按三列两行排列；窄屏依次两栏、单栏。 */
 .plan-panel{min-width:0}
-.trend-body{padding:0 18px 14px}
+.plan-panel.levels-panel-support .level-strike{color:var(--text)}
+.plan-panel.levels-panel-support .level-strong .level-strike{color:var(--up)}
+.level-strength-hint{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:10px!important;line-height:1.3}
+.level-strength-swatch{display:inline-block;width:9px;height:9px;border-left:3px solid currentColor;background:currentColor;opacity:.8}
+.level-strength-swatch.support{color:var(--up)}
+.level-strength-swatch.resistance{color:var(--down)}
+.trend-panel{display:flex;flex-direction:column;min-height:0}
+.trend-body{flex:1 1 auto;height:auto;min-height:0;padding:0 18px 14px;display:flex;flex-direction:column}
 .trend-label{display:block;margin-bottom:10px;font-size:19px;font-weight:700;line-height:1.25}
 .trend-label.up{color:var(--up)}
 .trend-label.down{color:var(--down)}
 .trend-label.range{color:var(--amber)}
+.trend-signal{margin:0 0 10px}
+.trend-signal.up .trend-label{color:var(--up)}
+.trend-signal.down .trend-label{color:var(--down)}
+.trend-signal.range .trend-label{color:var(--amber)}
+.trend-signal .trend-label{margin-bottom:3px}
+.trend-signal .trend-action{font-size:inherit}
+.trend-signal.buy .trend-action{color:var(--up)}
+.trend-signal.sell .trend-action{color:var(--down)}
+.trend-signal.hold .trend-action{color:var(--amber)}
+.trend-signal small{display:block;color:var(--muted);font-size:11px;line-height:1.35}
+.trend-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 24px;align-items:stretch;flex:1;min-height:0}
+.trend-core,.trend-side{min-width:0}
+.trend-core{display:flex;flex-direction:column;min-height:100%}
+.trend-core .trend-meta{flex:1;min-height:40px}
 .trend-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--row-line);color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
 .trend-meta:last-child{border-bottom:0}
 .trend-meta strong{color:var(--text);font-weight:600}
-@media(max-width:1100px){.plan-grid{grid-template-columns:1fr 1fr}}
-@media(max-width:560px){.plan-grid{grid-template-columns:1fr}}
+.trend-meta strong small{display:block;color:var(--muted);font-size:11px;font-weight:500;line-height:1.2;margin-top:2px;white-space:nowrap}
+.trend-opportunities{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px;border-bottom:1px solid var(--row-line)}
+.trend-opportunities .trend-meta{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;min-width:0;border-bottom:0}
+.trend-opportunities .trend-meta+.trend-meta{border-left:1px solid var(--row-line);padding-left:16px}
+.trend-opportunity strong{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:1px;min-width:0;white-space:nowrap}
+.trend-opportunity-label{display:flex;flex-direction:column;align-items:flex-start;gap:1px;min-width:0;white-space:nowrap}
+.trend-opportunity-label small{color:var(--muted);font-size:10px;font-weight:500;white-space:nowrap}
+.trend-opportunity.buy strong{color:var(--up)}
+.trend-opportunity.sell strong{color:var(--down)}
+.trend-opportunity strong small{color:var(--muted);font-size:10px;font-weight:500;white-space:nowrap}
+.trend-side{display:flex;flex-direction:column;min-height:100%}
+.trend-side .trend-opportunities{display:flex;flex:0 0 auto;flex-direction:column;grid-template-columns:1fr;column-gap:0;min-height:0}
+.trend-side .trend-opportunities .trend-meta{flex:0 0 auto;min-height:0;padding-block:6px}
+.trend-side .trend-opportunities:only-child{flex:1}
+.trend-side .trend-opportunities:only-child .trend-meta{flex:1;min-height:40px}
+.trend-side>.trend-meta{flex:1;min-height:40px}
+.trend-side .trend-opportunities .trend-meta+.trend-meta{border-left:0;padding-left:0;border-top:1px solid var(--row-line)}
+@media(max-width:560px){.trend-layout{grid-template-columns:1fr;gap:0}.trend-opportunities{grid-template-columns:1fr}.trend-opportunities .trend-meta+.trend-meta{border-left:0;padding-left:0;border-top:1px solid var(--row-line)}}
 /* 折叠组（分析详情 / 期权链 / 图表共用）：一块 panel 里包着若干子面板，标题栏整行可点。
    各自默认状态：分析详情与期权链默认折叠、图表默认展开；caret 展开时旋转 90°；body 用 hidden 控制显隐（[hidden] 在 flex/grid 上下文里会被覆盖，需显式声明）。 */
 .detail-group{margin-bottom:16px;padding:0}
@@ -126,3 +200,17 @@
 /* 图表折叠组：Gamma 敞口 / 压力位·支撑位 / 成交量分布 / 持仓量分布四张图，默认展开。
    内容体沿用 .detail-body 的内边距，内部 .analysis-grid 自带 16px 下边距，这里不再叠加。 */
 .chart-fold .analysis-grid{margin-bottom:0}
+/* 强支撑、强承接与集中抛压的视觉令牌，分主题保持浅底和清晰边界。 */
+:root{--strong-up-bg:rgba(25,189,131,.14);--strong-down-bg:rgba(240,77,104,.14);--strong-up-badge:rgba(25,189,131,.23);--strong-down-badge:rgba(240,77,104,.23)}
+:root[data-theme="light"]{--strong-up-bg:rgba(15,157,106,.12);--strong-down-bg:rgba(217,43,75,.12);--strong-up-badge:rgba(15,157,106,.19);--strong-down-badge:rgba(217,43,75,.19)}
+
+/* 可读性增强：整体放大正文与辅助信息，保留徽标的紧凑感，避免放大后表格失去层级。 */
+body{font-size:14px}
+.brand-mark{font-size:11px}.brand strong{font-size:14px}.brand small{font-size:10px}
+.top-meta,.panel-status,footer{font-size:12px}.control label{font-size:11px}.refresh-note{font-size:12px}
+.eyebrow{font-size:11px}.quote-sub{font-size:12px}.analysis-heading h2{font-size:18px}.analysis-heading p{font-size:12px}.wall-badges span{font-size:12px}
+.chart-label{font-size:11px}.chart-tooltip{font-size:12px}.chart-wall-call-label,.chart-wall-put-label{font-size:11px}.chart-legend{font-size:12px}.chart-summary{font-size:12px}.chart-summary th,.chart-summary td{font-size:12px}.chart-tag text{font-size:11px}
+.chain-filter{font-size:12px}.chain-filter select{font-size:13px}.chain-legend{font-size:12px}th{font-size:11px}
+.level-head{font-size:11px}.level-factors{font-size:13px}.level-strong .level-factors{font-size:13px}.level-strength-badge,.level-strong .level-strength-badge{font-size:11px}.level-note-row{font-size:12px}.levels-empty{font-size:12px}
+.level-strength-hint{font-size:11px!important}.trend-label{font-size:20px}.trend-signal small{font-size:14px}.trend-meta{font-size:14px;padding-block:9px}.trend-opportunity-label small,.trend-opportunity strong small{font-size:12px}
+.detail-title{font-size:16px}.detail-hint{font-size:12px}.detail-action{font-size:13px}.detail-modes-label{font-size:12px}.detail-seg{font-size:13px}

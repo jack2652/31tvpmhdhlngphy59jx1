@@ -42,7 +42,7 @@
       <div class="detail-header" id="detail-header">
         <button class="detail-toggle" id="detail-toggle" type="button" aria-expanded="false" aria-controls="detail-body">
           <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">ANALYSIS DETAIL</span><span class="detail-title">趋势通道 · 交易计划 · 压力位/支撑位</span><span class="detail-hint" id="detail-hint">默认折叠，点击展开这四张面板的明细表</span></span>
+          <span class="detail-text"><span class="eyebrow">ANALYSIS DETAIL</span><span class="detail-title">趋势通道 · 加仓价位 · 压力位/支撑位</span><span class="detail-hint" id="detail-hint">默认折叠，点击展开这四张面板的明细表</span></span>
         </button>
         <div class="detail-modes" id="detail-modes" hidden>
           <span class="detail-modes-label">基准价</span>
@@ -54,34 +54,28 @@
         <span class="detail-action" id="detail-action">展开</span>
       </div>
       <div class="detail-body" id="detail-body" hidden>
-        <section class="plan-grid">
-          <article class="panel plan-panel">
+        <section class="analysis-levels-grid">
+          <section class="plan-grid">
+          <article class="panel plan-panel trend-panel">
             <div class="analysis-heading"><div><span class="eyebrow">TREND CHANNEL</span><h2>趋势通道</h2><p id="trend-note">等待数据</p></div></div>
             <div class="trend-body" id="trend-body"></div>
           </article>
           <article class="panel plan-panel levels-panel-support">
-            <div class="analysis-heading"><div><span class="eyebrow">ENTRY</span><h2>推荐买入价位</h2><p>现价下方最近的 <span id="buy-count">5</span> 个支撑</p></div></div>
-            <div class="levels" id="buy-levels"></div>
-          </article>
-          <article class="panel plan-panel levels-panel-support">
-            <div class="analysis-heading"><div><span class="eyebrow">ADD</span><h2>加仓价位</h2><p>更深一档的 5 个支撑</p></div></div>
+            <div class="analysis-heading"><div><span class="eyebrow">ADD</span><h2>加仓价位</h2><p>更深一档的最多 10 个支撑</p><p class="level-strength-hint"><span class="level-strength-swatch support"></span>强化色=历史验证强位或多因子重点承接 · 颜色越深，综合强度越高</p></div></div>
             <div class="levels" id="add-levels"></div>
           </article>
-          <article class="panel plan-panel levels-panel-resistance">
-            <div class="analysis-heading"><div><span class="eyebrow">EXIT</span><h2>卖出价位</h2><p>现价上方最近的 5 个压力</p></div></div>
-            <div class="levels" id="sell-levels"></div>
-          </article>
-        </section>
+          </section>
 
-        <section class="levels-grid">
+          <section class="levels-grid">
           <article class="panel levels-panel levels-panel-support">
-            <div class="analysis-heading"><div><span class="eyebrow">SUPPORT</span><h2>支撑位</h2><p id="support-note">等待数据</p></div></div>
+            <div class="analysis-heading"><div><span class="eyebrow">SUPPORT</span><h2>支撑位</h2><p id="support-note">等待数据</p><p class="level-strength-hint"><span class="level-strength-swatch support"></span>强化色=独立证据共振且历史回踩后仍守住 · 颜色越深，综合强度越高</p></div></div>
             <div class="levels" id="support-levels"></div>
           </article>
           <article class="panel levels-panel levels-panel-resistance">
-            <div class="analysis-heading"><div><span class="eyebrow">RESISTANCE</span><h2>压力位</h2><p id="resistance-note">等待数据</p></div></div>
+            <div class="analysis-heading"><div><span class="eyebrow">RESISTANCE</span><h2>压力位</h2><p id="resistance-note">等待数据</p><p class="level-strength-hint"><span class="level-strength-swatch resistance"></span>强化色=独立证据共振且历史回踩后仍受压 · 颜色越深，综合强度越高</p></div></div>
             <div class="levels" id="resistance-levels"></div>
           </article>
+          </section>
         </section>
 
       </div>

@@ -158,12 +158,16 @@ class MarketDataProvider:
 
     def _ticker(self, symbol: str) -> Any:
         normalized = self.normalize_symbol(symbol)
+        return self._ticker_raw(normalized)
+
+    def _ticker_raw(self, symbol: str) -> Any:
+        """创建任意上游代码的行情对象；Beta 需要访问 ^GSPC 这类指数代码。"""
         try:
             if self.proxy and not self._uses_builtin_factory:
-                return self.ticker_factory(normalized, proxy=self.proxy)
-            return self.ticker_factory(normalized)
+                return self.ticker_factory(symbol, proxy=self.proxy)
+            return self.ticker_factory(symbol)
         except Exception as exc:
-            raise ProviderError(f"无法创建 {normalized} 行情对象: {exc}") from exc
+            raise ProviderError(f"无法创建 {symbol} 行情对象: {exc}") from exc
 
     def expirations(self, symbol: str) -> list[str]:
         ticker = self._ticker(symbol)
@@ -183,8 +187,9 @@ class MarketDataProvider:
                 info = {}
             price = safe_value(info.get("last_price"))
             previous = safe_value(info.get("previous_close"))
+            today_open = safe_value(info.get("open"))
             if price is None or previous is None:
-                price, previous = self._history_quote(ticker, price, previous)
+                price, previous, today_open = self._history_quote(ticker, price, previous, today_open)
             change = None
             if price is not None and previous not in (None, 0):
                 change = (price - previous) / previous * 100
@@ -193,6 +198,8 @@ class MarketDataProvider:
                 "symbol": normalized,
                 "price": price,
                 "change_percent": safe_value(change),
+                "today_open": today_open,
+                "previous_close": previous,
                 "currency": safe_value(info.get("currency")) or "USD",
                 "market_state": safe_value(info.get("market_state")) or extended["state"],
                 "sessions": extended["sessions"],
@@ -212,19 +219,25 @@ class MarketDataProvider:
             return {"state": None, "sessions": {}}
 
     @staticmethod
-    def _history_quote(ticker: Any, price: Any, previous: Any) -> tuple[Any, Any]:
-        """fast_info 缺字段时，使用最近两个交易日收盘价计算快照。"""
+    def _history_quote(ticker: Any, price: Any, previous: Any, today_open: Any) -> tuple[Any, Any, Any]:
+        """fast_info 缺字段时，使用最近两个交易日日线补齐现价、昨收和今开。"""
         history = ticker.history(period="5d", auto_adjust=False)
         if history is None or history.empty or "Close" not in history:
-            return price, previous
-        closes = [safe_value(value) for value in history["Close"].dropna().tolist()]
-        if not closes:
-            return price, previous
+            return price, previous, today_open
+        rows = []
+        for _, row in history.iterrows():
+            close = safe_value(row.get("Close"))
+            if close is not None:
+                rows.append((safe_value(row.get("Open")), close))
+        if not rows:
+            return price, previous, today_open
         if price is None:
-            price = closes[-1]
-        if previous is None and len(closes) > 1:
-            previous = closes[-2]
-        return price, previous
+            price = rows[-1][1]
+        if previous is None and len(rows) > 1:
+            previous = rows[-2][1]
+        if today_open is None:
+            today_open = rows[-1][0]
+        return price, previous, today_open
 
     def history(self, symbol: str, period: str = "6mo") -> list[dict[str, Any]]:
         """抓取日线 OHLCV，供斐波那契回撤、筹码分布和承接位计算使用。"""
@@ -234,8 +247,12 @@ class MarketDataProvider:
             frame = ticker.history(period=period, interval="1d", auto_adjust=False)
         except Exception as exc:
             raise ProviderError(f"获取 {normalized} 日线历史失败: {exc}") from exc
+        return self._history_bars(frame, normalized)
+
+    @staticmethod
+    def _history_bars(frame: Any, symbol: str) -> list[dict[str, Any]]:
         if frame is None or frame.empty:
-            raise ProviderError(f"{normalized} 没有可用的日线历史数据")
+            raise ProviderError(f"{symbol} 没有可用的日线历史数据")
         bars: list[dict[str, Any]] = []
         for timestamp, row in frame.iterrows():
             item = normalize_row(row)
@@ -251,8 +268,17 @@ class MarketDataProvider:
                 "volume": item.get("Volume"),
             })
         if not bars:
-            raise ProviderError(f"{normalized} 的日线历史没有有效的收盘价")
+            raise ProviderError(f"{symbol} 的日线历史没有有效的收盘价")
         return bars
+
+    def benchmark_history(self, symbol: str = "^GSPC", period: str = "2y") -> list[dict[str, Any]]:
+        """抓取 Beta 基准指数的日线；指数代码不走普通股票代码校验。"""
+        ticker = self._ticker_raw(symbol)
+        try:
+            frame = ticker.history(period=period, interval="1d", auto_adjust=True)
+        except Exception as exc:
+            raise ProviderError(f"获取 {symbol} 日线历史失败: {exc}") from exc
+        return self._history_bars(frame, symbol)
 
     @staticmethod
     def estimate_gamma(spot: Any, strike: Any, implied_volatility: Any, expiration: str) -> float | None:
@@ -352,6 +378,9 @@ class HybridMarketDataProvider:
 
     def history(self, symbol: str, period: str = "6mo") -> list[dict[str, Any]]:
         return self.regular_provider.history(symbol, period)
+
+    def benchmark_history(self, symbol: str = "^GSPC", period: str = "2y") -> list[dict[str, Any]]:
+        return self.regular_provider.benchmark_history(symbol, period)
 
     def chain(self, symbol: str, expiration: str) -> list[dict[str, Any]]:
         provider = self.delayed_provider if self.uses_delayed_options() else self.regular_provider

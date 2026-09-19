@@ -11,10 +11,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api import create_router, install_access_guard
+from app.api import create_router, install_access_guard, trend_market_data
 from app.config import Settings
 from app.db import NO_FLOOR, Database, iso, parse_sessions, utc_now
-from app.levels import absorption_levels, build_levels, chip_peaks, fibonacci_levels, merge_candidates, price_extremes, touch_probability, trend_channel
+from app.levels import absorption_levels, annotate_level_history, average_true_range, best_trade_points, build_levels, chip_peaks, fibonacci_levels, level_strength_tier, merge_candidates, option_levels, price_extremes, select_visible_levels, split_support_plan, touch_probability, trade_recommendation, trend_channel
 from app.providers import market
 from app.providers import cboe
 from app.providers.market import (
@@ -26,7 +26,7 @@ from app.providers.market import (
     summarize_extended_hours,
 )
 from app.providers.cboe import CboeOptionsProvider, parse_occ_option
-from app.services.history import HistoryService
+from app.services.history import HistoryService, calculate_beta
 from app.gamma import (
     annotate_model_greeks,
     black_scholes_price,
@@ -104,6 +104,9 @@ class FakeProvider:
         return sample_quote(symbol), sample_rows(symbol, expiration), iso()
 
     def history(self, symbol: str, period: str = "6mo") -> list[dict]:
+        return sample_bars()
+
+    def benchmark_history(self, symbol: str = "^GSPC", period: str = "2y") -> list[dict]:
         return sample_bars()
 
 
@@ -520,15 +523,15 @@ def test_palette_uses_green_up_red_down_tokens():
     # 颜色令牌只在 :root 定义一次，旧的颜色命名令牌不残留。
     assert "--up:#19bd83" in styles and "--down:#f04d68" in styles
     assert "var(--green)" not in styles and "var(--red)" not in styles
-    # 上涨 / 看涨 / Call / 压力位走 --up（绿）；下跌 / 看跌 / Put / 支撑位走 --down（红）。
+    # 行情上涨 / 看涨 / Call 仍走 --up，行情下跌 / 看跌 / Put 仍走 --down；支撑/压力区间按操作提示配色。
     assert ".chart-call{fill:var(--up)}" in styles
     assert ".chart-put{fill:var(--down)}" in styles
     assert ".type-call{color:var(--up)}" in styles
     assert ".type-put{color:var(--down)}" in styles
     assert ".legend-dot.call{background:var(--up)}" in styles
     assert ".legend-dot.put{background:var(--down)}" in styles
-    assert ".levels-panel-resistance .level-strike{color:var(--up)}" in styles
-    assert ".levels-panel-support .level-strike{color:var(--down)}" in styles
+    assert ".levels-panel-resistance .level-strike{color:var(--down)}" in styles
+    assert ".levels-panel-support .level-strike{color:var(--up)}" in styles
     # 行情百分比：涨用 --up，跌用 --down，与全局口径保持一致。
     assert '$("quote-change").style.color = change < 0 ? "var(--down)" : "var(--up)";' in source
 
@@ -994,12 +997,12 @@ def test_levels_chart_panel_sits_beside_gamma():
     assert "renderLevelsChart(null)" in source
 
 def test_support_panel_sits_left_of_resistance():
-    """支撑位在左、压力位在右；配色沿用面板自身的类，换位置不会串色。"""
+    """支撑位在左、压力位在右；区间按买入/卖出提示配色，换位置不会串色。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     styles = Path("app/static/styles.css").read_text(encoding="utf-8")
     assert page.index('id="support-levels"') < page.index('id="resistance-levels"')
-    assert ".levels-panel-resistance .level-strike{color:var(--up)}" in styles
-    assert ".levels-panel-support .level-strike{color:var(--down)}" in styles
+    assert ".levels-panel-resistance .level-strike{color:var(--down)}" in styles
+    assert ".levels-panel-support .level-strike{color:var(--up)}" in styles
 
 
 def test_model_iv_is_solved_from_option_prices():
@@ -1246,12 +1249,24 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert 'id="resistance-levels"' in page
     assert 'id="support-levels"' in page
     assert "levels-panel-resistance" in page and "levels-panel-support" in page
-    assert ".levels-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}" in styles
+    assert ".analysis-levels-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:16px}" in styles
+    assert ".plan-grid,.levels-grid{display:contents}" in styles
     # 多因子改造：页面改为请求后端合成接口（斐波那契 + 筹码密集 + 承接位 + 期权持仓），
     # 结果逐条展示组成该价位的因子标签；接口不可用时退回上面的单因子口径。
     assert "function loadFactorLevels(points, spot)" in source
     assert "function renderFactorLevels(payload)" in source
     assert "function renderFactorRows(target, levels, spot)" in source
+    assert "function levelTooltipText(level, score, strengthTag)" in source
+    assert "function levelDetailText(level)" in source
+    assert "function renderLevelDetailRow(detailText, strengthTag, side)" in source
+    assert "function levelStrengthIntensity(level)" in source
+    assert "level-strength-${levelStrengthIntensity(level)}" in source
+    assert 'class="level-note-row"' in source
+    assert 'class="level-note-content"' in source
+    assert 'class="level-note-strength level-note-strength-${side}"' in source
+    assert 'class="level-note-divider"> · </span>' in source
+    assert 'const prefix = Number.isFinite(representative) && representative > 0 ? `代表价 ${formatMoney(representative)} · ` : "";' in source
+    assert "历史回踩：暂无样本" in source
     assert "request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}&spot=${encodeURIComponent(spot)}`)" in source
     assert "loadFactorLevels(points, levelSpot);" in source
     # 基准价：优先盘后价，其次盘前价，最后常规价。
@@ -1262,9 +1277,33 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert "function formatProbability(value)" in source
     assert '<span>距现价</span><span title="在所选到期日之前触及该价位的概率' in source
     assert "level-prob" in source
-    assert ".level-factor-row{grid-template-columns:1fr 1fr 1fr 1.6fr}" in styles
+    assert ".level-factor-row,.level-plan-row{grid-template-columns:minmax(0,1.25fr) minmax(0,.85fr) minmax(0,.85fr) minmax(0,1.35fr);column-gap:0}" in styles
+    assert ".level-factor-row>span,.level-plan-row>span{min-width:0;padding-inline:8px;text-align:center!important}" in styles
+    assert ".level-factor-row>span+span,.level-plan-row>span+span{border-left:1px solid var(--row-line)}" in styles
+    assert ".level-factor-row .level-factors,.level-plan-row .level-factors{padding-inline:0;gap:4px;justify-content:center;text-align:center}" in styles
+    assert ".level-strong .level-factors{font-size:12px;gap:2px}" in styles
+    assert ".level-strong .level-strength-badge{padding-inline:3px;font-size:10px}" in styles
+    assert ".level-strong .level-factors{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;flex-wrap:nowrap;text-align:center}" in styles
+    assert ".level-strong .level-strength-badge{position:static;transform:none}" in styles
+    assert ".level-strong .level-factor-text{width:auto;min-width:0;max-width:100%;text-align:center!important}" in styles
+    assert "@media(max-width:500px){.level-factor-row,.level-plan-row{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.7fr);column-gap:8px}.level-factor-row>span,.level-plan-row>span{padding-inline:0}.level-factor-row>span+span,.level-plan-row>span+span{border-left:0}.level-strong .level-factors{display:flex;justify-content:center}.level-strong .level-strength-badge{position:static;transform:none}.level-strong .level-factor-text{width:auto}}" in styles
+    assert ".level-factor-row .level-strike{white-space:nowrap;overflow-wrap:normal}" in styles
+    assert ".levels-panel-resistance .level-strike{color:var(--down)}" in styles
+    assert ".levels-panel-support .level-strike{color:var(--up)}" in styles
     assert "斐波那契 · 筹码密集 · 承接位 · 期权持仓" in source
     assert ".level-factors" in styles
+    assert ".level-note-row{display:grid;grid-template-columns:minmax(0,1fr);padding:2px 8px 6px;border-bottom:1px solid var(--row-line);background:transparent;color:var(--muted);font-size:11px;font-weight:400;line-height:1.35;text-align:center;white-space:normal;overflow-wrap:anywhere}" in styles
+    assert ".level-note-content{display:inline;max-width:100%;min-width:0}" in styles
+    assert ".level-note-strength{display:inline;padding:0;border:0;border-radius:0;background:transparent;font-size:inherit;font-weight:650;line-height:inherit;white-space:nowrap}" in styles
+    assert ".level-note-strength-support{color:var(--up)}" in styles
+    assert ".level-note-divider{color:var(--muted);font-weight:400}" in styles
+    assert ".level-strength-1{--level-fill:8%;--level-edge:2px;--level-edge-fill:42%}" in styles
+    assert ".level-strength-5{--level-fill:34%;--level-edge:4px;--level-edge-fill:100%}" in styles
+    assert "颜色越深，综合强度越高" in page
+    assert "body{font-size:14px}" in styles
+    assert ".level-note-row{font-size:12px}" in styles
+    assert ".level-factors{font-size:13px}" in styles
+    assert ".trend-meta{font-size:14px" in styles
 
 
 def test_fibonacci_levels_follow_swing_leg():
@@ -1338,19 +1377,160 @@ def test_touch_probability_uses_volatility_and_horizon():
     assert touch_probability(110.0, 100.0, 0.2, None) is None
 
 
+def test_average_true_range_uses_recent_true_ranges():
+    """ATR 区域宽度使用最近真实波幅，并能识别前收盘跳空。"""
+    bars = [
+        {"high": 101, "low": 99, "close": 100},
+        {"high": 106, "low": 104, "close": 105},
+        {"high": 108, "low": 107, "close": 107.5},
+    ]
+    assert average_true_range(bars, period=2) == pytest.approx((6 + 3) / 2)
+    assert average_true_range([], period=14) is None
+    assert average_true_range(bars, period=0) is None
+
+
 def test_merge_candidates_groups_same_price_zone():
-    """合成：同一段价位（现价 0.5% 内）合并成一条，取综合强度前 10，近的排在前面。"""
+    """合成：同一段价位（现价 0.5% 内）合并成一条，按稳定综合强度排序。"""
     spot = 100.0
     levels = merge_candidates([(101.0, 1.0, "A"), (101.3, 0.5, "B"), (110.0, 0.4, "C")], spot, "above")
     assert [item["price"] for item in levels] == [101.0, 110.0]
     assert levels[0]["factors"] == ["A", "B"]
-    assert levels[0]["score"] == 1.0
-    assert levels[1]["score"] == pytest.approx(0.27, abs=0.01)
+    assert levels[0]["score"] == pytest.approx(0.7, abs=0.01)
+    assert levels[1]["score"] == pytest.approx(0.37, abs=0.01)
+    assert levels[0]["zone_low"] == pytest.approx(100.75)
+    assert levels[0]["zone_high"] == pytest.approx(101.55)
     assert all(item["price"] > spot for item in levels)
     many = [(100 + index, 1.0, f"F{index}") for index in range(1, 13)]
     picked = merge_candidates(many, spot, "above")
     assert len(picked) == 10
     assert [item["price"] for item in picked] == [101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0, 110.0]
+
+
+def test_merge_candidates_score_does_not_depend_on_current_side_peak():
+    """稳定综合强度：加入更强的远端候选，不应重新压低已有价位的分数。"""
+    base = merge_candidates([(95.0, 0.4, "看跌持仓")], 100.0, "below", limit=10)
+    with_stronger = merge_candidates([(95.0, 0.4, "看跌持仓"), (99.0, 1.0, "看跌墙")], 100.0, "below", limit=10)
+    base_score = next(item["score"] for item in base if item["price"] == 95.0)
+    stronger_score = next(item["score"] for item in with_stronger if item["price"] == 95.0)
+    assert stronger_score == base_score
+
+
+def test_merge_candidates_requires_independent_evidence_for_strong_score():
+    """综合强度：普通单因子不标强，明确墙位或多类别共振才可达到强阈值。"""
+    ordinary = merge_candidates([(101.0, 1.0, "看涨持仓")], 100.0, "above", limit=10)
+    wall = merge_candidates([(101.0, 1.0, "看涨墙")], 100.0, "above", limit=10)
+    resonance = merge_candidates(
+        [(101.0, 0.8, "看涨持仓"), (101.2, 0.8, "筹码密集")],
+        100.0,
+        "above",
+        limit=10,
+    )
+    assert ordinary[0]["score"] < 0.7
+    assert wall[0]["score"] >= 0.7
+    assert resonance[0]["score"] >= 0.7
+
+    # 强锚点只传播部分数值，不能把相邻普通期权位抬过强阈值。
+    clustered = merge_candidates(
+        [(101.0, 1.0, "看涨墙"), (102.5, 1.0, "看涨持仓")],
+        100.0,
+        "above",
+        limit=10,
+    )
+    nearby = next(item for item in clustered if item["price"] == 102.5)
+    assert nearby["score"] < 0.7
+
+
+def test_option_wall_requires_absolute_concentration_not_only_side_peak():
+    """期权墙：本侧所有价位都接近时，最大值不能单独被标成墙。"""
+    def point(strike, call_volume):
+        return {
+            "strike": strike, "callVolume": call_volume, "putVolume": 0.0,
+            "callOi": 0.0, "putOi": 0.0, "callGex": 0.0, "putGex": 0.0,
+        }
+
+    ordinary, _, metric = option_levels([point(101, 10), point(102, 9), point(103, 8)], 100.0)
+    assert metric == "volume"
+    assert all(tag == "看涨持仓" for _, _, tag in ordinary)
+    wall, _, _ = option_levels([point(101, 40), point(102, 10), point(103, 8)], 100.0)
+    assert any(tag == "看涨墙" for _, _, tag in wall)
+
+
+def test_level_history_validation_requires_hold_samples():
+    """历史验证：长期守住才是强位，近期反复反弹的多因子位保留重点提示。"""
+    bars = []
+    for index in range(26):
+        if index in (5, 12, 19):
+            bars.append({"high": 103, "low": 99, "close": 101, "volume": 1000})
+        elif index in (6, 7, 8, 13, 14, 15, 20, 21, 22):
+            bars.append({"high": 104, "low": 100, "close": 102, "volume": 1000})
+        else:
+            bars.append({"high": 106, "low": 104, "close": 105, "volume": 1000})
+    level = {"price": 100.0, "zone_low": 99.0, "zone_high": 101.0, "score": 0.8, "factors": ["筹码密集", "看跌持仓"]}
+    validated = annotate_level_history([level], bars, "support")[0]
+    assert validated["history_samples"] == 3
+    assert validated["history_hold_rate"] == pytest.approx(1.0)
+    assert validated["history_break_rate"] == pytest.approx(0.0)
+    assert validated["strength_tier"] == "strong"
+
+    insufficient = annotate_level_history([dict(level)], bars[:8], "support")[0]
+    assert insufficient["strength_tier"] == "reinforced"
+    absorption = annotate_level_history([{"price": 100.0, "zone_low": 99.0, "zone_high": 101.0, "score": 0.58, "factors": ["承接位"]}], bars[:8], "support")[0]
+    assert absorption["strength_tier"] == "reinforced"
+
+    broken_bars = list(bars)
+    broken_bars[6] = {"high": 104, "low": 97, "close": 98, "volume": 1000}
+    broken = annotate_level_history([dict(level)], broken_bars, "support")[0]
+    assert broken["history_break_rate"] > 0
+    assert broken["recent_reactions"] >= 2
+    assert broken["strength_tier"] == "reinforced"
+
+
+def test_recent_reaction_reinforces_multifactor_level_without_making_it_strong():
+    """近期反弹可保留重点色，但不能绕过长期回踩验证直接成为强位。"""
+    recent = {
+        "score": 0.55,
+        "model_score": 0.72,
+        "factors": ["筹码密集", "看跌持仓"],
+        "history_samples": 10,
+        "history_hold_rate": 0.2,
+        "history_break_rate": 0.8,
+        "recent_samples": 5,
+        "recent_reactions": 4,
+        "recent_reaction_rate": 0.8,
+    }
+    assert level_strength_tier(recent) == "reinforced"
+    assert level_strength_tier({**recent, "factors": ["筹码密集"], "recent_reactions": 2}) == "normal"
+
+
+def test_split_support_plan_prefers_deeper_quality_levels_for_add():
+    """加仓位：应比近端买入位更深，并优先保留更高质量的深层支撑。"""
+    levels = [
+        {"price": 99, "score": 0.4}, {"price": 97, "score": 0.9},
+        {"price": 95, "score": 0.8}, {"price": 93, "score": 0.3},
+    ]
+    buy, add = split_support_plan(levels, 100.0)
+    assert [item["price"] for item in buy] == [99, 97]
+    assert [item["price"] for item in add] == [95, 93]
+    assert max(item["price"] for item in add) < max(item["price"] for item in buy)
+
+
+def test_select_visible_levels_keeps_remote_strong_levels():
+    """展示名额：保留近端价位的同时，远端强支撑/强压力不能被距离全部淘汰。"""
+    levels = [{"price": float(100 - index * 2), "score": 0.2} for index in range(15)]
+    levels[-1]["score"] = 0.9
+    selected = select_visible_levels(levels, 100.0, 10)
+    assert len(selected) == 10
+    assert selected[-1]["price"] == 72.0
+
+
+def test_merge_candidates_splits_overlapping_display_zones():
+    """相邻候选的 ATR 区间按代表价中点切开，避免显示重复区间。"""
+    levels = merge_candidates([(101.0, 1.0, "A"), (102.0, 0.9, "B"), (110.0, 0.8, "C")], 100.0, "above", zone_width=2.0)
+    ordered = sorted(levels, key=lambda item: item["price"])
+    assert ordered[0]["zone_high"] == pytest.approx(101.5)
+    assert ordered[1]["zone_low"] == pytest.approx(101.5)
+    assert all(left["zone_high"] <= right["zone_low"] for left, right in zip(ordered, ordered[1:]))
+    assert all(item["zone_low"] <= item["price"] <= item["zone_high"] for item in ordered)
 
 
 def test_build_levels_mixes_factors_and_degrades_without_history():
@@ -1376,6 +1556,29 @@ def test_build_levels_mixes_factors_and_degrades_without_history():
     assert degraded["resistance"] and degraded["support"]
 
 
+def test_build_levels_preserves_trend_bias_in_scores():
+    """上行趋势偏向支撑、下行趋势偏向压力，且分数仍限制在 0 到 1。"""
+    rising = [{
+        "close": 100 + index * 0.5,
+        "high": 101 + index * 0.5,
+        "low": 99 + index * 0.5,
+        "volume": 1000,
+    } for index in range(60)]
+    falling = [{
+        "close": 130 - index * 0.5,
+        "high": 131 - index * 0.5,
+        "low": 129 - index * 0.5,
+        "volume": 1000,
+    } for index in range(60)]
+    up = build_levels(rising, sample_option_rows(129.5), 129.5, "2026-12-18")
+    down = build_levels(falling, sample_option_rows(100.5), 100.5, "2026-12-18")
+    assert up["trend"]["direction"] == "up"
+    assert down["trend"]["direction"] == "down"
+    assert max(item["score"] for item in up["support"]) > max(item["score"] for item in up["resistance"])
+    assert max(item["score"] for item in down["resistance"]) > max(item["score"] for item in down["support"])
+    assert all(0 < item["score"] <= 1 for side in ("resistance", "support") for item in up[side] + down[side])
+
+
 def test_levels_endpoint_combines_factors(tmp_path: Path):
     """接口：按所选到期日返回两侧压力位/支撑位与各因子标签，并带日线历史元信息。"""
     database = Database(tmp_path / "options.db")
@@ -1392,6 +1595,10 @@ def test_levels_endpoint_combines_factors(tmp_path: Path):
         assert payload["spot"] == pytest.approx(200.5)
         assert payload["history"]["bars"] == len(sample_bars())
         assert payload["history"]["source"] == "upstream"
+        assert payload["trend_market"]["today_open"] == pytest.approx(sample_bars()[-1]["open"])
+        assert payload["trend_market"]["previous_close"] == pytest.approx(sample_bars()[-1]["close"])
+        assert payload["beta"]["benchmark"] == "标普500"
+        assert payload["beta"]["period_label"] == "2年"
         for side in ("resistance", "support"):
             assert 0 < len(payload[side]) <= 10
             for item in payload[side]:
@@ -1403,14 +1610,57 @@ def test_levels_endpoint_combines_factors(tmp_path: Path):
         support_tags = {tag for item in payload["support"] for tag in item["factors"]}
         assert any(tag.startswith("斐波那契") for tag in resistance_tags)
         assert any(tag.startswith(("看跌", "斐波那契", "筹码", "承接")) for tag in support_tags)
-        # 趋势通道与交易计划（买入/加仓/卖出各最多 5 条）随合成结果一并返回
+        # 趋势通道与交易计划（买入/加仓/卖出各最多 10 条）随合成结果一并返回
         assert payload["trend"]["direction"] in {"up", "down", "range"}
         assert payload["trend"]["lower"] <= payload["trend"]["upper"]
         plan = payload["plan"]
-        # 买入/卖出各取最近 5 条；加仓是再往下的 5 条，支撑不足 10 条时可以为空
-        assert 0 < len(plan["buy"]) <= 5 and 0 < len(plan["sell"]) <= 5
-        assert len(plan["add"]) == max(len(payload["support"]) - 5, 0)
-        assert all(len(plan[key]) <= 5 for key in ("buy", "add", "sell"))
+        # 买入/卖出各取最近 10 条；加仓是再往下的 10 条，候选不足时允许少于 10 条
+        assert 0 < len(plan["buy"]) <= 10 and 0 < len(plan["sell"]) <= 10
+        assert all(len(plan[key]) <= 10 for key in ("buy", "add", "sell"))
+        trade_points = payload["trade_points"]
+        assert set(trade_points) == {"buy", "sell"}
+        assert payload["trade_points_horizon"] == {"trading_days": 5, "label": "未来 5 个交易日"}
+        for point in trade_points.values():
+            if point is not None:
+                assert point["zone_low"] <= point["price"] <= point["zone_high"]
+                assert 0 <= point["confidence"] <= 1
+
+
+def test_levels_endpoint_aggregates_multiple_expirations_without_changing_selected_chain(tmp_path: Path):
+    """价位接口聚合近期期限与选中远期期限；期权链图表接口仍按单一选中期限返回。"""
+    database = Database(tmp_path / "options.db")
+    selected = sample_rows(expiration="2026-12-18")
+    near = sample_rows(expiration="2026-10-16")
+    for index, row in enumerate(near):
+        row["strike"] = 240 if row["contract_type"] == "call" else 160
+        row["contract_symbol"] = f"AAPL261016{row['contract_type']}{index}"
+        row["open_interest"] = 2500
+        row["volume"] = 500
+    database.write_snapshot(sample_quote(), selected, iso(utc_now() - timedelta(minutes=10)))
+    database.write_snapshot(sample_quote(), near, iso(utc_now() - timedelta(minutes=5)))
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    service = SnapshotService(database, FakeProvider())
+    router = create_router(database, service, FakeProvider(), settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        payload = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18"}).json()
+        chain = client.get("/api/chain/AAPL", params={"expiration": "2026-12-18"}).json()
+        gamma = client.get("/api/gamma/AAPL", params={"horizon_days": 45}).json()
+        assert payload["options_expirations"] == ["2026-10-16", "2026-12-18"]
+        assert payload["options_horizon_days"] == 45
+        assert any(item["price"] == pytest.approx(240) for item in payload["resistance"])
+        assert {row["expiration"] for row in gamma["data"]} == {"2026-10-16"}
+        assert {row["expiration"] for row in chain["data"]} == {"2026-12-18"}
+
+
+def test_level_zones_stay_on_their_side_of_spot():
+    """压力区间不能跌破现价，支撑区间不能升过现价。"""
+    payload = build_levels(sample_bars(), sample_option_rows(200.5), 200.5, "2026-12-18")
+    assert payload["resistance"] and payload["support"]
+    assert all(item["zone_low"] >= payload["spot"] for item in payload["resistance"])
+    assert all(item["zone_high"] <= payload["spot"] for item in payload["support"])
+    assert all(item["zone_low"] <= item["price"] <= item["zone_high"] for side in ("resistance", "support") for item in payload[side])
 
 
 def test_trend_channel_classifies_direction():
@@ -1425,8 +1675,72 @@ def test_trend_channel_classifies_direction():
     assert trend_channel([]) is None
 
 
+def test_trend_channel_recognizes_confirmed_rebound_after_medium_term_drop():
+    """中期下跌后最近 20 根日线持续反弹时，趋势切换为反弹上行。"""
+    bars = [{"close": 200 - index * 2.0} for index in range(40)]
+    bars.extend({"close": 120 + index * 2.2} for index in range(20))
+    trend = trend_channel(bars)
+    assert trend and trend["direction"] == "up"
+    assert trend["label"] == "反弹上行 · 上涨趋势"
+    assert trend["background_direction"] == "down"
+    assert trend["reversal_confirmed"] is True
+    assert trend["bars"] == 20
+
+
+def test_calculate_beta_uses_common_daily_returns():
+    """Beta 使用共同交易日收益率；同比例缩放的价格序列 Beta 应为 1。"""
+    days = [{"date": (date(2025, 1, 1) + timedelta(days=index)).isoformat(), "close": 100 + index} for index in range(40)]
+    scaled = [{**bar, "close": bar["close"] * 2} for bar in days]
+    result = calculate_beta(scaled, days)
+    assert result and result["value"] == pytest.approx(1.0)
+    assert result["benchmark"] == "标普500"
+    assert result["period_label"] == "2年"
+    assert calculate_beta(days[:20], days[:20]) is None
+
+
+def test_trend_market_data_falls_back_to_last_trading_day(monkeypatch):
+    """当日没有日线时，今开/昨收回退到前一个交易日的开盘/收盘。"""
+    monkeypatch.setattr("app.api.market_today", lambda: date(2026, 9, 19))
+    bars = [
+        {"date": "2026-09-18", "open": 100, "close": 105},
+        {"date": "2026-09-19", "open": 110, "close": 115},
+    ]
+    current = trend_market_data(bars, {"market_state": "REGULAR"})
+    assert current["today_open"] == 110 and current["previous_close"] == 105
+    fallback = trend_market_data(bars[:1], {"market_state": "PRE"})
+    assert fallback["today_open"] == 100 and fallback["previous_close"] == 105
+
+
+def test_trade_recommendation_combines_trend_and_nearby_levels():
+    """操作建议：上行靠近支撑买入，下行靠近压力卖出，信号不明确时持有。"""
+    up = {"direction": "up", "lower": 95, "upper": 110}
+    down = {"direction": "down", "lower": 90, "upper": 110}
+    assert trade_recommendation(up, [{"price": 99}], [{"price": 109}], 100)["action"] == "buy"
+    assert trade_recommendation(down, [{"price": 90}], [{"price": 101}], 100)["action"] == "sell"
+    assert trade_recommendation(up, [{"price": 90}], [{"price": 110}], 100)["action"] == "hold"
+    assert trade_recommendation(None, [], [], 100)["action"] == "hold"
+
+
+def test_best_trade_points_selects_multi_factor_zones():
+    """最佳买卖点：按强度、因子共振、触及概率、距离和趋势方向综合评分。"""
+    result = best_trade_points(
+        {"direction": "up"},
+        [
+            {"price": 95, "zone_low": 94, "zone_high": 96, "score": 0.7, "probability": 0.8, "factors": ["承接位"]},
+            {"price": 98, "zone_low": 97, "zone_high": 99, "score": 1.0, "probability": 0.9, "factors": ["斐波那契", "筹码密集", "承接位"]},
+        ],
+        [{"price": 105, "zone_low": 104, "zone_high": 106, "score": 0.9, "probability": 0.8, "factors": ["筹码密集", "看涨持仓"]}],
+        100,
+    )
+    assert result["buy"]["zone_low"] == 97
+    assert result["buy"]["zone_high"] == 99
+    assert result["buy"]["confidence"] >= 0.8
+    assert result["sell"]["zone_low"] == 104
+    assert result["sell"]["zone_high"] == 106
+
+
 def test_build_levels_exposes_trend_and_plan():
-    """交易计划：买入取最近的支撑、加仓取更深一档支撑、卖出取最近的压力，各最多 5 条。"""
+    """交易计划：买入取最近的支撑、加仓取更深一档支撑、卖出取最近的压力，各最多 10 条。"""
     spot = 200.5
     payload = build_levels(sample_bars(), sample_option_rows(spot), spot, "2026-12-18")
     trend = payload["trend"]
@@ -1434,7 +1748,7 @@ def test_build_levels_exposes_trend_and_plan():
     assert trend["lower"] <= trend["upper"]
     plan = payload["plan"]
     for key in ("buy", "add", "sell"):
-        assert len(plan[key]) <= 5
+        assert len(plan[key]) <= 10
     assert plan["buy"] and plan["sell"]
     price = payload["spot"]
     assert all(item["price"] < price for item in plan["buy"] + plan["add"])
@@ -1454,42 +1768,91 @@ def test_trading_plan_panels_render_under_headline():
     source = Path("app/static/app.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     styles = Path("app/static/styles.css").read_text(encoding="utf-8")
-    # 趋势通道 + 买入/加仓/卖出三个价位面板紧跟在标的现货（headline-grid）之后
+    # 趋势通道 + 加仓价位 + 支撑/压力位四个面板紧跟在标的现货（headline-grid）之后
     assert page.index('id="quote-price"') < page.index('id="trend-body"')
-    assert page.index('id="trend-body"') < page.index('id="buy-levels"') < page.index('id="add-levels"') < page.index('id="sell-levels"')
-    assert page.index('id="sell-levels"') < page.index('id="resistance-levels"')
+    assert 'id="buy-levels"' not in page and 'id="sell-levels"' not in page
+    assert 'class="panel plan-panel trend-panel"' in page
+    assert page.index('id="trend-body"') < page.index('id="add-levels"') < page.index('id="support-levels"') < page.index('id="resistance-levels"')
     # 压力位/支撑位数据紧贴图表上方（Gamma 敞口与压力位/支撑位柱状图都在它下面）
     assert page.index('id="support-levels"') < page.index('id="gex-chart"')
     assert page.index('id="support-levels"') < page.index('id="levels-chart"')
     assert page.index('id="levels-chart"') < page.index('id="chain-body"')
-    assert "function renderTrend(trend, extremes, spot, historyMeta)" in source
+    assert "function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null)" in source
     assert "function renderPlanRows(target, levels, spot)" in source
     assert "function renderPlan(plan, spot)" in source
-    assert "const PLAN_COUNT = 5;" in source
-    assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null);" in source
+    assert "const PLAN_COUNT = 10;" in source
+    assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);" in source
+    assert '"今开"' in source and '"昨收"' in source and '"Beta（2年）"' in source
+    assert "基准指数：标普500" in source and "前一个交易日的开盘价" in source
+    assert 'trend-beta-sub' not in source
+    assert '"近期最佳买入点"' in source and '"近期最佳卖出点"' in source
+    assert "未来 5 个交易日" in source
+    assert "未来 5 个交易日（约 1 周）" not in source
+    assert "<div class=\"trend-opportunities\">${opportunityRows}</div>" in source
+    assert 'class="trend-layout"' in source and 'class="trend-core"' in source and 'class="trend-side"' in source
+    assert "formatLevelRange(point)" in source and "formatProbability(point.confidence)" in source
+    assert ".trend-opportunity.buy strong{color:var(--up)}" in styles
+    assert ".trend-opportunity.sell strong{color:var(--down)}" in styles
+    assert ".trend-opportunity-label small{color:var(--muted)" in styles
+    assert ".trend-opportunity strong small{color:var(--muted)" in styles
+    assert ".trend-opportunities .trend-meta{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;min-width:0;border-bottom:0}" in styles
+    assert ".trend-opportunity strong{display:flex;flex-direction:column;align-items:flex-end" in styles
+    assert ".trend-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 24px;align-items:stretch;flex:1;min-height:0}" in styles
+    assert ".trend-side{display:flex;flex-direction:column;min-height:100%}" in styles
+    assert ".trend-side .trend-opportunities{display:flex;flex:0 0 auto;flex-direction:column;grid-template-columns:1fr;column-gap:0;min-height:0}" in styles
+    assert ".trend-side .trend-opportunities:only-child{flex:1}" in styles
+    assert ".trend-side>.trend-meta{flex:1;min-height:40px}" in styles
+    assert ".trend-core .trend-meta{flex:1;min-height:40px}" in styles
+    assert ".trend-panel{display:flex;flex-direction:column;min-height:0}" in styles
+    assert "trend-signal" in source
+    assert 'trend.label}<span class="trend-action"> · ${recommendation.label' in source
+    assert ".trend-signal.up .trend-label{color:var(--up)}" in styles
+    assert ".trend-signal.down .trend-label{color:var(--down)}" in styles
+    assert ".trend-signal .trend-action{font-size:inherit}" in styles
     assert "renderPlan(payload?.plan, spot);" in source
     # 回退口径（合成接口不可用）也要给出趋势占位与三段计划
     assert "renderTrend(null);" in source
-    assert "renderPlan({ buy: supportSeries.slice(0, PLAN_COUNT)" in source
-    assert ".plan-grid{display:grid;grid-template-columns:repeat(4,1fr)" in styles
+    assert "const planSplit = Math.min(PLAN_COUNT, Math.ceil(planSupportSeries.length / 2));" in source
+    assert "renderPlan({ add: planSupportSeries.slice(planSplit, planSplit + PLAN_COUNT) }, price);" in source
+    assert ".analysis-levels-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:16px}" in styles
 
 
 def test_trading_plan_rows_expose_composite_basis_column():
-    """买入 / 加仓 / 卖出三张价位表都显示「综合依据」列，不再只藏在悬停提示里。"""
+    """加仓价位表显示「综合依据」列，不再只藏在悬停提示里。"""
     source = Path("app/static/app.js").read_text(encoding="utf-8")
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
     styles = Path("app/static/styles.css").read_text(encoding="utf-8")
     plan_section = source[source.index("function renderPlanRows("):source.index("function renderPlan(")]
     assert "<span>综合依据</span>" in plan_section
-    assert '<span class="level-factors">${factors}</span>' in plan_section
+    assert '<span class="level-factors"><span class="level-factor-text">${factors}</span></span>' in plan_section
+    assert "renderLevelDetailRow(detailText, strengthTag, \"support\")" in plan_section
     assert "level-plan-row" in plan_section
-    # 三张表共用同一个渲染函数：买入、加仓、卖出都会带上这一列
-    assert 'renderPlanRows($("buy-levels"), plan?.buy || [], price);' in source
+    assert "levelStrengthTag(level, \"support\", true)" in plan_section
+    # 加仓表使用统一渲染函数，买入/卖出改由支撑位/压力位面板展示
     assert 'renderPlanRows($("add-levels"), plan?.add || [], price);' in source
-    assert 'renderPlanRows($("sell-levels"), plan?.sell || [], price);' in source
-    # 桌面四栏是窄面板：综合依据单独占一行；面板变宽后回到一行四列
-    assert ".level-plan-row{grid-template-columns:1fr 1fr 1fr}" in styles
-    assert ".level-plan-row>span:last-child{grid-column:1 / -1}" in styles
-    assert "@media(max-width:1100px){.level-plan-row{grid-template-columns:1fr 1fr 1fr 1.6fr}" in styles
+    # 表头与数据行统一四列，避免距现价、触及概率、综合依据错位
+    assert ".level-factor-row,.level-plan-row{grid-template-columns:minmax(0,1.25fr) minmax(0,.85fr) minmax(0,.85fr) minmax(0,1.35fr);column-gap:0}" in styles
+    assert ".level-factor-row>span,.level-plan-row>span{min-width:0;padding-inline:8px;text-align:center!important}" in styles
+    assert ".level-factor-row>span+span,.level-plan-row>span+span{border-left:1px solid var(--row-line)}" in styles
+    assert ".level-factor-row .level-factors,.level-plan-row .level-factors{padding-inline:0;gap:4px;justify-content:center;text-align:center}" in styles
+    assert ".level-strong .level-factors{font-size:12px;gap:2px}" in styles
+    assert ".level-strong .level-strength-badge{padding-inline:3px;font-size:10px}" in styles
+    assert ".level-strong .level-factors{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;flex-wrap:nowrap;text-align:center}" in styles
+    assert ".level-strong .level-strength-badge{position:static;transform:none}" in styles
+    assert ".level-strong .level-factor-text{width:auto;min-width:0;max-width:100%;text-align:center!important}" in styles
+    assert "@media(max-width:500px){.level-factor-row,.level-plan-row{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.7fr);column-gap:8px}.level-factor-row>span,.level-plan-row>span{padding-inline:0}.level-factor-row>span+span,.level-plan-row>span+span{border-left:0}.level-strong .level-factors{display:flex;justify-content:center}.level-strong .level-strength-badge{position:static;transform:none}.level-strong .level-factor-text{width:auto}}" in styles
+    assert ".level-plan-row>span:last-child{grid-column:auto}" in styles
+    assert ".level-plan-row.level-head>span:last-child{grid-column:auto}" in styles
+    assert ".plan-panel.levels-panel-support .level-strike{color:var(--text)}" in styles
+    assert "const STRONG_LEVEL_SCORE = 0.7;" in source
+    assert "function levelStrengthTag(level, side, isAdd = false)" in source
+    assert "function hasStrongLevelEvidence(factors)" in source
+    assert "|| !hasStrongLevelEvidence(factors)" in source
+    assert ".level-strong-support,.level-reinforced-support{--level-color:var(--up)}" in styles
+    assert ".level-strong-resistance,.level-reinforced-resistance{--level-color:var(--down)}" in styles
+    assert "历史验证强位或多因子重点承接" in page
+    assert "strength_tier" in source
+    assert ".level-reinforced-support" in styles
     # 回退口径（合成接口不可用时）也要给出依据文案
     assert "factors: [metricLabel]" in source
 
@@ -1500,6 +1863,8 @@ def test_levels_module_shows_ten_per_side():
 
     assert levels.LEVEL_COUNT == 10
     assert levels.OPTION_LIMIT == 12
+    assert levels.PLAN_COUNT == 10
+    assert levels.TRADE_POINT_TRADING_DAYS == 5
 
 
 def test_levels_endpoint_accepts_spot_override(tmp_path: Path):
@@ -1570,7 +1935,7 @@ def test_trend_channel_renders_extremes_rows():
     assert "function trendExtremeRows(extremes, spot)" in source
     for label in ("52周最高", "52周最低", "历史最高", "历史最低"):
         assert f'["{label}", extremes?.week52?.high]' in source or f'["{label}",' in source
-    assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null)" in source
+    assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null)" in source
     # 取不到数据时整组不渲染，趋势行不受影响
     assert "const hasExtremes = extremeRows.some((row) => row.valid);" in source
 
@@ -1644,12 +2009,15 @@ def test_analysis_detail_group_collapses_by_default():
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     source = Path("app/static/app.js").read_text(encoding="utf-8")
     styles = Path("app/static/styles.css").read_text(encoding="utf-8")
-    # 分组从 detail-body 开始，把四张明细表面板（趋势通道 / 买卖计划 / 压力位支撑位）全包进去，
+    # 分组从 detail-body 开始，把四张明细表面板（趋势通道 / 加仓价位 / 压力位支撑位）全包进去，
     # 图表区（gex-chart）仍在分组之外。
     assert page.index('id="analysis-detail"') < page.index('id="detail-body"')
     body = page[page.index('id="detail-body"') : page.index('id="gex-chart"')]
-    for token in ('class="plan-grid"', 'class="levels-grid"', 'id="trend-body"', 'id="buy-levels"', 'id="add-levels"', 'id="sell-levels"', 'id="support-levels"', 'id="resistance-levels"'):
+    for token in ('class="analysis-levels-grid"', 'class="plan-grid"', 'class="levels-grid"', 'id="trend-body"', 'id="add-levels"', 'id="support-levels"', 'id="resistance-levels"'):
         assert token in body
+    assert 'id="buy-levels"' not in body and 'id="sell-levels"' not in body
+    order = [body.index(token) for token in ('id="trend-body"', 'id="add-levels"', 'id="support-levels"', 'id="resistance-levels"')]
+    assert order == sorted(order)
     # 默认折叠：body 带 hidden，按钮 aria-expanded=false
     assert 'id="detail-body" hidden' in page
     assert 'id="detail-toggle" type="button" aria-expanded="false" aria-controls="detail-body"' in page

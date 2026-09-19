@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from typing import Any
 
@@ -22,6 +23,61 @@ logger = logging.getLogger(__name__)
 HISTORY_PERIOD = "6mo"
 # 极值回看周期：52 周与历史高低点需要全量日线，因此单独抓一次并缓存一天。
 EXTREMES_PERIOD = "max"
+# Beta 采用两年日线收益率，并按天缓存结果。
+BETA_PERIOD = "2y"
+BETA_MAX_AGE_SECONDS = 86400
+BETA_BENCHMARK = "^GSPC"
+
+
+def calculate_beta(stock_bars: list[dict[str, Any]], benchmark_bars: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """按共同交易日的日收益率计算标的相对标普 500 的 Beta。"""
+    def close_map(bars: list[dict[str, Any]]) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for bar in bars:
+            try:
+                day = str(bar.get("date"))[:10]
+                close = float(bar.get("close"))
+            except (TypeError, ValueError):
+                continue
+            if day and math.isfinite(close) and close > 0:
+                values[day] = close
+        return values
+
+    stock = close_map(stock_bars)
+    benchmark = close_map(benchmark_bars)
+    days = sorted(set(stock) & set(benchmark))
+    if len(days) < 31:
+        return None
+    stock_returns: list[float] = []
+    benchmark_returns: list[float] = []
+    for previous_day, current_day in zip(days, days[1:]):
+        stock_previous = stock[previous_day]
+        benchmark_previous = benchmark[previous_day]
+        stock_current = stock[current_day]
+        benchmark_current = benchmark[current_day]
+        if stock_previous <= 0 or benchmark_previous <= 0:
+            continue
+        stock_returns.append(stock_current / stock_previous - 1.0)
+        benchmark_returns.append(benchmark_current / benchmark_previous - 1.0)
+    if len(stock_returns) < 30:
+        return None
+    stock_mean = sum(stock_returns) / len(stock_returns)
+    benchmark_mean = sum(benchmark_returns) / len(benchmark_returns)
+    covariance = sum(
+        (stock_value - stock_mean) * (benchmark_value - benchmark_mean)
+        for stock_value, benchmark_value in zip(stock_returns, benchmark_returns)
+    )
+    variance = sum((value - benchmark_mean) ** 2 for value in benchmark_returns)
+    if variance <= 0:
+        return None
+    return {
+        "value": round(covariance / variance, 4),
+        "benchmark": "标普500",
+        "benchmark_symbol": BETA_BENCHMARK,
+        "period": BETA_PERIOD,
+        "period_label": "2年",
+        "observations": len(stock_returns),
+    }
 
 
 class HistoryService:
@@ -31,11 +87,13 @@ class HistoryService:
         provider: MarketDataProvider,
         max_age_seconds: int = 3600,
         extremes_max_age_seconds: int = 86400,
+        beta_max_age_seconds: int = BETA_MAX_AGE_SECONDS,
     ):
         self.database = database
         self.provider = provider
         self.max_age_seconds = max(max_age_seconds, 0)
         self.extremes_max_age_seconds = max(extremes_max_age_seconds, 0)
+        self.beta_max_age_seconds = max(beta_max_age_seconds, 0)
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -93,11 +151,48 @@ class HistoryService:
             self.database.write_extremes(normalized, computed, fetched_at)
             return self._extremes_result(normalized, {"extremes": computed, "fetched_at": fetched_at}, "upstream", None)
 
+    def beta(self, symbol: str) -> dict[str, Any]:
+        """返回相对标普 500 的两年 Beta；回源失败时退回日缓存。"""
+        normalized = self.provider.normalize_symbol(symbol)
+        cached = self.database.latest_beta(normalized)
+        if cached and self._is_fresh(cached.get("fetched_at"), self.beta_max_age_seconds):
+            return self._beta_result(normalized, cached, "sqlite", None)
+        with self._lock_for(f"{normalized}:beta"):
+            cached = self.database.latest_beta(normalized)
+            if cached and self._is_fresh(cached.get("fetched_at"), self.beta_max_age_seconds):
+                return self._beta_result(normalized, cached, "sqlite", None)
+            benchmark_loader = getattr(self.provider, "benchmark_history", None)
+            try:
+                if not callable(benchmark_loader):
+                    raise ProviderError("行情源不支持标普500基准历史")
+                computed = calculate_beta(
+                    self.provider.history(normalized, period=BETA_PERIOD),
+                    benchmark_loader(BETA_BENCHMARK, BETA_PERIOD),
+                )
+                if computed is None:
+                    raise ProviderError("两年共同交易日不足，无法计算 Beta")
+            except ProviderError as exc:
+                logger.warning("获取 %s Beta 失败: %s", normalized, exc)
+                return self._beta_result(normalized, cached, "sqlite" if cached else "none", str(exc))
+            fetched_at = iso()
+            self.database.write_beta(normalized, computed, fetched_at)
+            return self._beta_result(normalized, {"beta": computed, "fetched_at": fetched_at}, "upstream", None)
+
     @staticmethod
     def _extremes_result(symbol: str, cached: dict[str, Any] | None, source: str, warning: str | None) -> dict[str, Any]:
         return {
             "symbol": symbol,
             "extremes": (cached or {}).get("extremes"),
+            "fetched_at": (cached or {}).get("fetched_at"),
+            "source": source,
+            "warning": warning,
+        }
+
+    @staticmethod
+    def _beta_result(symbol: str, cached: dict[str, Any] | None, source: str, warning: str | None) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "beta": (cached or {}).get("beta"),
             "fetched_at": (cached or {}).get("fetched_at"),
             "source": source,
             "warning": warning,

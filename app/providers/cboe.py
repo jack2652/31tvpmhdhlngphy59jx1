@@ -145,6 +145,8 @@ class CboeOptionsProvider:
             "symbol": normalized,
             "price": price,
             "change_percent": change,
+            "today_open": None,
+            "previous_close": previous,
             "currency": "USD",
             "market_state": current_session_state(now, None),
             "sessions": {},

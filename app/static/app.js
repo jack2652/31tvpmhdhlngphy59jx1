@@ -1,4 +1,4 @@
-const state = { symbol: "QQQ", expiration: null, timer: null, analysisReady: false, loadId: 0, refreshing: false, refreshInFlight: null, analysisRefreshSymbol: null, chainFetchedAt: null, levelsKey: "", levelsPayload: null, chainFilter: "all", chainRows: [], chainSpot: null, levelBasisMode: "live", lastQuote: null, accessKey: "", storageAvailable: false };
+const state = { symbol: "QQQ", expiration: null, timer: null, analysisReady: false, loadId: 0, refreshing: false, refreshInFlight: null, analysisRefreshSymbol: null, chainFetchedAt: null, levelsWindowFetchedAt: null, levelsKey: "", levelsPayload: null, chainFilter: "all", chainRows: [], chainSpot: null, levelBasisMode: "live", lastQuote: null, accessKey: "", storageAvailable: false };
 const GAMMA_MIN_MINUTES = 30;
 // 自动刷新间隔（秒）：页面提示文案与定时器共用同一个值。
 const AUTO_REFRESH_SECONDS = 60;
@@ -6,8 +6,10 @@ const AUTO_REFRESH_SECONDS = 60;
 const SNAPSHOT_FRESH_SECONDS = 60;
 // 压力位/支撑位各展示的条数。
 const LEVEL_COUNT = 10;
-// 交易计划（买入 / 加仓 / 卖出）各自展示的条数。
-const PLAN_COUNT = 5;
+// 交易计划（买入 / 加仓 / 卖出）各自最多展示的条数。
+const PLAN_COUNT = 10;
+// 强化色只显示后端同时通过模型强度、独立证据和历史回踩验证的价位。
+const STRONG_LEVEL_SCORE = 0.7;
 // 期权链热力底色：成交量与未平仓各自按本屏最大值归一，得到 0~100 的相对强度；
 // 底色深浅（含白天/黑夜各自的透明度区间）交给 styles.css 的 --heat-floor / --heat-gain 换算。
 // 达到这个强度的格子算「热点」：底色已经很亮，文字换成深色墨色，避免亮底浅字看不清。
@@ -76,7 +78,7 @@ function bindFoldGroup({ headerId, toggleId, bodyId, actionId, storageKey, defau
   });
 }
 
-// 分析详情折叠组：趋势通道、交易计划与压力位/支撑位四张明细表，默认折叠。
+// 分析详情折叠组：趋势通道、加仓价位与压力位/支撑位四张明细表，默认折叠。
 const DETAIL_KEY = "option-scope-detail";
 
 function initDetailGroup() {
@@ -689,13 +691,74 @@ function pickLevels(points, spot, side, valueOf, count = LEVEL_COUNT) {
 }
 
 // 逐条渲染价位表（行权价 / 距现价 / 排序口径数值），离现价近的排在前面。
+function levelScore(level) {
+  const score = Number(level?.score);
+  return Number.isFinite(score) ? Math.min(1, Math.max(0, score)) : 0;
+}
+
+function levelFactors(level) {
+  return Array.isArray(level?.factors) ? level.factors.map((factor) => String(factor)) : [];
+}
+
+function hasStrongLevelEvidence(factors) {
+  const groups = new Set();
+  let hasWall = false;
+  let hasAbsorption = false;
+  for (const factor of factors) {
+    if (factor.includes("看涨墙") || factor.includes("看跌墙")) hasWall = true;
+    if (factor.includes("看涨") || factor.includes("看跌")) groups.add("options");
+    else if (factor.includes("斐波那契")) groups.add("fibonacci");
+    else if (factor.includes("筹码密集")) groups.add("chips");
+    else if (factor.includes("承接位")) { groups.add("absorption"); hasAbsorption = true; }
+    else groups.add(`other:${factor}`);
+  }
+  return hasWall || hasAbsorption || groups.size >= 2;
+}
+
+function levelStrengthTag(level, side, isAdd = false) {
+  const factors = levelFactors(level);
+  const tier = String(level?.strength_tier || "");
+  if (!['strong', 'reinforced'].includes(tier) || !hasStrongLevelEvidence(factors)) return "";
+  const prefix = tier === "strong" ? "强" : "重点";
+  if (side === "support" && isAdd && factors.some((factor) => factor.includes("承接位"))) return tier === "strong" ? "强承接" : "重点承接";
+  if (side === "support") return `${prefix}支撑`;
+  return factors.some((factor) => factor.includes("看涨墙")) ? (tier === "strong" ? "集中抛压" : "重点抛压") : `${prefix}压力`;
+}
+
+// 强化色按最终综合分数分五档；strong 额外包含历史验证，因此视觉上高半档。
+function levelStrengthIntensity(level) {
+  const score = levelScore(level) + (level?.strength_tier === "strong" ? 0.1 : 0);
+  if (score >= 0.9) return 5;
+  if (score >= 0.8) return 4;
+  if (score >= 0.68) return 3;
+  if (score >= 0.56) return 2;
+  return 1;
+}
+
+function levelStrengthClass(level, side, isAdd = false) {
+  const tag = levelStrengthTag(level, side, isAdd);
+  const tier = String(level?.strength_tier || "");
+  const intensity = tag ? ` level-strength-${levelStrengthIntensity(level)}` : "";
+  return tag ? `level-strong level-${tier} level-strong-${side}${isAdd ? " level-strong-add" : ""}${intensity}` : "";
+}
+
+function levelStrengthBadge(level, side, isAdd = false) {
+  const tag = levelStrengthTag(level, side, isAdd);
+  return tag ? `<span class="level-strength-badge level-strength-badge-${side}">${tag}</span>` : "";
+}
+
 function renderLevelRows(target, levels, spot, valueOf, formatValue, metricLabel) {
   const head = `<div class="level-row level-head"><span>行权价</span><span>距现价</span><span>${metricLabel}</span></div>`;
   if (!levels.length) { target.innerHTML = head + '<div class="levels-empty">现价这一侧没有可用行权价</div>'; return; }
+  const side = target?.id === "resistance-levels" ? "resistance" : "support";
+  const peak = Math.max(0, ...levels.map(valueOf)) || 1;
   target.innerHTML = head + levels.map((point) => {
     const gap = (point.strike / spot - 1) * 100;
     const gapText = `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
-    return `<div class="level-row"><span class="level-strike">${formatMoney(point.strike)}</span><span class="level-gap ${gap >= 0 ? "up" : "down"}">${gapText}</span><span class="level-value">${formatValue(valueOf(point))}</span></div>`;
+    const level = { price: point.strike, score: valueOf(point) / peak, factors: [metricLabel] };
+    const strongClass = levelStrengthClass(level, side);
+    const badge = levelStrengthBadge(level, side);
+    return `<div class="level-row ${strongClass}"><span class="level-strike">${formatMoney(point.strike)}</span><span class="level-gap ${gap >= 0 ? "up" : "down"}">${gapText}</span><span class="level-value">${badge}${formatValue(valueOf(point))}</span></div>`;
   }).join("");
 }
 
@@ -732,6 +795,7 @@ function renderLevels(points, spot) {
   $("support-note").textContent = scope;
   const resistance = pickLevels(points, price, "above", callValue);
   const support = pickLevels(points, price, "below", putValue);
+  const planSupport = pickLevels(points, price, "below", putValue, PLAN_COUNT * 2);
   renderLevelRows(resistanceTarget, resistance, price, callValue, formatValue, metricLabel);
   renderLevelRows(supportTarget, support, price, putValue, formatValue, metricLabel);
   // 单因子回退时柱状图按同一批行权价绘制，综合强度按本侧最大值归一。
@@ -740,7 +804,9 @@ function renderLevels(points, spot) {
   renderLevelsChart({ spot: price, resistance: resistanceSeries, support: supportSeries });
   // 回退口径没有日线历史，趋势通道留空；交易计划按同一批支撑/压力价位切成三段。
   renderTrend(null);
-  renderPlan({ buy: supportSeries.slice(0, PLAN_COUNT), add: supportSeries.slice(PLAN_COUNT, PLAN_COUNT * 2), sell: resistanceSeries.slice(0, PLAN_COUNT) }, price);
+  const planSupportSeries = fallbackLevelSeries(planSupport, putValue, metricLabel);
+  const planSplit = Math.min(PLAN_COUNT, Math.ceil(planSupportSeries.length / 2));
+  renderPlan({ add: planSupportSeries.slice(planSplit, planSplit + PLAN_COUNT) }, price);
 }
 
 // 多因子压力位/支撑位：由后端按「斐波那契回撤 + 筹码密集 + 承接位 + 所选到期日期权持仓」合成，
@@ -748,7 +814,7 @@ function renderLevels(points, spot) {
 function loadFactorLevels(points, spot) {
   if (!points.length || !state.expiration) { renderLevels(points, spot); return; }
   // 缓存键带上基准价口径：两个口径取到同一价格时（盘后/夜盘时段）也各自成键，切换必然重绘一次。
-  const key = `${state.symbol}|${state.expiration}|${state.chainFetchedAt || ""}|${Number(spot).toFixed(2)}|${state.levelBasisMode}`;
+  const key = `${state.symbol}|${state.expiration}|${state.chainFetchedAt || ""}|${state.levelsWindowFetchedAt || ""}|${Number(spot).toFixed(2)}|${state.levelBasisMode}`;
   // 已请求过：窗口尺寸变化时直接用缓存结果重绘，不再打接口。
   if (state.levelsKey === key) {
     if (state.levelsPayload) renderFactorLevels(state.levelsPayload);
@@ -773,7 +839,7 @@ function loadFactorLevels(points, spot) {
 }
 
 // 渲染多因子结果：价位 / 距现价 / 综合依据（组成该价位的因子标签）。
-// 到达概率：0~1 的概率值转百分比，极小/极大用不等号，缺数据用占位符。
+// 触及概率：0~1 的概率值转百分比，极小/极大用不等号，缺数据用占位符。
 function formatProbability(value) {
   if (value == null || !Number.isFinite(Number(value))) return "--";
   const percent = Number(value) * 100;
@@ -782,15 +848,67 @@ function formatProbability(value) {
   return `${percent.toFixed(1)}%`;
 }
 
+function formatLevelRange(level) {
+  const center = Number(level?.price);
+  const low = Number(level?.zone_low);
+  const high = Number(level?.zone_high);
+  if (!Number.isFinite(center) || center <= 0) return "--";
+  if (!Number.isFinite(low) || !Number.isFinite(high) || high <= low) return formatMoney(center);
+  return `${formatMoney(low)}-${formatMoney(high)}`;
+}
+
+// 桌面端悬停提示保留完整信息，避免说明行精简后丢失详情。
+function levelTooltipText(level, score, strengthTag) {
+  const historyTitle = Number.isFinite(Number(level.history_samples)) && Number(level.history_samples) > 0
+    ? ` · 历史触及 ${level.history_samples} 次，守住 ${(Number(level.history_hold_rate) * 100).toFixed(1)}%，跌破 ${(Number(level.history_break_rate) * 100).toFixed(1)}%${Number(level.recent_samples) > 0 ? `；近期 ${level.recent_samples} 次反应，反弹 ${((Number(level.recent_reaction_rate) || 0) * 100).toFixed(1)}%` : ""}`
+    : " · 历史触及样本不足，未启用强化色";
+  const recentReinforcement = Number(level.recent_samples) >= 2 && Number(level.recent_reactions) >= 2;
+  const strengthTitle = strengthTag ? (level.strength_tier === "strong"
+    ? ` · ${strengthTag}（历史回踩验证通过）`
+    : ` · ${strengthTag}（${recentReinforcement ? "近期多次反应" : "多因子共振，历史样本不足"}）`) : "";
+  return `代表价 ${formatMoney(level.price)} · 综合强度 ${score.toFixed(2)}（1 为最强）${strengthTitle}${historyTitle}`;
+}
+
+// 手机端说明只保留历史验证摘要，主数据行已有代表价、强度和综合依据。
+function levelDetailText(level) {
+  const samples = Number(level?.history_samples);
+  const representative = Number(level?.price);
+  const prefix = Number.isFinite(representative) && representative > 0 ? `代表价 ${formatMoney(representative)} · ` : "";
+  if (!Number.isFinite(samples) || samples <= 0) return `${prefix}历史回踩：暂无样本`;
+  const holdRate = Number(level.history_hold_rate);
+  const breakRate = Number(level.history_break_rate);
+  const parts = [`${prefix}历史回踩：${samples} 次`];
+  if (Number.isFinite(holdRate)) parts.push(`守住 ${(holdRate * 100).toFixed(1)}%`);
+  if (Number.isFinite(breakRate)) parts.push(`跌破 ${(breakRate * 100).toFixed(1)}%`);
+  const recentSamples = Number(level.recent_samples);
+  if (Number.isFinite(recentSamples) && recentSamples > 0) {
+    parts.push(`近期 ${recentSamples} 次反应`);
+    const reactionRate = Number(level.recent_reaction_rate);
+    if (Number.isFinite(reactionRate)) parts.push(`反弹 ${(reactionRate * 100).toFixed(1)}%`);
+  }
+  return parts.join(" · ");
+}
+
+function renderLevelDetailRow(detailText, strengthTag, side) {
+  const strength = strengthTag ? `<span class="level-note-strength level-note-strength-${side}">${strengthTag}</span><span class="level-note-divider"> · </span>` : "";
+  return `<div class="level-note-row"><span class="level-note-content">${strength}<span>${detailText}</span></span></div>`;
+}
+
 function renderFactorRows(target, levels, spot) {
-  const head = `<div class="level-row level-head level-factor-row"><span>价位</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">到达概率</span><span>综合依据</span></div>`;
+  const head = `<div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>`;
   if (!levels.length) { target.innerHTML = head + '<div class="levels-empty">现价这一侧暂无可用价位</div>'; return; }
+  const side = target?.id === "resistance-levels" ? "resistance" : "support";
   target.innerHTML = head + levels.map((level) => {
     const gap = Number.isFinite(spot) && spot > 0 ? (Number(level.price) / spot - 1) * 100 : null;
     const gapText = gap == null ? "--" : `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
     const gapClass = gap == null ? "" : (gap >= 0 ? "up" : "down");
-    const factors = (level.factors || []).join(" · ");
-    return `<div class="level-row level-factor-row" title="综合强度 ${Number(level.score).toFixed(2)}（1 为最强）"><span class="level-strike">${formatMoney(level.price)}</span><span class="level-gap ${gapClass}">${gapText}</span><span class="level-prob">${formatProbability(level.probability)}</span><span class="level-factors">${factors}</span></div>`;
+    const score = levelScore(level);
+    const factors = levelFactors(level).join(" · ");
+    const strengthTag = levelStrengthTag(level, side);
+    const strongClass = levelStrengthClass(level, side);
+    const titleText = levelTooltipText(level, score, strengthTag);
+    const detailText = levelDetailText(level);
+    return `<div class="level-row level-factor-row ${strongClass}" title="${titleText}"><span class="level-strike">${formatLevelRange(level)}</span><span class="level-gap ${gapClass}">${gapText}</span><span class="level-prob">${formatProbability(level.probability)}</span><span class="level-factors"><span class="level-factor-text">${factors}</span></span></div>${renderLevelDetailRow(detailText, strengthTag, side)}`;
   }).join("");
 }
 
@@ -813,8 +931,8 @@ function trendExtremeRows(extremes, spot) {
   });
 }
 
-// 趋势通道：展示日线线性回归得到的方向、上下轨与日均斜率，以及 52 周 / 历史最高最低价。
-function renderTrend(trend, extremes, spot, historyMeta) {
+// 趋势通道：展示方向、上下轨、日均斜率、今开/昨收、Beta，以及 52 周 / 历史最高最低价。
+function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null) {
   const target = $("trend-body");
   if (!target) return;
   const note = $("trend-note");
@@ -827,14 +945,39 @@ function renderTrend(trend, extremes, spot, historyMeta) {
   }
   const className = trend?.direction === "up" ? "up" : (trend?.direction === "down" ? "down" : "range");
   const slope = Number(trend?.slope_percent) || 0;
+  const betaValue = Number(beta?.value);
+  const betaText = Number.isFinite(betaValue) ? betaValue.toFixed(2) : "--";
+  const betaTitle = "基准指数：标普500 · 时间跨度：2年 · Beta（β）衡量股票相对于整个股市的价格波动情况；高 Beta（>1.0）理论上风险更高但潜在回报更高，低 Beta（<1.0）理论上风险较低但潜在回报也较低";
   const rows = trend ? [
-    ["通道上轨", formatMoney(trend.upper)],
-    ["通道下轨", formatMoney(trend.lower)],
-    ["日均斜率", `${slope >= 0 ? "+" : ""}${slope.toFixed(3)}%`],
-    ["样本", `${Number(trend.bars) || 0} 根日线`],
+    ["通道上轨", formatMoney(trend.upper), ""],
+    ["通道下轨", formatMoney(trend.lower), ""],
+    ["日均斜率", `${slope >= 0 ? "+" : ""}${slope.toFixed(3)}%`, ""],
+    ["样本", `${Number(trend.bars) || 0} 根日线`, ""],
+    ["今开", formatMoney(trendMarket?.today_open), "今日开盘价；盘前、盘后和夜盘缺少当日开盘价时，使用前一个交易日的开盘价"],
+    ["昨收", formatMoney(trendMarket?.previous_close), "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"],
+    ["Beta（2年）", betaText, betaTitle],
   ] : [];
-  const head = trend ? `<strong class="trend-label ${className}">${trend.label}</strong>` : '<div class="levels-empty">历史行情不足，暂无趋势判断</div>';
-  target.innerHTML = head + rows.map(([label, value]) => `<div class="trend-meta"><span>${label}</span><strong>${value}</strong></div>`).join("") + (hasExtremes ? extremeRows.map((row) => row.html).join("") : "");
+  const action = ["buy", "sell", "hold"].includes(recommendation?.action) ? recommendation.action : null;
+  const head = trend
+    ? action
+      ? `<div class="trend-signal ${className} ${action}"><strong class="trend-label">${trend.label}<span class="trend-action"> · ${recommendation.label || "继续持有"}</span></strong><small>${recommendation.reason || "结合当前趋势与价位综合判断"}</small></div>`
+      : `<strong class="trend-label ${className}">${trend.label}</strong>`
+    : '<div class="levels-empty">历史行情不足，暂无趋势判断</div>';
+  const horizonLabel = tradePointsHorizon?.label || "未来 5 个交易日";
+  const opportunityRows = [
+    ["buy", "近期最佳买入点"],
+    ["sell", "近期最佳卖出点"],
+  ].map(([kind, label]) => {
+    const point = tradePoints?.[kind];
+    const range = point ? formatLevelRange(point) : "--";
+    const confidence = point ? formatProbability(point.confidence) : "--";
+    const title = point?.reason ? `${label}：${point.reason}` : `${label}暂无可用数据`;
+    return `<div class="trend-meta trend-opportunity ${kind}" title="${title} · 计算范围：${horizonLabel}"><span class="trend-opportunity-label"><span>${label}</span><small>${horizonLabel}</small></span><strong>${range}<small>综合置信度 ${confidence}</small></strong></div>`;
+  }).join("");
+  const coreRows = rows.map(([label, value, title]) => `<div class="trend-meta${label.startsWith("Beta") ? " trend-beta" : ""}"${title ? ` title="${title}"` : ""}><span>${label}</span><strong>${value}</strong></div>`).join("");
+  const coreContent = coreRows || '<div class="levels-empty">暂无趋势通道数据</div>';
+  const sideContent = `<div class="trend-opportunities">${opportunityRows}</div>` + (hasExtremes ? extremeRows.map((row) => row.html).join("") : "");
+  target.innerHTML = head + `<div class="trend-layout"><div class="trend-core">${coreContent}</div><div class="trend-side">${sideContent}</div></div>`;
   if (note) {
     note.textContent = "按最近日线收盘价的线性回归通道；高低点取日线最高/最低价（历史极值用全量历史）";
     const meta = historyMeta || {};
@@ -847,26 +990,29 @@ function renderTrend(trend, extremes, spot, historyMeta) {
   }
 }
 
-// 交易计划价位表：价位 / 距现价 / 到达概率 / 综合依据；综合强度仍放在悬停提示里。
+// 交易计划价位表：价位区间 / 距现价 / 触及概率 / 综合依据；强化标签放在说明行。
 function renderPlanRows(target, levels, spot) {
   if (!target) return;
-  const head = '<div class="level-row level-head level-plan-row"><span>价位</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">到达概率</span><span>综合依据</span></div>';
+  const head = '<div class="level-row level-head level-plan-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>';
   if (!levels.length) { target.innerHTML = head + '<div class="levels-empty">暂无可用价位</div>'; return; }
   target.innerHTML = head + levels.map((level) => {
     const gap = Number.isFinite(spot) && spot > 0 ? (Number(level.price) / spot - 1) * 100 : null;
     const gapText = gap == null ? "--" : `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
     const gapClass = gap == null ? "" : (gap >= 0 ? "up" : "down");
-    const factors = (level.factors || []).join(" · ");
-    return `<div class="level-row level-plan-row" title="综合强度 ${Number(level.score || 0).toFixed(2)}（1 为最强）"><span class="level-strike">${formatMoney(level.price)}</span><span class="level-gap ${gapClass}">${gapText}</span><span class="level-prob">${formatProbability(level.probability)}</span><span class="level-factors">${factors}</span></div>`;
+    const score = levelScore(level);
+    const factors = levelFactors(level).join(" · ");
+    const strengthTag = levelStrengthTag(level, "support", true);
+    const strongClass = levelStrengthClass(level, "support", true);
+    const titleText = levelTooltipText(level, score, strengthTag);
+    const detailText = levelDetailText(level);
+    return `<div class="level-row level-plan-row ${strongClass}" title="${titleText}"><span class="level-strike">${formatLevelRange(level)}</span><span class="level-gap ${gapClass}">${gapText}</span><span class="level-prob">${formatProbability(level.probability)}</span><span class="level-factors"><span class="level-factor-text">${factors}</span></span></div>${renderLevelDetailRow(detailText, strengthTag, "support")}`;
   }).join("");
 }
 
-// 交易计划：买入 = 现价下方最近的 5 个支撑，加仓 = 更深一档的 5 个支撑，卖出 = 上方最近的 5 个压力。
+// 交易计划：前端只展示更深一档的加仓支撑，推荐买入与卖出直接看支撑位/压力位面板。
 function renderPlan(plan, spot) {
   const price = Number(spot);
-  renderPlanRows($("buy-levels"), plan?.buy || [], price);
   renderPlanRows($("add-levels"), plan?.add || [], price);
-  renderPlanRows($("sell-levels"), plan?.sell || [], price);
 }
 
 function renderFactorLevels(payload) {
@@ -874,22 +1020,24 @@ function renderFactorLevels(payload) {
   const expiration = payload?.expiration || state.expiration || "--";
   const metric = payload?.options_metric === "volume" ? "成交量" : "Gamma 敞口";
   const hasHistory = Number(payload?.history?.bars) > 0;
+  const optionExpirations = payload?.options_expirations || [];
+  const optionScope = optionExpirations.length ? `多期限 ${optionExpirations.length} 个到期日` : "多期限暂无数据";
   const scope = hasHistory
-    ? `斐波那契 · 筹码密集 · 承接位 · 期权持仓（${metric}）综合 · 到期日 ${expiration}`
-    : `历史行情不可用，按期权持仓（${metric}）计算 · 到期日 ${expiration}`;
-  const detail = [hasHistory ? `日线 ${payload.history.bars} 根` : null, payload?.history?.warning ? `历史行情降级：${payload.history.warning}` : null, "到达概率：按该到期日隐含波动率与剩余期限的零漂移首次触及概率"].filter(Boolean).join(" · ");
+    ? `斐波那契 · 筹码密集 · 承接位 · 期权持仓（${metric}，${optionScope}）综合 · 选中期限 ${expiration}`
+    : `历史行情不可用，按期权持仓（${metric}，${optionScope}）计算 · 选中期限 ${expiration}`;
+  const detail = [hasHistory ? `日线 ${payload.history.bars} 根` : null, payload?.history?.warning ? `历史行情降级：${payload.history.warning}` : null, "触及概率：按选中期限隐含波动率与剩余期限的零漂移首次触及概率", "Gamma、成交量和持仓量图表仍按当前选中期限绘制"].filter(Boolean).join(" · ");
   const basisNote = Number.isFinite(spot) && spot > 0 ? ` · 基准 ${formatMoney(spot)}（${state.levelBasisLabel || "常规"}）` : "";
   for (const id of ["resistance-note", "support-note"]) { $(id).textContent = scope + basisNote; $(id).title = detail; }
   renderFactorRows($("resistance-levels"), payload?.resistance || [], spot);
   renderFactorRows($("support-levels"), payload?.support || [], spot);
   renderLevelsChart(payload);
-  renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null);
+  renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);
   renderPlan(payload?.plan, spot);
 }
 
 // expirationRows 为上方所选到期日（期权链表格）的合约：Gamma 敞口与两张分布图都以它为唯一口径。
 // 压力位/支撑位柱状图：横轴为价位（按价格线性排布），柱高为综合强度（1 为最强），
-// 压力位向上（绿）、支撑位向下（红）；悬停显示价位、距现价、到达概率与综合依据。
+// 压力位向上（绿）、支撑位向下（红）；悬停显示代表价、距现价、触及概率与综合依据。
 function renderLevelsChart(payload) {
   const target = $("levels-chart");
   if (!target) return;
@@ -1048,6 +1196,7 @@ function renderLevelsChart(payload) {
 function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivModel = {}, basis = null) {
   // 期权链聚合结果：Gamma 敞口、分布图与压力位/支撑位共用；切换基准价开关时直接复用，不重新聚合。
   const points = aggregateByStrike(expirationRows, spot);
+  state.levelsWindowFetchedAt = analysisPayload?.fetched_at || null;
   // 记录本次分析输入，窗口尺寸变化（含手机横竖屏切换）与基准价切换后都按这些输入重绘。
   state.lastAnalysis = { rows, spot, analysisPayload, expirationRows, ivModel, basis, points };
   // 压力位/支撑位用「基准价」（默认实时价，可切盘后价），图表仍用常规价。
@@ -1324,7 +1473,7 @@ function showPending(message) {
   $("levels-basis").textContent = "基准 --";
   $("trend-body").innerHTML = `<div class="levels-empty">${message}</div>`;
   $("trend-note").textContent = "等待数据";
-  for (const id of ["buy-levels", "add-levels", "sell-levels"]) $(id).innerHTML = `<div class="levels-empty">${message}</div>`;
+  $("add-levels").innerHTML = `<div class="levels-empty">${message}</div>`;
   $("chain-body").innerHTML = `<tr><td colspan="7" class="empty">${message}</td></tr>`;
   $("chain-heat-note").textContent = "等待数据";
 }
