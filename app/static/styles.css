@@ -89,19 +89,8 @@
 .level-factors{color:var(--muted);font-size:12px;line-height:1.4}
 .levels-empty{padding:16px 0;color:var(--muted);font-size:11px}
 @media(max-width:900px){.analysis-levels-grid{grid-template-columns:1fr}}
-/* 手机屏幕将三项数字保持在同一行，综合依据单独占满下一行，避免四列互相挤压。 */
-@media(max-width:500px){
-  .level-factor-row.level-head,.level-plan-row.level-head{grid-template-columns:minmax(0,1.5fr) minmax(0,.8fr) minmax(0,.8fr) minmax(0,1.2fr);column-gap:6px}
-  .level-factor-row:not(.level-head),.level-plan-row:not(.level-head){grid-template-columns:minmax(0,1.55fr) minmax(0,.8fr) minmax(0,.8fr);column-gap:6px;row-gap:4px}
-  .level-factor-row>span,.level-plan-row>span{padding-inline:0}
-  .level-factor-row>span+span,.level-plan-row>span+span{border-left:0}
-  .level-factor-row:not(.level-head)>span:last-child,.level-plan-row:not(.level-head)>span:last-child{grid-column:1 / -1;padding-top:4px;border-top:1px solid var(--row-line)}
-  .level-factor-row:not(.level-head)>span:not(:last-child),.level-plan-row:not(.level-head)>span:not(:last-child){white-space:nowrap}
-  .level-factor-row .level-factors,.level-plan-row .level-factors{justify-content:center;text-align:center}
-  .level-strong .level-factors{display:flex;justify-content:center}
-  .level-strong .level-strength-badge{position:static;transform:none}
-  .level-strong .level-factor-text{width:auto}
-}
+/* 手机屏幕给价位区间和依据列留出最低空间，避免四等分后区间文字溢出。 */
+@media(max-width:500px){.level-factor-row,.level-plan-row{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.7fr);column-gap:8px}.level-factor-row>span,.level-plan-row>span{padding-inline:0}.level-factor-row>span+span,.level-plan-row>span+span{border-left:0}.level-strong .level-factors{display:flex;justify-content:center}.level-strong .level-strength-badge{position:static;transform:none}.level-strong .level-factor-text{width:auto}}
 /* 顶栏右侧：行情状态与主题切换按钮同排；按钮在窄屏仍可见。 */
 .top-actions{display:flex;align-items:center;gap:14px}
 .theme-toggle{border:1px solid var(--field-line);background:transparent;color:var(--text);border-radius:999px;padding:5px 13px;font:inherit;font-size:12px;line-height:1;letter-spacing:.04em;cursor:pointer}
@@ -225,3 +214,13 @@ body{font-size:14px}
 .level-head{font-size:11px}.level-factors{font-size:13px}.level-strong .level-factors{font-size:13px}.level-strength-badge,.level-strong .level-strength-badge{font-size:11px}.level-note-row{font-size:12px}.levels-empty{font-size:12px}
 .level-strength-hint{font-size:11px!important}.trend-label{font-size:20px}.trend-signal small{font-size:14px}.trend-meta{font-size:14px;padding-block:9px}.trend-opportunity-label small,.trend-opportunity strong small{font-size:12px}
 .detail-title{font-size:16px}.detail-hint{font-size:12px}.detail-action{font-size:13px}.detail-modes-label{font-size:12px}.detail-seg{font-size:13px}
+/* 超窄屏价位表：允许区间自然换行，并缩小表格字号，避免四列争抢有限宽度。 */
+@media(max-width:500px){
+  .level-factor-row,.level-plan-row{font-size:12px;line-height:1.35;padding-block:6px}
+  .level-factor-row.level-head,.level-plan-row.level-head{font-size:10px;line-height:1.25}
+  .level-factor-row .level-factors,.level-plan-row .level-factors{font-size:12px}
+  .level-factor-row .level-strike,.level-plan-row .level-strike{white-space:normal;overflow-wrap:anywhere;line-height:1.2}
+  .level-factor-row .level-gap,.level-factor-row .level-prob,.level-plan-row .level-gap,.level-plan-row .level-prob{white-space:nowrap}
+  .level-note-row{font-size:11px;line-height:1.3}
+  .level-strength-badge,.level-strong .level-strength-badge{font-size:10px}
+}

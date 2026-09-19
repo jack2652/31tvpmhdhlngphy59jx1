@@ -1286,8 +1286,7 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert ".level-strong .level-factors{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;flex-wrap:nowrap;text-align:center}" in styles
     assert ".level-strong .level-strength-badge{position:static;transform:none}" in styles
     assert ".level-strong .level-factor-text{width:auto;min-width:0;max-width:100%;text-align:center!important}" in styles
-    assert ".level-factor-row:not(.level-head)>span:last-child,.level-plan-row:not(.level-head)>span:last-child{grid-column:1 / -1;padding-top:4px;border-top:1px solid var(--row-line)}" in styles
-    assert ".level-factor-row:not(.level-head)>span:not(:last-child),.level-plan-row:not(.level-head)>span:not(:last-child){white-space:nowrap}" in styles
+    assert "@media(max-width:500px){.level-factor-row,.level-plan-row{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.7fr);column-gap:8px}.level-factor-row>span,.level-plan-row>span{padding-inline:0}.level-factor-row>span+span,.level-plan-row>span+span{border-left:0}.level-strong .level-factors{display:flex;justify-content:center}.level-strong .level-strength-badge{position:static;transform:none}.level-strong .level-factor-text{width:auto}}" in styles
     assert ".level-factor-row .level-strike{white-space:nowrap;overflow-wrap:normal}" in styles
     assert ".levels-panel-resistance .level-strike{color:var(--down)}" in styles
     assert ".levels-panel-support .level-strike{color:var(--up)}" in styles
@@ -1305,6 +1304,8 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert ".level-note-row{font-size:12px}" in styles
     assert ".level-factors{font-size:13px}" in styles
     assert ".trend-meta{font-size:14px" in styles
+    assert ".level-factor-row .level-strike,.level-plan-row .level-strike{white-space:normal;overflow-wrap:anywhere;line-height:1.2}" in styles
+    assert ".level-factor-row .level-gap,.level-factor-row .level-prob,.level-plan-row .level-gap,.level-plan-row .level-prob{white-space:nowrap}" in styles
 
 
 def test_fibonacci_levels_follow_swing_leg():
@@ -1841,8 +1842,7 @@ def test_trading_plan_rows_expose_composite_basis_column():
     assert ".level-strong .level-factors{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;flex-wrap:nowrap;text-align:center}" in styles
     assert ".level-strong .level-strength-badge{position:static;transform:none}" in styles
     assert ".level-strong .level-factor-text{width:auto;min-width:0;max-width:100%;text-align:center!important}" in styles
-    assert ".level-factor-row:not(.level-head)>span:last-child,.level-plan-row:not(.level-head)>span:last-child{grid-column:1 / -1;padding-top:4px;border-top:1px solid var(--row-line)}" in styles
-    assert ".level-factor-row:not(.level-head)>span:not(:last-child),.level-plan-row:not(.level-head)>span:not(:last-child){white-space:nowrap}" in styles
+    assert "@media(max-width:500px){.level-factor-row,.level-plan-row{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.7fr);column-gap:8px}.level-factor-row>span,.level-plan-row>span{padding-inline:0}.level-factor-row>span+span,.level-plan-row>span+span{border-left:0}.level-strong .level-factors{display:flex;justify-content:center}.level-strong .level-strength-badge{position:static;transform:none}.level-strong .level-factor-text{width:auto}}" in styles
     assert ".level-plan-row>span:last-child{grid-column:auto}" in styles
     assert ".level-plan-row.level-head>span:last-child{grid-column:auto}" in styles
     assert ".plan-panel.levels-panel-support .level-strike{color:var(--text)}" in styles
