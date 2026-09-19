@@ -89,8 +89,19 @@
 .level-factors{color:var(--muted);font-size:12px;line-height:1.4}
 .levels-empty{padding:16px 0;color:var(--muted);font-size:11px}
 @media(max-width:900px){.analysis-levels-grid{grid-template-columns:1fr}}
-/* 手机屏幕给价位区间和依据列留出最低空间，避免四等分后区间文字溢出。 */
-@media(max-width:500px){.level-factor-row,.level-plan-row{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) minmax(0,1.7fr);column-gap:8px}.level-factor-row>span,.level-plan-row>span{padding-inline:0}.level-factor-row>span+span,.level-plan-row>span+span{border-left:0}.level-strong .level-factors{display:flex;justify-content:center}.level-strong .level-strength-badge{position:static;transform:none}.level-strong .level-factor-text{width:auto}}
+/* 手机屏幕将三项数字保持在同一行，综合依据单独占满下一行，避免四列互相挤压。 */
+@media(max-width:500px){
+  .level-factor-row.level-head,.level-plan-row.level-head{grid-template-columns:minmax(0,1.5fr) minmax(0,.8fr) minmax(0,.8fr) minmax(0,1.2fr);column-gap:6px}
+  .level-factor-row:not(.level-head),.level-plan-row:not(.level-head){grid-template-columns:minmax(0,1.55fr) minmax(0,.8fr) minmax(0,.8fr);column-gap:6px;row-gap:4px}
+  .level-factor-row>span,.level-plan-row>span{padding-inline:0}
+  .level-factor-row>span+span,.level-plan-row>span+span{border-left:0}
+  .level-factor-row:not(.level-head)>span:last-child,.level-plan-row:not(.level-head)>span:last-child{grid-column:1 / -1;padding-top:4px;border-top:1px solid var(--row-line)}
+  .level-factor-row:not(.level-head)>span:not(:last-child),.level-plan-row:not(.level-head)>span:not(:last-child){white-space:nowrap}
+  .level-factor-row .level-factors,.level-plan-row .level-factors{justify-content:center;text-align:center}
+  .level-strong .level-factors{display:flex;justify-content:center}
+  .level-strong .level-strength-badge{position:static;transform:none}
+  .level-strong .level-factor-text{width:auto}
+}
 /* 顶栏右侧：行情状态与主题切换按钮同排；按钮在窄屏仍可见。 */
 .top-actions{display:flex;align-items:center;gap:14px}
 .theme-toggle{border:1px solid var(--field-line);background:transparent;color:var(--text);border-radius:999px;padding:5px 13px;font:inherit;font-size:12px;line-height:1;letter-spacing:.04em;cursor:pointer}
