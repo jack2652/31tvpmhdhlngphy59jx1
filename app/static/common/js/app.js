@@ -1,4 +1,88 @@
-const state = { symbol: "QQQ", expiration: null, timer: null, analysisReady: false, loadId: 0, refreshing: false, refreshInFlight: null, analysisRefreshSymbol: null, chainFetchedAt: null, levelsWindowFetchedAt: null, levelsKey: "", levelsPayload: null, chainFilter: "all", chainRows: [], chainSpot: null, levelBasisMode: "live", lastQuote: null, accessKey: "", storageAvailable: false };
+const defaultSymbolValue = (document.getElementById("symbol-input")?.getAttribute("value") || "").trim().toUpperCase();
+const defaultSymbol = /^[A-Z0-9][A-Z0-9.-]{0,9}$/.test(defaultSymbolValue) ? defaultSymbolValue : "QQQ";
+const state = {
+  symbol: defaultSymbol,
+  symbolInput: defaultSymbol,
+  expiration: null,
+  expirationOptions: [],
+  expirationPlaceholder: "先载入标的",
+  timer: null,
+  analysisReady: false,
+  loadId: 0,
+  refreshing: false,
+  loading: false,
+  refreshInFlight: null,
+  analysisRefreshSymbol: null,
+  chainFetchedAt: null,
+  levelsWindowFetchedAt: null,
+  levelsKey: "",
+  levelsPayload: null,
+  chainFilter: "all",
+  chainRows: [],
+  chainSpot: null,
+  levelBasisMode: "live",
+  lastQuote: null,
+  accessKey: "",
+  storageAvailable: false,
+  view: {
+    marketState: "等待数据",
+    clock: "--:--:--",
+    themeLabel: "白天",
+    refreshNote: "每 60 秒自动更新",
+    quoteSymbol: defaultSymbol,
+    quotePrice: "--",
+    quoteChange: "涨跌 --",
+    quoteChangeColor: "var(--muted)",
+    quoteCurrency: "USD",
+    quoteMarket: "--",
+    totalCount: "--",
+    callVolume: "--",
+    putVolume: "--",
+    callInterest: "未平仓 --",
+    putInterest: "未平仓 --",
+    chainTitle: "选择到期日查看期权链",
+    dataSource: "尚未加载",
+    fetchedAt: "快照时间 --",
+    chainHeatNote: "等待数据",
+    chainRows: [],
+    chainEmpty: "输入标的并载入数据",
+    chart: {
+      netGex: "净 Gamma --",
+      gammaFlip: "零 Gamma --",
+      callWall: "看涨墙 --",
+      putWall: "看跌墙 --",
+      gammaScope: "Gamma 范围 --",
+      levelsBasis: "基准 --",
+      volumeScope: "",
+      oiScope: "",
+    },
+    levels: {
+      resistance: [],
+      support: [],
+      add: [],
+      resistanceNote: "等待数据",
+      supportNote: "等待数据",
+      resistanceEmpty: "暂无数据",
+      supportEmpty: "暂无数据",
+      addEmpty: "暂无数据",
+    },
+    trend: {
+      available: false,
+      label: "",
+      directionClass: "range",
+      action: "",
+      actionClass: "hold",
+      reason: "",
+      rows: [],
+      opportunities: [],
+      extremes: [],
+      note: "等待数据",
+      empty: "历史行情不足，暂无趋势判断",
+    },
+    error: "",
+    lastStatus: "系统就绪",
+  },
+};
 const GAMMA_MIN_MINUTES = 30;
 // 自动刷新间隔（秒）：页面提示文案与定时器共用同一个值。
 const AUTO_REFRESH_SECONDS = 60;
@@ -19,7 +103,19 @@ const HEAT_HOT_LEVEL = { call: 68, put: 80 };
 const CHAIN_FILTERS = { all: "全部", call: "看涨", put: "看跌" };
 // 时段标签：数据源给的是上游的 marketState 口径（PRE/REGULAR/POST/CLOSED），夜盘由本地时钟补充。
 const MARKET_STATE_LABELS = { PRE: "盘前", REGULAR: "正常交易", POST: "盘后", OVERNIGHT: "夜盘", CLOSED: "休市" };
-const $ = (id) => document.getElementById(id);
+// DOM 访问只保留给折叠交互和图表容器；业务展示数据统一交给 Vue 模板。
+const byId = (id) => document.getElementById(id);
+
+// Vue 挂载后折叠标题中的事件目标仍可能来自文本节点；同时兼容没有 Element.closest 的旧浏览器。
+function closestElement(target, selector) {
+  let node = target && target.nodeType === 1 ? target : target?.parentElement;
+  while (node && node !== document) {
+    const matches = node.matches || node.msMatchesSelector || node.webkitMatchesSelector;
+    if (matches && matches.call(node, selector)) return node;
+    node = node.parentElement;
+  }
+  return null;
+}
 
 // 主题：默认黑夜模式，用户可在右上角切换到白天；偏好写入 localStorage，刷新后保持。
 const THEME_KEY = "option-scope-theme";
@@ -31,9 +127,9 @@ const THEME_LABELS = { light: "白天", dark: "黑夜" };
 function applyTheme(theme) {
   const next = theme === "light" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
-  const button = $("theme-toggle");
+  state.view.themeLabel = THEME_LABELS[next];
+  const button = byId("theme-toggle");
   if (!button) return;
-  button.textContent = THEME_LABELS[next];
   button.title = next === "dark" ? "切换到白天模式" : "切换到黑夜模式";
   button.setAttribute("aria-pressed", String(next === "dark"));
 }
@@ -43,27 +139,20 @@ function initTheme() {
   let stored = null;
   try { stored = localStorage.getItem(THEME_KEY); } catch (error) { stored = null; }
   applyTheme(stored === "light" ? "light" : "dark");
-  const button = $("theme-toggle");
-  if (!button) return;
-  button.addEventListener("click", () => {
-    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-    applyTheme(next);
-    try { localStorage.setItem(THEME_KEY, next); } catch (error) { /* 隐私模式等写入失败时忽略 */ }
-  });
 }
 
 // 折叠组通用逻辑：内容体用 hidden 控制显隐（[hidden] 在 flex/grid 上下文里会被覆盖，样式里补了 [hidden]{display:none}），
 // 按钮同步 aria-expanded 与「展开/收起」文案，展开状态记在 sessionStorage——同一标签页里换标的、跳 URL 不必重复展开，
 // 关掉标签页就回到各自默认状态（分析详情与期权链默认折叠、图表默认展开）。
 function bindFoldGroup({ headerId, toggleId, bodyId, actionId, storageKey, defaultExpanded, onChange, shouldIgnore }) {
-  const header = $(headerId);
-  const body = $(bodyId);
-  const toggle = $(toggleId);
+  const header = byId(headerId);
+  const body = byId(bodyId);
+  const toggle = byId(toggleId);
   if (!header || !body || !toggle) return;
   const apply = (expanded) => {
     body.hidden = !expanded;
     toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
-    const action = actionId ? $(actionId) : null;
+    const action = actionId ? byId(actionId) : null;
     if (action) action.textContent = expanded ? "收起" : "展开";
     if (onChange) onChange(expanded);
   };
@@ -90,12 +179,12 @@ function initDetailGroup() {
     storageKey: DETAIL_KEY,
     defaultExpanded: false,
     // 基准价开关只在展开时出现：折叠态下不占位，也避免误点。
-    onChange: (expanded) => { const modes = $("detail-modes"); if (modes) modes.hidden = !expanded; },
+    onChange: (expanded) => { const modes = byId("detail-modes"); if (modes) modes.hidden = !expanded; },
     // 标题栏里混着「基准价」开关：命中开关就切口径，开关容器里的空白则不改折叠状态，避免贴着按钮点空时把面板收了。
     shouldIgnore: (event) => {
-      const basisButton = event.target.closest("[data-basis]");
+      const basisButton = closestElement(event.target, "[data-basis]");
       if (basisButton) { applyBasisMode(basisButton.dataset.basis); return true; }
-      return Boolean(event.target.closest("#detail-modes"));
+      return Boolean(closestElement(event.target, "#detail-modes"));
     },
   });
 }
@@ -112,7 +201,7 @@ function initChainGroup() {
     storageKey: CHAIN_KEY,
     defaultExpanded: true,
     // 标题行右侧是数据来源与快照时间，点它不折叠。
-    shouldIgnore: (event) => Boolean(event.target.closest(".panel-status")),
+    shouldIgnore: (event) => Boolean(closestElement(event.target, ".panel-status")),
   });
 }
 
@@ -217,7 +306,7 @@ function showAccessDenied() {
   if (state.timer) clearInterval(state.timer);
   state.timer = null;
   document.body.classList.add("access-denied-page");
-  const view = $("access-denied-view");
+  const view = byId("access-denied-view");
   if (view) view.hidden = false;
 }
 
@@ -228,7 +317,7 @@ function syncPageQuery() {
   history.replaceState(null, "", next);
 }
 
-function setError(message) { $("error-box").textContent = message || ""; $("error-box").hidden = !message; }
+function setError(message) { state.view.error = message || ""; }
 // 快照年龄（秒）：时间戳缺失或无法解析返回 null，时钟偏差导致的负值按 0 处理。
 function snapshotAgeSeconds(fetchedAt) {
   if (!fetchedAt) return null;
@@ -269,10 +358,9 @@ function formatChartValue(value, digits, unit) { return unit === "M" ? formatGex
 // 刷新按钮只由「是否正在刷新」决定，避免多条并发路径各自改写 disabled 后被误启用；
 // 没有到期日（标的没有挂牌期权）时同样允许手动刷新现货快照。
 function syncRefreshButton() {
-  $("refresh-button").disabled = state.refreshing;
-  $("refresh-note").textContent = state.refreshing ? "正在刷新…" : `每 ${AUTO_REFRESH_SECONDS} 秒自动更新`;
+  state.view.refreshNote = state.refreshing ? "正在刷新…" : `每 ${AUTO_REFRESH_SECONDS} 秒自动更新`;
 }
-function setBusy(busy) { $("load-button").disabled = busy; $("expiration-select").disabled = busy || !state.expiration; syncRefreshButton(); }
+function setBusy(busy) { state.loading = busy; syncRefreshButton(); }
 
 function aggregateByStrike(rows, spot) {
   const grouped = new Map();
@@ -400,211 +488,6 @@ function findGammaFlip(rows, currentSpot, expiration) {
   return { strike: roots.reduce((nearest, root) => Math.abs(root - spot) < Math.abs(nearest - spot) ? root : nearest) };
 }
 
-function strikePosition(points, strike) {
-  if (!points.length || strike < points[0].strike || strike > points[points.length - 1].strike) return null;
-  for (let index = 1; index < points.length; index += 1) {
-    if (strike <= points[index].strike) {
-      const distance = points[index].strike - points[index - 1].strike;
-      const ratio = distance === 0 ? 0 : (strike - points[index - 1].strike) / distance;
-      return index - 1 + ratio;
-    }
-  }
-  return points.length - 1;
-}
-
-// 图表容器的内容尺寸（扣除内边距），用于让 SVG 与容器按 1:1 像素渲染。
-function chartContentBox(target) {
-  const rect = target.getBoundingClientRect();
-  const style = getComputedStyle(target);
-  return {
-    width: Math.max(240, Math.round(rect.width - parseFloat(style.paddingLeft || 0) - parseFloat(style.paddingRight || 0))),
-    height: Math.max(140, Math.round(rect.height - parseFloat(style.paddingTop || 0) - parseFloat(style.paddingBottom || 0))),
-  };
-}
-
-// 柱端标记的文字宽度测量上下文（与 CSS 中 10px 粗体一致），用于贴边时避免文字被 SVG 视口裁剪。
-let markerLabelContext = null;
-function markerLabelWidth(text, weight = 700) {
-  if (!markerLabelContext) markerLabelContext = document.createElement("canvas").getContext("2d");
-  markerLabelContext.font = `${weight} 10px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
-  return markerLabelContext.measureText(text).width;
-}
-
-function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emptyMessage, options = {}) {
-  const target = $(targetId);
-  if (!points.length || points.every((point) => !(Math.abs(point[positiveKey]) + Math.abs(point[negativeKey])))) { target.innerHTML = `<div class="chart-empty">${emptyMessage}</div>`; return; }
-  // 按容器实际像素绘制：viewBox 与元素 1:1，手机窄屏不会再把柱子和坐标文字整体等比缩小。
-  const { width, height } = chartContentBox(target);
-  target.dataset.chartWidth = String(width); target.dataset.chartHeight = String(height);
-  // 成交量/持仓量图按行情软件样式把数值列放在右侧，Gamma 图保留左侧数值列。
-  const axisOnRight = options.axis === "right";
-  const pad = axisOnRight ? { left: 16, right: 56, top: 14, bottom: 26 } : { left: 48, right: 12, top: 14, bottom: 26 }; const innerWidth = width - pad.left - pad.right; const innerHeight = height - pad.top - pad.bottom; const baseline = pad.top + innerHeight / 2;
-  // 上下各留一条固定高度的「标签通道」：柱子最高只顶到通道内侧的标高线，柱端文字与方向角标住在通道里，不会再压到坐标刻度。
-  const gutter = Math.min(44, Math.max(16, innerHeight / 2 - 16)); const scaleTop = pad.top + gutter; const scaleBottom = height - pad.bottom - gutter; const maxBarHeight = innerHeight / 2 - gutter;
-  const maxValue = Math.max(1, ...points.map((point) => Math.max(Math.abs(point[positiveKey]), Math.abs(point[negativeKey])))); const slot = innerWidth / points.length; const barWidth = Math.max(3, Math.min(26, slot * 0.68));
-  const yLabel = formatChartValue(maxValue, 2, unit);
-  // 左侧数值列右边界：最左行权价的柱端文字压到数值时向右避让。
-  const axisColumnWidth = 6 + Math.max(markerLabelWidth(yLabel, 400), markerLabelWidth(`-${yLabel}`, 400));
-  const labelColumnRight = axisOnRight ? 0 : axisColumnWidth + 4;
-  // 刻度文字按可用宽度决定数量：桌面宽屏约每 84px 一个，手机上自动减少避免重叠。
-  const labelEvery = Math.max(1, Math.ceil(points.length / Math.max(2, Math.floor(innerWidth / 84))));
-  const bars = points.map((point, index) => { const x = pad.left + index * slot + (slot - barWidth) / 2; const positive = Number(point[positiveKey]) || 0; const negative = Number(point[negativeKey]) || 0; const positiveHeight = Math.abs(positive) / maxValue * maxBarHeight; const negativeHeight = Math.abs(negative) / maxValue * maxBarHeight; const label = index % labelEvery === 0 ? `<text class="chart-label" x="${x + barWidth / 2}" y="${height - 8}" text-anchor="middle">${formatMoney(point.strike)}</text>` : ""; return `<rect class="chart-call" x="${x}" y="${baseline - positiveHeight}" width="${barWidth}" height="${positiveHeight}" rx="1"><title>${formatMoney(point.strike)} 看涨 ${formatChartValue(positive, 2, unit)}</title></rect><rect class="chart-put" x="${x}" y="${baseline}" width="${barWidth}" height="${negativeHeight}" rx="1"><title>${formatMoney(point.strike)} 看跌 ${formatChartValue(Math.abs(negative), 2, unit)}</title></rect>${label}`; }).join("");
-  // 柱端标记：Gamma 图标注看涨墙/看跌墙，成交量与持仓量图标注最高看涨柱/最高看跌柱。
-  const markers = (options.markers || []).filter((marker) => marker.point).map((marker) => {
-    const index = points.indexOf(marker.point);
-    if (index < 0) return "";
-    const x = pad.left + index * slot + slot / 2;
-    const positive = Number(marker.point[positiveKey]) || 0;
-    const negative = Number(marker.point[negativeKey]) || 0;
-    const barHeight = marker.position === "top"
-      ? Math.abs(positive) / maxValue * maxBarHeight
-      : Math.abs(negative) / maxValue * maxBarHeight;
-    const tipY = marker.position === "top" ? baseline - barHeight : baseline + barHeight;
-    const labelText = `${marker.label} ${formatMoney(marker.point.strike)}`;
-    // 柱端文字始终贴在柱端外侧（看涨在上、看跌在下），并落在标签通道范围内，不会翻到柱身上。
-    const labelY = Math.min(Math.max(marker.position === "top" ? tipY - 14 : tipY + 22, pad.top + 27), scaleBottom + 24);
-    // 最左行权价的文字若压到左侧数值列则向右避让；最左/最右再按 SVG 视口收边，避免被裁剪。
-    const halfLabel = markerLabelWidth(labelText) / 2 + 1;
-    let labelX = Math.min(Math.max(x, halfLabel), width - halfLabel);
-    const overScaleRow = [scaleTop, scaleBottom].some((line) => labelY - 11 < line + 7 && labelY + 3 > line - 7);
-    if (overScaleRow && !axisOnRight && labelX - halfLabel < labelColumnRight) labelX = Math.min(labelColumnRight + halfLabel, width - halfLabel);
-    if (overScaleRow && axisOnRight && labelX + halfLabel > width - axisColumnWidth) labelX = Math.max(width - axisColumnWidth - halfLabel, halfLabel);
-    return `<text class="${marker.className}-label" x="${labelX}" y="${labelY}" text-anchor="middle">${labelText}</text>`;
-  }).join("");
-  const gammaFlip = options.gammaFlip;
-  const gammaFlipMarker = gammaFlip ? (() => {
-    const position = strikePosition(points, gammaFlip.strike);
-    if (position == null) return "";
-    const x = pad.left + position * slot + slot / 2;
-    return `<line class="chart-gamma-flip" x1="${x}" x2="${x}" y1="${pad.top}" y2="${height - pad.bottom}"/>`;
-  })() : "";
-  // 右轴图表给出参考样式的 5 档刻度（±最大 / ±一半 / 0），Gamma 图保持 3 档。
-  const halfTop = (scaleTop + baseline) / 2; const halfBottom = (scaleBottom + baseline) / 2;
-  const halfLabel = formatChartValue(maxValue / 2, 2, unit);
-  const axisLabels = axisOnRight
-    ? `<text class="chart-label" x="${width - 6}" y="${scaleTop + 4}" text-anchor="end">${yLabel}</text><text class="chart-label" x="${width - 6}" y="${halfTop + 4}" text-anchor="end">${halfLabel}</text><text class="chart-label" x="${width - 6}" y="${baseline + 4}" text-anchor="end">0</text><text class="chart-label" x="${width - 6}" y="${halfBottom + 4}" text-anchor="end">-${halfLabel}</text><text class="chart-label" x="${width - 6}" y="${scaleBottom + 4}" text-anchor="end">-${yLabel}</text>`
-    : `<text class="chart-label" x="4" y="${scaleTop + 4}">${yLabel}</text><text class="chart-label" x="4" y="${baseline + 4}">0</text><text class="chart-label" x="4" y="${scaleBottom + 4}">-${yLabel}</text>`;
-  const gridLines = axisOnRight ? `<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${halfTop}" y2="${halfTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${halfBottom}" y2="${halfBottom}"/>` : "";
-  // 右轴图表不再画角落方向文字，方向改由图例说明，避免与右侧数值列抢位。
-  const cornerLabels = axisOnRight ? "" : `<text class="chart-label" x="${width - 12}" y="${pad.top + 10}" text-anchor="end">看涨 ↑</text><text class="chart-label" x="${width - 12}" y="${height - pad.bottom - 3}" text-anchor="end">看跌 ↓</text>`;
-  const tagElements = options.crosshairTags ? `<line class="chart-crosshair-h" x1="${pad.left}" x2="${width - pad.right}" y1="0" y2="0" visibility="hidden"/><g class="chart-tag chart-tag-x" visibility="hidden"><rect rx="2" height="16" width="0"/><text></text></g><g class="chart-tag chart-tag-y" visibility="hidden"><rect rx="2" height="16" width="0"/><text></text></g>` : "";
-  const svg = `<svg viewBox="0 0 ${width} ${height}" role="img" tabindex="0" aria-label="${target.getAttribute("aria-label") || "期权分布图"}">${gridLines}<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleTop}" y2="${scaleTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleBottom}" y2="${scaleBottom}"/><line class="chart-zero" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/>${axisLabels}${gammaFlipMarker}${bars}${markers}<line class="chart-crosshair" x1="0" x2="0" y1="${pad.top}" y2="${height - pad.bottom}" visibility="hidden"/>${tagElements}${cornerLabels}</svg><div class="chart-tooltip" hidden></div>`; target.innerHTML = svg;
-
-  const chartSvg = target.querySelector("svg");
-  const crosshair = target.querySelector(".chart-crosshair");
-  const tooltip = target.querySelector(".chart-tooltip");
-  const tooltipTitle = options.tooltipTitle || "行权价";
-  // SVG 按等比缩放绘制，容器与绘图区之间可能有留白，坐标换算必须走屏幕矩阵，保证十字虚线与数据卡严格对齐。
-  const viewBoxXToClient = (viewBoxX) => {
-    const matrix = chartSvg.getScreenCTM();
-    if (matrix && chartSvg.createSVGPoint) {
-      const point = chartSvg.createSVGPoint();
-      point.x = viewBoxX;
-      point.y = 0;
-      return point.matrixTransform(matrix).x;
-    }
-    const rect = chartSvg.getBoundingClientRect();
-    return rect.left + (viewBoxX / width) * rect.width;
-  };
-  const clientToViewBox = (clientX, clientY) => {
-    const matrix = chartSvg.getScreenCTM();
-    if (matrix && chartSvg.createSVGPoint) {
-      const point = chartSvg.createSVGPoint();
-      point.x = clientX;
-      point.y = clientY;
-      return point.matrixTransform(matrix.inverse());
-    }
-    const rect = chartSvg.getBoundingClientRect();
-    return { x: ((clientX - rect.left) / rect.width) * width, y: ((clientY - rect.top) / rect.height) * height };
-  };
-  const crosshairLine = target.querySelector(".chart-crosshair-h");
-  const tagX = target.querySelector(".chart-tag-x");
-  const tagY = target.querySelector(".chart-tag-y");
-  // 十字光标取值标签（参考行情软件）：数值列一侧贴当前鼠标高度的取值，底部贴所在行权价。
-  const updateTags = (index, clientY, centerX) => {
-    if (!crosshairLine) return;
-    const point = points[index];
-    const hidden = clientY == null || !point;
-    crosshairLine.setAttribute("visibility", hidden ? "hidden" : "visible");
-    tagX.setAttribute("visibility", hidden ? "hidden" : "visible");
-    tagY.setAttribute("visibility", hidden ? "hidden" : "visible");
-    if (hidden) return;
-    const localY = Math.min(Math.max(clientToViewBox(0, clientY).y, pad.top + 6), height - pad.bottom - 6);
-    crosshairLine.setAttribute("y1", localY);
-    crosshairLine.setAttribute("y2", localY);
-    const value = (baseline - localY) / maxBarHeight * maxValue;
-    const valueText = `${value < 0 ? "-" : ""}${formatChartValue(Math.abs(value), 2, unit)}`;
-    const valueWidth = markerLabelWidth(valueText, 700) + 10;
-    const valueLeft = axisOnRight ? width - valueWidth - 4 : 4;
-    tagY.querySelector("rect").setAttribute("x", valueLeft);
-    tagY.querySelector("rect").setAttribute("y", localY - 8);
-    tagY.querySelector("rect").setAttribute("width", valueWidth);
-    const valueNode = tagY.querySelector("text");
-    valueNode.setAttribute("x", valueLeft + 5);
-    valueNode.setAttribute("y", localY + 4);
-    valueNode.textContent = valueText;
-    const strikeText = formatMoney(point.strike);
-    const strikeWidth = markerLabelWidth(strikeText, 700) + 10;
-    const strikeLeft = Math.min(Math.max(centerX - strikeWidth / 2, 2), width - strikeWidth - 2);
-    tagX.querySelector("rect").setAttribute("x", strikeLeft);
-    tagX.querySelector("rect").setAttribute("y", height - 20);
-    tagX.querySelector("rect").setAttribute("width", strikeWidth);
-    const strikeNode = tagX.querySelector("text");
-    strikeNode.setAttribute("x", strikeLeft + 5);
-    strikeNode.setAttribute("y", height - 8);
-    strikeNode.textContent = strikeText;
-  };
-  const showTooltip = (index, clientY) => {
-    const point = points[index];
-    if (!point) return;
-    const positive = Number(point[positiveKey]) || 0;
-    const negative = Number(point[negativeKey]) || 0;
-    const isGamma = targetId === "gex-chart";
-    const net = isGamma ? positive + negative : positive - negative;
-    const valueLabel = isGamma ? " GEX" : (options.valueLabel || "");
-    const rows = [
-      `<div class="chart-tooltip-row"><span><i class="tooltip-dot call"></i>看涨${valueLabel}</span><strong>${formatChartValue(Math.abs(positive), 2, unit)}</strong></div>`,
-      `<div class="chart-tooltip-row"><span><i class="tooltip-dot put"></i>看跌${valueLabel}</span><strong>${formatChartValue(Math.abs(negative), 2, unit)}</strong></div>`,
-    ];
-    if (isGamma) {
-      rows.push(`<div class="chart-tooltip-row"><span><i class="tooltip-dot net"></i>净 GEX</span><strong>${formatChartValue(net, 2, unit)}</strong></div>`);
-      if (options.spot != null) rows.unshift(`<div class="chart-tooltip-sub">行情价 ${formatMoney(options.spot)}</div>`);
-    } else if (options.valueLabel) {
-      rows.push(`<div class="chart-tooltip-row"><span><i class="tooltip-dot net"></i>总${options.valueLabel}</span><strong>${formatChartValue(Math.abs(positive) + Math.abs(negative), 2, unit)}</strong></div>`);
-    }
-    tooltip.innerHTML = `<div class="chart-tooltip-title">${tooltipTitle} ${formatMoney(point.strike)}</div>${rows.join("")}`;
-    const x = pad.left + index * slot + slot / 2;
-    crosshair.setAttribute("x1", x);
-    crosshair.setAttribute("x2", x);
-    crosshair.setAttribute("visibility", "visible");
-    tooltip.hidden = false;
-    const targetRect = target.getBoundingClientRect();
-    const tooltipWidth = tooltip.offsetWidth || 180;
-    // 数据卡固定悬浮在图表容器上沿之外（不进入图表内部），横向跟随十字虚线，纵向不跟随鼠标。
-    const lineClientX = viewBoxXToClient(x);
-    const left = Math.max(8, Math.min(targetRect.width - tooltipWidth - 8, lineClientX - targetRect.left - tooltipWidth / 2));
-    tooltip.style.left = `${left}px`;
-    tooltip.style.top = "auto";
-    tooltip.style.bottom = `${targetRect.height + 4}px`;
-    updateTags(index, clientY, x);
-  };
-  const hideTooltip = () => {
-    crosshair.setAttribute("visibility", "hidden");
-    tooltip.hidden = true;
-    if (crosshairLine) crosshairLine.setAttribute("visibility", "hidden");
-    if (tagX) tagX.setAttribute("visibility", "hidden");
-    if (tagY) tagY.setAttribute("visibility", "hidden");
-  };
-  const pointFromEvent = (event) => {
-    const local = clientToViewBox(event.clientX, event.clientY);
-    return Math.max(0, Math.min(points.length - 1, Math.floor((local.x - pad.left) / slot)));
-  };
-  chartSvg.addEventListener("pointermove", (event) => showTooltip(pointFromEvent(event), event.clientY));
-  chartSvg.addEventListener("pointerleave", hideTooltip);
-  chartSvg.addEventListener("focus", () => showTooltip(0, null));
-  chartSvg.addEventListener("blur", hideTooltip);
-}
-
 // 取指定字段数值最大的执行价，用于标注成交量/持仓量里的最高柱。
 function maxPoint(points, key) {
   return points.reduce((best, point) => (Number(point[key]) || 0) > (Number(best?.[key]) || 0) ? point : best, null);
@@ -626,14 +509,6 @@ function summarizeDistribution(rows, spot, key) {
     if (contractInTheMoney(row, spot)) bucket.itm += value;
   }
   return summary;
-}
-// 渲染图表下方的汇总小表（列：全部 / 价内 / 价外；行：看涨 / 看跌 / 合计）。
-function renderDistributionSummary(target, rows, spot, key, totalLabel) {
-  if (!target) return;
-  const summary = summarizeDistribution(rows, spot, key);
-  const line = (label, bucket) => `<tr><th>${label}</th><td>${formatCount(bucket.all)}</td><td>${formatCount(bucket.itm)}</td><td>${formatCount(bucket.all - bucket.itm)}</td></tr>`;
-  const total = { all: summary.call.all + summary.put.all, itm: summary.call.itm + summary.put.itm };
-  target.innerHTML = `<table><thead><tr><th></th><th>全部</th><th>价内</th><th>价外</th></tr></thead><tbody>${line("看涨", summary.call)}${line("看跌", summary.put)}${line(totalLabel, total)}</tbody></table>`;
 }
 // 压力位/支撑位的基准价：优先盘后价——盘后成交更接近当日结算价，盘前冲高与盘中回落常是「假突破」，
 // 用它们当基准会把关键位算偏；没有盘后数据时依次回退盘前价、常规价。
@@ -662,7 +537,7 @@ function activeBasis(quote) {
 function applyBasisMode(mode) {
   state.levelBasisMode = mode === "close" ? "close" : "live";
   for (const key of Object.keys(BASIS_MODES)) {
-    const button = $(key === "live" ? "basis-live" : "basis-close");
+    const button = byId(key === "live" ? "basis-live" : "basis-close");
     if (button) button.setAttribute("aria-pressed", String(key === state.levelBasisMode));
   }
   const last = state.lastAnalysis;
@@ -690,7 +565,7 @@ function pickLevels(points, spot, side, valueOf, count = LEVEL_COUNT) {
   return picked.sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot));
 }
 
-// 逐条渲染价位表（行权价 / 距现价 / 排序口径数值），离现价近的排在前面。
+// 把单因子价位转换为 Vue 行数据（行权价 / 距现价 / 排序口径数值），离现价近的排在前面。
 function levelScore(level) {
   const score = Number(level?.score);
   return Number.isFinite(score) ? Math.min(1, Math.max(0, score)) : 0;
@@ -742,24 +617,35 @@ function levelStrengthClass(level, side, isAdd = false) {
   return tag ? `level-strong level-${tier} level-strong-${side}${isAdd ? " level-strong-add" : ""}${intensity}` : "";
 }
 
-function levelStrengthBadge(level, side, isAdd = false) {
-  const tag = levelStrengthTag(level, side, isAdd);
-  return tag ? `<span class="level-strength-badge level-strength-badge-${side}">${tag}</span>` : "";
+function buildLevelView(level, index, spot, side, isAdd = false) {
+  const price = Number(level?.price ?? level?.strike);
+  const normalized = { ...level, price };
+  const gap = Number.isFinite(spot) && spot > 0 && Number.isFinite(price) ? (price / spot - 1) * 100 : null;
+  const strengthTag = levelStrengthTag(normalized, side, isAdd);
+  const factors = levelFactors(normalized).join(" · ") || "--";
+  return {
+    ...normalized,
+    key: `${side}-${isAdd ? "add" : "level"}-${Number.isFinite(price) ? price.toFixed(4) : index}`,
+    range: formatLevelRange(normalized),
+    gap: gap == null ? "--" : `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`,
+    gapClass: gap == null ? "" : (gap >= 0 ? "up" : "down"),
+    probability: formatProbability(normalized.probability),
+    factors,
+    strengthTag,
+    className: levelStrengthClass(normalized, side, isAdd),
+    title: levelTooltipText(normalized, levelScore(normalized), strengthTag),
+    detail: levelDetailText(normalized),
+  };
 }
 
-function renderLevelRows(target, levels, spot, valueOf, formatValue, metricLabel) {
-  const head = `<div class="level-row level-head"><span>行权价</span><span>距现价</span><span>${metricLabel}</span></div>`;
-  if (!levels.length) { target.innerHTML = head + '<div class="levels-empty">现价这一侧没有可用行权价</div>'; return; }
-  const side = target?.id === "resistance-levels" ? "resistance" : "support";
+function buildSimpleLevelViews(levels, spot, side, valueOf, formatValue, metricLabel) {
   const peak = Math.max(0, ...levels.map(valueOf)) || 1;
-  target.innerHTML = head + levels.map((point) => {
-    const gap = (point.strike / spot - 1) * 100;
-    const gapText = `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
-    const level = { price: point.strike, score: valueOf(point) / peak, factors: [metricLabel] };
-    const strongClass = levelStrengthClass(level, side);
-    const badge = levelStrengthBadge(level, side);
-    return `<div class="level-row ${strongClass}"><span class="level-strike">${formatMoney(point.strike)}</span><span class="level-gap ${gap >= 0 ? "up" : "down"}">${gapText}</span><span class="level-value">${badge}${formatValue(valueOf(point))}</span></div>`;
-  }).join("");
+  return levels.map((point, index) => buildLevelView({
+    price: point.strike,
+    score: valueOf(point) / peak,
+    factors: [metricLabel],
+    displayValue: formatValue(valueOf(point)),
+  }, index, spot, side));
 }
 
 // 单因子回退时把选出的行权价转成柱状图口径：综合强度按本侧最大值归一（与多因子接口一致）。
@@ -770,14 +656,17 @@ function fallbackLevelSeries(picked, valueOf, metricLabel) {
 
 function renderLevels(points, spot) {
   const price = Number(spot);
-  const resistanceTarget = $("resistance-levels");
-  const supportTarget = $("support-levels");
+  state.view.chart.levelsBasis = Number.isFinite(price) && price > 0 ? `基准 ${formatMoney(price)}` : "基准 --";
   if (!points.length || !Number.isFinite(price) || price <= 0) {
-    resistanceTarget.innerHTML = '<div class="levels-empty">暂无数据</div>';
-    supportTarget.innerHTML = '<div class="levels-empty">暂无数据</div>';
-    $("resistance-note").textContent = `现价上方持仓最集中的 ${LEVEL_COUNT} 个价位`;
-    $("support-note").textContent = `现价下方持仓最集中的 ${LEVEL_COUNT} 个价位`;
-    renderLevelsChart(null);
+    state.view.levels.resistance = [];
+    state.view.levels.support = [];
+    state.view.levels.add = [];
+    state.view.levels.resistanceNote = `现价上方持仓最集中的 ${LEVEL_COUNT} 个价位`;
+    state.view.levels.supportNote = `现价下方持仓最集中的 ${LEVEL_COUNT} 个价位`;
+    state.view.levels.resistanceEmpty = "暂无数据";
+    state.view.levels.supportEmpty = "暂无数据";
+    state.view.levels.addEmpty = "暂无数据";
+    OptionScopeCharts.renderLevelsChart(null);
     renderTrend(null);
     renderPlan(null, price);
     return;
@@ -791,17 +680,19 @@ function renderLevels(points, spot) {
   const metricLabel = byGex ? "Gamma 敞口" : "成交量";
   const formatValue = byGex ? (value) => formatGex(value, 2) : (value) => formatCount(value, 2);
   const scope = `到期日 ${state.expiration || "--"} · 按${metricLabel}排序`;
-  $("resistance-note").textContent = scope;
-  $("support-note").textContent = scope;
+  state.view.levels.resistanceNote = scope;
+  state.view.levels.supportNote = scope;
   const resistance = pickLevels(points, price, "above", callValue);
   const support = pickLevels(points, price, "below", putValue);
   const planSupport = pickLevels(points, price, "below", putValue, PLAN_COUNT * 2);
-  renderLevelRows(resistanceTarget, resistance, price, callValue, formatValue, metricLabel);
-  renderLevelRows(supportTarget, support, price, putValue, formatValue, metricLabel);
+  state.view.levels.resistance = buildSimpleLevelViews(resistance, price, "resistance", callValue, formatValue, metricLabel);
+  state.view.levels.support = buildSimpleLevelViews(support, price, "support", putValue, formatValue, metricLabel);
+  state.view.levels.add = [];
+  state.view.levels.addEmpty = "暂无多因子加仓数据";
   // 单因子回退时柱状图按同一批行权价绘制，综合强度按本侧最大值归一。
   const resistanceSeries = fallbackLevelSeries(resistance, callValue, metricLabel);
   const supportSeries = fallbackLevelSeries(support, putValue, metricLabel);
-  renderLevelsChart({ spot: price, resistance: resistanceSeries, support: supportSeries });
+  OptionScopeCharts.renderLevelsChart({ spot: price, resistance: resistanceSeries, support: supportSeries });
   // 回退口径没有日线历史，趋势通道留空；交易计划按同一批支撑/压力价位切成三段。
   renderTrend(null);
   const planSupportSeries = fallbackLevelSeries(planSupport, putValue, metricLabel);
@@ -859,11 +750,19 @@ function formatLevelRange(level) {
 
 // 桌面端悬停提示保留完整信息，避免说明行精简后丢失详情。
 function levelTooltipText(level, score, strengthTag) {
+  const adjustedHoldRate = Number(level.history_adjusted_hold_rate);
+  const adjustedBreakRate = Number(level.history_adjusted_break_rate);
+  const holdRate = Number.isFinite(adjustedHoldRate) ? adjustedHoldRate : Number(level.history_hold_rate);
+  const breakRate = Number.isFinite(adjustedBreakRate) ? adjustedBreakRate : Number(level.history_break_rate);
+  const strengthTier = String(level?.strength_tier || "");
+  const rateLabel = Number.isFinite(adjustedHoldRate) ? "校准守住" : "守住";
   const historyTitle = Number.isFinite(Number(level.history_samples)) && Number(level.history_samples) > 0
-    ? ` · 历史触及 ${level.history_samples} 次，守住 ${(Number(level.history_hold_rate) * 100).toFixed(1)}%，跌破 ${(Number(level.history_break_rate) * 100).toFixed(1)}%${Number(level.recent_samples) > 0 ? `；近期 ${level.recent_samples} 次反应，反弹 ${((Number(level.recent_reaction_rate) || 0) * 100).toFixed(1)}%` : ""}`
-    : " · 历史触及样本不足，未启用强化色";
+    ? ` · 历史触及 ${level.history_samples} 次，${rateLabel} ${(holdRate * 100).toFixed(1)}%，跌破 ${(breakRate * 100).toFixed(1)}%${Number(level.recent_samples) > 0 ? `；近期 ${level.recent_samples} 次反应，反弹 ${((Number(level.recent_reaction_rate) || 0) * 100).toFixed(1)}%` : ""}`
+    : strengthTier === "reinforced"
+      ? " · 历史触及样本不足，重点强化已启用"
+      : " · 历史触及样本不足，未启用强化色";
   const recentReinforcement = Number(level.recent_samples) >= 2 && Number(level.recent_reactions) >= 2;
-  const strengthTitle = strengthTag ? (level.strength_tier === "strong"
+  const strengthTitle = strengthTag ? (strengthTier === "strong"
     ? ` · ${strengthTag}（历史回踩验证通过）`
     : ` · ${strengthTag}（${recentReinforcement ? "近期多次反应" : "多因子共振，历史样本不足"}）`) : "";
   return `代表价 ${formatMoney(level.price)} · 综合强度 ${score.toFixed(2)}（1 为最强）${strengthTitle}${historyTitle}`;
@@ -874,11 +773,17 @@ function levelDetailText(level) {
   const samples = Number(level?.history_samples);
   const representative = Number(level?.price);
   const prefix = Number.isFinite(representative) && representative > 0 ? `代表价 ${formatMoney(representative)} · ` : "";
-  if (!Number.isFinite(samples) || samples <= 0) return `${prefix}历史回踩：暂无样本`;
-  const holdRate = Number(level.history_hold_rate);
-  const breakRate = Number(level.history_break_rate);
+  const strengthTier = String(level?.strength_tier || "");
+  if (!Number.isFinite(samples) || samples <= 0) {
+    const reinforcement = strengthTier === "reinforced" ? "重点强化已启用 · " : "";
+    return `${prefix}${reinforcement}历史回踩：暂无样本`;
+  }
+  const adjustedHoldRate = Number(level.history_adjusted_hold_rate);
+  const adjustedBreakRate = Number(level.history_adjusted_break_rate);
+  const holdRate = Number.isFinite(adjustedHoldRate) ? adjustedHoldRate : Number(level.history_hold_rate);
+  const breakRate = Number.isFinite(adjustedBreakRate) ? adjustedBreakRate : Number(level.history_break_rate);
   const parts = [`${prefix}历史回踩：${samples} 次`];
-  if (Number.isFinite(holdRate)) parts.push(`守住 ${(holdRate * 100).toFixed(1)}%`);
+  if (Number.isFinite(holdRate)) parts.push(`${Number.isFinite(adjustedHoldRate) ? "校准守住" : "守住"} ${(holdRate * 100).toFixed(1)}%`);
   if (Number.isFinite(breakRate)) parts.push(`跌破 ${(breakRate * 100).toFixed(1)}%`);
   const recentSamples = Number(level.recent_samples);
   if (Number.isFinite(recentSamples) && recentSamples > 0) {
@@ -889,27 +794,8 @@ function levelDetailText(level) {
   return parts.join(" · ");
 }
 
-function renderLevelDetailRow(detailText, strengthTag, side) {
-  const strength = strengthTag ? `<span class="level-note-strength level-note-strength-${side}">${strengthTag}</span><span class="level-note-divider"> · </span>` : "";
-  return `<div class="level-note-row"><span class="level-note-content">${strength}<span>${detailText}</span></span></div>`;
-}
-
-function renderFactorRows(target, levels, spot) {
-  const head = `<div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>`;
-  if (!levels.length) { target.innerHTML = head + '<div class="levels-empty">现价这一侧暂无可用价位</div>'; return; }
-  const side = target?.id === "resistance-levels" ? "resistance" : "support";
-  target.innerHTML = head + levels.map((level) => {
-    const gap = Number.isFinite(spot) && spot > 0 ? (Number(level.price) / spot - 1) * 100 : null;
-    const gapText = gap == null ? "--" : `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
-    const gapClass = gap == null ? "" : (gap >= 0 ? "up" : "down");
-    const score = levelScore(level);
-    const factors = levelFactors(level).join(" · ");
-    const strengthTag = levelStrengthTag(level, side);
-    const strongClass = levelStrengthClass(level, side);
-    const titleText = levelTooltipText(level, score, strengthTag);
-    const detailText = levelDetailText(level);
-    return `<div class="level-row level-factor-row ${strongClass}" title="${titleText}"><span class="level-strike">${formatLevelRange(level)}</span><span class="level-gap ${gapClass}">${gapText}</span><span class="level-prob">${formatProbability(level.probability)}</span><span class="level-factors"><span class="level-factor-text">${factors}</span></span></div>${renderLevelDetailRow(detailText, strengthTag, side)}`;
-  }).join("");
+function buildFactorViews(levels, spot, side, isAdd = false) {
+  return (levels || []).map((level, index) => buildLevelView(level, index, spot, side, isAdd));
 }
 
 // 高低点行：52 周与历史最高/最低价（取自日线最高/最低价；悬停显示发生日期与距现价）。
@@ -927,20 +813,16 @@ function trendExtremeRows(extremes, spot) {
     const gapText = gap == null ? "" : ` · 距现价 ${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
     const when = valid && item?.date ? `（${formatDay(item.date)}）` : "";
     const title = valid ? `${label} ${formatMoney(value)}${when}${gapText}` : `${label} 暂无数据`;
-    return { valid, html: `<div class="trend-meta" title="${title}"><span>${label}</span><strong>${valid ? formatMoney(value) : "--"}</strong></div>` };
+    return { valid, label, value: valid ? formatMoney(value) : "--", title };
   });
 }
 
 // 趋势通道：展示方向、上下轨、日均斜率、今开/昨收、Beta，以及 52 周 / 历史最高最低价。
 function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null) {
-  const target = $("trend-body");
-  if (!target) return;
-  const note = $("trend-note");
   const extremeRows = trendExtremeRows(extremes, spot);
   const hasExtremes = extremeRows.some((row) => row.valid);
   if (!trend && !hasExtremes) {
-    target.innerHTML = '<div class="levels-empty">历史行情不足，暂无趋势判断</div>';
-    if (note) note.textContent = "等待数据";
+    state.view.trend = { ...state.view.trend, available: false, rows: [], opportunities: [], extremes: [], note: "等待数据" };
     return;
   }
   const className = trend?.direction === "up" ? "up" : (trend?.direction === "down" ? "down" : "range");
@@ -956,13 +838,10 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     ["今开", formatMoney(trendMarket?.today_open), "今日开盘价；盘前、盘后和夜盘缺少当日开盘价时，使用前一个交易日的开盘价"],
     ["昨收", formatMoney(trendMarket?.previous_close), "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"],
     ["Beta（2年）", betaText, betaTitle],
-  ] : [];
+  ].map(([label, value, title]) => ({ label, value, title, className: label.startsWith("Beta") ? "trend-beta" : "" })) : [];
   const action = ["buy", "sell", "hold"].includes(recommendation?.action) ? recommendation.action : null;
-  const head = trend
-    ? action
-      ? `<div class="trend-signal ${className} ${action}"><strong class="trend-label">${trend.label}<span class="trend-action"> · ${recommendation.label || "继续持有"}</span></strong><small>${recommendation.reason || "结合当前趋势与价位综合判断"}</small></div>`
-      : `<strong class="trend-label ${className}">${trend.label}</strong>`
-    : '<div class="levels-empty">历史行情不足，暂无趋势判断</div>';
+  const actionLabel = action ? (recommendation.label || "继续持有") : "";
+  const actionReason = action ? (recommendation.reason || "结合当前趋势与价位综合判断") : "";
   const horizonLabel = tradePointsHorizon?.label || "未来 5 个交易日";
   const opportunityRows = [
     ["buy", "近期最佳买入点"],
@@ -972,51 +851,45 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     const range = point ? formatLevelRange(point) : "--";
     const confidence = point ? formatProbability(point.confidence) : "--";
     const title = point?.reason ? `${label}：${point.reason}` : `${label}暂无可用数据`;
-    return `<div class="trend-meta trend-opportunity ${kind}" title="${title} · 计算范围：${horizonLabel}"><span class="trend-opportunity-label"><span>${label}</span><small>${horizonLabel}</small></span><strong>${range}<small>综合置信度 ${confidence}</small></strong></div>`;
-  }).join("");
-  const coreRows = rows.map(([label, value, title]) => `<div class="trend-meta${label.startsWith("Beta") ? " trend-beta" : ""}"${title ? ` title="${title}"` : ""}><span>${label}</span><strong>${value}</strong></div>`).join("");
-  const coreContent = coreRows || '<div class="levels-empty">暂无趋势通道数据</div>';
-  const sideContent = `<div class="trend-opportunities">${opportunityRows}</div>` + (hasExtremes ? extremeRows.map((row) => row.html).join("") : "");
-  target.innerHTML = head + `<div class="trend-layout"><div class="trend-core">${coreContent}</div><div class="trend-side">${sideContent}</div></div>`;
-  if (note) {
-    note.textContent = "按最近日线收盘价的线性回归通道；高低点取日线最高/最低价（历史极值用全量历史）";
-    const meta = historyMeta || {};
-    const parts = [
-      meta.extremes_fetched_at ? `高低点快照 ${formatTime(meta.extremes_fetched_at)}` : null,
-      meta.extremes_source ? `来源 ${meta.extremes_source}` : null,
-      meta.extremes_warning ? `高低点降级：${meta.extremes_warning}` : null,
-    ].filter(Boolean);
-    if (parts.length) note.title = parts.join(" · ");
-  }
+    return { kind, label, horizon: horizonLabel, range, confidence, title: `${title} · 计算范围：${horizonLabel}` };
+  });
+  const meta = historyMeta || {};
+  const parts = [
+    meta.extremes_fetched_at ? `高低点快照 ${formatTime(meta.extremes_fetched_at)}` : null,
+    meta.extremes_source ? `来源 ${meta.extremes_source}` : null,
+    meta.extremes_warning ? `高低点降级：${meta.extremes_warning}` : null,
+  ].filter(Boolean);
+  state.view.trend = {
+    available: true,
+    label: trend?.label || "趋势通道",
+    directionClass: className,
+    action: actionLabel,
+    actionClass: action || "hold",
+    reason: actionReason,
+    rows,
+    opportunities: opportunityRows,
+    extremes: hasExtremes ? extremeRows : [],
+    note: "按最近日线收盘价的线性回归通道；高低点取日线最高/最低价（历史极值用全量历史）",
+    noteTitle: parts.join(" · "),
+    empty: "历史行情不足，暂无趋势判断",
+  };
 }
 
 // 交易计划价位表：价位区间 / 距现价 / 触及概率 / 综合依据；强化标签放在说明行。
-function renderPlanRows(target, levels, spot) {
-  if (!target) return;
-  const head = '<div class="level-row level-head level-plan-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>';
-  if (!levels.length) { target.innerHTML = head + '<div class="levels-empty">暂无可用价位</div>'; return; }
-  target.innerHTML = head + levels.map((level) => {
-    const gap = Number.isFinite(spot) && spot > 0 ? (Number(level.price) / spot - 1) * 100 : null;
-    const gapText = gap == null ? "--" : `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
-    const gapClass = gap == null ? "" : (gap >= 0 ? "up" : "down");
-    const score = levelScore(level);
-    const factors = levelFactors(level).join(" · ");
-    const strengthTag = levelStrengthTag(level, "support", true);
-    const strongClass = levelStrengthClass(level, "support", true);
-    const titleText = levelTooltipText(level, score, strengthTag);
-    const detailText = levelDetailText(level);
-    return `<div class="level-row level-plan-row ${strongClass}" title="${titleText}"><span class="level-strike">${formatLevelRange(level)}</span><span class="level-gap ${gapClass}">${gapText}</span><span class="level-prob">${formatProbability(level.probability)}</span><span class="level-factors"><span class="level-factor-text">${factors}</span></span></div>${renderLevelDetailRow(detailText, strengthTag, "support")}`;
-  }).join("");
+function renderPlanRows(levels, spot) {
+  state.view.levels.add = buildFactorViews(levels, spot, "support", true);
+  state.view.levels.addEmpty = levels?.length ? "" : "暂无可用价位";
 }
 
 // 交易计划：前端只展示更深一档的加仓支撑，推荐买入与卖出直接看支撑位/压力位面板。
 function renderPlan(plan, spot) {
   const price = Number(spot);
-  renderPlanRows($("add-levels"), plan?.add || [], price);
+  renderPlanRows(plan?.add || [], price);
 }
 
 function renderFactorLevels(payload) {
   const spot = Number(payload?.spot);
+  state.view.chart.levelsBasis = Number.isFinite(spot) && spot > 0 ? `基准 ${formatMoney(spot)}` : "基准 --";
   const expiration = payload?.expiration || state.expiration || "--";
   const metric = payload?.options_metric === "volume" ? "成交量" : "Gamma 敞口";
   const hasHistory = Number(payload?.history?.bars) > 0;
@@ -1027,170 +900,15 @@ function renderFactorLevels(payload) {
     : `历史行情不可用，按期权持仓（${metric}，${optionScope}）计算 · 选中期限 ${expiration}`;
   const detail = [hasHistory ? `日线 ${payload.history.bars} 根` : null, payload?.history?.warning ? `历史行情降级：${payload.history.warning}` : null, "触及概率：按选中期限隐含波动率与剩余期限的零漂移首次触及概率", "Gamma、成交量和持仓量图表仍按当前选中期限绘制"].filter(Boolean).join(" · ");
   const basisNote = Number.isFinite(spot) && spot > 0 ? ` · 基准 ${formatMoney(spot)}（${state.levelBasisLabel || "常规"}）` : "";
-  for (const id of ["resistance-note", "support-note"]) { $(id).textContent = scope + basisNote; $(id).title = detail; }
-  renderFactorRows($("resistance-levels"), payload?.resistance || [], spot);
-  renderFactorRows($("support-levels"), payload?.support || [], spot);
-  renderLevelsChart(payload);
+  state.view.levels.resistanceNote = scope + basisNote;
+  state.view.levels.supportNote = scope + basisNote;
+  state.view.levels.resistance = buildFactorViews(payload?.resistance || [], spot, "resistance");
+  state.view.levels.support = buildFactorViews(payload?.support || [], spot, "support");
+  state.view.levels.resistanceEmpty = "现价这一侧暂无可用价位";
+  state.view.levels.supportEmpty = "现价这一侧暂无可用价位";
+  OptionScopeCharts.renderLevelsChart(payload);
   renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);
   renderPlan(payload?.plan, spot);
-}
-
-// expirationRows 为上方所选到期日（期权链表格）的合约：Gamma 敞口与两张分布图都以它为唯一口径。
-// 压力位/支撑位柱状图：横轴为价位（按价格线性排布），柱高为综合强度（1 为最强），
-// 压力位向上（绿）、支撑位向下（红）；悬停显示代表价、距现价、触及概率与综合依据。
-function renderLevelsChart(payload) {
-  const target = $("levels-chart");
-  if (!target) return;
-  const spot = Number(payload?.spot);
-  const levels = [
-    ...(payload?.resistance || []).map((item) => ({ ...item, side: "up" })),
-    ...(payload?.support || []).map((item) => ({ ...item, side: "down" })),
-  ]
-    .map((item) => ({ price: Number(item.price), score: Math.max(0, Number(item.score) || 0), probability: item.probability, factors: item.factors || [], side: item.side }))
-    .filter((item) => Number.isFinite(item.price) && item.price > 0);
-  const basisBadge = $("levels-basis");
-  if (basisBadge) basisBadge.textContent = Number.isFinite(spot) && spot > 0 ? `基准 ${formatMoney(spot)}` : "基准 --";
-  if (!levels.length) { target.innerHTML = '<div class="chart-empty">暂无压力位/支撑位数据</div>'; return; }
-  const { width, height } = chartContentBox(target);
-  target.dataset.chartWidth = String(width); target.dataset.chartHeight = String(height);
-  const pad = { left: 48, right: 12, top: 14, bottom: 26 };
-  const innerWidth = width - pad.left - pad.right;
-  const innerHeight = height - pad.top - pad.bottom;
-  const baseline = pad.top + innerHeight / 2;
-  // 上下各留一条「标签通道」，柱高最高只顶到通道内侧，柱端不会压到坐标刻度。
-  const gutter = Math.min(44, Math.max(16, innerHeight / 2 - 16));
-  const maxBarHeight = innerHeight / 2 - gutter;
-  const maxScore = Math.max(0.01, ...levels.map((item) => item.score));
-  const ordered = [...levels].sort((a, b) => a.price - b.price);
-  const prices = ordered.map((item) => item.price);
-  const rawMin = prices[0];
-  const rawMax = prices[prices.length - 1];
-  const span = rawMax - rawMin || Math.max(1, rawMax * 0.02);
-  // 横轴按价格线性排布（真实反映价位间距），首尾各留 6% 余量避免柱子贴边。
-  const domainMin = rawMin - span * 0.06;
-  const domainMax = rawMax + span * 0.06;
-  const scale = innerWidth / (domainMax - domainMin);
-  const xOf = (price) => pad.left + (price - domainMin) * scale;
-  // 柱宽取相邻价位最小间距的 60%，价位密集时柱子也不会互相压盖。
-  const gaps = prices.slice(1).map((value, index) => value - prices[index]).filter((value) => value > 0);
-  const minGap = gaps.length ? Math.min(...gaps) : span;
-  const barWidth = Math.max(3, Math.min(26, minGap * scale * 0.6));
-  const yLabel = maxScore.toFixed(2);
-  // 价位刻度按像素间距抽样：横轴按价格线性排布、间距不均，必须按实际像素判断而不是按条数取样。
-  const minLabelGap = 46;
-  let lastLabelX = -Infinity;
-  const barNodes = ordered.map((item) => {
-    const centerX = xOf(item.price);
-    const barHeight = item.score / maxScore * maxBarHeight;
-    const y = item.side === "up" ? baseline - barHeight : baseline;
-    const className = item.side === "up" ? "chart-call" : "chart-put";
-    const title = `${item.side === "up" ? "压力位" : "支撑位"} ${formatMoney(item.price)} · 强度 ${item.score.toFixed(2)}`;
-    const showLabel = centerX - lastLabelX >= minLabelGap;
-    if (showLabel) lastLabelX = centerX;
-    const label = showLabel ? `<text class="chart-label" x="${centerX}" y="${height - 8}" text-anchor="middle">${formatMoney(item.price)}</text>` : "";
-    return `<rect class="${className}" x="${centerX - barWidth / 2}" y="${y}" width="${barWidth}" height="${barHeight}" rx="1"><title>${title}</title></rect>${label}`;
-  }).join("");
-  const gridLines = [baseline - maxBarHeight, baseline, baseline + maxBarHeight].map((line) => `<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${line}" y2="${line}"/>`).join("");
-  const axisLabels = `<text class="chart-label" x="4" y="${baseline - maxBarHeight + 4}">${yLabel}</text><text class="chart-label" x="4" y="${baseline + 4}">0</text><text class="chart-label" x="4" y="${baseline + maxBarHeight + 4}">-${yLabel}</text>`;
-  const basisLine = Number.isFinite(spot) && spot > 0 && spot >= domainMin && spot <= domainMax
-    ? `<line class="chart-level-basis" x1="${xOf(spot)}" x2="${xOf(spot)}" y1="${pad.top}" y2="${height - pad.bottom}"/><text class="chart-label" x="${Math.min(Math.max(xOf(spot), pad.left + 14), width - pad.right - 14)}" y="${pad.top + 10}" text-anchor="middle">基准</text>`
-    : "";
-  const cornerLabels = `<text class="chart-label" x="${width - 12}" y="${pad.top + 10}" text-anchor="end">压力 ↑</text><text class="chart-label" x="${width - 12}" y="${height - pad.bottom - 3}" text-anchor="end">支撑 ↓</text>`;
-  // 与成交量/持仓量图一致的十字虚线：竖向跟随鼠标所在价位、横向贴鼠标高度，两端各带取值标签。
-  const crosshairTags = `<line class="chart-crosshair-h" x1="${pad.left}" x2="${width - pad.right}" y1="0" y2="0" visibility="hidden"/><g class="chart-tag chart-tag-x" visibility="hidden"><rect rx="2" height="16" width="0"/><text></text></g><g class="chart-tag chart-tag-y" visibility="hidden"><rect rx="2" height="16" width="0"/><text></text></g>`;
-  target.innerHTML = `<svg viewBox="0 0 ${width} ${height}" role="img" tabindex="0" aria-label="压力位/支撑位柱状图">${gridLines}${axisLabels}${basisLine}${barNodes}${cornerLabels}<line class="chart-crosshair" x1="0" x2="0" y1="${pad.top}" y2="${height - pad.bottom}" visibility="hidden"/>${crosshairTags}</svg><div class="chart-tooltip" hidden></div>`;
-
-  const chartSvg = target.querySelector("svg");
-  const crosshair = target.querySelector(".chart-crosshair");
-  const crosshairLine = target.querySelector(".chart-crosshair-h");
-  const tagX = target.querySelector(".chart-tag-x");
-  const tagY = target.querySelector(".chart-tag-y");
-  const tooltip = target.querySelector(".chart-tooltip");
-  // SVG 与绘图区之间可能有留白，坐标换算走屏幕矩阵，保证十字虚线与数据卡严格对齐。
-  const clientToViewBox = (clientX, clientY) => {
-    const matrix = chartSvg.getScreenCTM();
-    if (matrix && chartSvg.createSVGPoint) {
-      const point = chartSvg.createSVGPoint();
-      point.x = clientX; point.y = clientY;
-      return point.matrixTransform(matrix.inverse());
-    }
-    const rect = chartSvg.getBoundingClientRect();
-    return { x: ((clientX - rect.left) / rect.width) * width, y: ((clientY - rect.top) / rect.height) * height };
-  };
-  const viewBoxXToClient = (viewBoxX) => {
-    const matrix = chartSvg.getScreenCTM();
-    if (matrix && chartSvg.createSVGPoint) {
-      const point = chartSvg.createSVGPoint();
-      point.x = viewBoxX; point.y = 0;
-      return point.matrixTransform(matrix).x;
-    }
-    const rect = chartSvg.getBoundingClientRect();
-    return rect.left + (viewBoxX / width) * rect.width;
-  };
-  const nearestLevel = (clientX) => {
-    const localX = clientToViewBox(clientX, 0).x;
-    return ordered.reduce((best, item) => (best == null || Math.abs(xOf(item.price) - localX) < Math.abs(xOf(best.price) - localX) ? item : best), null);
-  };
-  // 十字光标取值标签：左侧贴当前鼠标高度的强度值，底部贴所在价位。
-  const updateTags = (item, clientY) => {
-    const hidden = clientY == null || !item;
-    crosshairLine.setAttribute("visibility", hidden ? "hidden" : "visible");
-    tagX.setAttribute("visibility", hidden ? "hidden" : "visible");
-    tagY.setAttribute("visibility", hidden ? "hidden" : "visible");
-    if (hidden) return;
-    const localY = Math.min(Math.max(clientToViewBox(0, clientY).y, pad.top + 6), height - pad.bottom - 6);
-    crosshairLine.setAttribute("y1", localY);
-    crosshairLine.setAttribute("y2", localY);
-    const value = (baseline - localY) / maxBarHeight * maxScore;
-    const valueText = `${value < 0 ? "-" : ""}${Math.abs(value).toFixed(2)}`;
-    const valueWidth = markerLabelWidth(valueText, 700) + 10;
-    tagY.querySelector("rect").setAttribute("x", 4);
-    tagY.querySelector("rect").setAttribute("y", localY - 8);
-    tagY.querySelector("rect").setAttribute("width", valueWidth);
-    const valueNode = tagY.querySelector("text");
-    valueNode.setAttribute("x", 9);
-    valueNode.setAttribute("y", localY + 4);
-    valueNode.textContent = valueText;
-    const priceText = formatMoney(item.price);
-    const priceWidth = markerLabelWidth(priceText, 700) + 10;
-    const priceLeft = Math.min(Math.max(xOf(item.price) - priceWidth / 2, 2), width - priceWidth - 2);
-    tagX.querySelector("rect").setAttribute("x", priceLeft);
-    tagX.querySelector("rect").setAttribute("y", height - 20);
-    tagX.querySelector("rect").setAttribute("width", priceWidth);
-    const priceNode = tagX.querySelector("text");
-    priceNode.setAttribute("x", priceLeft + 5);
-    priceNode.setAttribute("y", height - 8);
-    priceNode.textContent = priceText;
-  };
-  const showTooltip = (item, clientY) => {
-    if (!item) return;
-    const gap = Number.isFinite(spot) && spot > 0 ? (item.price / spot - 1) * 100 : null;
-    const gapText = gap == null ? "--" : `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
-    const sideLabel = item.side === "up" ? "压力位" : "支撑位";
-    const rows = [
-      `<div class="chart-tooltip-row"><span>距现价</span><strong>${gapText}</strong></div>`,
-      `<div class="chart-tooltip-row"><span>到达概率</span><strong>${formatProbability(item.probability)}</strong></div>`,
-      `<div class="chart-tooltip-row"><span>综合强度</span><strong>${item.score.toFixed(2)}</strong></div>`,
-    ];
-    const factors = (item.factors || []).join(" · ");
-    tooltip.innerHTML = `<div class="chart-tooltip-title"><i class="tooltip-dot ${item.side === "up" ? "call" : "put"}"></i>${sideLabel} ${formatMoney(item.price)}</div>${rows.join("")}${factors ? `<div class="chart-tooltip-sub">${factors}</div>` : ""}`;
-    crosshair.setAttribute("x1", xOf(item.price));
-    crosshair.setAttribute("x2", xOf(item.price));
-    crosshair.setAttribute("visibility", "visible");
-    tooltip.hidden = false;
-    const targetRect = target.getBoundingClientRect();
-    const tooltipWidth = tooltip.offsetWidth || 180;
-    const lineClientX = viewBoxXToClient(xOf(item.price));
-    tooltip.style.left = `${Math.max(8, Math.min(targetRect.width - tooltipWidth - 8, lineClientX - targetRect.left - tooltipWidth / 2))}px`;
-    tooltip.style.top = "auto";
-    tooltip.style.bottom = `${targetRect.height + 4}px`;
-    updateTags(item, clientY);
-  };
-  const hideTooltip = () => { crosshair.setAttribute("visibility", "hidden"); tooltip.hidden = true; crosshairLine.setAttribute("visibility", "hidden"); tagX.setAttribute("visibility", "hidden"); tagY.setAttribute("visibility", "hidden"); };
-  chartSvg.addEventListener("pointermove", (event) => showTooltip(nearestLevel(event.clientX), event.clientY));
-  chartSvg.addEventListener("pointerleave", hideTooltip);
-  chartSvg.addEventListener("focus", () => showTooltip(ordered[0], null));
-  chartSvg.addEventListener("blur", hideTooltip);
 }
 
 function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivModel = {}, basis = null) {
@@ -1203,8 +921,8 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   const levelSpot = Number(basis?.price) > 0 ? Number(basis.price) : spot;
   state.levelBasisLabel = basis?.label || "常规";
   const scopeText = expirationRows.length ? `到期日 ${state.expiration || "--"} · ${expirationRows.length} 个合约` : "当前到期日无数据";
-  if ($("volume-scope")) $("volume-scope").textContent = scopeText;
-  if ($("oi-scope")) $("oi-scope").textContent = scopeText;
+  state.view.chart.volumeScope = scopeText;
+  state.view.chart.oiScope = scopeText;
   const modelIv = Number(ivModel?.[state.expiration]?.iv);
   const scopeSuffix = Number.isFinite(modelIv) && modelIv > 0 ? ` · 模型 IV ${(modelIv * 100).toFixed(1)}%` : "";
   const serverFlip = Number(analysisPayload?.zero_gamma?.price);
@@ -1217,28 +935,28 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   const volumePutPeak = maxPoint(points, "putVolume");
   const oiCallPeak = maxPoint(points, "callOi");
   const oiPutPeak = maxPoint(points, "putOi");
-  $("net-gex").textContent = `净 Gamma ${formatGex(points.reduce((sum, point) => sum + point.callGex + point.putGex, 0), 2)}`;
-  $("gamma-flip").textContent = `零 Gamma ${gammaFlip ? formatMoney(gammaFlip.strike) : "--"}`;
-  $("gamma-scope").textContent = `柱状图 ${scopeText}${scopeSuffix}`;
+  state.view.chart.netGex = `净 Gamma ${formatGex(points.reduce((sum, point) => sum + point.callGex + point.putGex, 0), 2)}`;
+  state.view.chart.gammaFlip = `零 Gamma ${gammaFlip ? formatMoney(gammaFlip.strike) : "--"}`;
+  state.view.chart.gammaScope = `柱状图 ${scopeText}${scopeSuffix}`;
   const analysisFallback = analysisPayload?.oi_fallback || {};
-  if (analysisFallback.restored) $("gamma-scope").textContent += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
-  $("call-wall").textContent = `看涨墙 ${callWall?.callGex ? formatMoney(callWall.strike) : "--"}`;
-  $("put-wall").textContent = `看跌墙 ${putWall?.putGex ? formatMoney(putWall.strike) : "--"}`;
+  if (analysisFallback.restored) state.view.chart.gammaScope += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
+  state.view.chart.callWall = `看涨墙 ${callWall?.callGex ? formatMoney(callWall.strike) : "--"}`;
+  state.view.chart.putWall = `看跌墙 ${putWall?.putGex ? formatMoney(putWall.strike) : "--"}`;
   loadFactorLevels(points, levelSpot);
-  renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "当前期权链未提供 Gamma，暂无法估算 GEX", { spot, gammaFlip, crosshairTags: true, markers: [
+  OptionScopeCharts.renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "当前期权链未提供 Gamma，暂无法估算 GEX", { spot, gammaFlip, crosshairTags: true, markers: [
     { point: callWall, className: "chart-wall-call", label: "看涨墙", position: "top" },
     { point: putWall, className: "chart-wall-put", label: "看跌墙", position: "bottom" },
   ] });
-  renderSignedChart("volume-chart", points, "callVolume", "putVolume", "", "暂无成交量分布", { axis: "right", crosshairTags: true, valueLabel: "成交量", markers: [
+  OptionScopeCharts.renderSignedChart("volume-chart", points, "callVolume", "putVolume", "", "暂无成交量分布", { axis: "right", crosshairTags: true, valueLabel: "成交量", markers: [
     { point: volumeCallPeak, className: "chart-wall-call", label: "看涨", position: "top" },
     { point: volumePutPeak, className: "chart-wall-put", label: "看跌", position: "bottom" },
   ] });
-  renderSignedChart("oi-chart", points, "callOi", "putOi", "", "暂无持仓量分布", { axis: "right", crosshairTags: true, valueLabel: "持仓量", markers: [
+  OptionScopeCharts.renderSignedChart("oi-chart", points, "callOi", "putOi", "", "暂无持仓量分布", { axis: "right", crosshairTags: true, valueLabel: "持仓量", markers: [
     { point: oiCallPeak, className: "chart-wall-call", label: "看涨", position: "top" },
     { point: oiPutPeak, className: "chart-wall-put", label: "看跌", position: "bottom" },
   ] });
-  renderDistributionSummary($("volume-summary"), expirationRows, spot, "volume", "总成交量");
-  renderDistributionSummary($("oi-summary"), expirationRows, spot, "open_interest", "总持仓量");
+  OptionScopeCharts.renderDistributionSummary(byId("volume-summary"), expirationRows, spot, "volume", "总成交量");
+  OptionScopeCharts.renderDistributionSummary(byId("oi-summary"), expirationRows, spot, "open_interest", "总持仓量");
 }
 
 // 所有 AJAX 请求都优先把 key 放进 URL 查询参数，避免浏览器存储策略影响鉴权。
@@ -1257,17 +975,12 @@ async function request(path, options = {}) {
     showAccessDenied();
     throw new Error(message);
   }
-  const headers = new Headers(options.headers || {});
-  if (accessKey) headers.set("X-Access-Key", accessKey);
-  const response = await fetch(withAccessKey(path, accessKey), { ...options, headers });
-  const body = await response.json().catch(() => ({}));
-  if (response.status === 403) {
-    const message = body.detail || "403 Forbidden";
-    showAccessDenied();
-    throw new Error(message);
-  }
-  if (!response.ok) throw new Error(body.detail || `请求失败 (${response.status})`);
-  return body;
+  return OptionScopeRequest.request(path, options, {
+    accessKey,
+    required: accessKeyRequired(),
+    withAccessKey,
+    onDenied: showAccessDenied,
+  });
 }
 
 // 现价按时段动态取值：盘前显示盘前价，盘后/夜盘显示盘后价，盘中与休市显示常规价。
@@ -1284,14 +997,15 @@ function renderQuote(quote) {
   const active = activeSessionQuote(quote);
   const price = active?.price ?? quote?.price;
   const change = active?.change_percent ?? quote?.change_percent;
-  $("quote-symbol").textContent = quote?.symbol || state.symbol;
-  $("quote-price").textContent = formatMoney(price);
-  $("quote-change").textContent = change == null ? "涨跌 --" : `涨跌 ${change >= 0 ? "+" : ""}${Number(change).toFixed(2)}%`;
+  state.view.quoteSymbol = quote?.symbol || state.symbol;
+  state.view.quotePrice = formatMoney(price);
+  state.view.quoteChange = change == null ? "涨跌 --" : `涨跌 ${change >= 0 ? "+" : ""}${Number(change).toFixed(2)}%`;
   // 涨跌色统一走 --up / --down：当前全局口径是绿涨红跌，变量名不再写死颜色。
-  $("quote-change").style.color = change < 0 ? "var(--down)" : "var(--up)";
-  $("quote-currency").textContent = quote?.currency || "USD";
-  $("quote-market").textContent = marketStateLabel(quote?.market_state);
-  $("market-state").textContent = marketStateLabel(quote?.market_state, "快照数据");
+  state.view.quoteChangeColor = change == null ? "var(--muted)" : (change < 0 ? "var(--down)" : "var(--up)");
+  state.view.quoteCurrency = quote?.currency || "USD";
+  state.view.quoteMarket = marketStateLabel(quote?.market_state);
+  state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
+  state.lastQuote = quote || null;
 }
 
 // 时段标签：数据源若返回未知取值就原样展示，避免换口径时把信息吞掉。
@@ -1317,16 +1031,19 @@ function heatPercent(value, peak) {
   return Math.round(Math.sqrt(Math.min(number / Number(peak), 1)) * 100);
 }
 
-// 热力单元格：底色深浅表示该值在本列的相对强弱，悬停给出数值与本列最强值。
-function heatCell(value, peak, label, hotLevel) {
+// 热力单元格模型：底色深浅表示该值在本列的相对强弱，悬停给出数值与本列最强值。
+function heatCellModel(value, peak, label, hotLevel) {
   const number = Number(value) || 0;
   const percent = heatPercent(number, peak);
   const title = percent == null
     ? `${label} ${formatNumber(number)}`
     : `${label} ${formatNumber(number)} · 本屏最强 ${formatNumber(peak)}（占 ${Math.round((number / Number(peak)) * 100)}%）`;
-  if (percent == null) return `<td class="num chain-heat" title="${title}">${formatNumber(number)}</td>`;
-  const hot = percent >= hotLevel ? " chain-heat-hot" : "";
-  return `<td class="num chain-heat${hot}" style="--heat:${percent}" title="${title}">${formatNumber(number)}</td>`;
+  return {
+    value: formatNumber(number),
+    className: percent != null && percent >= hotLevel ? "chain-heat-hot" : "",
+    style: percent == null ? "" : `--heat:${percent}`,
+    title,
+  };
 }
 
 // 单张合约的 GEX（美元 / 现价每变动 1%）：与 Gamma 敞口图同口径（模型 Gamma × 未平仓 × 100 × 现价² × 0.01），
@@ -1350,30 +1067,42 @@ function chainHeatNote(volumePeak, interestPeak) {
 // 期权链表格：行权价在最左，文字颜色即类型（看涨绿 / 看跌红，原先单独的「类型」列已并入行权价）；
 // 成交量与未平仓两列按本屏强弱铺底色，另给出 GEX 估值列（与 Gamma 敞口图同口径）。
 function renderChainRows(rows, spot, emptyLabel = "没有期权数据") {
-  const body = $("chain-body");
   if (!rows.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty">${emptyLabel}</td></tr>`;
-    $("chain-heat-note").textContent = chainHeatNote(0, 0);
+    state.view.chainRows = [];
+    state.view.chainEmpty = emptyLabel;
+    state.view.chainHeatNote = chainHeatNote(0, 0);
     return;
   }
   const volumePeak = Math.max(0, ...rows.map((row) => Number(row.volume) || 0));
   const interestPeak = Math.max(0, ...rows.map((row) => Number(row.open_interest) || 0));
-  $("chain-heat-note").textContent = chainHeatNote(volumePeak, interestPeak);
-  body.innerHTML = rows.map((row) => {
+  state.view.chainHeatNote = chainHeatNote(volumePeak, interestPeak);
+  state.view.chainEmpty = emptyLabel;
+  state.view.chainRows = rows.map((row, index) => {
     const isCall = row.contract_type === "call";
     const gex = contractGex(row, spot);
-    return [
-      `<tr class="${isCall ? "chain-call" : "chain-put"}">`,
-      `<td class="num chain-strike ${isCall ? "type-call" : "type-put"}">${formatMoney(row.strike)}</td>`,
-      heatCell(row.volume, volumePeak, "成交量", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put),
-      heatCell(row.open_interest, interestPeak, "未平仓", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put),
-      `<td class="num">${formatModelGamma(row)}</td>`,
-      `<td class="num" title="Gamma × 未平仓 × 100 × 现价² × 0.01，即现价每变动 1% 的美元敞口">${gex == null ? "--" : formatGex(gex / 1000000)}</td>`,
-      `<td class="num">${formatModelIv(row)}</td>`,
-      `<td class="${row.in_the_money ? "itm" : ""}">${row.in_the_money ? "价内" : "价外"}</td>`,
-      "</tr>",
-    ].join("");
-  }).join("");
+    const volume = heatCellModel(row.volume, volumePeak, "成交量", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put);
+    const interest = heatCellModel(row.open_interest, interestPeak, "未平仓", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put);
+    return {
+      key: row.contract_symbol || `${row.contract_type || "option"}-${row.strike}-${index}`,
+      rowClass: isCall ? "chain-call" : "chain-put",
+      typeClass: isCall ? "type-call" : "type-put",
+      strike: formatMoney(row.strike),
+      volume: volume.value,
+      volumeClass: volume.className,
+      volumeStyle: volume.style,
+      volumeTitle: volume.title,
+      interest: interest.value,
+      interestClass: interest.className,
+      interestStyle: interest.style,
+      interestTitle: interest.title,
+      gamma: formatModelGamma(row),
+      gex: gex == null ? "--" : formatGex(gex / 1000000),
+      gexTitle: "Gamma × 未平仓 × 100 × 现价² × 0.01，即现价每变动 1% 的美元敞口",
+      iv: formatModelIv(row),
+      itm: row.in_the_money ? "价内" : "价外",
+      itmClass: row.in_the_money ? "itm" : "",
+    };
+  });
 }
 
 // 期权链筛选（全部 / 看涨 / 看跌）：切换筛选只重绘表格，不重新请求数据；
@@ -1389,19 +1118,19 @@ function renderChain(payload, quote, analysisPayload) {
   const rows = payload.data || []; state.expiration = payload.expiration;
   // 基准价开关切换时要用最近一次快照重算，这里留一份引用。
   state.lastQuote = quote || null;
-  $("chain-title").textContent = `${payload.symbol} · ${payload.expiration}`;
+  state.view.chainTitle = `${payload.symbol} · ${payload.expiration}`;
   // 期权链始终从 SQLite 读取，这里按快照新鲜度标注来源，避免刚抓完还显示“缓存”造成误解。
   const snapshotAge = payload.fetched_at ? (Date.now() - new Date(payload.fetched_at).getTime()) / 1000 : null;
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
   const oiFallback = payload.oi_fallback || {};
-  $("data-source").textContent = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < 180 ? "上游新快照" : "SQLite 缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
-  $("fetched-at").textContent = `快照时间 ${formatTime(payload.fetched_at)}`;
-  $("total-count").textContent = formatNumber(rows.length);
+  state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < 180 ? "上游新快照" : "SQLite 缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
+  state.view.fetchedAt = `快照时间 ${formatTime(payload.fetched_at)}`;
+  state.view.totalCount = formatNumber(rows.length);
   const calls = rows.filter((row) => row.contract_type === "call"); const puts = rows.filter((row) => row.contract_type === "put");
-  $("call-volume").textContent = formatNumber(calls.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
-  $("put-volume").textContent = formatNumber(puts.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
-  $("call-interest").textContent = `未平仓 ${formatNumber(calls.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
-  $("put-interest").textContent = `未平仓 ${formatNumber(puts.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
+  state.view.callVolume = formatNumber(calls.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
+  state.view.putVolume = formatNumber(puts.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
+  state.view.callInterest = `未平仓 ${formatNumber(calls.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
+  state.view.putInterest = `未平仓 ${formatNumber(puts.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
   const analysisRows = analysisPayload?.data?.length ? analysisPayload.data : rows;
   // 记录本次快照时间：压力位/支撑位的合成接口按「标的 + 到期日 + 快照时间」去重请求。
   state.chainFetchedAt = payload.fetched_at || null;
@@ -1413,18 +1142,14 @@ function renderChain(payload, quote, analysisPayload) {
 // emptyLabel：本地没有到期日时的占位文案，需要区分「还没抓过」（正在获取）和「该标的没有期权」。
 function applyExpirations(dates, preferred, emptyLabel = "正在获取到期日…") {
   const unique = [...new Set((dates || []).filter(Boolean))];
-  const select = $("expiration-select");
+  state.expirationOptions = unique;
+  state.expirationPlaceholder = emptyLabel;
   if (!unique.length) {
-    select.innerHTML = "<option>" + emptyLabel + "</option>";
-    select.disabled = true;
     syncRefreshButton();
     return false;
   }
-  select.innerHTML = unique.map((date) => `<option value="${date}">${date}</option>`).join("");
   const requested = preferred || parsePageQuery(location.search).expiration || state.expiration;
   state.expiration = unique.includes(requested) ? requested : unique[0];
-  select.value = state.expiration;
-  select.disabled = false;
   syncRefreshButton();
   return true;
 }
@@ -1441,52 +1166,59 @@ function isSnapshotFresh(snapshot) {
 
 function showFreshStatus(snapshot) {
   const age = snapshotAgeSeconds(snapshot?.fetchedAt);
-  $("last-status").textContent = `本地快照 ${formatTime(snapshot?.fetchedAt)} 已是最新（${Math.round(age ?? 0)} 秒前）`;
+  state.view.lastStatus = `本地快照 ${formatTime(snapshot?.fetchedAt)} 已是最新（${Math.round(age ?? 0)} 秒前）`;
 }
 
 function showPending(message) {
-  $("chain-title").textContent = `${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
-  $("data-source").textContent = "后台刷新中";
-  $("fetched-at").textContent = "快照时间 --";
-  $("total-count").textContent = "--";
-  $("call-volume").textContent = "--";
-  $("put-volume").textContent = "--";
-  $("call-interest").textContent = "未平仓 --";
-  $("put-interest").textContent = "未平仓 --";
-  $("net-gex").textContent = "净 Gamma --";
-  $("gamma-flip").textContent = "零 Gamma --";
-  $("call-wall").textContent = "看涨墙 --";
-  $("put-wall").textContent = "看跌墙 --";
-  $("gamma-scope").textContent = "Gamma 范围 --";
-  $("gex-chart").innerHTML = `<div class="chart-empty">${message}</div>`;
-  $("volume-chart").innerHTML = '<div class="chart-empty">正在后台加载</div>';
-  $("oi-chart").innerHTML = '<div class="chart-empty">正在后台加载</div>';
-  $("volume-summary").innerHTML = ""; $("oi-summary").innerHTML = "";
+  state.view.chainTitle = `${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
+  state.view.dataSource = "后台刷新中";
+  state.view.fetchedAt = "快照时间 --";
+  state.view.totalCount = "--";
+  state.view.callVolume = "--";
+  state.view.putVolume = "--";
+  state.view.callInterest = "未平仓 --";
+  state.view.putInterest = "未平仓 --";
+  state.view.lastStatus = message;
+  state.view.chart.netGex = "净 Gamma --";
+  state.view.chart.gammaFlip = "零 Gamma --";
+  state.view.chart.callWall = "看涨墙 --";
+  state.view.chart.putWall = "看跌墙 --";
+  state.view.chart.gammaScope = "Gamma 范围 --";
+  state.view.chart.levelsBasis = "基准 --";
+  state.view.chart.volumeScope = "";
+  state.view.chart.oiScope = "";
+  OptionScopeCharts.showEmpty("gex-chart", message);
+  OptionScopeCharts.showEmpty("volume-chart", "正在后台加载");
+  OptionScopeCharts.showEmpty("oi-chart", "正在后台加载");
+  OptionScopeCharts.clearSummary("volume-summary");
+  OptionScopeCharts.clearSummary("oi-summary");
   // 压力位/支撑位会在新快照渲染后重新请求合成接口，这里先清空并解除去重键。
   state.levelsKey = "";
   state.levelsPayload = null;
-  $("resistance-note").textContent = "等待数据";
-  $("support-note").textContent = "等待数据";
-  $("resistance-levels").innerHTML = `<div class="levels-empty">${message}</div>`;
-  $("support-levels").innerHTML = `<div class="levels-empty">${message}</div>`;
-  $("levels-chart").innerHTML = `<div class="chart-empty">${message}</div>`;
-  $("levels-basis").textContent = "基准 --";
-  $("trend-body").innerHTML = `<div class="levels-empty">${message}</div>`;
-  $("trend-note").textContent = "等待数据";
-  $("add-levels").innerHTML = `<div class="levels-empty">${message}</div>`;
-  $("chain-body").innerHTML = `<tr><td colspan="7" class="empty">${message}</td></tr>`;
-  $("chain-heat-note").textContent = "等待数据";
+  state.view.levels.resistance = [];
+  state.view.levels.support = [];
+  state.view.levels.add = [];
+  state.view.levels.resistanceNote = "等待数据";
+  state.view.levels.supportNote = "等待数据";
+  state.view.levels.resistanceEmpty = message;
+  state.view.levels.supportEmpty = message;
+  state.view.levels.addEmpty = message;
+  OptionScopeCharts.showEmpty("levels-chart", message);
+  state.view.trend = { ...state.view.trend, available: false, rows: [], opportunities: [], extremes: [], note: "等待数据", empty: message };
+  state.view.chainRows = [];
+  state.view.chainEmpty = message;
+  state.view.chainHeatNote = "等待数据";
 }
 
 function applyCachedQuote(quote) {
   if (!quote || quote.price == null) {
-    $("quote-symbol").textContent = state.symbol;
-    $("quote-price").textContent = "--";
-    $("quote-change").textContent = "正在更新";
-    $("quote-change").style.color = "var(--muted)";
-    $("quote-currency").textContent = "USD";
-    $("quote-market").textContent = "后台刷新";
-    $("market-state").textContent = "后台刷新中";
+    state.view.quoteSymbol = state.symbol;
+    state.view.quotePrice = "--";
+    state.view.quoteChange = "正在更新";
+    state.view.quoteChangeColor = "var(--muted)";
+    state.view.quoteCurrency = "USD";
+    state.view.quoteMarket = "后台刷新";
+    state.view.marketState = "后台刷新中";
     return;
   }
   renderQuote(quote);
@@ -1510,7 +1242,7 @@ async function renderSnapshot(loadId) {
   if (!payload?.data?.length) return { shown: false, source: payload?.source || quote?.source || null, fetchedAt: payload?.fetched_at || null };
   state.analysisReady = Boolean(analysis?.data?.length) || state.analysisReady;
   renderChain(payload, quote, analysis);
-  $("last-status").textContent = payload.source === "sqlite"
+  state.view.lastStatus = payload.source === "sqlite"
     ? `本地缓存 ${formatTime(payload.fetched_at)}`
     : `最近更新 ${formatTime(payload.fetched_at)}`;
   syncPageQuery();
@@ -1525,7 +1257,7 @@ function refreshAnalysisWindow(loadId, payload, quote) {
   state.analysisRefreshSymbol = symbol;
   const encodedSymbol = encodeURIComponent(symbol);
   const pendingText = `快照已更新 ${formatTime(payload?.fetched_at)} · 正在后台刷新 Gamma 窗口…`;
-  $("last-status").textContent = pendingText;
+  state.view.lastStatus = pendingText;
   request(`/api/gamma/${encodedSymbol}?horizon_days=45&refresh=true`)
     .then((analysis) => {
       if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
@@ -1533,11 +1265,11 @@ function refreshAnalysisWindow(loadId, payload, quote) {
       state.analysisReady = true;
       renderChain(payload, quote, analysis);
       // 窗口刷新期间用户可能又点了刷新：只在提示文案还属于本次窗口刷新时才改写，避免覆盖更新的状态。
-      if ($("last-status").textContent === pendingText) $("last-status").textContent = `最近更新 ${formatTime(payload?.fetched_at)}`;
+      if (state.view.lastStatus === pendingText) state.view.lastStatus = `最近更新 ${formatTime(payload?.fetched_at)}`;
     })
     .catch((error) => {
       if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
-      if ($("last-status").textContent === pendingText) $("last-status").textContent = `Gamma 窗口刷新失败，仍显示本地缓存（${error.message}）`;
+      if (state.view.lastStatus === pendingText) state.view.lastStatus = `Gamma 窗口刷新失败，仍显示本地缓存（${error.message}）`;
     })
     .finally(() => { if (state.analysisRefreshSymbol === symbol) state.analysisRefreshSymbol = null; });
 }
@@ -1551,7 +1283,7 @@ async function refreshInBackground(loadId) {
   if (state.refreshInFlight === symbol) return;
   state.refreshInFlight = symbol;
   try {
-    $("last-status").textContent = "正在请求上游快照…";
+    state.view.lastStatus = "正在请求上游快照…";
     // max_age 交给后端再兜底一次：本地快照仍在新鲜期内时后端会直接返回 skipped，不再打上游接口。
     const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });
     if (expiration) params.set("expiration", expiration);
@@ -1560,7 +1292,7 @@ async function refreshInBackground(loadId) {
     // 后端在标的没有挂牌期权时只写现货快照：走现货渲染分支，避免页面一直停在“后台刷新中”。
     if (refreshResult?.quote_only) { await loadQuoteOnly(loadId); return; }
     if (refreshResult?.skipped) {
-      $("last-status").textContent = `本地快照 ${formatTime(refreshResult.fetched_at)} 已是最新（${Math.round(Number(refreshResult.age_seconds) || 0)} 秒前）`;
+      state.view.lastStatus = `本地快照 ${formatTime(refreshResult.fetched_at)} 已是最新（${Math.round(Number(refreshResult.age_seconds) || 0)} 秒前）`;
       return;
     }
     if (!state.expiration && refreshResult?.expiration) {
@@ -1593,13 +1325,13 @@ async function refreshInBackground(loadId) {
     }
     renderQuote(quote);
     renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);
-    $("last-status").textContent = `最近更新 ${formatTime(payload.fetched_at)}`;
+    state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
     syncPageQuery();
     refreshAnalysisWindow(loadId, payload, quote);
   } catch (error) {
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
-    $("last-status").textContent = `后台刷新失败，仍显示本地缓存（${error.message}）`;
-    if (!$("chain-body").querySelector("td:not(.empty)")) setError(error.message);
+    state.view.lastStatus = `后台刷新失败，仍显示本地缓存（${error.message}）`;
+    if (!state.view.chainRows.length) setError(error.message);
     // 失败原因通常是所选到期日已过期下架：拉一次最新到期日，必要时自动切换到可刷新的期限。
     state.refreshInFlight = null;
     const fresh = await request(`/api/expirations/${encodedSymbol}?refresh=true`).catch(() => null);
@@ -1638,8 +1370,8 @@ async function loadQuoteOnly(loadId) {
   state.expiration = null;
   showPending(symbol + " 没有挂牌期权（或可用期限已全部到期），仅显示现货行情");
   applyExpirations([], null, "无期权到期日");
-  $("data-source").textContent = "上游无期权数据";
-  $("last-status").textContent = "该标的没有期权合约，仅显示现货行情";
+  state.view.dataSource = "上游无期权数据";
+  state.view.lastStatus = "该标的没有期权合约，仅显示现货行情";
 }
 
 async function loadExpirations(loadId) {
@@ -1664,22 +1396,23 @@ async function loadChain(options = {}) {
 }
 
 async function loadSymbol() {
-  const symbol = $("symbol-input").value.trim().toUpperCase();
+  const symbol = (state.symbolInput || byId("symbol-input").value).trim().toUpperCase();
   if (!symbol) return;
-  $("symbol-input").value = symbol;
+  state.symbolInput = symbol;
   state.symbol = symbol;
   state.expiration = parsePageQuery(location.search).expiration || null;
   state.analysisReady = false;
   const loadId = ++state.loadId;
   setError("");
   applyCachedQuote(null);
-  $("last-status").textContent = "正在读取本地缓存…";
+  state.view.lastStatus = "正在读取本地缓存…";
   syncPageQuery();
   try {
     await loadExpirations(loadId);
   } catch (error) {
     if (!isCurrentLoad(loadId)) return;
-    $("expiration-select").innerHTML = "<option>加载失败</option>";
+    state.expirationOptions = [];
+    state.expirationPlaceholder = "加载失败";
     showPending("暂无数据");
     setError(error.message);
   }
@@ -1715,7 +1448,7 @@ async function switchExpiration(expiration) {
 
 // 载入按钮与输入框回车都改为真实跳转：地址栏即状态，刷新、前进后退与分享链接都能复现同一视图。
 function navigateToSymbol() {
-  const symbol = $("symbol-input").value.trim().toUpperCase();
+  const symbol = (state.symbolInput || byId("symbol-input").value).trim().toUpperCase();
   if (!symbol) return;
   if (!/^[A-Z0-9][A-Z0-9.-]{0,9}$/.test(symbol)) { setError(`标的代码 ${symbol} 无效`); return; }
   setError("");
@@ -1745,20 +1478,41 @@ async function refresh(silent = false) {
   }
 }
 
-$("load-button").addEventListener("click", navigateToSymbol); $("refresh-button").addEventListener("click", () => refresh(false)); $("expiration-select").addEventListener("change", (event) => { switchExpiration(event.target.value); }); $("symbol-input").addEventListener("keydown", (event) => { if (event.key === "Enter") navigateToSymbol(); }); $("chain-type-filter").addEventListener("change", (event) => { state.chainFilter = event.target.value; renderChainTable(); });
 initTheme();
+// Element UI 2.x 基于 Vue 2，必须在根实例创建前注册；静态库已经由 index.html 按依赖顺序加载。
+if (window.Vue && window.ELEMENT) Vue.use(ELEMENT);
+const optionScopeApp = new Vue({
+  el: "#app",
+  data: state,
+  computed: {
+    busy() { return this.loading || this.refreshing; },
+  },
+  methods: {
+    navigateToSymbol() { return navigateToSymbol(); },
+    refreshNow() { return refresh(false); },
+    expirationChanged() { return switchExpiration(this.expiration); },
+    filterChanged() { return renderChainTable(); },
+    toggleTheme() {
+      const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+      applyTheme(next);
+      try { localStorage.setItem(THEME_KEY, next); } catch (error) { /* 存储被禁用时保留当前页面主题。 */ }
+    },
+  },
+});
+window.optionScopeApp = optionScopeApp;
+// Vue 挂载会重建模板中的后代节点，折叠事件必须在根实例创建后绑定到最终 DOM 节点。
 initDetailGroup();
 initChainGroup();
 initChartGroup();
-setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false }); }, 1000);
+setInterval(() => { state.view.clock = new Date().toLocaleTimeString("zh-CN", { hour12: false }); }, 1000);
 // 容器尺寸与上次绘制不一致时按新尺寸重绘图表：窗口缩放、图表折叠组展开后都走这里。
 // 图表是按容器实际像素绘制的，隐藏状态下只能量到最小尺寸，所以展开后必须补一次重绘。
 function redrawChartsIfResized() {
   if (!state.lastAnalysis) return;
-  const charts = ["gex-chart", "levels-chart", "volume-chart", "oi-chart"].filter((id) => $(id).querySelector("svg"));
+  const charts = ["gex-chart", "levels-chart", "volume-chart", "oi-chart"].filter((id) => byId(id).querySelector("svg"));
   const changed = charts.some((id) => {
-    const box = chartContentBox($(id));
-    return String(box.width) !== $(id).dataset.chartWidth || String(box.height) !== $(id).dataset.chartHeight;
+    const box = OptionScopeCharts.chartContentBox(byId(id));
+    return String(box.width) !== byId(id).dataset.chartWidth || String(box.height) !== byId(id).dataset.chartHeight;
   });
   if (!changed) return;
   const { rows, spot, analysisPayload, expirationRows, ivModel, basis } = state.lastAnalysis;
@@ -1774,8 +1528,8 @@ window.addEventListener("resize", () => {
 const initialQuery = parsePageQuery(location.search);
 const initialAccessKey = initializeAccessKey();
 // 页面默认标的由服务端按 DEFAULT_SYMBOLS 注入到输入框，这里只在注入缺失时兜底。
-state.symbol = initialQuery.symbol || $("symbol-input").value.trim().toUpperCase() || "QQQ";
-$("symbol-input").value = state.symbol;
+state.symbol = initialQuery.symbol || byId("symbol-input").value.trim().toUpperCase() || "QQQ";
+state.symbolInput = state.symbol;
 if (accessKeyRequired() && !initialAccessKey) {
   showAccessDenied();
 } else {

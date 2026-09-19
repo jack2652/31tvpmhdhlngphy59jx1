@@ -475,7 +475,7 @@ def test_snapshot_service_refresh_and_api(tmp_path: Path):
         assert gamma.json()["expirations"] == ["2026-12-18"]
 
 def test_page_query_helpers_are_exported_in_frontend():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     assert "function parsePageQuery(search)" in source
     assert "function buildPageQuery(symbol, expiration, pathname)" in source
     assert "history.replaceState(null, \"\", next);" in source
@@ -483,8 +483,8 @@ def test_page_query_helpers_are_exported_in_frontend():
 
 
 def test_chart_tooltip_floats_above_chart_container():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/charts.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 数据卡用 bottom 锚定图表容器上沿，纵向不跟随鼠标，保证卡片停在图表外部上方。
     assert 'tooltip.style.top = "auto";' in source
     assert 'tooltip.style.bottom = `${targetRect.height + 4}px`;' in source
@@ -497,9 +497,9 @@ def test_chart_tooltip_floats_above_chart_container():
 
 def test_quote_price_follows_current_session():
     """现货现价按时段动态取值：盘前用盘前价、盘后/夜盘用盘后价、盘中用常规价；不再单列时段价格卡。"""
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 独立的盘后/盘前价格卡及其渲染、样式全部移除。
     assert "quote-sessions" not in page and "quote-sessions" not in source
     assert "renderSessions" not in source and "SESSION_LABELS" not in source
@@ -513,13 +513,13 @@ def test_quote_price_follows_current_session():
     assert "const change = active?.change_percent ?? quote?.change_percent;" in source
     # 时段标签映射与顶栏时段展示保留。
     assert 'const MARKET_STATE_LABELS = { PRE: "盘前", REGULAR: "正常交易", POST: "盘后", OVERNIGHT: "夜盘", CLOSED: "休市" };' in source
-    assert '$("market-state").textContent = marketStateLabel(quote?.market_state, "快照数据");' in source
+    assert 'state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");' in source
 
 
 def test_palette_uses_green_up_red_down_tokens():
     """全局涨跌配色：绿涨红跌，令牌按 --up / --down 语义命名，不再按颜色命名。"""
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 颜色令牌只在 :root 定义一次，旧的颜色命名令牌不残留。
     assert "--up:#19bd83" in styles and "--down:#f04d68" in styles
     assert "var(--green)" not in styles and "var(--red)" not in styles
@@ -533,14 +533,14 @@ def test_palette_uses_green_up_red_down_tokens():
     assert ".levels-panel-resistance .level-strike{color:var(--down)}" in styles
     assert ".levels-panel-support .level-strike{color:var(--up)}" in styles
     # 行情百分比：涨用 --up，跌用 --down，与全局口径保持一致。
-    assert '$("quote-change").style.color = change < 0 ? "var(--down)" : "var(--up)";' in source
+    assert 'state.view.quoteChangeColor = change == null ? "var(--muted)" : (change < 0 ? "var(--down)" : "var(--up)");' in source
 
 
 def test_theme_defaults_to_dark_with_light_override():
     """主题：默认黑夜模式，白天通过 data-theme="light" 覆盖，偏好写入 localStorage 记忆。"""
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     html = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 黑夜令牌定义在 :root（默认值），白天令牌挂在 data-theme="light" 上覆盖。
     assert ":root{color-scheme:dark;" in styles
     assert ':root[data-theme="light"]{color-scheme:light;' in styles
@@ -564,8 +564,8 @@ def test_theme_defaults_to_dark_with_light_override():
 def test_chain_table_drops_contract_column_and_price_columns():
     """期权链表格：去掉合约列与最新价/买价/卖价，类型并入行权价后共 7 列，数据单元格统一居中。"""
     html = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 表头去掉「合约」与「类型」（类型改由行权价文字颜色表达），共 7 列（<thead> 不计入）。
     assert "<th>合约</th>" not in html
     assert "<th>类型</th>" not in html
@@ -575,10 +575,10 @@ def test_chain_table_drops_contract_column_and_price_columns():
     assert "最新价" not in html and "买价" not in html and "卖价" not in html
     assert "row.last_price" not in source and "row.bid" not in source and "row.ask" not in source
     # 数据行不再渲染合约代码列。
-    assert "row.contract_symbol" not in source
+    assert 'key: row.contract_symbol ||' in source
     # 空态与数据行的 colspan 与列数一致。
     assert 'colspan="7"' in html
-    assert source.count('colspan="7"') == 2
+    assert html.count('colspan="7"') == 1
     # 期权链单元格统一居中（覆盖默认左对齐与 .num 的右对齐）。
     assert ".data-panel table th,.data-panel table td{text-align:center}" in styles
 
@@ -586,23 +586,24 @@ def test_chain_table_drops_contract_column_and_price_columns():
 def test_chain_rows_heat_up_by_volume_and_open_interest():
     """期权链：成交量与未平仓按本屏强弱铺底色（看涨绿 / 看跌红），并新增 GEX 数字列。"""
     html = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 表头新增 GEX 列，位置在 Gamma 与 IV（估）之间
     assert '<th class="num">Gamma</th>' in html
     assert html.index(">Gamma</th>") < html.index(">GEX</th>") < html.index(">IV（估）</th>")
     # 底色只覆盖成交量与未平仓两列，口径为「各自列本屏最大值」
     assert "function heatPercent(value, peak)" in source
-    assert "function heatCell(value, peak, label, hotLevel)" in source
+    assert "function heatCellModel(value, peak, label, hotLevel)" in source
     # 客户端只算 0~100 的相对强度，透明度区间交给 CSS 主题变量（黑夜里必须比白天更实，否则强弱看不出来）
     # 热点阈值按方向分开：绿底更亮，绿色格子更早换深色字（阈值取自两种字色的对比度交叉点）
     assert "const HEAT_HOT_LEVEL = { call: 68, put: 80 };" in source
-    assert "style=\"--heat:${percent}\"" in source
+    assert ':style="row.volumeStyle"' in html and ':style="row.interestStyle"' in html
+    assert 'style: percent == null ? "" : `--heat:${percent}`' in source
     assert "color-mix(in srgb,var(--heat-tone) calc((var(--heat-floor) + var(--heat-gain) * var(--heat) / 100) * 1%),transparent)" in styles
     assert "--heat-floor:10;--heat-gain:68;--heat-tone-up:#34e0a1;--heat-tone-down:#ff8fa0;--heat-ink:#06211a" in styles
     assert "--heat-floor:12;--heat-gain:70;--heat-tone-up:#0f9d6a;--heat-tone-down:#d92b4b;--heat-ink:#0b241b" in styles
-    assert 'heatCell(row.volume, volumePeak, "成交量", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put)' in source
-    assert 'heatCell(row.open_interest, interestPeak, "未平仓", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put)' in source
+    assert 'heatCellModel(row.volume, volumePeak, "成交量", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put)' in source
+    assert 'heatCellModel(row.open_interest, interestPeak, "未平仓", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put)' in source
     assert "const volumePeak = Math.max(0, ...rows.map((row) => Number(row.volume) || 0));" in source
     assert "const interestPeak = Math.max(0, ...rows.map((row) => Number(row.open_interest) || 0));" in source
     # GEX 与 Gamma 敞口图同口径（模型 Gamma × 未平仓 × 100 × 现价² × 0.01），按中文单位展示
@@ -613,7 +614,7 @@ def test_chain_rows_heat_up_by_volume_and_open_interest():
     assert "看涨为正、看跌为负" in html
     # 图例给出归一基准，等待数据时复位
     assert 'id="chain-heat-note"' in html
-    assert '$("chain-heat-note").textContent = "等待数据";' in source
+    assert 'state.view.chainHeatNote = "等待数据";' in source
     assert "function chainHeatNote(volumePeak, interestPeak)" in source
     # 配色走主题令牌，白天/黑夜自动适配；热点格文字换深色墨色，保证亮底上仍然读得清
     assert ".chain-call .chain-heat{--heat-tone:var(--heat-tone-up)}" in styles
@@ -624,13 +625,13 @@ def test_chain_rows_heat_up_by_volume_and_open_interest():
 def test_chain_type_filter_select():
     """期权链：类型筛选下拉框（全部 / 看涨 / 看跌），切换后只重绘表格且底色按当前显示的行归一。"""
     html = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 下拉框放在期权链面板标题右侧，三个选项齐全
     assert 'id="chain-type-filter"' in html
-    assert '<option value="all">全部</option>' in html
-    assert '<option value="call">看涨</option>' in html
-    assert '<option value="put">看跌</option>' in html
+    assert '<el-option value="all" label="全部"></el-option>' in html
+    assert '<el-option value="call" label="看涨"></el-option>' in html
+    assert '<el-option value="put" label="看跌"></el-option>' in html
     assert html.index('id="chain-title"') < html.index('id="chain-type-filter"') < html.index('id="chain-body"')
     # 选项文案与状态键走同一份常量，避免两边写错
     assert 'const CHAIN_FILTERS = { all: "全部", call: "看涨", put: "看跌" };' in source
@@ -638,7 +639,8 @@ def test_chain_type_filter_select():
     # 切换筛选只重绘表格：保留最近一次链数据，不重新请求接口
     assert "function renderChainTable()" in source
     assert 'state.chainRows = rows; state.chainSpot = quote?.price ?? null;' in source
-    assert 'state.chainFilter = event.target.value; renderChainTable();' in source
+    assert 'v-model="chainFilter"' in html and '@change="filterChanged"' in html
+    assert 'filterChanged() { return renderChainTable(); }' in source
     # 归一基准跟着当前显示的行走
     assert 'const shown = state.chainFilter === "all" ? rows : rows.filter((row) => row.contract_type === state.chainFilter);' in source
     # 筛选框属于表格工具条：整块放在折叠区里（收起时随内容一起隐藏），并与表格左侧对齐
@@ -648,13 +650,16 @@ def test_chain_type_filter_select():
     assert ".panel-tools" not in styles and ".panel-tools" not in html
     assert ".chain-filter{display:flex;align-items:center;gap:8px" in styles
     assert ".chain-filter select{min-width:0;height:30px" in styles
+    assert ".chain-filter .el-select .el-input__inner{height:30px;border:1px solid var(--field-line);background:var(--field);color:var(--text);font:inherit}" in styles
+    assert 'class="chain-filter"><span class="chain-filter-label">类型</span><el-select' in html
+    assert '<label class="chain-filter">' not in html
 
 
 def test_chain_panel_expands_by_default():
     """期权链面板：表格与图例默认展开；标题行（标的 · 到期日）与右侧状态栏始终可见。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 折叠按钮挂在标题行左侧（caret + 展开/收起），受控内容是包住工具栏、表格与图例的 chain-fold
     assert 'id="chain-toggle" type="button" aria-expanded="true" aria-controls="chain-fold"' in page
     assert 'id="chain-action"' in page
@@ -677,7 +682,7 @@ def test_chain_panel_expands_by_default():
     # 通用实现按 storageKey 读写本次会话的偏好
     assert "sessionStorage.getItem(storageKey)" in source and "sessionStorage.setItem(storageKey" in source
     # 标题行右侧是数据来源与快照时间，点它不折叠
-    assert 'shouldIgnore: (event) => Boolean(event.target.closest(".panel-status")),' in chain_group
+    assert 'shouldIgnore: (event) => Boolean(closestElement(event.target, ".panel-status")),' in chain_group
     # 样式：hidden 生效；分隔线从标题行挪到内容体上，收起时不会出现双层边框
     assert ".chain-fold[hidden]{display:none}" in styles
     assert ".chain-fold{border-top:1px solid var(--line)}" in styles
@@ -689,8 +694,8 @@ def test_chain_panel_expands_by_default():
 def test_chart_group_collapses_but_defaults_expanded():
     """图表折叠组：Gamma 敞口 / 压力位·支撑位 / 成交量分布 / 持仓量分布四张图，默认展开。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 四张图整块包进一个折叠组，标题栏给出四张图的名字
     assert 'id="chart-group"' in page
     assert 'id="chart-toggle" type="button" aria-expanded="true" aria-controls="chart-fold"' in page
@@ -715,16 +720,29 @@ def test_chart_group_collapses_but_defaults_expanded():
     assert ".chart-fold .analysis-grid{margin-bottom:0}" in styles
 
 
+def test_fold_handlers_bind_after_vue_mount():
+    """折叠事件必须绑定在 Vue 挂载之后，避免 Vue 重建模板节点时丢失原生监听器。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    mount = source.index("const optionScopeApp = new Vue({")
+    mounted = source.index("window.optionScopeApp = optionScopeApp;")
+    assert mounted > mount
+    assert source.index("initDetailGroup();", mounted) > mounted
+    assert source.index("initChainGroup();", mounted) > mounted
+    assert source.index("initChartGroup();", mounted) > mounted
+    assert "function closestElement(target, selector)" in source
+
+
 def test_chain_strike_column_carries_contract_type():
     """期权链：类型列并入行权价——行权价文字看涨绿、看跌红，仍保持加粗。"""
     html = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 表头不再有类型列，行权价是首列
     assert "<th>类型</th>" not in html
     assert html.index(">行权价</th>") < html.index(">成交量</th>")
     # 行权价单元格同时带 chain-strike 与看涨/看跌类，颜色由后者决定
-    assert '<td class="num chain-strike ${isCall ? "type-call" : "type-put"}">${formatMoney(row.strike)}</td>' in source
+    assert 'typeClass: isCall ? "type-call" : "type-put"' in source
+    assert 'strike: formatMoney(row.strike)' in source
     # 旧的类型列样式与单元格类已清掉（注意 chain-type-filter 是筛选下拉框，不受影响）
     assert 'class="chain-type' not in source and "td.chain-type" not in styles
     # 行权价保留加粗；取色规则必须盖过 td:first-child 的蓝色强调
@@ -737,13 +755,14 @@ def test_chain_strike_column_carries_contract_type():
 
 
 def test_charts_render_in_container_pixels_for_mobile():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    charts = Path("app/static/common/js/charts.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # viewBox 按容器像素绘制（1:1），手机窄屏不会把柱子和坐标文字整体等比缩小。
-    assert "function chartContentBox(target)" in source
-    assert "const { width, height } = chartContentBox(target);" in source
-    assert "target.dataset.chartWidth = String(width);" in source
+    assert "function chartContentBox(target)" in charts
+    assert "const { width, height } = chartContentBox(target);" in charts
+    assert "target.dataset.chartWidth = String(width);" in charts
     # 横轴刻度数量按可用宽度自适应，避免窄屏标签重叠。
-    assert "Math.floor(innerWidth / 84)" in source
+    assert "Math.floor(innerWidth / 84)" in charts
     # 窗口尺寸变化（含手机横竖屏切换）后按新尺寸重绘。
     assert 'window.addEventListener("resize"' in source
     assert "renderAnalysis(rows, spot, analysisPayload, expirationRows || [], ivModel || {}, basis || null);" in source
@@ -853,7 +872,7 @@ def test_expirations_endpoint_hides_expired_dates(tmp_path: Path):
 
 
 def test_volume_and_open_interest_charts_mark_peak_strikes():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8") + Path("app/static/common/js/charts.js").read_text(encoding="utf-8")
     # 成交量、持仓量图分别标注最高看涨柱与最高看跌柱，样式与看涨墙/看跌墙一致
     # 峰值同样取所选到期日的分布数据（与柱状图口径一致）
     assert 'maxPoint(points, "callVolume")' in source
@@ -924,7 +943,7 @@ def test_chain_and_gamma_endpoints_expose_open_interest_fallback(tmp_path: Path)
 
 
 def test_open_interest_fallback_is_surfaced_in_frontend():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 回溯只展示到日期，期权链来源标签与 Gamma 范围角标都要标注，避免把回溯值当成实时未平仓量
     assert "function formatDay(value)" in source
     assert "payload.oi_fallback" in source
@@ -933,7 +952,7 @@ def test_open_interest_fallback_is_surfaced_in_frontend():
 
 
 def test_symbol_load_navigates_via_url():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 载入按钮与输入框回车都走真实跳转：地址栏即状态，刷新/前进后退/分享链接都能复现同一视图
     assert "function navigateToSymbol()" in source
     # 换标的时清空 URL 里的到期日参数，统一回到列表第一个（最近）到期日；同标的重复载入保留当前选择
@@ -943,14 +962,14 @@ def test_symbol_load_navigates_via_url():
     assert "location.reload()" in source
     # 到期日列表加载后，URL 未指定或指定的日期不在列表里时回退到第一个（最近）到期日
     assert "state.expiration = unique.includes(requested) ? requested : unique[0];" in source
-    assert '$("load-button").addEventListener("click", navigateToSymbol)' in source
-    assert 'if (event.key === "Enter") navigateToSymbol();' in source
+    assert '@click="navigateToSymbol"' in Path("app/static/index.html").read_text(encoding="utf-8")
+    assert '@keyup.enter.native="navigateToSymbol"' in Path("app/static/index.html").read_text(encoding="utf-8")
     # 载入不再走页内切换，避免两套入口行为不一致
     assert '$("load-button").addEventListener("click", loadSymbol)' not in source
 
 
 def test_gex_values_use_chinese_units():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8") + Path("app/static/common/js/charts.js").read_text(encoding="utf-8")
     # GEX 内部按「百万美元」存储，展示时统一换算成「亿 / 万」，不再出现英文 M
     assert "function formatGex(value, digits = 2)" in source
     assert "${formatNumber(absolute / 100, digits)}亿" in source
@@ -964,7 +983,7 @@ def test_gex_values_use_chinese_units():
 
 
 def test_distribution_charts_match_reference_layout():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8") + Path("app/static/common/js/charts.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     # 成交量/持仓量图启用右轴、五档刻度与十字光标取值标签
     assert 'axis: "right", crosshairTags: true, valueLabel: "成交量"' in source
@@ -984,7 +1003,8 @@ def test_distribution_charts_match_reference_layout():
 
 
 def test_levels_chart_panel_sits_beside_gamma():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/charts.js").read_text(encoding="utf-8")
+    app_source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     # 新增的压力位/支撑位柱状图面板紧跟在 Gamma 敞口之后，两者同一行左右排布
     assert 'id="levels-chart"' in page and 'id="levels-basis"' in page
@@ -994,12 +1014,12 @@ def test_levels_chart_panel_sits_beside_gamma():
     assert 'id="resistance-levels"' in page and 'id="support-levels"' in page
     assert "function renderLevelsChart(" in source
     assert "renderLevelsChart(payload)" in source
-    assert "renderLevelsChart(null)" in source
+    assert "renderLevelsChart(null)" in app_source
 
 def test_support_panel_sits_left_of_resistance():
     """支撑位在左、压力位在右；区间按买入/卖出提示配色，换位置不会串色。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     assert page.index('id="support-levels"') < page.index('id="resistance-levels"')
     assert ".levels-panel-resistance .level-strike{color:var(--down)}" in styles
     assert ".levels-panel-support .level-strike{color:var(--up)}" in styles
@@ -1059,14 +1079,14 @@ def test_chain_and_gamma_endpoints_expose_model_iv(tmp_path: Path):
 
 
 def test_analysis_panels_share_selected_expiration():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # Gamma 敞口与两张分布图统一只统计上方所选到期日
     assert "function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivModel = {}, basis = null)" in source
     assert "const points = aggregateByStrike(expirationRows, spot);" in source
     assert "renderAnalysis(analysisRows, quote?.price, analysisPayload, rows, payload.iv_model || {}, activeBasis(quote));" in source
     assert '`到期日 ${state.expiration || "--"} · ${expirationRows.length} 个合约`' in source
-    assert 'renderDistributionSummary($("volume-summary"), expirationRows, spot, "volume", "总成交量");' in source
-    assert 'renderDistributionSummary($("oi-summary"), expirationRows, spot, "open_interest", "总持仓量");' in source
+    assert 'OptionScopeCharts.renderDistributionSummary(byId("volume-summary"), expirationRows, spot, "volume", "总成交量");' in source
+    assert 'OptionScopeCharts.renderDistributionSummary(byId("oi-summary"), expirationRows, spot, "open_interest", "总持仓量");' in source
     assert 'renderSignedChart("gex-chart", points' in source
     assert 'renderSignedChart("volume-chart", points' in source
     assert 'renderSignedChart("oi-chart", points' in source
@@ -1122,7 +1142,7 @@ def test_refresh_requests_provider_after_fresh_window(tmp_path: Path):
 
 
 def test_refresh_button_reads_sqlite_before_hitting_upstream():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 刷新入口先读 SQLite 判断新鲜度，只有过期才请求上游接口，并用 state.refreshing 拦截连点。
     assert "if (state.refreshing) return;" in source
     assert "function isSnapshotFresh(snapshot)" in source
@@ -1130,7 +1150,8 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     assert "if (isSnapshotFresh(snapshot)) { showFreshStatus(snapshot); return; }" in source
     assert 'const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });' in source
     assert "if (refreshResult?.skipped)" in source
-    assert '$("refresh-button").disabled = state.refreshing;' in source
+    assert '@click="refreshNow"' in Path("app/static/index.html").read_text(encoding="utf-8")
+    assert ':disabled="refreshing"' in Path("app/static/index.html").read_text(encoding="utf-8")
     assert "setInterval(() => refresh(true), AUTO_REFRESH_SECONDS * 1000);" in source
     # 跨期限 Gamma 窗口刷新改为后台任务，表格渲染完成后不再等待窗口。
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
@@ -1140,6 +1161,14 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     assert "if (state.refreshInFlight === symbol) return;" in source
     assert "await loadChain({ loadId, refresh: true });" in source
     assert 'id="refresh-note"' in Path("app/static/index.html").read_text(encoding="utf-8")
+
+
+def test_refresh_toolbar_places_note_before_button_and_uses_blue_hover():
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
+    toolbar = page[page.index('<div class="toolbar-actions">') : page.index('</div>', page.index('<div class="toolbar-actions">'))]
+    assert toolbar.index('id="refresh-note"') < toolbar.index('id="refresh-button"')
+    assert ".toolbar-actions .el-button.secondary.el-button--button:hover,.toolbar-actions .el-button.secondary.el-button--button:focus{border-color:var(--blue);background:var(--blue);color:var(--on-blue)}" in styles
 
 
 def test_symbol_without_expirations_falls_back_to_quote_only(tmp_path: Path):
@@ -1203,7 +1232,7 @@ def test_refresh_endpoint_returns_quote_only_without_expirations(tmp_path: Path)
 
 
 def test_frontend_loads_symbol_without_cached_expiration():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 首次载入一个从未抓过的标的时本地没有到期日：必须继续走到后台回源，否则页面永远停在无数据状态。
     assert "if (!state.expiration) return;" not in source
     assert "async function loadExpirations(loadId)" in source
@@ -1217,7 +1246,7 @@ def test_frontend_loads_symbol_without_cached_expiration():
 
 
 def test_zero_gamma_scan_reuses_expiry_cache():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 到期日时间戳按到期日缓存：扫描十几万次时重复构造 Date/Intl 会占满主线程。
     assert "const expiryCache = new Map();" in source
     assert "if (expiryCache.has(expiration)) return expiryCache.get(expiration);" in source
@@ -1231,9 +1260,9 @@ def test_zero_gamma_scan_reuses_expiry_cache():
 
 def test_support_and_resistance_panels_render_ten_levels():
     """压力位/支撑位面板：各 10 条，以基准价（默认盘后价）上下分侧取持仓最集中的行权价。"""
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     assert "const LEVEL_COUNT = 10;" in source
     assert "function pickLevels(points, spot, side, valueOf, count = LEVEL_COUNT)" in source
     assert 'side === "above" ? point.strike >= spot : point.strike <= spot' in source
@@ -1244,7 +1273,7 @@ def test_support_and_resistance_panels_render_ten_levels():
     # 逐条渲染 行权价 / 距现价 / 排序口径数值，离现价近的在前；同一段价位不重复占用名额。
     assert "return picked.sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot));" in source
     assert "if (picked.some((item) => Math.abs(item.strike - point.strike) < minGap)) continue;" in source
-    assert '<div class="level-row level-head"><span>行权价</span><span>距现价</span>' in source
+    assert '<div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span>' in page
     assert "renderLevels(points, spot);" in source
     assert 'id="resistance-levels"' in page
     assert 'id="support-levels"' in page
@@ -1255,16 +1284,17 @@ def test_support_and_resistance_panels_render_ten_levels():
     # 结果逐条展示组成该价位的因子标签；接口不可用时退回上面的单因子口径。
     assert "function loadFactorLevels(points, spot)" in source
     assert "function renderFactorLevels(payload)" in source
-    assert "function renderFactorRows(target, levels, spot)" in source
+    assert "function buildFactorViews(levels, spot, side, isAdd = false)" in source
     assert "function levelTooltipText(level, score, strengthTag)" in source
     assert "function levelDetailText(level)" in source
-    assert "function renderLevelDetailRow(detailText, strengthTag, side)" in source
+    assert 'class="level-note-row"' in page
     assert "function levelStrengthIntensity(level)" in source
     assert "level-strength-${levelStrengthIntensity(level)}" in source
-    assert 'class="level-note-row"' in source
-    assert 'class="level-note-content"' in source
-    assert 'class="level-note-strength level-note-strength-${side}"' in source
-    assert 'class="level-note-divider"> · </span>' in source
+    assert 'class="level-note-row"' in page
+    assert 'class="level-note-content"' in page
+    assert 'class="level-note-strength level-note-strength-support"' in page
+    assert 'class="level-note-strength level-note-strength-resistance"' in page
+    assert 'class="level-note-divider"> · </span>' in page
     assert 'const prefix = Number.isFinite(representative) && representative > 0 ? `代表价 ${formatMoney(representative)} · ` : "";' in source
     assert "历史回踩：暂无样本" in source
     assert "request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}&spot=${encodeURIComponent(spot)}`)" in source
@@ -1275,8 +1305,8 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert "renderAnalysis(analysisRows, quote?.price, analysisPayload, rows, payload.iv_model || {}, activeBasis(quote));" in source
     # 到达概率列位于「距现价」与「综合依据」之间，四列布局。
     assert "function formatProbability(value)" in source
-    assert '<span>距现价</span><span title="在所选到期日之前触及该价位的概率' in source
-    assert "level-prob" in source
+    assert '<span>距现价</span><span title="在所选到期日之前触及该价位的概率' in page
+    assert "level-prob" in page
     assert ".level-factor-row,.level-plan-row{grid-template-columns:minmax(0,1.25fr) minmax(0,.85fr) minmax(0,.85fr) minmax(0,1.35fr);column-gap:0}" in styles
     assert ".level-factor-row>span,.level-plan-row>span{min-width:0;padding-inline:8px;text-align:center!important}" in styles
     assert ".level-factor-row>span+span,.level-plan-row>span+span{border-left:1px solid var(--row-line)}" in styles
@@ -1473,7 +1503,21 @@ def test_level_history_validation_requires_hold_samples():
     assert validated["history_samples"] == 3
     assert validated["history_hold_rate"] == pytest.approx(1.0)
     assert validated["history_break_rate"] == pytest.approx(0.0)
-    assert validated["strength_tier"] == "strong"
+    assert validated["history_adjusted_hold_rate"] == pytest.approx(0.8333)
+    assert validated["history_adjusted_break_rate"] == pytest.approx(0.1667)
+    assert validated["history_confidence"] == pytest.approx(0.5)
+    assert validated["strength_tier"] == "reinforced"
+
+    enough_samples = {
+        **level,
+        "history_samples": 8,
+        "history_hold_rate": 0.875,
+        "history_break_rate": 0.125,
+        "history_adjusted_hold_rate": 0.75,
+        "history_adjusted_break_rate": 0.25,
+        "history_confidence": 8 / 11,
+    }
+    assert level_strength_tier(enough_samples) == "strong"
 
     insufficient = annotate_level_history([dict(level)], bars[:8], "support")[0]
     assert insufficient["strength_tier"] == "reinforced"
@@ -1503,6 +1547,22 @@ def test_recent_reaction_reinforces_multifactor_level_without_making_it_strong()
     }
     assert level_strength_tier(recent) == "reinforced"
     assert level_strength_tier({**recent, "factors": ["筹码密集"], "recent_reactions": 2}) == "normal"
+
+
+def test_level_history_uses_atr_available_at_each_historical_touch():
+    """历史验证：后续极端波动不能改写早期触及时的突破阈值。"""
+    bars = []
+    for _ in range(5):
+        bars.append({"high": 98, "low": 97, "close": 97.5, "volume": 1000})
+    bars.append({"high": 101, "low": 99, "close": 100.5, "volume": 1000})
+    # 早期触及后的低点已经跌破区域下沿；后续日线的巨大波动只用于制造未来 ATR 干扰。
+    bars.append({"high": 100, "low": 98, "close": 98.5, "volume": 1000})
+    for _ in range(14):
+        bars.append({"high": 120, "low": 110, "close": 115, "volume": 1000})
+    level = {"price": 100.0, "zone_low": 99.0, "zone_high": 101.0, "score": 0.8, "factors": ["筹码密集", "看跌持仓"]}
+    validated = annotate_level_history([level], bars, "support")[0]
+    assert validated["history_samples"] == 1
+    assert validated["history_break_rate"] == pytest.approx(1.0)
 
 
 def test_split_support_plan_prefers_deeper_quality_levels_for_add():
@@ -1768,9 +1828,9 @@ def test_build_levels_exposes_trend_and_plan():
 
 
 def test_trading_plan_panels_render_under_headline():
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 趋势通道 + 加仓价位 + 支撑/压力位四个面板紧跟在标的现货（headline-grid）之后
     assert page.index('id="quote-price"') < page.index('id="trend-body"')
     assert 'id="buy-levels"' not in page and 'id="sell-levels"' not in page
@@ -1781,7 +1841,7 @@ def test_trading_plan_panels_render_under_headline():
     assert page.index('id="support-levels"') < page.index('id="levels-chart"')
     assert page.index('id="levels-chart"') < page.index('id="chain-body"')
     assert "function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null)" in source
-    assert "function renderPlanRows(target, levels, spot)" in source
+    assert "function renderPlanRows(levels, spot)" in source
     assert "function renderPlan(plan, spot)" in source
     assert "const PLAN_COUNT = 10;" in source
     assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);" in source
@@ -1791,8 +1851,8 @@ def test_trading_plan_panels_render_under_headline():
     assert '"近期最佳买入点"' in source and '"近期最佳卖出点"' in source
     assert "未来 5 个交易日" in source
     assert "未来 5 个交易日（约 1 周）" not in source
-    assert "<div class=\"trend-opportunities\">${opportunityRows}</div>" in source
-    assert 'class="trend-layout"' in source and 'class="trend-core"' in source and 'class="trend-side"' in source
+    assert 'class="trend-opportunities"' in page
+    assert 'class="trend-layout"' in page and 'class="trend-core"' in page and 'class="trend-side"' in page
     assert "formatLevelRange(point)" in source and "formatProbability(point.confidence)" in source
     assert ".trend-opportunity.buy strong{color:var(--up)}" in styles
     assert ".trend-opportunity.sell strong{color:var(--down)}" in styles
@@ -1807,8 +1867,8 @@ def test_trading_plan_panels_render_under_headline():
     assert ".trend-side>.trend-meta{flex:1;min-height:40px}" in styles
     assert ".trend-core .trend-meta{flex:1;min-height:40px}" in styles
     assert ".trend-panel{display:flex;flex-direction:column;min-height:0}" in styles
-    assert "trend-signal" in source
-    assert 'trend.label}<span class="trend-action"> · ${recommendation.label' in source
+    assert 'class="trend-signal"' in page
+    assert '<strong class="trend-label">{{ view.trend.label }}<span v-if="view.trend.action" class="trend-action"> · {{ view.trend.action }}</span></strong>' in page
     assert ".trend-signal.up .trend-label{color:var(--up)}" in styles
     assert ".trend-signal.down .trend-label{color:var(--down)}" in styles
     assert ".trend-signal .trend-action{font-size:inherit}" in styles
@@ -1822,17 +1882,17 @@ def test_trading_plan_panels_render_under_headline():
 
 def test_trading_plan_rows_expose_composite_basis_column():
     """加仓价位表显示「综合依据」列，不再只藏在悬停提示里。"""
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     plan_section = source[source.index("function renderPlanRows("):source.index("function renderPlan(")]
-    assert "<span>综合依据</span>" in plan_section
-    assert '<span class="level-factors"><span class="level-factor-text">${factors}</span></span>' in plan_section
-    assert "renderLevelDetailRow(detailText, strengthTag, \"support\")" in plan_section
-    assert "level-plan-row" in plan_section
-    assert "levelStrengthTag(level, \"support\", true)" in plan_section
+    assert "buildFactorViews(levels, spot, \"support\", true)" in plan_section
+    assert '<span>综合依据</span>' in page
+    assert 'class="level-factors"><span class="level-factor-text">{{ level.factors }}</span>' in page
+    assert 'class="level-factors"><span v-if="level.strengthTag" class="level-strength-badge' not in page
+    assert "level-plan-row" in page
     # 加仓表使用统一渲染函数，买入/卖出改由支撑位/压力位面板展示
-    assert 'renderPlanRows($("add-levels"), plan?.add || [], price);' in source
+    assert 'renderPlanRows(plan?.add || [], price);' in source
     # 表头与数据行统一四列，避免距现价、触及概率、综合依据错位
     assert ".level-factor-row,.level-plan-row{grid-template-columns:minmax(0,1.25fr) minmax(0,.85fr) minmax(0,.85fr) minmax(0,1.35fr);column-gap:0}" in styles
     assert ".level-factor-row>span,.level-plan-row>span{min-width:0;padding-inline:8px;text-align:center!important}" in styles
@@ -1934,7 +1994,7 @@ def test_price_extremes_splits_52_week_and_all_time():
 
 def test_trend_channel_renders_extremes_rows():
     """趋势通道面板：新增 52 周与历史最高/最低四行，数据来自 /api/levels 的 extremes。"""
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     assert "function trendExtremeRows(extremes, spot)" in source
     for label in ("52周最高", "52周最低", "历史最高", "历史最低"):
         assert f'["{label}", extremes?.week52?.high]' in source or f'["{label}",' in source
@@ -1981,7 +2041,7 @@ def test_history_service_caches_extremes_separately(tmp_path: Path):
     # 日线历史走自己的周期，不会顺手把极值缓存顶掉
     service.bars("AAPL")
     assert service.extremes("AAPL")["source"] == "sqlite"
-    assert periods == ["max", "6mo"]
+    assert periods == ["max", "2y"]
 
 
 def test_extremes_degrade_when_provider_fails(tmp_path: Path):
@@ -2010,8 +2070,8 @@ def test_extremes_degrade_when_provider_fails(tmp_path: Path):
 def test_analysis_detail_group_collapses_by_default():
     """分析详情折叠面板：趋势通道 + 交易计划 + 压力位/支撑位包在一个默认折叠的分组里，点标题展开。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 分组从 detail-body 开始，把四张明细表面板（趋势通道 / 加仓价位 / 压力位支撑位）全包进去，
     # 图表区（gex-chart）仍在分组之外。
     assert page.index('id="analysis-detail"') < page.index('id="detail-body"')
@@ -2044,8 +2104,8 @@ def test_analysis_detail_group_collapses_by_default():
 def test_basis_price_switch_defaults_to_live():
     """基准价开关：实时价（默认）/ 盘后价两档，放在折叠组标题栏里，仅展开时显示。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 开关挂在标题栏（detail-header）里、位于内容体之前，初始隐藏（折叠态），默认按下「实时价」。
     assert page.index('id="detail-header"') < page.index('id="basis-live"') < page.index('id="detail-body"')
     assert 'id="detail-modes" hidden' in page
@@ -2068,11 +2128,11 @@ def test_basis_price_switch_defaults_to_live():
     assert "state.lastQuote = quote || null;" in source
     assert '${state.levelBasisMode}' in source
     # 开关只在展开时出现；点击开关不会连带折叠，点标题栏其它区域仍然折叠/展开。
-    assert 'const modes = $("detail-modes");' in source
+    assert 'const modes = byId("detail-modes");' in source
     assert "if (modes) modes.hidden = !expanded;" in source
-    assert 'const basisButton = event.target.closest("[data-basis]");' in source
+    assert 'const basisButton = closestElement(event.target, "[data-basis]");' in source
     # 开关容器里的空白点击不改折叠：ignore 回调里用 closest 命中 #detail-modes 就吃掉这次点击
-    assert 'return Boolean(event.target.closest("#detail-modes"));' in source
+    assert 'return Boolean(closestElement(event.target, "#detail-modes"));' in source
     # 样式：隐藏态生效 + 选中态用 --blue 实心。
     assert ".detail-modes[hidden]{display:none}" in styles
     assert ".detail-segmented{display:inline-flex;" in styles
@@ -2081,7 +2141,7 @@ def test_basis_price_switch_defaults_to_live():
 
 def test_expiration_switch_discards_stale_response():
     """到期日切换：请求在飞时禁用下拉框，旧期限的响应回来时整份作废，不覆盖后来切换的选择。"""
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 切换入口：拉链式 token + 立即禁用下拉框，并用加载中的期限去请求。
     assert "let expirationSwitchToken = 0;" in source
     assert "async function switchExpiration(expiration)" in source
@@ -2099,14 +2159,14 @@ def test_expiration_switch_discards_stale_response():
     assert "const EXPIRATION_SWITCH_TIMEOUT_MS = 20000;" in source
     assert "clearTimeout(releaseTimer);" in source
     # 旧的「静默重载」绑定已删除，切换只走 switchExpiration 一条路径。
-    assert 'switchExpiration(event.target.value);' in source
+    assert 'expirationChanged() { return switchExpiration(this.expiration); }' in source
     assert 'loadChain({ silent: true })' not in source
 
 
 def test_chain_header_matches_other_fold_groups():
     """期权链标题行：与「分析详情」「图表」两个折叠组同构 —— 左侧折叠按钮、右侧状态与展开/收起文案。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    styles = Path("app/static/styles.css").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 标题行复用同一个 .detail-header，三个折叠组外观与交互一致
     assert 'class="detail-header" id="chain-header"' in page
     header = page[page.index('id="chain-header"') : page.index('id="error-box"')]
@@ -2133,7 +2193,7 @@ def test_default_symbol_defaults_to_qqq(monkeypatch):
 def test_page_default_symbol_comes_from_server_config():
     """页面默认标的由服务端按 DEFAULT_SYMBOLS 注入，避免前后端默认值不一致。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     main = Path("app/main.py").read_text(encoding="utf-8")
     # 输入框与现货卡片都留占位符，等待服务端替换（占位符不留在前端脚本里）。
     assert page.count("__DEFAULT_SYMBOL__") == 2
@@ -2141,8 +2201,8 @@ def test_page_default_symbol_comes_from_server_config():
     assert '"__DEFAULT_SYMBOL__"' not in source
     assert 'page.replace("__DEFAULT_SYMBOL__", settings.default_symbols[0])' in main
     # 注入缺失时才走的前端兜底值同样是 QQQ。
-    assert '|| "QQQ"' in source
-    assert 'symbol: "QQQ"' in source
+    assert ' : "QQQ"' in source
+    assert 'symbol: defaultSymbol' in source
 
 
 def test_database_max_mb_parsing(monkeypatch):
@@ -2402,14 +2462,15 @@ def test_access_key_from_env(monkeypatch):
 
 def test_access_key_supports_browsers_with_disabled_storage():
     """浏览器禁用 localStorage/sessionStorage 时仍使用 URL key，不能让 URL 重写或 AJAX 丢凭证。"""
-    source = Path("app/static/app.js").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     assert "function currentAccessKey()" in source
     assert "sessionStorage.getItem(ACCESS_KEY_STORAGE)" in source
     assert "const accessKey = currentAccessKey();" in source
     assert "state.storageAvailable = storageWritable();" in source
     assert "function withAccessKey(path, accessKey)" in source
-    assert "fetch(withAccessKey(path, accessKey)" in source
+    assert "OptionScopeRequest.request(path, options" in source
+    assert "fetch(withAccessKey(path, accessKey)" not in source
     # URL key 存在时必须无条件写回内存，storage 写入失败也不能把它置空。
     assert "state.accessKey = queryKey;" in source
     # 首屏主题脚本也不能因为存储被禁用而抛错。

@@ -19,8 +19,8 @@ from app.services.snapshots import snapshot_age_seconds
 
 logger = logging.getLogger(__name__)
 
-# 回看周期：6 个月的日线足以覆盖摆动高低点、筹码分布和近期承接位。
-HISTORY_PERIOD = "6mo"
+# 回看周期：两年日线为候选形成窗口留出历史验证样本，避免用近期形成数据验证当前价位。
+HISTORY_PERIOD = "2y"
 # 极值回看周期：52 周与历史高低点需要全量日线，因此单独抓一次并缓存一天。
 EXTREMES_PERIOD = "max"
 # Beta 采用两年日线收益率，并按天缓存结果。

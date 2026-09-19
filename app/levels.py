@@ -69,12 +69,20 @@ LEVEL_HISTORY_LOOKAHEAD = 5
 LEVEL_HISTORY_MIN_SAMPLES = 3
 LEVEL_HISTORY_MIN_HOLD_RATE = 0.65
 LEVEL_HISTORY_MAX_BREAK_RATE = 0.25
+# 强位需要比“重点位”更多的历史触及样本，避免少量样本把颜色直接推到最强等级。
+LEVEL_HISTORY_STRONG_MIN_SAMPLES = 6
+LEVEL_HISTORY_STRONG_MIN_CONFIDENCE = 0.65
 LEVEL_HISTORY_BREAK_ATR = 0.25
 LEVEL_HISTORY_REBOUND_ATR = 0.25
 # 近期反应窗口约 2 个月；至少出现两次反弹才给“重点”提示，不升级为“强”位。
 LEVEL_RECENT_WINDOW_BARS = 45
 LEVEL_RECENT_MIN_SAMPLES = 2
 LEVEL_RECENT_MIN_REACTIONS = 2
+# 当前候选主要由最近 120 根日线形成；验证时留出这段数据，避免用形成候选的样本验证候选。
+LEVEL_HISTORY_FORMATION_BARS = max(FIB_WINDOW_BARS, CHIP_WINDOW_BARS, ABSORPTION_WINDOW_BARS)
+# 历史比例使用轻量 Beta 先验收缩，避免 3 次触及全部守住就显示成确定性结果。
+LEVEL_HISTORY_PRIOR_HOLD = 2.0
+LEVEL_HISTORY_PRIOR_BREAK = 1.0
 # 期权持仓：每侧取分量最大的执行价作为候选（不设阈值，GEX 高度集中在墙位时仍能凑齐价位）
 # 取值略大于 LEVEL_COUNT，保证「无历史行情、只按期权持仓」时也能凑齐每侧 10 条。
 OPTION_LIMIT = 12
@@ -745,6 +753,16 @@ def level_strength_tier(level: dict[str, Any]) -> str:
     if model_score < 0.55 or not _has_independent_level_evidence(factors):
         return "normal"
     samples = int(_number(level.get("history_samples")) or 0)
+    adjusted_hold_rate = _number(level.get("history_adjusted_hold_rate"))
+    adjusted_break_rate = _number(level.get("history_adjusted_break_rate"))
+    if adjusted_hold_rate is None:
+        adjusted_hold_rate = _number(level.get("history_hold_rate"))
+    if adjusted_break_rate is None:
+        adjusted_break_rate = _number(level.get("history_break_rate"))
+    confidence = _number(level.get("history_confidence"))
+    if confidence is None:
+        prior_total = LEVEL_HISTORY_PRIOR_HOLD + LEVEL_HISTORY_PRIOR_BREAK
+        confidence = samples / (samples + prior_total) if samples else 0.0
     if samples < LEVEL_HISTORY_MIN_SAMPLES:
         # 深层价位往往尚未被当前日线再次回踩；筹码密集、承接位或多因子共振仍保留重点色，
         # 但使用“重点”标签，明确它不是已经完成历史命中率验证的强位。
@@ -754,9 +772,14 @@ def level_strength_tier(level: dict[str, Any]) -> str:
             return "reinforced"
         return "normal"
     if score >= STRONG_LEVEL_SCORE:
-        hold_rate = _number(level.get("history_hold_rate")) or 0.0
-        break_rate = _number(level.get("history_break_rate")) or 0.0
-        if hold_rate >= LEVEL_HISTORY_MIN_HOLD_RATE and break_rate <= LEVEL_HISTORY_MAX_BREAK_RATE:
+        hold_rate = adjusted_hold_rate or 0.0
+        break_rate = adjusted_break_rate or 0.0
+        if (
+            samples >= LEVEL_HISTORY_STRONG_MIN_SAMPLES
+            and confidence >= LEVEL_HISTORY_STRONG_MIN_CONFIDENCE
+            and hold_rate >= LEVEL_HISTORY_MIN_HOLD_RATE
+            and break_rate <= LEVEL_HISTORY_MAX_BREAK_RATE
+        ):
             return "strong"
     # 最近约两个月如果同一价位至少两次出现反弹，说明当前仍有承接/抛压反应；
     # 这只给“重点”提示，不替代长期守住率验证，也不把它误称为强位。
@@ -774,50 +797,55 @@ def annotate_level_history(
     bars: Iterable[dict[str, Any]],
     side: str,
     lookahead: int = LEVEL_HISTORY_LOOKAHEAD,
+    exclude_recent: int = 0,
 ) -> list[dict[str, Any]]:
     """用历史日线评估候选区域被触及后的守住/跌破结果。
 
     这是当前数据条件下的历史反应统计，不是未来信息训练出的保证概率；
-    同一轮连续触及只计一次，避免横盘时重复放大样本。
+    同一轮连续触及只计一次，避免横盘时重复放大样本。调用方可以排除最近的候选形成窗口，
+    让验证只使用更早的留出数据。
     """
     items = list(levels)
     history = list(bars)
     horizon = max(int(lookahead), 1)
+    excluded = max(int(exclude_recent), 0)
+    validation_end = max(0, len(history) - excluded)
+
+    def set_empty_history(item: dict[str, Any], method: str) -> None:
+        item["history_samples"] = 0
+        item["history_hold_rate"] = None
+        item["history_break_rate"] = None
+        item["history_reaction_rate"] = None
+        item["history_adjusted_hold_rate"] = None
+        item["history_adjusted_break_rate"] = None
+        item["history_confidence"] = 0.0
+        item["validation_method"] = method
+        item["recent_samples"] = 0
+        item["recent_reactions"] = 0
+        item["recent_reaction_rate"] = None
+        item["strength_tier"] = level_strength_tier(item)
+
     atr = average_true_range(history)
-    if atr is None or atr <= 0 or len(history) <= horizon:
+    if atr is None or atr <= 0 or validation_end <= horizon:
         for item in items:
-            item["history_samples"] = 0
-            item["history_hold_rate"] = None
-            item["history_break_rate"] = None
-            item["history_reaction_rate"] = None
-            item["recent_samples"] = 0
-            item["recent_reactions"] = 0
-            item["recent_reaction_rate"] = None
-            item["strength_tier"] = level_strength_tier(item)
+            set_empty_history(item, "insufficient_history")
         return items
+    # 每个历史触及点只使用当日及之前的波动率，避免当前 ATR 把未来波动信息带回旧样本。
+    atr_by_index = [average_true_range(history[:index + 1]) for index in range(validation_end)]
 
     for item in items:
         zone_low = _number(item.get("zone_low"))
         zone_high = _number(item.get("zone_high"))
         center = _number(item.get("price"))
         if zone_low is None or zone_high is None or center is None or center <= 0:
-            item["history_samples"] = 0
-            item["history_hold_rate"] = None
-            item["history_break_rate"] = None
-            item["history_reaction_rate"] = None
-            item["recent_samples"] = 0
-            item["recent_reactions"] = 0
-            item["recent_reaction_rate"] = None
-            item["strength_tier"] = level_strength_tier(item)
+            set_empty_history(item, "invalid_level")
             continue
 
         samples = holds = breaks = 0
         reactions = 0
         sample_results: list[tuple[int, bool, bool]] = []
         last_touch = -horizon
-        break_buffer = max(atr * LEVEL_HISTORY_BREAK_ATR, center * MIN_ZONE_RATIO)
-        rebound_buffer = max(atr * LEVEL_HISTORY_REBOUND_ATR, center * MIN_ZONE_RATIO)
-        for index in range(0, len(history) - horizon):
+        for index in range(0, validation_end - horizon):
             if index - last_touch < horizon:
                 continue
             bar_low = _number(history[index].get("low"))
@@ -835,12 +863,15 @@ def annotate_level_history(
                 continue
             last_touch = index
             samples += 1
+            sample_atr = atr_by_index[index] or atr
+            sample_break_buffer = max(sample_atr * LEVEL_HISTORY_BREAK_ATR, center * MIN_ZONE_RATIO)
+            sample_rebound_buffer = max(sample_atr * LEVEL_HISTORY_REBOUND_ATR, center * MIN_ZONE_RATIO)
             if side == "support":
-                broken = min(future_lows) < zone_low - break_buffer
-                reacted = max(future_closes) >= center + rebound_buffer
+                broken = min(future_lows) < zone_low - sample_break_buffer
+                reacted = max(future_closes) >= center + sample_rebound_buffer
             else:
-                broken = max(future_highs) > zone_high + break_buffer
-                reacted = min(future_closes) <= center - rebound_buffer
+                broken = max(future_highs) > zone_high + sample_break_buffer
+                reacted = min(future_closes) <= center - sample_rebound_buffer
             if broken:
                 breaks += 1
             else:
@@ -855,7 +886,20 @@ def annotate_level_history(
         item["history_hold_rate"] = round(hold_rate, 4) if hold_rate is not None else None
         item["history_break_rate"] = round(break_rate, 4) if break_rate is not None else None
         item["history_reaction_rate"] = round((reactions / samples), 4) if samples else None
-        recent_cutoff = max(0, len(history) - LEVEL_RECENT_WINDOW_BARS)
+        prior_total = LEVEL_HISTORY_PRIOR_HOLD + LEVEL_HISTORY_PRIOR_BREAK
+        adjusted_hold_rate = (
+            (holds + LEVEL_HISTORY_PRIOR_HOLD) / (samples + prior_total)
+            if samples else None
+        )
+        adjusted_break_rate = (
+            (breaks + LEVEL_HISTORY_PRIOR_BREAK) / (samples + prior_total)
+            if samples else None
+        )
+        item["history_adjusted_hold_rate"] = round(adjusted_hold_rate, 4) if adjusted_hold_rate is not None else None
+        item["history_adjusted_break_rate"] = round(adjusted_break_rate, 4) if adjusted_break_rate is not None else None
+        item["history_confidence"] = round(samples / (samples + prior_total), 4) if samples else 0.0
+        item["validation_method"] = "holdout_price_action" if excluded else "in_sample_price_action"
+        recent_cutoff = max(0, validation_end - LEVEL_RECENT_WINDOW_BARS)
         recent_results = [result for result in sample_results if result[0] >= recent_cutoff]
         recent_samples = len(recent_results)
         recent_reactions = sum(1 for _, _, reacted in recent_results if reacted)
@@ -863,10 +907,13 @@ def annotate_level_history(
         item["recent_reactions"] = recent_reactions
         item["recent_reaction_rate"] = round(recent_reactions / recent_samples, 4) if recent_samples else None
         if samples:
-            # 样本少时只做有限修正，避免三次历史触及就完全覆盖多因子模型分数。
+            # 样本少时只做有限修正，并使用收缩后的比例，避免三次历史触及就完全覆盖多因子模型分数。
             historical_weight = min(0.25, samples / 20.0)
             base_score = _number(item.get("score")) or 0.0
-            empirical_score = max(0.0, min(1.0, (hold_rate or 0.0) * (1.0 - (break_rate or 0.0))))
+            empirical_score = max(
+                0.0,
+                min(1.0, (adjusted_hold_rate or 0.0) * (1.0 - (adjusted_break_rate or 0.0))),
+            )
             item["score"] = round(base_score * (1.0 - historical_weight) + empirical_score * historical_weight, 2)
         item["strength_tier"] = level_strength_tier(item)
     return items
@@ -979,8 +1026,18 @@ def build_levels(
         technical + put_levels, price, "below", volatility, years, support_weight, zone_width,
         limit=candidate_limit, merge_tolerance=merge_tolerance,
     )
-    resistance_all = annotate_level_history(resistance_all, bar_list, "resistance")
-    support_all = annotate_level_history(support_all, bar_list, "support")
+    resistance_all = annotate_level_history(
+        resistance_all,
+        bar_list,
+        "resistance",
+        exclude_recent=LEVEL_HISTORY_FORMATION_BARS,
+    )
+    support_all = annotate_level_history(
+        support_all,
+        bar_list,
+        "support",
+        exclude_recent=LEVEL_HISTORY_FORMATION_BARS,
+    )
     resistance = select_visible_levels(resistance_all, price, LEVEL_COUNT)
     support = select_visible_levels(support_all, price, LEVEL_COUNT)
     buy_levels, add_levels = split_support_plan(support_all, price)
@@ -997,6 +1054,11 @@ def build_levels(
         "recommendation": recommendation,
         "trade_points": trade_points,
         "trade_points_horizon": {"trading_days": TRADE_POINT_TRADING_DAYS, "label": "未来 5 个交易日"},
+        "history_validation": {
+            "method": "holdout_price_action",
+            "lookahead_bars": LEVEL_HISTORY_LOOKAHEAD,
+            "excluded_recent_bars": LEVEL_HISTORY_FORMATION_BARS,
+        },
         # 52 周与历史高低点来自全量日线（由 HistoryService 抓取并缓存后传入）。
         "extremes": extremes,
         # 交易计划：支撑候选平均分为买入位和加仓位，两侧各最多 10 条；压力位最多 10 条。
