@@ -1238,6 +1238,7 @@ def test_refresh_skips_upstream_when_snapshot_is_fresh(tmp_path: Path):
         assert body["expiration"] == "2026-12-18"
         assert body["fetched_at"]
         assert body["age_seconds"] < 60
+        assert body["quote"]["price"] == 200.5
 
 
 def test_refresh_requests_provider_after_fresh_window(tmp_path: Path):
@@ -1321,18 +1322,22 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     # 刷新入口先读 SQLite 判断新鲜度，只有过期才请求上游接口，并用 state.refreshing 拦截连点。
     assert "if (state.refreshing) return;" in source
     assert "function isSnapshotFresh(snapshot)" in source
+    assert "function quoteIsReady(quote)" in source
     assert "snapshot?.shown && snapshot?.quoteReady" in source
     assert "age !== null && age < SNAPSHOT_FRESH_SECONDS" in source
     assert "if (isSnapshotFresh(snapshot)) {" in source
     assert "showFreshStatus(snapshot);" in source
     assert 'const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });' in source
     assert "if (refreshResult?.skipped)" in source
+    assert "const snapshot = await renderSnapshot(loadId, refreshResult.quote || null);" in source
+    assert "let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;" in source
+    assert "?refresh=true`" in source
     assert '@click="refreshNow"' in Path("app/static/index.html").read_text(encoding="utf-8")
     assert ':disabled="refreshing"' in Path("app/static/index.html").read_text(encoding="utf-8")
     assert "setInterval(() => refresh(true), AUTO_REFRESH_SECONDS * 1000);" in source
     # 跨期限 Gamma 窗口刷新改为后台任务，表格渲染完成后不再等待窗口。
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
-    assert "refreshAnalysisWindow(loadId, payload, quote);" in source
+    assert "refreshAnalysisWindow(loadId, payload, resolvedQuote);" in source
     assert "async function latestSelectedChain(loadId, symbol, fallbackPayload)" in source
     assert "const selectedPayload = await latestSelectedChain(loadId, symbol, payload);" in source
     assert "?horizon_days=45&refresh=true" in source
@@ -1467,6 +1472,10 @@ def test_support_and_resistance_panels_render_ten_levels():
     # 多因子改造：页面改为请求后端合成接口（斐波那契 + 筹码密集 + 承接位 + 期权持仓），
     # 结果逐条展示组成该价位的因子标签；接口不可用时退回上面的单因子口径。
     assert "function loadFactorLevels(points, spot)" in source
+    assert "function renderFactorFallback(points, spot)" in source
+    assert "function requestFactorLevels(points, spot, key, attempt = 0)" in source
+    assert "state.levelsRetryTimer = setTimeout" in source
+    assert "renderFactorFallback(points, spot);" in source
     assert "function renderFactorLevels(payload)" in source
     assert "function buildFactorViews(levels, spot, side, isAdd = false)" in source
     assert "function levelTooltipText(level, score, strengthTag)" in source
@@ -2074,7 +2083,10 @@ def test_trading_plan_panels_render_under_headline():
     assert "未来 5 个交易日（约 1 周）" not in source
     assert 'class="trend-opportunities"' in page
     assert 'class="trend-layout"' in page and 'class="trend-core"' in page and 'class="trend-side"' in page
+    assert 'class="trend-meta trend-current-price" :title="view.trend.priceTitle"' in page
     assert "formatLevelRange(point)" in source and "formatProbability(point.confidence)" in source
+    assert 'const priceLabel = BASIS_MODES[state.levelBasisMode] || BASIS_MODES.live;' in source
+    assert 'price: validPrice ? formatMoney(displayedPrice) : "--"' in source
     assert ".trend-opportunity.buy strong{color:var(--up)}" in styles
     assert ".trend-opportunity.sell strong{color:var(--down)}" in styles
     assert ".trend-opportunity-label small{color:var(--muted)" in styles

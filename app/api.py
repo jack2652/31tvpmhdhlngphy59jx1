@@ -284,7 +284,13 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         """刷新一次快照；本地快照在 max_age 秒内时直接复用（skipped=True），不再请求上游接口。"""
         normalized = symbol(stock_symbol)
         try:
-            return snapshots.refresh(normalized, expiration, max_age_seconds=max_age)
+            result = snapshots.refresh(normalized, expiration, max_age_seconds=max_age)
+            # 刷新请求与页面的 quote 请求可能在弱服务器上出现先后顺序差异；
+            # 把本次最终快照里的行情一并返回，避免期权链已显示而现价仍停在占位符。
+            cached_quote = database.latest_quote(normalized)
+            if cached_quote:
+                result["quote"] = quote_response(cached_quote, "sqlite")
+            return result
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (ProviderError, RuntimeError) as exc:

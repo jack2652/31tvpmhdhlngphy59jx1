@@ -18,6 +18,7 @@ const state = {
   levelsWindowFetchedAt: null,
   levelsKey: "",
   levelsPayload: null,
+  levelsRetryTimer: null,
   chainFilter: "all",
   chainRows: [],
   chainSpot: null,
@@ -75,6 +76,9 @@ const state = {
       actionClass: "hold",
       reason: "",
       rows: [],
+      priceLabel: "实时价",
+      price: "--",
+      priceTitle: "等待数据",
       opportunities: [],
       extremes: [],
       note: "等待数据",
@@ -701,6 +705,45 @@ function renderLevels(points, spot) {
   renderPlan({ add: planSupportSeries.slice(planSplit, planSplit + PLAN_COUNT) }, price);
 }
 
+// 综合接口还在计算时，先用已经拿到的当前期限期权分布填充基础价位和图表，避免首屏整块留空。
+// 综合结果回来后会覆盖这份临时结果；已有结果时保留旧值，避免刷新过程中闪回空状态。
+function renderFactorFallback(points, spot) {
+  const hasVisibleLevels = Boolean(
+    state.view.levels.support.length
+    || state.view.levels.resistance.length
+    || state.view.levels.add.length
+    || state.view.trend.available
+  );
+  if (!hasVisibleLevels) renderLevels(points, spot);
+}
+
+function requestFactorLevels(points, spot, key, attempt = 0) {
+  const encodedSymbol = encodeURIComponent(state.symbol);
+  const encodedExpiration = encodeURIComponent(state.expiration);
+  const numericSpot = Number(spot);
+  const spotQuery = Number.isFinite(numericSpot) && numericSpot > 0
+    ? `&spot=${encodeURIComponent(numericSpot)}`
+    : "";
+  request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}`)
+    .then((payload) => {
+      if (state.levelsKey !== key) return; // 期间切换了标的、期限或快照，丢弃过期结果
+      state.levelsPayload = payload;
+      renderFactorLevels(payload);
+    })
+    .catch(() => {
+      if (state.levelsKey !== key) return;
+      state.levelsPayload = null;
+      renderFactorFallback(points, spot);
+      // 首次历史数据可能仍在上游或 SQLite 写入链路中，短暂失败时只补一次，避免反复请求。
+      if (attempt >= 1) return;
+      clearTimeout(state.levelsRetryTimer);
+      state.levelsRetryTimer = setTimeout(() => {
+        state.levelsRetryTimer = null;
+        if (state.levelsKey === key) requestFactorLevels(points, spot, key, attempt + 1);
+      }, 1200);
+    });
+}
+
 // 多因子压力位/支撑位：由后端按「斐波那契回撤 + 筹码密集 + 承接位 + 所选到期日期权持仓」合成，
 // 前端只负责渲染；同一标的、同一到期日、同一快照只请求一次，图表尺寸变化时复用已有结果。
 function loadFactorLevels(points, spot) {
@@ -713,25 +756,12 @@ function loadFactorLevels(points, spot) {
     else renderLevels(points, spot);
     return;
   }
+  clearTimeout(state.levelsRetryTimer);
+  state.levelsRetryTimer = null;
   state.levelsKey = key;
   state.levelsPayload = null;
-  const encodedSymbol = encodeURIComponent(state.symbol);
-  const encodedExpiration = encodeURIComponent(state.expiration);
-  const numericSpot = Number(spot);
-  const spotQuery = Number.isFinite(numericSpot) && numericSpot > 0
-    ? `&spot=${encodeURIComponent(numericSpot)}`
-    : "";
-  request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}`)
-    .then((payload) => {
-      if (state.levelsKey !== key) return; // 期间切换了标的或到期日，丢弃过期结果
-      state.levelsPayload = payload;
-      renderFactorLevels(payload);
-    })
-    .catch(() => {
-      if (state.levelsKey !== key) return;
-      // 合成接口不可用时退回「按期权持仓」的单因子口径，表格与图表都不空着。
-      renderLevels(points, spot);
-    });
+  renderFactorFallback(points, spot);
+  requestFactorLevels(points, spot, key);
 }
 
 // 渲染多因子结果：价位 / 距现价 / 综合依据（组成该价位的因子标签）。
@@ -835,6 +865,17 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const betaValue = Number(beta?.value);
   const betaText = Number.isFinite(betaValue) ? betaValue.toFixed(2) : "--";
   const betaTitle = "基准指数：标普500 · 时间跨度：2年 · Beta（β）衡量股票相对于整个股市的价格波动情况；高 Beta（>1.0）理论上风险更高但潜在回报更高，低 Beta（<1.0）理论上风险较低但潜在回报也较低";
+  const selectedBasis = state.levelBasisMode === "close"
+    ? levelBasis(state.lastQuote, spot)
+    : activeBasis(state.lastQuote);
+  const basisPrice = Number(selectedBasis?.price);
+  const fallbackPrice = Number(spot);
+  const displayedPrice = Number.isFinite(basisPrice) && basisPrice > 0 ? basisPrice : fallbackPrice;
+  const validPrice = Number.isFinite(displayedPrice) && displayedPrice > 0;
+  const priceLabel = BASIS_MODES[state.levelBasisMode] || BASIS_MODES.live;
+  const priceTitle = validPrice
+    ? `${priceLabel} ${formatMoney(displayedPrice)} · 数据来源：${selectedBasis?.label || "常规"}`
+    : `${priceLabel}暂无数据`;
   const rows = trend ? [
     ["通道上轨", formatMoney(trend.upper), ""],
     ["通道下轨", formatMoney(trend.lower), ""],
@@ -872,6 +913,9 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     actionClass: action || "hold",
     reason: actionReason,
     rows,
+    priceLabel,
+    price: validPrice ? formatMoney(displayedPrice) : "--",
+    priceTitle,
     opportunities: opportunityRows,
     extremes: hasExtremes ? extremeRows : [],
     note: "按最近日线收盘价的线性回归通道；高低点取日线最高/最低价（历史极值用全量历史）",
@@ -1164,6 +1208,11 @@ function isCurrentLoad(loadId, expiration) {
   return state.loadId === loadId && (!expiration || state.expiration === expiration);
 }
 
+function quoteIsReady(quote) {
+  const price = Number(quote?.price);
+  return Number.isFinite(price) && price > 0;
+}
+
 // 快照仍在新鲜期内时不再请求上游接口，只把本地缓存的状态回显给用户。
 function isSnapshotFresh(snapshot) {
   const age = snapshotAgeSeconds(snapshot?.fetchedAt);
@@ -1199,6 +1248,8 @@ function showPending(message) {
   OptionScopeCharts.clearSummary("volume-summary");
   OptionScopeCharts.clearSummary("oi-summary");
   // 压力位/支撑位会在新快照渲染后重新请求合成接口，这里先清空并解除去重键。
+  clearTimeout(state.levelsRetryTimer);
+  state.levelsRetryTimer = null;
   state.levelsKey = "";
   state.levelsPayload = null;
   state.view.levels.resistance = [];
@@ -1230,7 +1281,7 @@ function applyCachedQuote(quote) {
   renderQuote(quote);
 }
 
-async function renderSnapshot(loadId) {
+async function renderSnapshot(loadId, fallbackQuote = null) {
   if (!isCurrentLoad(loadId)) return { shown: false, source: null };
   // 记住这次请求对应的到期日：响应回来时如果用户已经切走，整份数据作废（见 isCurrentLoad 的第二个参数），
   // 否则后到的旧响应会把新选择的数据覆盖掉。
@@ -1244,10 +1295,11 @@ async function renderSnapshot(loadId) {
   ];
   const [quote, payload, analysis] = await Promise.all(requests);
   if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null };
-  applyCachedQuote(quote);
-  if (!payload?.data?.length) return { shown: false, source: payload?.source || quote?.source || null, fetchedAt: payload?.fetched_at || null, quote };
+  const resolvedQuote = quoteIsReady(quote) ? quote : fallbackQuote;
+  applyCachedQuote(resolvedQuote);
+  if (!payload?.data?.length) return { shown: false, source: payload?.source || resolvedQuote?.source || null, fetchedAt: payload?.fetched_at || null, quote: resolvedQuote };
   state.analysisReady = Boolean(analysis?.data?.length) || state.analysisReady;
-  renderChain(payload, quote, analysis);
+  renderChain(payload, resolvedQuote, analysis);
   state.view.lastStatus = payload.source === "sqlite"
     ? `本地缓存 ${formatTime(payload.fetched_at)}`
     : `最近更新 ${formatTime(payload.fetched_at)}`;
@@ -1256,10 +1308,10 @@ async function renderSnapshot(loadId) {
     shown: true,
     source: payload.source || null,
     fetchedAt: payload.fetched_at || null,
-    quote,
+    quote: resolvedQuote,
     payload,
     analysisReady: Boolean(analysis?.data?.length),
-    quoteReady: Number.isFinite(Number(quote?.price)) && Number(quote.price) > 0,
+    quoteReady: quoteIsReady(resolvedQuote),
   };
 }
 
@@ -1340,6 +1392,12 @@ async function refreshInBackground(loadId) {
     // 后端在标的没有挂牌期权时只写现货快照：走现货渲染分支，避免页面一直停在“后台刷新中”。
     if (refreshResult?.quote_only) { await loadQuoteOnly(loadId); return; }
     if (refreshResult?.skipped) {
+      // 首次读取时某个并发请求可能暂时失败，但后端已经确认 SQLite 快照新鲜；
+      // 重新读取并使用刷新响应附带的 quote，避免页面停在“股价 -- / Gamma 0”。
+      const snapshot = await renderSnapshot(loadId, refreshResult.quote || null);
+      if (snapshot.shown && !snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
+        refreshAnalysisWindow(loadId, snapshot.payload, snapshot.quote);
+      }
       state.view.lastStatus = `本地快照 ${formatTime(refreshResult.fetched_at)} 已是最新（${Math.round(Number(refreshResult.age_seconds) || 0)} 秒前）`;
       return;
     }
@@ -1371,12 +1429,18 @@ async function refreshInBackground(loadId) {
       await refreshInBackground(loadId);
       return;
     }
-    renderQuote(quote);
+    let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;
+    if (!quoteIsReady(resolvedQuote)) {
+      // 快照响应和 quote 查询都可能在低配服务器上错开；最后再主动读一次上游行情。
+      const retryQuote = await request(`/api/quote/${encodedSymbol}?refresh=true`).catch(() => null);
+      if (quoteIsReady(retryQuote)) resolvedQuote = retryQuote;
+    }
+    renderQuote(resolvedQuote);
     // Gamma 窗口继续后台刷新；选中期限的综合价位已在这里与窗口任务并行请求。
-    renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);
+    renderChain(payload, resolvedQuote, state.lastAnalysis?.analysisPayload || null);
     state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
     syncPageQuery();
-    refreshAnalysisWindow(loadId, payload, quote);
+    refreshAnalysisWindow(loadId, payload, resolvedQuote);
   } catch (error) {
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
     state.view.lastStatus = `后台刷新失败，仍显示本地缓存（${error.message}）`;
