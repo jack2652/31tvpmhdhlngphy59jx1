@@ -10,7 +10,9 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from typing import Any
+from uuid import uuid4
 
 from app.db import Database, iso
 from app.levels import price_extremes
@@ -27,6 +29,8 @@ EXTREMES_PERIOD = "max"
 BETA_PERIOD = "2y"
 BETA_MAX_AGE_SECONDS = 86400
 BETA_BENCHMARK = "^GSPC"
+HISTORY_LEASE_SECONDS = 120
+HISTORY_WAIT_SECONDS = 60
 
 
 def calculate_beta(stock_bars: list[dict[str, Any]], benchmark_bars: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -96,6 +100,7 @@ class HistoryService:
         self.beta_max_age_seconds = max(beta_max_age_seconds, 0)
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._owner = uuid4().hex
 
     def _lock_for(self, symbol: str) -> threading.Lock:
         with self._locks_guard:
@@ -104,6 +109,13 @@ class HistoryService:
     def _is_fresh(self, fetched_at: str | None, max_age_seconds: int | None = None) -> bool:
         age = snapshot_age_seconds(fetched_at)
         return age is not None and age < (self.max_age_seconds if max_age_seconds is None else max_age_seconds)
+
+    def _acquire_lease(self, name: str) -> None:
+        deadline = time.monotonic() + HISTORY_WAIT_SECONDS
+        while not self.database.try_acquire_lease(name, self._owner, HISTORY_LEASE_SECONDS):
+            if time.monotonic() >= deadline:
+                raise ProviderError(f"{name} 历史数据刷新等待超时")
+            time.sleep(0.1)
 
     def bars(self, symbol: str) -> dict[str, Any]:
         """返回 {symbol, bars, fetched_at, source, warning}；同一标的的并发请求只回源一次。"""
@@ -116,14 +128,22 @@ class HistoryService:
             cached = self.database.latest_history(normalized)
             if cached and self._is_fresh(cached.get("fetched_at")):
                 return self._result(normalized, cached, "sqlite", None)
+            lease_name = f"history:bars:{normalized}"
+            self._acquire_lease(lease_name)
             try:
-                bars = self.provider.history(normalized, period=HISTORY_PERIOD)
-            except ProviderError as exc:
-                logger.warning("获取 %s 日线历史失败: %s", normalized, exc)
-                return self._result(normalized, cached, "sqlite" if cached else "none", str(exc))
-            fetched_at = iso()
-            self.database.write_history(normalized, bars, fetched_at)
-            return self._result(normalized, {"bars": bars, "fetched_at": fetched_at}, "upstream", None)
+                cached = self.database.latest_history(normalized)
+                if cached and self._is_fresh(cached.get("fetched_at")):
+                    return self._result(normalized, cached, "sqlite", None)
+                try:
+                    bars = self.provider.history(normalized, period=HISTORY_PERIOD)
+                except ProviderError as exc:
+                    logger.warning("获取 %s 日线历史失败: %s", normalized, exc)
+                    return self._result(normalized, cached, "sqlite" if cached else "none", str(exc))
+                fetched_at = iso()
+                self.database.write_history(normalized, bars, fetched_at)
+                return self._result(normalized, {"bars": bars, "fetched_at": fetched_at}, "upstream", None)
+            finally:
+                self.database.release_lease(lease_name, self._owner)
 
     def extremes(self, symbol: str) -> dict[str, Any]:
         """返回 {symbol, extremes, fetched_at, source, warning}：52 周与历史最高/最低价。
@@ -140,18 +160,26 @@ class HistoryService:
             cached = self.database.latest_extremes(normalized)
             if cached and self._is_fresh(cached.get("fetched_at"), self.extremes_max_age_seconds):
                 return self._extremes_result(normalized, cached, "sqlite", None)
+            lease_name = f"history:extremes:{normalized}"
+            self._acquire_lease(lease_name)
             try:
-                computed = price_extremes(self.provider.history(normalized, period=EXTREMES_PERIOD))
-                if computed is None:
-                    raise ProviderError(f"{normalized} 的全量日线没有可用的高低价")
-            except ProviderError as exc:
-                logger.warning("获取 %s 日线极值失败: %s", normalized, exc)
-                return self._extremes_result(normalized, cached, "sqlite" if cached else "none", str(exc))
-            fetched_at = iso()
-            self.database.write_extremes(normalized, computed, fetched_at)
-            return self._extremes_result(normalized, {"extremes": computed, "fetched_at": fetched_at}, "upstream", None)
+                cached = self.database.latest_extremes(normalized)
+                if cached and self._is_fresh(cached.get("fetched_at"), self.extremes_max_age_seconds):
+                    return self._extremes_result(normalized, cached, "sqlite", None)
+                try:
+                    computed = price_extremes(self.provider.history(normalized, period=EXTREMES_PERIOD))
+                    if computed is None:
+                        raise ProviderError(f"{normalized} 的全量日线没有可用的高低价")
+                except ProviderError as exc:
+                    logger.warning("获取 %s 日线极值失败: %s", normalized, exc)
+                    return self._extremes_result(normalized, cached, "sqlite" if cached else "none", str(exc))
+                fetched_at = iso()
+                self.database.write_extremes(normalized, computed, fetched_at)
+                return self._extremes_result(normalized, {"extremes": computed, "fetched_at": fetched_at}, "upstream", None)
+            finally:
+                self.database.release_lease(lease_name, self._owner)
 
-    def beta(self, symbol: str) -> dict[str, Any]:
+    def beta(self, symbol: str, stock_bars: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """返回相对标普 500 的两年 Beta；回源失败时退回日缓存。"""
         normalized = self.provider.normalize_symbol(symbol)
         cached = self.database.latest_beta(normalized)
@@ -161,22 +189,30 @@ class HistoryService:
             cached = self.database.latest_beta(normalized)
             if cached and self._is_fresh(cached.get("fetched_at"), self.beta_max_age_seconds):
                 return self._beta_result(normalized, cached, "sqlite", None)
-            benchmark_loader = getattr(self.provider, "benchmark_history", None)
+            lease_name = f"history:beta:{normalized}"
+            self._acquire_lease(lease_name)
             try:
-                if not callable(benchmark_loader):
-                    raise ProviderError("行情源不支持标普500基准历史")
-                computed = calculate_beta(
-                    self.provider.history(normalized, period=BETA_PERIOD),
-                    benchmark_loader(BETA_BENCHMARK, BETA_PERIOD),
-                )
-                if computed is None:
-                    raise ProviderError("两年共同交易日不足，无法计算 Beta")
-            except ProviderError as exc:
-                logger.warning("获取 %s Beta 失败: %s", normalized, exc)
-                return self._beta_result(normalized, cached, "sqlite" if cached else "none", str(exc))
-            fetched_at = iso()
-            self.database.write_beta(normalized, computed, fetched_at)
-            return self._beta_result(normalized, {"beta": computed, "fetched_at": fetched_at}, "upstream", None)
+                cached = self.database.latest_beta(normalized)
+                if cached and self._is_fresh(cached.get("fetched_at"), self.beta_max_age_seconds):
+                    return self._beta_result(normalized, cached, "sqlite", None)
+                benchmark_loader = getattr(self.provider, "benchmark_history", None)
+                try:
+                    if not callable(benchmark_loader):
+                        raise ProviderError("行情源不支持标普500基准历史")
+                    computed = calculate_beta(
+                        stock_bars if stock_bars is not None else self.provider.history(normalized, period=BETA_PERIOD),
+                        benchmark_loader(BETA_BENCHMARK, BETA_PERIOD),
+                    )
+                    if computed is None:
+                        raise ProviderError("两年共同交易日不足，无法计算 Beta")
+                except ProviderError as exc:
+                    logger.warning("获取 %s Beta 失败: %s", normalized, exc)
+                    return self._beta_result(normalized, cached, "sqlite" if cached else "none", str(exc))
+                fetched_at = iso()
+                self.database.write_beta(normalized, computed, fetched_at)
+                return self._beta_result(normalized, {"beta": computed, "fetched_at": fetched_at}, "upstream", None)
+            finally:
+                self.database.release_lease(lease_name, self._owner)
 
     @staticmethod
     def _extremes_result(symbol: str, cached: dict[str, Any] | None, source: str, warning: str | None) -> dict[str, Any]:

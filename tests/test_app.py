@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -11,10 +14,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import app.api as api_module
 from app.api import create_router, install_access_guard, trend_market_data
 from app.config import Settings
 from app.db import NO_FLOOR, Database, iso, parse_sessions, utc_now
-from app.levels import absorption_levels, annotate_level_history, average_true_range, best_trade_points, build_levels, chip_peaks, fibonacci_levels, level_strength_tier, merge_candidates, option_levels, price_extremes, select_visible_levels, split_support_plan, touch_probability, trade_recommendation, trend_channel
+from app.levels import absorption_levels, annotate_level_history, average_true_range, average_true_ranges, best_trade_points, build_levels, chip_peaks, fibonacci_levels, level_strength_tier, merge_candidates, option_levels, price_extremes, select_visible_levels, split_support_plan, touch_probability, trade_recommendation, trend_channel
 from app.providers import market
 from app.providers import cboe
 from app.providers.market import (
@@ -27,6 +31,9 @@ from app.providers.market import (
 )
 from app.providers.cboe import CboeOptionsProvider, parse_occ_option
 from app.services.history import HistoryService, calculate_beta
+from app.services.concurrency import SingleFlight, UpstreamGate
+from app.services.market_calendar import is_regular_session, is_trading_day
+from app.http import ETagMiddleware
 from app.gamma import (
     annotate_model_greeks,
     black_scholes_price,
@@ -122,6 +129,65 @@ def test_safe_value_and_symbol_validation():
     assert MarketDataProvider.normalize_symbol("BF-B") == "BF-B"
     with pytest.raises(ValueError):
         MarketDataProvider.normalize_symbol("AAPL/")
+
+
+def test_single_flight_runs_same_key_once():
+    """并发请求同一分析键时共享结果，不重复执行计算。"""
+    flight = SingleFlight()
+    calls = {"count": 0}
+
+    def compute():
+        calls["count"] += 1
+        time.sleep(0.05)
+        return {"value": 42}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda _: flight.do("same", compute), range(8)))
+    assert results == [{"value": 42}] * 8
+    assert calls["count"] == 1
+
+
+def test_upstream_gate_limits_concurrent_calls():
+    """上游闸门限制并发请求数量，释放后其余任务继续执行。"""
+    gate = UpstreamGate(limit=2, wait_seconds=2)
+    active = {"now": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def request():
+        with gate.slot():
+            with guard:
+                active["now"] += 1
+                active["peak"] = max(active["peak"], active["now"])
+            time.sleep(0.03)
+            with guard:
+                active["now"] -= 1
+        return True
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        assert all(executor.map(lambda _: request(), range(6)))
+    assert active["peak"] <= 2
+
+
+def test_etag_middleware_returns_not_modified_for_same_api_body():
+    """API 条件请求命中 ETag 时不再传输完整 JSON。"""
+    async def endpoint(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": b'{"ok":true}'})
+
+    async def run(headers):
+        sent = []
+        scope = {"type": "http", "method": "GET", "path": "/api/levels/AAPL", "headers": headers}
+        async def send(message):
+            sent.append(message)
+        await ETagMiddleware(endpoint)(scope, None, send)
+        return sent
+
+    first = asyncio.run(run([]))
+    etag = dict(first[0]["headers"])[b"etag"]
+    second = asyncio.run(run([(b"if-none-match", etag)]))
+    assert first[0]["status"] == 200
+    assert second[0]["status"] == 304
+    assert second[1]["body"] == b""
 
 
 def test_parse_occ_option_and_map_cboe_chain():
@@ -235,6 +301,13 @@ def test_hybrid_provider_routes_options_by_market_session():
     assert "primary-expirations" in calls and "primary-fetch" in calls
     assert "delayed-chain" not in calls
 
+    calls.clear()
+    provider._now_factory = lambda: datetime(2026, 7, 3, 10, 0, tzinfo=eastern)
+    provider.expirations("QQQ")
+    provider.fetch("QQQ", "2026-12-18")
+    assert "delayed-expirations" in calls and "delayed-chain" in calls
+    assert "primary-fetch" not in calls
+
 
 def test_nonregular_cboe_failure_keeps_cached_chain(tmp_path: Path):
     """盘外免费源故障时不覆盖已有快照，页面仍可读取旧期权链。"""
@@ -260,8 +333,9 @@ def test_nonregular_cboe_failure_keeps_cached_chain(tmp_path: Path):
         Primary(), BrokenDelayed(), now_factory=lambda: datetime(2026, 9, 18, 8, 0, tzinfo=eastern)
     )
     service = SnapshotService(database, provider)
-    with pytest.raises(ProviderError):
-        service.refresh("AAPL", "2026-12-18")
+    result = service.refresh("AAPL", "2026-12-18")
+    assert result["stale"] is True
+    assert result["warning"] == "Cboe 请求失败"
     cached = database.latest_chain("AAPL", "2026-12-18")
     assert cached["data"] and cached["data"][0]["open_interest"] == 500
 
@@ -349,6 +423,18 @@ def test_current_session_state_falls_back_to_eastern_clock():
     assert current_session_state(datetime(2026, 9, 18, 19, 58, tzinfo=eastern), datetime(2026, 9, 18, 19, 55, tzinfo=eastern)) == "POST"
 
 
+def test_market_calendar_recognizes_holidays_and_early_closes():
+    """交易日历识别完整节假日，并将提前收盘后的时段视为盘后。"""
+    eastern = ZoneInfo("America/New_York")
+    assert not is_trading_day(datetime(2026, 7, 3, 10, 0, tzinfo=eastern))
+    assert not is_regular_session(datetime(2026, 7, 3, 10, 0, tzinfo=eastern))
+    assert current_session_state(datetime(2026, 7, 3, 10, 0, tzinfo=eastern), None) == "CLOSED"
+    assert is_trading_day(datetime(2026, 11, 27, 12, 59, tzinfo=eastern))
+    assert is_regular_session(datetime(2026, 11, 27, 12, 59, tzinfo=eastern))
+    assert not is_regular_session(datetime(2026, 11, 27, 13, 1, tzinfo=eastern))
+    assert current_session_state(datetime(2026, 11, 27, 13, 1, tzinfo=eastern), None) == "POST"
+
+
 def test_market_provider_quote_includes_extended_sessions():
     class FakeTicker:
         fast_info = {"last_price": 102.5, "previous_close": 100.0, "currency": "USD"}
@@ -396,6 +482,23 @@ def test_database_snapshot_lookup_and_cleanup(tmp_path: Path):
     result = database.cleanup(30)
     assert result == {"quotes": 1, "options": 2, "runs": 0, "history": 0, "extremes": 0}
     assert database.latest_quote("AAPL") is None
+    assert database.latest_expirations("AAPL") == []
+
+
+def test_latest_option_batch_index_keeps_newest_snapshot(tmp_path: Path):
+    """最新批次索引只加速定位，不改变按 fetched_at 取最新链的口径。"""
+    database = Database(tmp_path / "options.db")
+    newest = iso(utc_now() - timedelta(minutes=1))
+    older = iso(utc_now() - timedelta(minutes=5))
+    database.write_snapshot(sample_quote(), sample_rows(), newest)
+    database.write_snapshot(sample_quote(), sample_rows(), older)
+    assert database.latest_chain("AAPL", "2026-12-18")["fetched_at"] == newest
+    with database.connect() as connection:
+        indexed = connection.execute(
+            "SELECT fetched_at FROM option_latest_batches WHERE symbol=? AND expiration=?",
+            ("AAPL", "2026-12-18"),
+        ).fetchone()[0]
+    assert indexed == newest
 
 
 def test_existing_database_gets_gamma_column(tmp_path: Path):
@@ -1141,6 +1244,41 @@ def test_refresh_requests_provider_after_fresh_window(tmp_path: Path):
     assert fresh["skipped"] is True
 
 
+def test_refreshes_from_separate_workers_share_sqlite_lease(tmp_path: Path):
+    """两个 worker 实例同时刷新同一标的时只允许一次回源，其余复用新快照。"""
+    database_path = tmp_path / "options.db"
+    first_database = Database(database_path)
+    second_database = Database(database_path)
+    calls = {"expirations": 0, "fetch": 0}
+    calls_lock = threading.Lock()
+    start = threading.Barrier(2)
+
+    class CountingProvider(FakeProvider):
+        def expirations(self, symbol: str) -> list[str]:
+            with calls_lock:
+                calls["expirations"] += 1
+            return super().expirations(symbol)
+
+        def fetch(self, symbol: str, expiration: str):
+            with calls_lock:
+                calls["fetch"] += 1
+            time.sleep(0.08)
+            return super().fetch(symbol, expiration)
+
+    first = SnapshotService(first_database, CountingProvider())
+    second = SnapshotService(second_database, CountingProvider())
+
+    def refresh(service: SnapshotService):
+        start.wait()
+        return service.refresh("AAPL", "2026-12-18", max_age_seconds=0)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(refresh, (first, second)))
+    assert calls == {"expirations": 1, "fetch": 1}
+    assert any(result.get("coalesced") for result in results)
+    assert first_database.latest_chain("AAPL", "2026-12-18")["data"]
+
+
 def test_refresh_button_reads_sqlite_before_hitting_upstream():
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 刷新入口先读 SQLite 判断新鲜度，只有过期才请求上游接口，并用 state.refreshing 拦截连点。
@@ -1422,6 +1560,16 @@ def test_average_true_range_uses_recent_true_ranges():
     assert average_true_range(bars, period=0) is None
 
 
+def test_average_true_ranges_matches_each_prefix_atr():
+    """批量 ATR 与逐前缀口径一致，供历史回踩验证共享结果。"""
+    bars = [
+        {"high": 101, "low": 99, "close": 100},
+        {"high": 106, "low": 104, "close": 105},
+        {"high": 108, "low": 107, "close": 107.5},
+    ]
+    assert average_true_ranges(bars, period=2) == pytest.approx([2.0, 4.0, 4.5])
+
+
 def test_merge_candidates_groups_same_price_zone():
     """合成：同一段价位（现价 0.5% 内）合并成一条，按稳定综合强度排序。"""
     spot = 100.0
@@ -1687,6 +1835,31 @@ def test_levels_endpoint_combines_factors(tmp_path: Path):
             if point is not None:
                 assert point["zone_low"] <= point["price"] <= point["zone_high"]
                 assert 0 <= point["confidence"] <= 1
+
+
+def test_levels_endpoint_reuses_same_snapshot_analysis(tmp_path: Path, monkeypatch):
+    """同一输入快照重复读取时只执行一次价位合成，快照变化后缓存键会自然失效。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote(), sample_rows(), iso())
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    service = SnapshotService(database, FakeProvider())
+    calls = {"count": 0}
+    original = api_module.build_levels
+
+    def counted_build_levels(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api_module, "build_levels", counted_build_levels)
+    router = create_router(database, service, FakeProvider(), settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        first = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18"})
+        second = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18"})
+    assert first.status_code == 200 and second.status_code == 200
+    assert first.json()["support"] == second.json()["support"]
+    assert calls["count"] == 1
 
 
 def test_levels_endpoint_aggregates_multiple_expirations_without_changing_selected_chain(tmp_path: Path):

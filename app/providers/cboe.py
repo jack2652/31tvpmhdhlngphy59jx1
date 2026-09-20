@@ -11,12 +11,14 @@ import logging
 import re
 from datetime import date, datetime, timezone
 from time import monotonic
+from threading import Lock
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, ProxyHandler, build_opener
 
 from app.providers.market import MARKET_TIMEZONE, ProviderError, MarketDataProvider, current_session_state, safe_value
+from app.services.concurrency import SingleFlight, UpstreamBusyError, UpstreamGate
 
 
 logger = logging.getLogger(__name__)
@@ -89,11 +91,15 @@ class CboeOptionsProvider:
         timeout: float = 15.0,
         cache_seconds: float = CBOE_CACHE_SECONDS,
         proxy: str | None = None,
+        upstream_gate: UpstreamGate | None = None,
     ):
         self.proxy = proxy.strip() if proxy and proxy.strip() else None
         self._request_json = request_json or (lambda url: download_json(url, timeout, self.proxy))
         self.cache_seconds = cache_seconds
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._cache_lock = Lock()
+        self._payload_flight: SingleFlight[str, dict[str, Any]] = SingleFlight()
+        self.upstream_gate = upstream_gate or UpstreamGate()
 
     @staticmethod
     def normalize_symbol(symbol: str) -> str:
@@ -101,17 +107,30 @@ class CboeOptionsProvider:
 
     def _payload(self, symbol: str) -> dict[str, Any]:
         normalized = self.normalize_symbol(symbol)
-        now = monotonic()
-        cached = self._cache.get(normalized)
-        if cached and now - cached[0] < self.cache_seconds:
+        with self._cache_lock:
+            cached = self._cache.get(normalized)
+        if cached and monotonic() - cached[0] < self.cache_seconds:
             return cached[1]
-        url = CBOE_OPTIONS_URL.format(symbol=quote(normalized, safe=".-"))
-        payload = self._request_json(url)
-        data = payload.get("data")
-        if not isinstance(data, dict) or not isinstance(data.get("options"), list):
-            raise ProviderError(f"Cboe 返回 {normalized} 的期权链格式无效")
-        self._cache[normalized] = (now, payload)
-        return payload
+
+        def download() -> dict[str, Any]:
+            with self._cache_lock:
+                cached_inner = self._cache.get(normalized)
+            if cached_inner and monotonic() - cached_inner[0] < self.cache_seconds:
+                return cached_inner[1]
+            url = CBOE_OPTIONS_URL.format(symbol=quote(normalized, safe=".-"))
+            with self.upstream_gate.slot():
+                payload = self._request_json(url)
+            data = payload.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("options"), list):
+                raise ProviderError(f"Cboe 返回 {normalized} 的期权链格式无效")
+            with self._cache_lock:
+                self._cache[normalized] = (monotonic(), payload)
+            return payload
+
+        try:
+            return self._payload_flight.do(normalized, download)
+        except UpstreamBusyError as exc:
+            raise ProviderError(str(exc)) from exc
 
     @staticmethod
     def _data(payload: dict[str, Any]) -> dict[str, Any]:

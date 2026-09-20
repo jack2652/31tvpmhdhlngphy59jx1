@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from datetime import date, timedelta
 from statistics import median
 from typing import Any, Iterable
@@ -336,6 +337,38 @@ def best_trade_points(
         }
 
     return {"buy": select(support, "buy"), "sell": select(resistance, "sell")}
+
+
+def average_true_ranges(bars: Iterable[dict[str, Any]], period: int = ATR_PERIOD) -> list[float | None]:
+    """一次性计算每根日线对应的 ATR，保持逐前缀计算的原有口径。"""
+    items = list(bars)
+    if period <= 0:
+        return [None] * len(items)
+    window: deque[float] = deque(maxlen=period)
+    window_total = 0.0
+    values: list[float | None] = []
+    previous_close: float | None = None
+    for bar in items:
+        high = _number(bar.get("high"))
+        low = _number(bar.get("low"))
+        close = _number(bar.get("close"))
+        if high is None or low is None or high < low:
+            previous_close = close if close is not None and close > 0 else previous_close
+            values.append(sum(window) / len(window) if window else None)
+            continue
+        if previous_close is None or previous_close <= 0:
+            true_range = high - low
+        else:
+            true_range = max(high - low, abs(high - previous_close), abs(low - previous_close))
+        if true_range >= 0 and math.isfinite(true_range):
+            if len(window) == period:
+                window_total -= window[0]
+            window.append(true_range)
+            window_total += true_range
+        previous_close = close if close is not None and close > 0 else previous_close
+        # 使用窗口求和保持与历史 average_true_range 的浮点运算顺序一致。
+        values.append(sum(window) / len(window) if window else None)
+    return values
 
 
 def average_true_range(bars: Iterable[dict[str, Any]], period: int = ATR_PERIOD) -> float | None:
@@ -798,6 +831,7 @@ def annotate_level_history(
     side: str,
     lookahead: int = LEVEL_HISTORY_LOOKAHEAD,
     exclude_recent: int = 0,
+    atr_by_index: list[float | None] | None = None,
 ) -> list[dict[str, Any]]:
     """用历史日线评估候选区域被触及后的守住/跌破结果。
 
@@ -825,13 +859,13 @@ def annotate_level_history(
         item["recent_reaction_rate"] = None
         item["strength_tier"] = level_strength_tier(item)
 
+    atr_values = atr_by_index if atr_by_index is not None else average_true_ranges(history)
     atr = average_true_range(history)
     if atr is None or atr <= 0 or validation_end <= horizon:
         for item in items:
             set_empty_history(item, "insufficient_history")
         return items
     # 每个历史触及点只使用当日及之前的波动率，避免当前 ATR 把未来波动信息带回旧样本。
-    atr_by_index = [average_true_range(history[:index + 1]) for index in range(validation_end)]
 
     for item in items:
         zone_low = _number(item.get("zone_low"))
@@ -863,7 +897,7 @@ def annotate_level_history(
                 continue
             last_touch = index
             samples += 1
-            sample_atr = atr_by_index[index] or atr
+            sample_atr = (atr_values[index] if index < len(atr_values) else None) or atr
             sample_break_buffer = max(sample_atr * LEVEL_HISTORY_BREAK_ATR, center * MIN_ZONE_RATIO)
             sample_rebound_buffer = max(sample_atr * LEVEL_HISTORY_REBOUND_ATR, center * MIN_ZONE_RATIO)
             if side == "support":
@@ -1012,6 +1046,7 @@ def build_levels(
         resistance_weight, support_weight = 1.15, 0.9
     else:
         resistance_weight = support_weight = 1.0
+    atr_by_index = average_true_ranges(bar_list)
     atr = average_true_range(bar_list)
     zone_width = max((atr or 0.0) * ATR_ZONE_RATIO, price * MIN_ZONE_RATIO)
     # 公共面板最终展示 10 条，但内部候选池保留 30 条，避免远端强支撑/强压力在选强位前被截掉。
@@ -1031,12 +1066,14 @@ def build_levels(
         bar_list,
         "resistance",
         exclude_recent=LEVEL_HISTORY_FORMATION_BARS,
+        atr_by_index=atr_by_index,
     )
     support_all = annotate_level_history(
         support_all,
         bar_list,
         "support",
         exclude_recent=LEVEL_HISTORY_FORMATION_BARS,
+        atr_by_index=atr_by_index,
     )
     resistance = select_visible_levels(resistance_all, price, LEVEL_COUNT)
     support = select_visible_levels(support_all, price, LEVEL_COUNT)

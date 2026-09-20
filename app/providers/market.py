@@ -14,6 +14,8 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from app.services.concurrency import UpstreamGate
+from app.services.market_calendar import is_regular_session, is_trading_day, localize, regular_session_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +44,17 @@ def current_session_state(now: datetime, latest_bar: datetime | None) -> str:
     取绝对差值是为了容忍数据源与本地的少量时钟偏差；时钟判断不识别节假日，
     但只有在最近一根 K 线超出新鲜期时才走到这一步。
     """
+    now = localize(now)
+    if latest_bar is not None:
+        latest_bar = localize(latest_bar)
+    if not is_trading_day(now):
+        return "CLOSED"
     if latest_bar is not None and abs((now - latest_bar).total_seconds()) <= SESSION_FRESH_SECONDS:
         return SESSION_STATES[session_of(latest_bar)]
-    if now.weekday() >= 5:
-        return "CLOSED"
+    if not is_regular_session(now):
+        bounds = regular_session_bounds(now)
+        if bounds is not None and now >= bounds[1] and now.hour < 20:
+            return SESSION_STATES["post"]
     return SESSION_STATES[session_of(now)]
 
 
@@ -138,8 +147,14 @@ class MarketDataProvider:
     # 对外暴露的数据来源标识：只表示「来自上游接口」，不暴露具体供应商
     name = "upstream"
 
-    def __init__(self, ticker_factory: Any | None = None, proxy: str | None = None):
+    def __init__(
+        self,
+        ticker_factory: Any | None = None,
+        proxy: str | None = None,
+        upstream_gate: UpstreamGate | None = None,
+    ):
         self.proxy = proxy.strip() if proxy and proxy.strip() else None
+        self.upstream_gate = upstream_gate or UpstreamGate()
         self._uses_builtin_factory = ticker_factory is None
         if ticker_factory is None:
             sdk = load_upstream_sdk()
@@ -172,7 +187,8 @@ class MarketDataProvider:
     def expirations(self, symbol: str) -> list[str]:
         ticker = self._ticker(symbol)
         try:
-            values = list(ticker.options or ())
+            with self.upstream_gate.slot():
+                values = list(ticker.options or ())
         except Exception as exc:
             raise ProviderError(f"获取 {symbol.upper()} 到期日失败: {exc}") from exc
         return [str(value) for value in values]
@@ -182,14 +198,16 @@ class MarketDataProvider:
         ticker = self._ticker(normalized)
         try:
             try:
-                info = ticker.fast_info
+                with self.upstream_gate.slot():
+                    info = ticker.fast_info
             except Exception:
                 info = {}
             price = safe_value(info.get("last_price"))
             previous = safe_value(info.get("previous_close"))
             today_open = safe_value(info.get("open"))
             if price is None or previous is None:
-                price, previous, today_open = self._history_quote(ticker, price, previous, today_open)
+                with self.upstream_gate.slot():
+                    price, previous, today_open = self._history_quote(ticker, price, previous, today_open)
             change = None
             if price is not None and previous not in (None, 0):
                 change = (price - previous) / previous * 100
@@ -212,7 +230,8 @@ class MarketDataProvider:
     def _extended_hours(self, ticker: Any, symbol: str) -> dict[str, Any]:
         """盘前 / 盘后 / 夜盘属于附加信息：抓取失败只记日志，不影响行情快照本身。"""
         try:
-            frame = ticker.history(period="5d", interval="1m", prepost=True, auto_adjust=False)
+            with self.upstream_gate.slot():
+                frame = ticker.history(period="5d", interval="1m", prepost=True, auto_adjust=False)
             return summarize_extended_hours(frame)
         except Exception as exc:
             logger.warning("获取 %s 盘前盘后行情失败: %s", symbol, exc)
@@ -244,7 +263,8 @@ class MarketDataProvider:
         normalized = self.normalize_symbol(symbol)
         ticker = self._ticker(normalized)
         try:
-            frame = ticker.history(period=period, interval="1d", auto_adjust=False)
+            with self.upstream_gate.slot():
+                frame = ticker.history(period=period, interval="1d", auto_adjust=False)
         except Exception as exc:
             raise ProviderError(f"获取 {normalized} 日线历史失败: {exc}") from exc
         return self._history_bars(frame, normalized)
@@ -275,7 +295,8 @@ class MarketDataProvider:
         """抓取 Beta 基准指数的日线；指数代码不走普通股票代码校验。"""
         ticker = self._ticker_raw(symbol)
         try:
-            frame = ticker.history(period=period, interval="1d", auto_adjust=True)
+            with self.upstream_gate.slot():
+                frame = ticker.history(period=period, interval="1d", auto_adjust=True)
         except Exception as exc:
             raise ProviderError(f"获取 {symbol} 日线历史失败: {exc}") from exc
         return self._history_bars(frame, symbol)
@@ -303,7 +324,8 @@ class MarketDataProvider:
         normalized = self.normalize_symbol(symbol)
         ticker = self._ticker(normalized)
         try:
-            options = ticker.option_chain(expiration)
+            with self.upstream_gate.slot():
+                options = ticker.option_chain(expiration)
         except Exception as exc:
             raise ProviderError(f"获取 {normalized} {expiration} 期权链失败: {exc}") from exc
         rows: list[dict[str, Any]] = []
@@ -367,7 +389,7 @@ class HybridMarketDataProvider:
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=MARKET_TIMEZONE)
         moment = moment.astimezone(MARKET_TIMEZONE)
-        return moment.weekday() >= 5 or session_of(moment) != "regular"
+        return not is_regular_session(moment)
 
     def expirations(self, symbol: str) -> list[str]:
         provider = self.delayed_provider if self.uses_delayed_options() else self.regular_provider

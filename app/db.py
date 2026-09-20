@@ -103,6 +103,18 @@ class Database:
                     ON option_snapshots(symbol, expiration, fetched_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_option_symbol_time
                     ON option_snapshots(symbol, fetched_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_option_oi_fallback
+                    ON option_snapshots(symbol, expiration, contract_symbol, fetched_at DESC)
+                    WHERE open_interest > 0;
+
+                CREATE TABLE IF NOT EXISTS option_latest_batches (
+                    symbol TEXT NOT NULL,
+                    expiration TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY (symbol, expiration)
+                );
+                CREATE INDEX IF NOT EXISTS idx_option_latest_expiration
+                    ON option_latest_batches(symbol, expiration);
 
                 CREATE TABLE IF NOT EXISTS refresh_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,6 +151,33 @@ class Database:
                     payload TEXT NOT NULL,
                     fetched_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS analysis_refresh_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    horizon_days INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    result_json TEXT,
+                    error_message TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status
+                    ON analysis_refresh_jobs(status, started_at DESC);
+
+                CREATE TABLE IF NOT EXISTS service_leases (
+                    name TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS api_analysis_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_api_analysis_cache_time
+                    ON api_analysis_cache(created_at ASC);
                 """
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(option_snapshots)")}
@@ -151,6 +190,14 @@ class Database:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN today_open REAL")
             if "previous_close" not in quote_columns:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN previous_close REAL")
+            # 旧库首次升级时建立每个到期日的最新批次索引，后续写入由 write_snapshot 增量维护。
+            if connection.execute("SELECT COUNT(*) FROM option_latest_batches").fetchone()[0] == 0:
+                connection.execute(
+                    """INSERT INTO option_latest_batches(symbol, expiration, fetched_at)
+                       SELECT symbol, expiration, MAX(fetched_at)
+                         FROM option_snapshots
+                        GROUP BY symbol, expiration"""
+                )
 
     def start_run(self, symbol: str) -> int:
         with self.connect() as connection:
@@ -165,6 +212,152 @@ class Database:
             connection.execute(
                 "UPDATE refresh_runs SET finished_at=?, status=?, rows_written=?, error_message=? WHERE id=?",
                 (iso(), status, rows_written, error_message, run_id),
+            )
+
+    @staticmethod
+    def _age_seconds(fetched_at: str | None) -> float | None:
+        if not fetched_at:
+            return None
+        try:
+            moment = datetime.fromisoformat(fetched_at)
+        except ValueError:
+            return None
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return max((utc_now() - moment.astimezone(timezone.utc)).total_seconds(), 0.0)
+
+    def claim_analysis_job(
+        self,
+        symbol: str,
+        horizon_days: int,
+        cooldown_seconds: int = 30,
+        stale_seconds: int = 600,
+    ) -> dict[str, Any]:
+        """跨进程领取 Gamma 后台任务；同一标的窗口只允许一个 worker 执行。"""
+        job_id = f"{symbol}:{horizon_days}"
+        now = iso()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM analysis_refresh_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row:
+                current = dict(row)
+                running_age = self._age_seconds(current.get("started_at"))
+                finished_age = self._age_seconds(current.get("finished_at"))
+                if current["status"] == "running" and running_age is not None and running_age < stale_seconds:
+                    return {"job_id": job_id, "symbol": symbol, "horizon_days": horizon_days, "status": "running", "started_at": current.get("started_at"), "claimed": False}
+                if current["status"] in {"completed", "failed"} and finished_age is not None and finished_age < cooldown_seconds:
+                    return {"job_id": job_id, "symbol": symbol, "horizon_days": horizon_days, "status": current["status"], "finished_at": current.get("finished_at"), "claimed": False}
+            connection.execute(
+                """INSERT INTO analysis_refresh_jobs
+                   (job_id, symbol, horizon_days, status, started_at, finished_at, result_json, error_message)
+                   VALUES (?, ?, ?, 'running', ?, NULL, NULL, NULL)
+                   ON CONFLICT(job_id) DO UPDATE SET
+                       symbol=excluded.symbol,
+                       horizon_days=excluded.horizon_days,
+                       status='running',
+                       started_at=excluded.started_at,
+                       finished_at=NULL,
+                       result_json=NULL,
+                       error_message=NULL""",
+                (job_id, symbol, horizon_days, now),
+            )
+        return {
+            "job_id": job_id,
+            "symbol": symbol,
+            "horizon_days": horizon_days,
+            "status": "running",
+            "started_at": now,
+            "claimed": True,
+        }
+
+    def finish_analysis_job(
+        self,
+        job_id: str,
+        status: str,
+        result: dict[str, Any] | None,
+        error_message: str | None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE analysis_refresh_jobs
+                      SET status=?, finished_at=?, result_json=?, error_message=?
+                    WHERE job_id=?""",
+                (status, iso(), json.dumps(result, ensure_ascii=False) if result is not None else None, error_message, job_id),
+            )
+
+    def analysis_job(self, symbol: str, horizon_days: int) -> dict[str, Any] | None:
+        job_id = f"{symbol}:{horizon_days}"
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM analysis_refresh_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+        if not row:
+            return None
+        payload = dict(row)
+        raw_result = payload.pop("result_json", None)
+        if raw_result:
+            try:
+                payload["result"] = json.loads(raw_result)
+            except (TypeError, ValueError):
+                payload["result"] = None
+        else:
+            payload["result"] = None
+        return payload
+
+    def try_acquire_lease(self, name: str, owner: str, lease_seconds: int = 120) -> bool:
+        """用 SQLite 短事务选出多 worker 下唯一的后台调度者。"""
+        now = iso()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT owner, acquired_at FROM service_leases WHERE name=?", (name,)
+            ).fetchone()
+            if row and row["owner"] != owner:
+                age = self._age_seconds(row["acquired_at"])
+                if age is not None and age < lease_seconds:
+                    return False
+            connection.execute(
+                """INSERT INTO service_leases(name, owner, acquired_at) VALUES (?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET owner=excluded.owner, acquired_at=excluded.acquired_at""",
+                (name, owner, now),
+            )
+        return True
+
+    def release_lease(self, name: str, owner: str) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM service_leases WHERE name=? AND owner=?", (name, owner))
+
+    def get_analysis_cache(self, cache_key: str) -> Any | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM api_analysis_cache WHERE cache_key=?", (cache_key,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["payload"])
+        except (TypeError, ValueError):
+            return None
+
+    def put_analysis_cache(self, cache_key: str, payload: Any, max_entries: int = 128) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO api_analysis_cache(cache_key, payload, created_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, created_at=excluded.created_at""",
+                (cache_key, encoded, iso()),
+            )
+            connection.execute(
+                """DELETE FROM api_analysis_cache
+                    WHERE cache_key IN (
+                        SELECT cache_key FROM api_analysis_cache
+                         ORDER BY created_at DESC
+                         LIMIT -1 OFFSET ?
+                    )""",
+                (max(1, max_entries),),
             )
 
     def write_snapshot(self, quote: dict[str, Any], options: Iterable[dict[str, Any]], fetched_at: str) -> int:
@@ -196,6 +389,13 @@ class Database:
                     )
                     for row in option_rows
                 ],
+            )
+            connection.executemany(
+                """INSERT INTO option_latest_batches(symbol, expiration, fetched_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(symbol, expiration) DO UPDATE SET fetched_at=excluded.fetched_at
+                   WHERE excluded.fetched_at >= option_latest_batches.fetched_at""",
+                sorted({(row["symbol"], row["expiration"], fetched_at) for row in option_rows}),
             )
         return len(option_rows)
 
@@ -311,14 +511,14 @@ class Database:
     def latest_expirations(self, symbol: str) -> list[str]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT DISTINCT expiration FROM option_snapshots WHERE symbol=? ORDER BY expiration", (symbol,)
+                "SELECT expiration FROM option_latest_batches WHERE symbol=? ORDER BY expiration", (symbol,)
             ).fetchall()
         return [str(row[0]) for row in rows]
 
     def latest_chain(self, symbol: str, expiration: str) -> dict[str, Any]:
         with self.connect() as connection:
             timestamp_row = connection.execute(
-                "SELECT MAX(fetched_at) FROM option_snapshots WHERE symbol=? AND expiration=?",
+                "SELECT fetched_at FROM option_latest_batches WHERE symbol=? AND expiration=?",
                 (symbol, expiration),
             ).fetchone()
             fetched_at = timestamp_row[0] if timestamp_row else None
@@ -341,7 +541,7 @@ class Database:
         rows = connection.execute(
             """SELECT expiration, contract_symbol, open_interest, MAX(fetched_at) AS fetched_at
                  FROM option_snapshots
-                WHERE symbol=? AND expiration BETWEEN ? AND ? AND COALESCE(open_interest, 0) > 0
+                WHERE symbol=? AND expiration BETWEEN ? AND ? AND open_interest > 0
                 GROUP BY expiration, contract_symbol""",
             (symbol, start, end),
         ).fetchall()
@@ -371,17 +571,18 @@ class Database:
         end = (utc_now().date() + timedelta(days=horizon_days)).isoformat()
         with self.connect() as connection:
             rows = connection.execute(
-                """SELECT contract_symbol, expiration, contract_type, strike, last_price, bid, ask,
-                          volume, open_interest, implied_volatility, gamma, in_the_money, change_percent,
-                          fetched_at
-                   FROM option_snapshots AS current
-                  WHERE symbol=? AND expiration BETWEEN ? AND ?
-                    AND fetched_at=(
-                        SELECT MAX(latest.fetched_at) FROM option_snapshots AS latest
-                         WHERE latest.symbol=current.symbol
-                           AND latest.expiration=current.expiration
-                    )
-                  ORDER BY expiration, strike, contract_type""",
+                """SELECT current.contract_symbol, current.expiration, current.contract_type,
+                          current.strike, current.last_price, current.bid, current.ask,
+                          current.volume, current.open_interest, current.implied_volatility,
+                          current.gamma, current.in_the_money, current.change_percent,
+                          current.fetched_at
+                     FROM option_latest_batches AS latest
+                     JOIN option_snapshots AS current
+                       ON current.symbol=latest.symbol
+                      AND current.expiration=latest.expiration
+                      AND latest.fetched_at=current.fetched_at
+                    WHERE latest.symbol=? AND latest.expiration BETWEEN ? AND ?
+                   ORDER BY current.expiration, current.strike, current.contract_type""",
                 (symbol, start, end),
             ).fetchall()
             fallback = self._open_interest_fallback(connection, symbol, start, end)
@@ -427,6 +628,16 @@ class Database:
                 deleted["runs"] += cursor.rowcount
                 if cursor.rowcount < batch_size:
                     break
+            # 清理掉已没有对应快照的索引行，避免过期到期日继续出现在选择框中。
+            connection.execute(
+                """DELETE FROM option_latest_batches AS latest
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM option_snapshots AS current
+                         WHERE current.symbol=latest.symbol
+                           AND current.expiration=latest.expiration
+                           AND current.fetched_at=latest.fetched_at
+                    )"""
+            )
         return deleted
 
     def database_size_bytes(self) -> int:

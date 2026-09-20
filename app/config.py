@@ -58,6 +58,10 @@ class Settings:
     database_max_mb: int = 0
     # 页面与 API 的访问密钥；留空表示不启用访问保护，run.sh 会自动生成 16 位密钥
     access_key: str = ""
+    # 单进程同时访问上游行情源的最大数量，避免并发用户触发供应商限流
+    upstream_concurrency: int = 6
+    # 等待上游请求槽位的最长时间，超时后优先回退本地旧数据
+    upstream_wait_seconds: int = 20
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -77,4 +81,6 @@ class Settings:
             extremes_max_age_seconds=_positive_int("EXTREMES_MAX_AGE_SECONDS", 86400),
             database_max_mb=_size_mb("DATABASE_MAX_MB", 0),
             access_key=os.getenv("ACCESS_KEY", "").strip(),
+            upstream_concurrency=_positive_int("UPSTREAM_CONCURRENCY", 6),
+            upstream_wait_seconds=_positive_int("UPSTREAM_WAIT_SECONDS", 20),
         )

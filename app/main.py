@@ -9,20 +9,25 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.api import create_router, install_access_guard
 from app.config import Settings
 from app.db import Database
+from app.http import ETagMiddleware
 from app.providers.market import HybridMarketDataProvider, MarketDataProvider
 from app.providers.cboe import CboeOptionsProvider
 from app.services.scheduler import Scheduler
+from app.services.concurrency import UpstreamGate
 from app.services.snapshots import SnapshotService
 
 
 settings = Settings.from_env()
 database = Database(settings.database_path)
-regular_provider = MarketDataProvider(proxy=settings.proxy_url)
-provider = HybridMarketDataProvider(regular_provider, CboeOptionsProvider(proxy=settings.proxy_url))
+upstream_gate = UpstreamGate(settings.upstream_concurrency, settings.upstream_wait_seconds)
+regular_provider = MarketDataProvider(proxy=settings.proxy_url, upstream_gate=upstream_gate)
+delayed_provider = CboeOptionsProvider(proxy=settings.proxy_url, upstream_gate=upstream_gate)
+provider = HybridMarketDataProvider(regular_provider, delayed_provider)
 snapshots = SnapshotService(database, provider)
 scheduler = Scheduler(settings, snapshots, database)
 
@@ -43,6 +48,8 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Option Scope", version="0.1.0", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(ETagMiddleware)
 install_access_guard(app, settings)
 app.include_router(create_router(database, snapshots, provider, settings))
 static_dir = Path(__file__).parent / "static"

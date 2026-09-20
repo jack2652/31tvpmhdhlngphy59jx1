@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import date, datetime, time, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,14 @@ IV_FLOOR = 0.05
 IV_CEILING = 3.0
 IV_MIN_PRICE = 0.02
 IV_FALLBACK = 0.25
+
+
+def _cache_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def option_expiry(expiration: str) -> datetime | None:
@@ -81,6 +90,62 @@ def within_horizon(row: dict[str, Any], horizon_days: int, now: datetime | None 
     return remain_seconds >= -MIN_MINUTES * 60
 
 
+@lru_cache(maxsize=32)
+def _scan_zero_gamma(
+    spot_value: float,
+    horizon_days: int,
+    prepared: tuple[tuple[float, float, float, float, float], ...],
+    expirations: tuple[str, ...],
+    lower: float,
+    upper: float,
+) -> tuple[float, float, tuple[str, ...]] | None:
+    """缓存固定快照的 Zero Gamma 扫描；prepared 已包含所有与时间有关的参数。"""
+    if not upper > lower:
+        return None
+
+    def gex_at(price: float) -> float:
+        total = 0.0
+        for strike, implied_volatility, open_interest, sign, time_years in prepared:
+            if implied_volatility <= 0 or open_interest <= 0:
+                continue
+            gamma = black_scholes_gamma(price, strike, implied_volatility, time_years)
+            if gamma is not None:
+                total += sign * gamma * open_interest * 100 * price ** 2 * 0.01
+        return total
+
+    roots: list[float] = []
+    previous_spot = lower
+    previous_value = gex_at(previous_spot)
+    for index in range(1, SCAN_STEPS + 1):
+        next_spot = lower + (upper - lower) * index / SCAN_STEPS
+        next_value = gex_at(next_spot)
+        if previous_value == 0:
+            roots.append(previous_spot)
+        if previous_value * next_value < 0:
+            left, right, left_value = previous_spot, next_spot, previous_value
+            for _ in range(BISECTION_STEPS):
+                middle = (left + right) / 2
+                middle_value = gex_at(middle)
+                if left_value * middle_value <= 0:
+                    right = middle
+                else:
+                    left, left_value = middle, middle_value
+            roots.append((left + right) / 2)
+        previous_spot, previous_value = next_spot, next_value
+    if not roots:
+        return None
+    net_gex = gex_at(spot_value)
+    actionable = [root for root in roots if abs(root - spot_value) / spot_value <= MAX_ACTIONABLE_DISTANCE]
+    candidates = actionable or roots
+    if net_gex >= 0:
+        below = [root for root in candidates if root <= spot_value]
+        chosen = max(below) if below else min(candidates, key=lambda root: abs(root - spot_value))
+    else:
+        above = [root for root in candidates if root >= spot_value]
+        chosen = min(above) if above else min(candidates, key=lambda root: abs(root - spot_value))
+    return chosen, net_gex, expirations
+
+
 def contract_gex(row: dict[str, Any], spot: float, now: datetime | None = None) -> float:
     try:
         strike = float(row["strike"])
@@ -127,49 +192,41 @@ def find_zero_gamma(
             strikes.append(strike)
     if not selected or not strikes:
         return None
-    lower = max(min(strikes), spot_value * (1 - SCAN_BAND))
-    upper = min(max(strikes), spot_value * (1 + SCAN_BAND))
-    if not upper > lower:
+    # 扫描过程中每个价格点都会重复使用这些合约参数；到期时间和方向与扫描价格无关，
+    # 先固定下来，避免 161 个扫描点加二分步骤反复解析日期和转换时区。
+    current = _as_now(now)
+    prepared: list[tuple[float, float, float, float, float]] = []
+    for row in selected:
+        try:
+            strike = float(row["strike"])
+            implied_volatility = float(row.get("model_iv") or row.get("implied_volatility") or 0)
+            open_interest = float(row.get("open_interest") or 0)
+        except (TypeError, ValueError, KeyError):
+            continue
+        if strike <= 0:
+            continue
+        time_years = years_to_expiry(str(row.get("expiration")), current)
+        if time_years is None or time_years <= 0:
+            continue
+        sign = 1.0 if row.get("contract_type") == "call" else -1.0
+        prepared.append((strike, implied_volatility, open_interest, sign, time_years))
+    if not prepared:
         return None
 
-    def gex_at(price: float) -> float:
-        return total_gex(selected, price, now)
-
-    roots: list[float] = []
-    previous_spot = lower
-    previous_value = gex_at(previous_spot)
-    for index in range(1, SCAN_STEPS + 1):
-        next_spot = lower + (upper - lower) * index / SCAN_STEPS
-        next_value = gex_at(next_spot)
-        if previous_value == 0:
-            roots.append(previous_spot)
-        if previous_value * next_value < 0:
-            left, right, left_value = previous_spot, next_spot, previous_value
-            for _ in range(BISECTION_STEPS):
-                middle = (left + right) / 2
-                middle_value = gex_at(middle)
-                if left_value * middle_value <= 0:
-                    right = middle
-                else:
-                    left, left_value = middle, middle_value
-            roots.append((left + right) / 2)
-        previous_spot, previous_value = next_spot, next_value
-    if not roots:
+    expirations = tuple(sorted({str(row["expiration"]) for row in selected if row.get("expiration")}))
+    strike_values = [strike for row in selected for strike in [_cache_number(row.get("strike"))] if strike and strike > 0]
+    if not strike_values:
         return None
-    net_gex = gex_at(spot_value)
-    actionable = [root for root in roots if abs(root - spot_value) / spot_value <= MAX_ACTIONABLE_DISTANCE]
-    candidates = actionable or roots
-    if net_gex >= 0:
-        below = [root for root in candidates if root <= spot_value]
-        chosen = max(below) if below else min(candidates, key=lambda root: abs(root - spot_value))
-    else:
-        above = [root for root in candidates if root >= spot_value]
-        chosen = min(above) if above else min(candidates, key=lambda root: abs(root - spot_value))
-    expirations = sorted({str(row["expiration"]) for row in selected if row.get("expiration")})
+    lower = max(min(strike_values), spot_value * (1 - SCAN_BAND))
+    upper = min(max(strike_values), spot_value * (1 + SCAN_BAND))
+    result = _scan_zero_gamma(spot_value, horizon_days, tuple(prepared), expirations, lower, upper)
+    if result is None:
+        return None
+    chosen, net_gex, expirations = result
     return {
         "price": chosen,
         "net_gex": net_gex,
-        "expirations": expirations,
+        "expirations": list(expirations),
         "horizon_days": horizon_days,
         "method": "spot-shift-7d-et-close",
     }
@@ -266,6 +323,34 @@ def estimate_expiration_iv(samples: list[tuple[float, float]], rows: Iterable[di
     return IV_FALLBACK, 0, "default"
 
 
+@lru_cache(maxsize=64)
+def _cached_expiration_greeks(
+    spot: float,
+    expiration: str,
+    years: float,
+    inputs: tuple[tuple[Any, ...], ...],
+) -> tuple[float, int, str, tuple[float | None, ...]]:
+    """缓存同一快照期限的 IV 反解与 Gamma，避免多个接口重复计算。"""
+    group = [
+        {
+            "strike": row[0],
+            "bid": row[1],
+            "ask": row[2],
+            "last_price": row[3],
+            "implied_volatility": row[4],
+            "contract_type": row[5],
+        }
+        for row in inputs
+    ]
+    samples = [sample for sample in (_contract_sample_iv(row, spot, years) for row in group) if sample]
+    volatility, count, source = estimate_expiration_iv(samples, group)
+    gammas = tuple(
+        black_scholes_gamma(spot, _cache_number(row[0]) or 0.0, volatility, years)
+        for row in inputs
+    )
+    return volatility, count, source, gammas
+
+
 def annotate_model_greeks(rows: Iterable[dict[str, Any]], spot: float | None, now: datetime | None = None) -> dict[str, dict[str, Any]]:
     """按到期日用价格反解的 IV 写回 model_iv / model_gamma，并返回每个到期日的估计摘要。"""
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -282,15 +367,22 @@ def annotate_model_greeks(rows: Iterable[dict[str, Any]], spot: float | None, no
         return summary
     for expiration, group in grouped.items():
         years = years_to_expiry(expiration, now) or 0
-        samples = [sample for sample in (_contract_sample_iv(row, spot_value, years) for row in group) if sample]
-        # 同一到期日统一用 ATM 中位数，避免单笔陈旧成交把个别执行价的柱子放得过大。
-        volatility, count, source = estimate_expiration_iv(samples, group)
-        for row in group:
+        inputs = tuple(
+            (
+                _cache_number(row.get("strike")),
+                _cache_number(row.get("bid")),
+                _cache_number(row.get("ask")),
+                _cache_number(row.get("last_price")),
+                _cache_number(row.get("implied_volatility")),
+                row.get("contract_type"),
+            )
+            for row in group
+        )
+        volatility, count, source, gammas = _cached_expiration_greeks(
+            spot_value, expiration, years, inputs
+        )
+        for row, gamma in zip(group, gammas):
             row["model_iv"] = volatility
-            try:
-                strike = float(row["strike"])
-            except (TypeError, ValueError, KeyError):
-                strike = 0.0
-            row["model_gamma"] = black_scholes_gamma(spot_value, strike, volatility, years)
+            row["model_gamma"] = gamma
         summary[expiration] = {"iv": round(volatility, 6), "samples": count, "source": source}
     return summary

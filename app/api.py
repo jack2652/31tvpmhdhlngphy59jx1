@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from app.config import Settings
@@ -15,6 +18,7 @@ from app.db import Database, iso, parse_sessions
 from app.gamma import annotate_model_greeks, find_zero_gamma
 from app.levels import build_levels
 from app.providers.market import ProviderError, MarketDataProvider
+from app.services.concurrency import SingleFlightCache
 from app.services.history import HistoryService
 from app.services.snapshots import SnapshotService, active_expirations, market_today
 
@@ -29,6 +33,12 @@ _FORBIDDEN_PAGE = """<!doctype html>
 </body>
 </html>
 """
+
+
+def snapshot_signature(value: Any) -> str:
+    """为缓存键生成稳定的输入摘要，避免仅依赖时间戳漏掉同批次数据变化。"""
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
 def install_access_guard(app: FastAPI, settings: Settings) -> None:
@@ -87,6 +97,33 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
     history = HistoryService(
         database, provider, settings.history_max_age_seconds, settings.extremes_max_age_seconds
     )
+    # 只缓存同一份输入快照的计算结果；快照时间或基准价变化时自然失效，不会改变算法口径。
+    levels_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=32)
+    gamma_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=16)
+    chain_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=32)
+
+    def shared_cached(
+        namespace: str,
+        cache_key: tuple[Any, ...],
+        callback,
+    ) -> dict[str, Any]:
+        """先用进程内缓存，再用 SQLite 共享缓存，支持多 worker 复用同一快照结果。"""
+        shared_key = f"{namespace}:{snapshot_signature(cache_key)}"
+        stored = database.get_analysis_cache(shared_key)
+        if isinstance(stored, dict):
+            return stored
+        value = callback()
+        database.put_analysis_cache(shared_key, value)
+        return value
+
+    def run_gamma_refresh(job_key: str, symbol_name: str, horizon_days: int) -> None:
+        """后台刷新 Gamma 窗口；任务状态写入 SQLite，允许多 worker 共享。"""
+        try:
+            result = snapshots.refresh_window(symbol_name, horizon_days)
+        except Exception as exc:  # noqa: BLE001 - 后台任务必须把异常写回状态
+            database.finish_analysis_job(job_key, "failed", None, str(exc))
+            return
+        database.finish_analysis_job(job_key, "completed", result, None)
 
     def symbol(value: str) -> str:
         try:
@@ -158,13 +195,38 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         cached = database.latest_chain(normalized, expiration)
         if cached["data"]:
             quote = database.latest_quote(normalized) or {}
-            iv_model = annotate_model_greeks(cached["data"], quote.get("price"))
-            return {"symbol": normalized, "expiration": expiration, "iv_model": iv_model, **cached, "source": "sqlite"}
+            quote_price = quote.get("price")
+            chain_key = (
+                normalized,
+                expiration,
+                cached.get("fetched_at"),
+                cached.get("oi_fallback", {}).get("as_of"),
+                quote_price,
+                snapshot_signature(cached["data"]),
+            )
+
+            def compute_chain() -> dict[str, Any]:
+                rows = [dict(row) for row in cached["data"]]
+                return {"data": rows, "iv_model": annotate_model_greeks(rows, quote_price)}
+
+            analyzed = chain_cache.get_or_compute(
+                chain_key,
+                lambda: shared_cached("chain", chain_key, compute_chain),
+            )
+            return {
+                "symbol": normalized,
+                "expiration": expiration,
+                "iv_model": analyzed["iv_model"],
+                **cached,
+                "data": analyzed["data"],
+                "source": "sqlite",
+            }
         return {"symbol": normalized, "expiration": expiration, "fetched_at": None, "data": [], "source": "pending"}
 
     @router.get("/gamma/{stock_symbol}")
     def gamma_profile(
         stock_symbol: str,
+        background_tasks: BackgroundTasks,
         refresh: bool = Query(default=False),
         horizon_days: int = Query(default=45, ge=1, le=365),
     ) -> dict[str, Any]:
@@ -172,28 +234,49 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         normalized = symbol(stock_symbol)
         refresh_result: dict[str, Any] | None = None
         if refresh:
-            try:
-                refresh_result = snapshots.refresh_window(normalized, horizon_days)
-            except (ProviderError, RuntimeError, ValueError) as exc:
-                refresh_result = {
-                    "symbol": normalized,
-                    "horizon_days": horizon_days,
-                    "expirations": [],
-                    "results": [],
-                    "errors": [str(exc)],
-                }
+            refresh_result = database.claim_analysis_job(normalized, horizon_days)
+            if refresh_result.get("claimed"):
+                background_tasks.add_task(
+                    run_gamma_refresh,
+                    refresh_result["job_id"],
+                    normalized,
+                    horizon_days,
+                )
         profile = database.latest_chains(normalized, horizon_days)
         quote = database.latest_quote(normalized) or {}
         rows = profile.get("data") or []
-        iv_model = annotate_model_greeks(rows, quote.get("price"))
-        zero_gamma = find_zero_gamma(rows, quote.get("price"))
+        quote_price = quote.get("price")
+        gamma_key = (
+            normalized,
+            horizon_days,
+            profile.get("fetched_at"),
+            profile.get("oi_fallback", {}).get("as_of"),
+            quote_price,
+            snapshot_signature(rows),
+        )
+
+        def compute_gamma() -> dict[str, Any]:
+            analysis_rows = [dict(row) for row in rows]
+            iv_model = annotate_model_greeks(analysis_rows, quote_price)
+            return {
+                "data": analysis_rows,
+                "iv_model": iv_model,
+                "zero_gamma": find_zero_gamma(analysis_rows, quote_price),
+            }
+
+        gamma_result = gamma_cache.get_or_compute(
+            gamma_key,
+            lambda: shared_cached("gamma", gamma_key, compute_gamma),
+        )
+        job_state = refresh_result or database.analysis_job(normalized, horizon_days)
         return {
             "symbol": normalized,
-            "iv_model": iv_model,
+            "iv_model": gamma_result["iv_model"],
             **profile,
+            "data": gamma_result["data"],
             "source": "sqlite",
-            "refresh": refresh_result,
-            "zero_gamma": zero_gamma,
+            "refresh": job_state,
+            "zero_gamma": gamma_result["zero_gamma"],
         }
 
     @router.post("/refresh/{stock_symbol}")
@@ -222,25 +305,56 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         quote = database.latest_quote(normalized) or {}
         # 价位接口使用跨期限链；选中的远期期限若不在 45 天窗口内，额外并入，避免切换期限后期权因子消失。
         profile = database.latest_chains(normalized, horizon_days=45)
-        selected_chain = database.latest_chain(normalized, expiration)
         option_rows = list(profile.get("data") or [])
-        seen = {(str(row.get("expiration")), str(row.get("contract_symbol"))) for row in option_rows}
-        for row in selected_chain.get("data") or []:
-            key = (str(row.get("expiration")), str(row.get("contract_symbol")))
-            if key not in seen:
-                option_rows.append(row)
-                seen.add(key)
+        selected_chain: dict[str, Any] | None = None
+        # 选中期限已经在 45 天窗口时直接复用窗口查询结果，避免再次读取同一批次。
+        # 远期期限不在窗口内时才额外读取，保持切换远期期限后仍能参与合成。
+        if expiration not in profile.get("expirations", []):
+            selected_chain = database.latest_chain(normalized, expiration)
+            seen = {(str(row.get("expiration")), str(row.get("contract_symbol"))) for row in option_rows}
+            for row in selected_chain.get("data") or []:
+                key = (str(row.get("expiration")), str(row.get("contract_symbol")))
+                if key not in seen:
+                    option_rows.append(row)
+                    seen.add(key)
         option_expirations = sorted({str(row.get("expiration")) for row in option_rows if row.get("expiration")})
-        fetched_values = [value for value in (profile.get("fetched_at"), selected_chain.get("fetched_at")) if value]
+        fetched_values = [value for value in (profile.get("fetched_at"), (selected_chain or {}).get("fetched_at")) if value]
         history_payload = history.bars(normalized)
-        extremes_payload = history.extremes(normalized)
-        beta_payload = history.beta(normalized)
-        computed = build_levels(
-            history_payload.get("bars") or [],
-            option_rows,
-            spot if spot is not None else quote.get("price"),
+        # 极值和 Beta 使用不同缓存/锁；并行读取可以缩短首次加载等待。Beta 复用已经取回的两年日线，
+        # 避免同一请求再次向行情源请求同一份标的数据。
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="levels-input") as executor:
+            extremes_future = executor.submit(history.extremes, normalized)
+            beta_future = executor.submit(history.beta, normalized, history_payload.get("bars") or None)
+            extremes_payload = extremes_future.result()
+            beta_payload = beta_future.result()
+        resolved_spot = spot if spot is not None else quote.get("price")
+        cache_key = (
+            normalized,
             expiration,
-            extremes_payload.get("extremes"),
+            resolved_spot,
+            profile.get("fetched_at"),
+            (selected_chain or {}).get("fetched_at"),
+            profile.get("oi_fallback", {}).get("as_of"),
+            (selected_chain or {}).get("oi_fallback", {}).get("as_of"),
+            history_payload.get("fetched_at"),
+            extremes_payload.get("fetched_at"),
+            snapshot_signature(option_rows),
+            len(history_payload.get("bars") or []),
+            snapshot_signature(extremes_payload.get("extremes")),
+        )
+        computed = levels_cache.get_or_compute(
+            cache_key,
+            lambda: shared_cached(
+                "levels",
+                cache_key,
+                lambda: build_levels(
+                    history_payload.get("bars") or [],
+                    option_rows,
+                    resolved_spot,
+                    expiration,
+                    extremes_payload.get("extremes"),
+                ),
+            ),
         )
         bars = list(history_payload.get("bars") or [])
         return {

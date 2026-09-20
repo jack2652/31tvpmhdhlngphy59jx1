@@ -8,7 +8,7 @@
 bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
 ```
 
-脚本会先把仓库克隆到当前目录下的 `us_stocks/`（该目录已是仓库时改跑 `git pull` 更新到最新源码），然后切换进去打开交互菜单：第 1 项装环境、第 2 项启动（后台运行 + 看门狗守护）。
+脚本会先把仓库克隆到当前目录下的 `us_stocks/`（该目录已是仓库时改跑 `git pull` 更新到最新源码），然后切换进去打开交互菜单：第 1 项装环境、第 2 项启动（后台运行 + 看门狗守护）、第 5 项服务管理中包含重启应用。
 
 | 需求 | 命令 |
 | --- | --- |
@@ -63,10 +63,11 @@ Gamma 敞口使用 Black-Scholes 根据标的价格、执行价、隐含波动�
 推荐直接用运维脚本 `run.sh`（幂等，重复执行安全，Ubuntu/Debian、CentOS/RHEL、Alpine 通用）：
 
 ```bash
-./run.sh            # 交互菜单：装环境、启动、停止、状态日志、服务管理、配置、数据库工具、自检
+./run.sh            # 交互菜单：装环境、启动、停止、状态日志、服务管理、配置、数据库工具、自检、更新、重启
 ./run.sh 2          # 等价于「一键启动」：装环境 → 后台启动 → 挂看门狗守护
 ./run.sh status     # 查看运行状态（也可用 ./run.sh 4）
 ./run.sh stop       # 停止应用与看门狗
+./run.sh restart    # 停止后重新启动应用
 ```
 
 脚本做的四件事与手动命令一一对应：`python -m venv .venv`、`.venv/bin/pip install -e .`、
@@ -96,6 +97,7 @@ URL 中的密钥会进入浏览器历史记录，
 请避免在公开截图或聊天中直接分享完整地址。
 
 应用会自动读取项目根目录下的 `.env`；也可以直接在启动命令前导出环境变量。
+交互菜单第 6 项会以数字菜单逐项修改配置，包含 `ACCESS_KEY`：可手动设置、自动生成或清空（清空表示关闭访问保护），修改后应用运行中会询问是否立即重启。
 
 也可以直接使用 `.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000`。可通过 `HOST` 和 `PORT` 环境变量覆盖 `python -m app` 的默认值。
 
@@ -141,7 +143,11 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 | `CLEANUP_INTERVAL_SECONDS` | `86400` | 历史清理间隔 |
 | `DATABASE_MAX_MB` | `0` | SQLite 体积上限，纯数字按 MB 解释，也支持 `300M`、`1G`；`0` 表示不限制 |
 | `HISTORY_MAX_AGE_SECONDS` | `3600` | 日线历史（斐波那契/筹码分布/承接位）的回源间隔 |
+| `EXTREMES_MAX_AGE_SECONDS` | `86400` | 52 周和历史最高/最低价的回源间隔 |
 | `SCHEDULER_ENABLED` | `true` | 是否启用后台刷新和清理 |
+| `UPSTREAM_CONCURRENCY` | `6` | 单进程访问上游行情源的最大并发数 |
+| `UPSTREAM_WAIT_SECONDS` | `20` | 等待上游并发槽位的最长时间，超时后优先使用本地旧快照 |
+| `WEB_WORKERS` | `1` | Web worker 数量；增加前请确认部署机器内存足够 |
 
 表中「默认值」是环境变量缺失时代码的回退值；`.env.example` 面向小磁盘环境，
 已经把 `DATABASE_MAX_MB` 预设为 `256M`、`RAW_RETENTION_DAYS` 预设为 `7`，改成 `0` / 更大的天数即可放宽。

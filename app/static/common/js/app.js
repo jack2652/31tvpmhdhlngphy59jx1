@@ -13,10 +13,12 @@ const state = {
   loading: false,
   refreshInFlight: null,
   analysisRefreshSymbol: null,
+  analysisRefreshTimer: null,
   chainFetchedAt: null,
   levelsWindowFetchedAt: null,
   levelsKey: "",
   levelsPayload: null,
+  deferLevels: false,
   chainFilter: "all",
   chainRows: [],
   chainSpot: null,
@@ -942,7 +944,7 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   if (analysisFallback.restored) state.view.chart.gammaScope += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
   state.view.chart.callWall = `看涨墙 ${callWall?.callGex ? formatMoney(callWall.strike) : "--"}`;
   state.view.chart.putWall = `看跌墙 ${putWall?.putGex ? formatMoney(putWall.strike) : "--"}`;
-  loadFactorLevels(points, levelSpot);
+  if (!state.deferLevels) loadFactorLevels(points, levelSpot);
   OptionScopeCharts.renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "当前期权链未提供 Gamma，暂无法估算 GEX", { spot, gammaFlip, crosshairTags: true, markers: [
     { point: callWall, className: "chart-wall-call", label: "看涨墙", position: "top" },
     { point: putWall, className: "chart-wall-put", label: "看跌墙", position: "bottom" },
@@ -1114,7 +1116,7 @@ function renderChainTable() {
   renderChainRows(shown, state.chainSpot, emptyLabel);
 }
 
-function renderChain(payload, quote, analysisPayload) {
+function renderChain(payload, quote, analysisPayload, options = {}) {
   const rows = payload.data || []; state.expiration = payload.expiration;
   // 基准价开关切换时要用最近一次快照重算，这里留一份引用。
   state.lastQuote = quote || null;
@@ -1134,7 +1136,10 @@ function renderChain(payload, quote, analysisPayload) {
   const analysisRows = analysisPayload?.data?.length ? analysisPayload.data : rows;
   // 记录本次快照时间：压力位/支撑位的合成接口按「标的 + 到期日 + 快照时间」去重请求。
   state.chainFetchedAt = payload.fetched_at || null;
+  const previousDeferLevels = state.deferLevels;
+  state.deferLevels = Boolean(options.deferLevels);
   renderAnalysis(analysisRows, quote?.price, analysisPayload, rows, payload.iv_model || {}, activeBasis(quote));
+  state.deferLevels = previousDeferLevels;
   state.chainRows = rows; state.chainSpot = quote?.price ?? null;
   renderChainTable();
 }
@@ -1258,10 +1263,26 @@ function refreshAnalysisWindow(loadId, payload, quote) {
   const encodedSymbol = encodeURIComponent(symbol);
   const pendingText = `快照已更新 ${formatTime(payload?.fetched_at)} · 正在后台刷新 Gamma 窗口…`;
   state.view.lastStatus = pendingText;
+  pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, 0);
+}
+
+// 后端 Gamma 刷新改为 SQLite 任务协调的后台任务；前端轮询任务状态，期间继续展示旧分析。
+function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt) {
   request(`/api/gamma/${encodedSymbol}?horizon_days=45&refresh=true`)
     .then((analysis) => {
       if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
-      if (!analysis?.data?.length) return;
+      if (analysis?.refresh?.status === "running" && attempt < 30) {
+        state.analysisRefreshTimer = setTimeout(() => {
+          state.analysisRefreshTimer = null;
+          pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt + 1);
+        }, 1000);
+        return;
+      }
+      if (!analysis?.data?.length) {
+        // 没有可用的新窗口数据时，至少用旧分析完成一次价位刷新，保持价位与新快照同步。
+        renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);
+        return;
+      }
       state.analysisReady = true;
       renderChain(payload, quote, analysis);
       // 窗口刷新期间用户可能又点了刷新：只在提示文案还属于本次窗口刷新时才改写，避免覆盖更新的状态。
@@ -1269,9 +1290,15 @@ function refreshAnalysisWindow(loadId, payload, quote) {
     })
     .catch((error) => {
       if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
+      // Gamma 窗口刷新失败时仍补做一次价位请求，避免快照已更新却继续显示旧的价位结果。
+      renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);
       if (state.view.lastStatus === pendingText) state.view.lastStatus = `Gamma 窗口刷新失败，仍显示本地缓存（${error.message}）`;
     })
-    .finally(() => { if (state.analysisRefreshSymbol === symbol) state.analysisRefreshSymbol = null; });
+    .finally(() => {
+      if (state.analysisRefreshTimer || (state.analysisRefreshSymbol !== symbol)) return;
+      if (attempt >= 30) state.analysisRefreshSymbol = null;
+      else state.analysisRefreshSymbol = null;
+    });
 }
 
 async function refreshInBackground(loadId) {
@@ -1324,7 +1351,9 @@ async function refreshInBackground(loadId) {
       return;
     }
     renderQuote(quote);
-    renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);
+    // Gamma 窗口随后会再次返回并重绘分析；先复用旧分析显示链数据，延后价位请求，
+    // 避免同一次刷新因链快照和跨期限窗口先后落地而重复计算 /api/levels。
+    renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null, { deferLevels: true });
     state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
     syncPageQuery();
     refreshAnalysisWindow(loadId, payload, quote);

@@ -987,7 +987,7 @@ action_status() {
   return 0
 }
 
-# 配置向导用的单键修改：直接回车表示保持原值
+# 配置菜单用的单项修改：只修改当前选中的配置项
 ask_env_value() {
   local key="$1" desc="$2" current="" input=""
   current="$(read_env_value "$key" "")"
@@ -1003,20 +1003,83 @@ ask_env_value() {
   return 0
 }
 
-action_config() {
-  local port limit answer=""
-  section "修改配置（.env）"
-  ensure_env_file || return 1
+mask_access_key() {
+  local value="$1"
+  if [ -z "$value" ]; then
+    printf '（未配置）'
+  elif [ "${#value}" -le 4 ]; then
+    printf '****'
+  else
+    printf '%s****%s' "${value:0:2}" "${value:$((${#value} - 2)):2}"
+  fi
+}
+
+ask_access_key() {
+  local choice="" input="" generated="" current=""
+  current="$(read_env_value ACCESS_KEY "")"
+  printf '\n  ACCESS_KEY 当前值：%s\n' "$(mask_access_key "$current")"
+  printf '  1) 手动设置新密钥\n'
+  printf '  2) 自动生成 16 位密钥\n'
+  printf '  3) 清空密钥（关闭访问保护）\n'
+  printf '  0) 返回\n'
+  printf '  请选择：'
+  read -r choice || return 0
+  case "$choice" in
+    1)
+      printf '  输入新 ACCESS_KEY（直接回车取消）：'
+      read -r input || input=""
+      if [ -z "$input" ]; then
+        info "ACCESS_KEY 保持不变"
+      else
+        write_env_value ACCESS_KEY "$input" && ok "ACCESS_KEY 已更新"
+      fi
+      ;;
+    2)
+      generated="$(generate_access_key)" || {
+        fail "无法生成访问密钥"
+        return 1
+      }
+      write_env_value ACCESS_KEY "$generated" && ok "ACCESS_KEY 已重新生成：$generated"
+      ;;
+    3)
+      printf '  清空后页面和 API 将不再要求密钥，确认请输入 yes：'
+      read -r input || input=""
+      if [ "$input" = "yes" ]; then
+        write_env_value ACCESS_KEY "" && ok "ACCESS_KEY 已清空，访问保护已关闭"
+      else
+        info "已取消"
+      fi
+      ;;
+    0 | "") return 0 ;;
+    *) warn "无效选择：$choice" ;;
+  esac
+  return 0
+}
+
+show_config_summary() {
+  local access_key
+  access_key="$(read_env_value ACCESS_KEY "")"
   printf '  配置文件：%s\n' "$ENV_FILE"
-  ask_env_value HOST "监听地址（0.0.0.0 表示允许局域网访问）"
-  ask_env_value PORT "监听端口（1024-65535）"
-  ask_env_value DEFAULT_SYMBOLS "默认标的（多个用英文逗号分隔）"
-  ask_env_value REFRESH_INTERVAL_SECONDS "后台刷新间隔（秒）"
-  ask_env_value RAW_RETENTION_DAYS "历史数据保留天数"
-  ask_env_value DATABASE_MAX_MB "SQLite 体积上限（512 / 512M / 1G，0 表示不限制）"
-  ask_env_value MARKET_PROXY "上游行情接口的代理地址（留空表示不使用代理）"
-  ask_env_value SCHEDULER_ENABLED "是否启用后台刷新（true/false）"
-  printf '\n'
+  printf '  1) DATABASE_PATH=%s\n' "$(read_env_value DATABASE_PATH data/options.db)"
+  printf '  2) HOST=%s\n' "$(read_env_value HOST 0.0.0.0)"
+  printf '  3) PORT=%s\n' "$(read_env_value PORT 8000)"
+  printf '  4) ACCESS_KEY=%s\n' "$(mask_access_key "$access_key")"
+  printf '  5) MARKET_PROXY=%s\n' "$(read_env_value MARKET_PROXY "（空）")"
+  printf '  6) DEFAULT_SYMBOLS=%s\n' "$(read_env_value DEFAULT_SYMBOLS QQQ)"
+  printf '  7) REFRESH_INTERVAL_SECONDS=%s\n' "$(read_env_value REFRESH_INTERVAL_SECONDS 60)"
+  printf '  8) RAW_RETENTION_DAYS=%s\n' "$(read_env_value RAW_RETENTION_DAYS 30)"
+  printf '  9) CLEANUP_INTERVAL_SECONDS=%s\n' "$(read_env_value CLEANUP_INTERVAL_SECONDS 86400)"
+  printf ' 10) DATABASE_MAX_MB=%s\n' "$(read_env_value DATABASE_MAX_MB 0)"
+  printf ' 11) HISTORY_MAX_AGE_SECONDS=%s\n' "$(read_env_value HISTORY_MAX_AGE_SECONDS 3600)"
+  printf ' 12) EXTREMES_MAX_AGE_SECONDS=%s\n' "$(read_env_value EXTREMES_MAX_AGE_SECONDS 86400)"
+  printf ' 13) SCHEDULER_ENABLED=%s\n' "$(read_env_value SCHEDULER_ENABLED true)"
+  printf ' 14) UPSTREAM_CONCURRENCY=%s\n' "$(read_env_value UPSTREAM_CONCURRENCY 6)"
+  printf ' 15) UPSTREAM_WAIT_SECONDS=%s\n' "$(read_env_value UPSTREAM_WAIT_SECONDS 20)"
+  printf ' 16) WEB_WORKERS=%s\n' "$(read_env_value WEB_WORKERS 2)"
+}
+
+validate_config_values() {
+  local port limit workers concurrency wait_seconds
   port="$(read_env_value PORT 8000)"
   case "$port" in
     '' | *[!0-9]*)
@@ -1031,14 +1094,64 @@ action_config() {
   case "$(printf '%s' "$limit" | tr '[:lower:]' '[:upper:]')" in
     '' | *[!0-9MG]*) warn "DATABASE_MAX_MB=$limit 写法可能不合法，应用启动时会报错" ;;
   esac
-  ok "配置已保存到 $ENV_FILE"
-  if app_running; then
-    printf '  配置需要重启后才生效，现在重启？[y/N]：'
-    read -r answer || answer=""
-    case "$answer" in
-      y | Y | yes | YES) restart_app ;;
-      *) info "稍后可执行 ./run.sh 5 选择重启使其生效" ;;
+  workers="$(read_env_value WEB_WORKERS 2)"
+  concurrency="$(read_env_value UPSTREAM_CONCURRENCY 6)"
+  wait_seconds="$(read_env_value UPSTREAM_WAIT_SECONDS 20)"
+  case "$workers" in '' | *[!0-9]*) fail "WEB_WORKERS 必须是正整数"; return 1 ;; esac
+  case "$concurrency" in '' | *[!0-9]*) fail "UPSTREAM_CONCURRENCY 必须是正整数"; return 1 ;; esac
+  case "$wait_seconds" in '' | *[!0-9]*) fail "UPSTREAM_WAIT_SECONDS 必须是正整数"; return 1 ;; esac
+  [ "$workers" -ge 1 ] || { fail "WEB_WORKERS 必须大于等于 1"; return 1; }
+  [ "$concurrency" -ge 1 ] || { fail "UPSTREAM_CONCURRENCY 必须大于等于 1"; return 1; }
+  [ "$wait_seconds" -ge 1 ] || { fail "UPSTREAM_WAIT_SECONDS 必须大于等于 1"; return 1; }
+  return 0
+}
+
+action_config() {
+  local choice="" answer="" before="" after=""
+  section "修改配置（.env）"
+  ensure_env_file || return 1
+  before="$(cksum "$ENV_FILE" 2>/dev/null || true)"
+  while true; do
+    section "配置菜单"
+    show_config_summary
+    printf '  0) 返回\n'
+    printf '请选择要修改的配置项：'
+    read -r choice || break
+    case "$choice" in
+      1) ask_env_value DATABASE_PATH "SQLite 数据库路径" ;;
+      2) ask_env_value HOST "监听地址（0.0.0.0 表示允许局域网访问）" ;;
+      3) ask_env_value PORT "监听端口（1024-65535）" ;;
+      4) ask_access_key ;;
+      5) ask_env_value MARKET_PROXY "上游行情接口代理地址（留空表示不使用代理）" ;;
+      6) ask_env_value DEFAULT_SYMBOLS "默认标的（多个用英文逗号分隔）" ;;
+      7) ask_env_value REFRESH_INTERVAL_SECONDS "后台刷新间隔（秒）" ;;
+      8) ask_env_value RAW_RETENTION_DAYS "历史数据保留天数" ;;
+      9) ask_env_value CLEANUP_INTERVAL_SECONDS "历史清理间隔（秒）" ;;
+      10) ask_env_value DATABASE_MAX_MB "SQLite 体积上限（512 / 512M / 1G，0 表示不限制）" ;;
+      11) ask_env_value HISTORY_MAX_AGE_SECONDS "日线历史回源间隔（秒）" ;;
+      12) ask_env_value EXTREMES_MAX_AGE_SECONDS "历史极值回源间隔（秒）" ;;
+      13) ask_env_value SCHEDULER_ENABLED "是否启用后台刷新和清理（true/false）" ;;
+      14) ask_env_value UPSTREAM_CONCURRENCY "单进程上游最大并发数" ;;
+      15) ask_env_value UPSTREAM_WAIT_SECONDS "等待上游并发槽位的最长秒数" ;;
+      16) ask_env_value WEB_WORKERS "Web worker 数量（建议 2-4）" ;;
+      0 | "") break ;;
+      *) warn "无效选择：$choice" ;;
     esac
+  done
+  validate_config_values || return 1
+  after="$(cksum "$ENV_FILE" 2>/dev/null || true)"
+  if [ "$before" != "$after" ]; then
+    ok "配置已保存到 $ENV_FILE"
+    if app_running; then
+      printf '  配置需要重启后才生效，现在重启？[y/N]：'
+      read -r answer || answer=""
+      case "$answer" in
+        y | Y | yes | YES) restart_app ;;
+        *) info "稍后可从主菜单选择“重启应用”使其生效" ;;
+      esac
+    fi
+  else
+    info "未修改配置"
   fi
   return 0
 }

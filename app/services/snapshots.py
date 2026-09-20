@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from app.db import Database, iso, parse_sessions
 from app.providers.market import ProviderError, MarketDataProvider
+from app.services.concurrency import SingleFlight, UpstreamBusyError
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +21,9 @@ MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 # 跨期限 Gamma 窗口的单到期日新鲜期（秒）：窗口刷新很慢，短期内的重复请求直接跳过。
 WINDOW_FRESH_SECONDS = 120
+REFRESH_LOCK_TIMEOUT_SECONDS = 60
+REFRESH_LEASE_SECONDS = 180
+REFRESH_COALESCE_SECONDS = 60
 
 
 def market_today() -> date:
@@ -50,6 +56,8 @@ class SnapshotService:
         self.provider = provider or MarketDataProvider()
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._refresh_flight: SingleFlight[tuple[str, str | None, int], dict[str, Any]] = SingleFlight()
+        self._owner = uuid4().hex
 
     def _lock_for(self, symbol: str) -> threading.Lock:
         with self._locks_guard:
@@ -62,23 +70,96 @@ class SnapshotService:
         避免定时刷新与手动刷新对同一份数据反复打接口。
         """
         normalized = self.provider.normalize_symbol(symbol)
+        flight_key = (normalized, expiration, max_age_seconds)
+        return self._refresh_flight.do(
+            flight_key,
+            lambda: self._refresh_locked(normalized, expiration, max_age_seconds),
+        )
+
+    def _refresh_locked(self, normalized: str, expiration: str | None, max_age_seconds: int) -> dict[str, Any]:
+        """同标的刷新串行化；同一请求键由 SingleFlight 共享结果，不再并发返回 502。"""
         lock = self._lock_for(normalized)
-        if not lock.acquire(blocking=False):
-            raise RuntimeError(f"{normalized} 正在刷新，请稍后再试")
+        waited_for_process_lock = not lock.acquire(blocking=False)
+        if waited_for_process_lock and not lock.acquire(timeout=REFRESH_LOCK_TIMEOUT_SECONDS):
+            raise RuntimeError(f"{normalized} 刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
+        lease_name = f"snapshot-refresh:{normalized}"
+        deadline = time.monotonic() + REFRESH_LOCK_TIMEOUT_SECONDS
+        waited_for_database_lease = False
+        lease_acquired = False
         try:
-            if max_age_seconds > 0:
-                cached = self.recent_snapshot(normalized, expiration, max_age_seconds)
-                if cached is not None:
-                    logger.debug(
-                        "跳过刷新 %s %s：本地快照仍有 %.1f 秒新鲜度",
-                        normalized,
-                        cached.get("expiration") or "(仅现货)",
-                        cached["age_seconds"],
-                    )
-                    return cached
-            return self._fetch_and_store(normalized, expiration)
+            while not self.database.try_acquire_lease(lease_name, self._owner, REFRESH_LEASE_SECONDS):
+                waited_for_database_lease = True
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"{normalized} 跨进程刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
+                time.sleep(0.1)
+            lease_acquired = True
+            try:
+                # 另一个 worker 刚刚完成了同一标的刷新时，复用其新快照；只有真正的独立强制刷新才继续回源。
+                if waited_for_process_lock or waited_for_database_lease:
+                    coalesced = self.recent_snapshot(normalized, expiration, REFRESH_COALESCE_SECONDS)
+                    if coalesced is not None:
+                        coalesced["coalesced"] = True
+                        return coalesced
+                if max_age_seconds > 0:
+                    cached = self.recent_snapshot(normalized, expiration, max_age_seconds)
+                    if cached is not None:
+                        logger.debug(
+                            "跳过刷新 %s %s：本地快照仍有 %.1f 秒新鲜度",
+                            normalized,
+                            cached.get("expiration") or "(仅现货)",
+                            cached["age_seconds"],
+                        )
+                        return cached
+                try:
+                    return self._fetch_and_store(normalized, expiration)
+                except (ProviderError, UpstreamBusyError, RuntimeError) as exc:
+                    stale = self._stale_snapshot(normalized, expiration, str(exc))
+                    if stale is not None:
+                        logger.warning("刷新 %s 失败，沿用本地旧快照：%s", normalized, exc)
+                        return stale
+                    raise
+            finally:
+                try:
+                    if lease_acquired:
+                        self.database.release_lease(lease_name, self._owner)
+                finally:
+                    lease_acquired = False
         finally:
             lock.release()
+
+    def _stale_snapshot(self, symbol: str, expiration: str | None, warning: str) -> dict[str, Any] | None:
+        """上游拥塞或失败时返回本地旧快照元数据，让调用方继续使用本地链。"""
+        target = expiration
+        if not target:
+            values = active_expirations(self.database.latest_expirations(symbol))
+            target = values[0] if values else None
+        if target:
+            cached = self.database.latest_chain(symbol, target)
+            if cached.get("data"):
+                return {
+                    "symbol": symbol,
+                    "expiration": target,
+                    "fetched_at": cached.get("fetched_at"),
+                    "rows": 0,
+                    "skipped": True,
+                    "stale": True,
+                    "age_seconds": round(snapshot_age_seconds(cached.get("fetched_at")) or 0.0, 1),
+                    "warning": warning,
+                }
+        quote = self.database.latest_quote(symbol) or {}
+        if quote.get("price") is None:
+            return None
+        return {
+            "symbol": symbol,
+            "expiration": None,
+            "fetched_at": quote.get("fetched_at"),
+            "rows": 0,
+            "skipped": True,
+            "stale": True,
+            "age_seconds": round(snapshot_age_seconds(quote.get("fetched_at")) or 0.0, 1),
+            "quote_only": True,
+            "warning": warning,
+        }
 
     def recent_snapshot(self, symbol: str, expiration: str | None, max_age_seconds: int) -> dict[str, Any] | None:
         """本地快照仍在新鲜期内时返回可复用的结果，否则返回 None。"""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -21,9 +22,21 @@ class Scheduler:
         self.database = database
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        self._owner = uuid4().hex
+        self._lease_name = "option-snapshot-scheduler"
+        self._lease_seconds = max(120, settings.refresh_interval_seconds * 3)
 
     async def start(self) -> None:
         if self.settings.scheduler_enabled and self._task is None:
+            acquired = await asyncio.to_thread(
+                self.database.try_acquire_lease,
+                self._lease_name,
+                self._owner,
+                self._lease_seconds,
+            )
+            if not acquired:
+                logger.info("当前 worker 不持有后台调度租约，跳过重复调度")
+                return
             self._stop.clear()
             self._task = asyncio.create_task(self._loop(), name="option-snapshot-scheduler")
 
@@ -33,6 +46,7 @@ class Scheduler:
             # 调度协程可能因为历史异常提前结束，这里显式取回结果，避免关闭流程被异常打断
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+            await asyncio.to_thread(self.database.release_lease, self._lease_name, self._owner)
 
     async def _guard(self, step: Callable[[], Awaitable[Any]], description: str) -> None:
         """执行单个调度步骤并吞掉异常。
@@ -54,6 +68,15 @@ class Scheduler:
         await self._guard(self._cleanup_by_size, "体积清理")
         elapsed = 0
         while not self._stop.is_set():
+            lease_alive = await asyncio.to_thread(
+                self.database.try_acquire_lease,
+                self._lease_name,
+                self._owner,
+                self._lease_seconds,
+            )
+            if not lease_alive:
+                logger.warning("后台调度租约已被其他 worker 接管，当前调度退出")
+                break
             interval = self.settings.cleanup_interval_seconds if elapsed >= self.settings.cleanup_interval_seconds else self.settings.refresh_interval_seconds
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
