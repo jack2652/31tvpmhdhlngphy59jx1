@@ -269,7 +269,14 @@ class SnapshotService:
             try:
                 cached = self.database.latest_chain(normalized, expiration)
                 age = snapshot_age_seconds(cached.get("fetched_at"))
-                if age is not None and age < WINDOW_FRESH_SECONDS:
+                # 盘前/盘后上游可能先返回整链但未平仓量为 0。此时即使快照刚写入，
+                # 也不能把它当作完整数据跳过，否则首屏 Gamma 会一直是 0，直到手动刷新。
+                has_open_interest = any(
+                    float(row.get("open_interest") or 0) > 0
+                    for row in cached.get("data") or []
+                    if isinstance(row, dict)
+                )
+                if age is not None and age < WINDOW_FRESH_SECONDS and has_open_interest:
                     continue
                 results.append(self.refresh(normalized, expiration))
             except Exception as exc:

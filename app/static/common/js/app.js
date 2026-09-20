@@ -1275,10 +1275,20 @@ function refreshAnalysisWindow(loadId, payload, quote) {
   pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, 0);
 }
 
+async function latestSelectedChain(loadId, symbol, fallbackPayload) {
+  const expiration = state.expiration;
+  if (!expiration) return fallbackPayload;
+  const encodedSymbol = encodeURIComponent(symbol);
+  const encodedExpiration = encodeURIComponent(expiration);
+  const latest = await request(`/api/chain/${encodedSymbol}?expiration=${encodedExpiration}`).catch(() => null);
+  if (!isCurrentLoad(loadId, expiration) || state.symbol !== symbol) return null;
+  return latest?.data?.length ? latest : fallbackPayload;
+}
+
 // 后端 Gamma 刷新改为 SQLite 任务协调的后台任务；前端轮询任务状态，期间继续展示旧分析。
 function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt) {
   request(`/api/gamma/${encodedSymbol}?horizon_days=45&refresh=true`)
-    .then((analysis) => {
+    .then(async (analysis) => {
       if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
       if (analysis?.refresh?.status === "running" && attempt < 30) {
         state.analysisRefreshTimer = setTimeout(() => {
@@ -1287,13 +1297,15 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
         }, 1000);
         return;
       }
+      const selectedPayload = await latestSelectedChain(loadId, symbol, payload);
+      if (!selectedPayload) return;
       if (!analysis?.data?.length) {
         // 没有可用的新窗口数据时，至少用旧分析完成一次价位刷新，保持价位与新快照同步。
-        renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);
+        renderChain(selectedPayload, quote, state.lastAnalysis?.analysisPayload || null);
         return;
       }
       state.analysisReady = true;
-      renderChain(payload, quote, analysis);
+      renderChain(selectedPayload, quote, analysis);
       // 窗口刷新期间用户可能又点了刷新：只在提示文案还属于本次窗口刷新时才改写，避免覆盖更新的状态。
       if (state.view.lastStatus === pendingText) state.view.lastStatus = `最近更新 ${formatTime(payload?.fetched_at)}`;
     })

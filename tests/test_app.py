@@ -1254,6 +1254,33 @@ def test_refresh_requests_provider_after_fresh_window(tmp_path: Path):
     assert fresh["skipped"] is True
 
 
+def test_gamma_window_refreshes_fresh_chain_without_open_interest(tmp_path: Path):
+    """刚写入但未平仓量全为 0 的链不能阻止 Gamma 窗口补抓。"""
+    database = Database(tmp_path / "options.db")
+    expiration = (market_today() + timedelta(days=7)).isoformat()
+    blank_rows = sample_rows(expiration=expiration)
+    for row in blank_rows:
+        row["open_interest"] = 0
+    database.write_snapshot(sample_quote(), blank_rows, iso())
+
+    calls = {"fetch": 0}
+
+    class CountingProvider(FakeProvider):
+        def expirations(self, symbol: str) -> list[str]:
+            return [expiration]
+
+        def fetch(self, symbol: str, requested_expiration: str):
+            calls["fetch"] += 1
+            return sample_quote(symbol), sample_rows(symbol, requested_expiration), iso()
+
+    service = SnapshotService(database, CountingProvider())
+    result = service.refresh_window("AAPL", horizon_days=45)
+
+    assert calls["fetch"] == 1
+    assert result["results"]
+    assert any(row["open_interest"] > 0 for row in database.latest_chain("AAPL", expiration)["data"])
+
+
 def test_refreshes_from_separate_workers_share_sqlite_lease(tmp_path: Path):
     """两个 worker 实例同时刷新同一标的时只允许一次回源，其余复用新快照。"""
     database_path = tmp_path / "options.db"
@@ -1306,6 +1333,8 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     # 跨期限 Gamma 窗口刷新改为后台任务，表格渲染完成后不再等待窗口。
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
     assert "refreshAnalysisWindow(loadId, payload, quote);" in source
+    assert "async function latestSelectedChain(loadId, symbol, fallbackPayload)" in source
+    assert "const selectedPayload = await latestSelectedChain(loadId, symbol, payload);" in source
     assert "?horizon_days=45&refresh=true" in source
     # 首次拿到选中期限的链后立即请求综合价位，不再等待慢速的跨期限 Gamma 窗口。
     assert "loadFactorLevels(points, levelSpot);" in source
