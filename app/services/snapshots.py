@@ -129,11 +129,13 @@ class SnapshotService:
 
     def _stale_snapshot(self, symbol: str, expiration: str | None, warning: str) -> dict[str, Any] | None:
         """上游拥塞或失败时返回本地旧快照元数据，让调用方继续使用本地链。"""
+        cached_quote = self.database.latest_quote(symbol) or {}
+        has_cached_price = cached_quote.get("price") is not None and snapshot_age_seconds(cached_quote.get("fetched_at")) is not None
         target = expiration
         if not target:
             values = active_expirations(self.database.latest_expirations(symbol))
             target = values[0] if values else None
-        if target:
+        if target and has_cached_price:
             cached = self.database.latest_chain(symbol, target)
             if cached.get("data"):
                 return {
@@ -146,7 +148,7 @@ class SnapshotService:
                     "age_seconds": round(snapshot_age_seconds(cached.get("fetched_at")) or 0.0, 1),
                     "warning": warning,
                 }
-        quote = self.database.latest_quote(symbol) or {}
+        quote = cached_quote
         if quote.get("price") is None:
             return None
         return {
@@ -182,8 +184,18 @@ class SnapshotService:
                 "age_seconds": round(age, 1),
             }
         cached = self.database.latest_chain(symbol, target)
-        age = snapshot_age_seconds(cached.get("fetched_at"))
-        if age is None or age >= max_age_seconds:
+        chain_age = snapshot_age_seconds(cached.get("fetched_at"))
+        quote = self.database.latest_quote(symbol) or {}
+        quote_age = snapshot_age_seconds(quote.get("fetched_at"))
+        # 期权链和行情是同一份页面快照的两个必要部分；只缓存到链而没有有效现价时，
+        # 不能返回 skipped，否则首屏会一直显示 --，直到用户手动再次刷新。
+        if (
+            chain_age is None
+            or chain_age >= max_age_seconds
+            or quote.get("price") is None
+            or quote_age is None
+            or quote_age >= max_age_seconds
+        ):
             return None
         return {
             "symbol": symbol,
@@ -191,7 +203,7 @@ class SnapshotService:
             "fetched_at": cached["fetched_at"],
             "rows": 0,
             "skipped": True,
-            "age_seconds": round(age, 1),
+            "age_seconds": round(max(chain_age, quote_age), 1),
         }
 
     def _fetch_and_store(self, normalized: str, expiration: str | None) -> dict[str, Any]:

@@ -896,6 +896,16 @@ def test_cached_chain_returns_sqlite_without_refresh(tmp_path: Path):
         assert chain.json()["source"] == "sqlite"
         assert chain.json()["data"]
 
+
+def test_recent_snapshot_requires_quote_and_chain(tmp_path: Path):
+    """只有期权链没有有效现价时不能误判为新鲜快照。"""
+    database = Database(tmp_path / "options.db")
+    quote = sample_quote()
+    quote["price"] = None
+    database.write_snapshot(quote, sample_rows(), iso())
+    service = SnapshotService(database, FakeProvider())
+    assert service.recent_snapshot("AAPL", "2026-12-18", 60) is None
+
 def test_zero_gamma_uses_nearby_expirations_and_regime_root():
     now_price = 330.0
     rows = [
@@ -1284,8 +1294,10 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     # 刷新入口先读 SQLite 判断新鲜度，只有过期才请求上游接口，并用 state.refreshing 拦截连点。
     assert "if (state.refreshing) return;" in source
     assert "function isSnapshotFresh(snapshot)" in source
+    assert "snapshot?.shown && snapshot?.quoteReady" in source
     assert "age !== null && age < SNAPSHOT_FRESH_SECONDS" in source
-    assert "if (isSnapshotFresh(snapshot)) { showFreshStatus(snapshot); return; }" in source
+    assert "if (isSnapshotFresh(snapshot)) {" in source
+    assert "showFreshStatus(snapshot);" in source
     assert 'const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });' in source
     assert "if (refreshResult?.skipped)" in source
     assert '@click="refreshNow"' in Path("app/static/index.html").read_text(encoding="utf-8")
@@ -1295,6 +1307,11 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
     assert "refreshAnalysisWindow(loadId, payload, quote);" in source
     assert "?horizon_days=45&refresh=true" in source
+    # 首次拿到选中期限的链后立即请求综合价位，不再等待慢速的跨期限 Gamma 窗口。
+    assert "loadFactorLevels(points, levelSpot);" in source
+    assert "renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);" in source
+    assert "deferLevels: true" not in source
+    assert "if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote)" in source
     # 页面加载、手动点击、定时刷新共用同一条刷新链路与网络互斥。
     assert "if (state.refreshInFlight === symbol) return;" in source
     assert "await loadChain({ loadId, refresh: true });" in source

@@ -18,7 +18,6 @@ const state = {
   levelsWindowFetchedAt: null,
   levelsKey: "",
   levelsPayload: null,
-  deferLevels: false,
   chainFilter: "all",
   chainRows: [],
   chainSpot: null,
@@ -948,7 +947,8 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   if (analysisFallback.restored) state.view.chart.gammaScope += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
   state.view.chart.callWall = `看涨墙 ${callWall?.callGex ? formatMoney(callWall.strike) : "--"}`;
   state.view.chart.putWall = `看跌墙 ${putWall?.putGex ? formatMoney(putWall.strike) : "--"}`;
-  if (!state.deferLevels) loadFactorLevels(points, levelSpot);
+  // 选中期限的综合价位与 Gamma 窗口并行请求，避免首次加载时趋势/支撑/压力面板长期空白。
+  loadFactorLevels(points, levelSpot);
   OptionScopeCharts.renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "当前期权链未提供 Gamma，暂无法估算 GEX", { spot, gammaFlip, crosshairTags: true, markers: [
     { point: callWall, className: "chart-wall-call", label: "看涨墙", position: "top" },
     { point: putWall, className: "chart-wall-put", label: "看跌墙", position: "bottom" },
@@ -1120,7 +1120,7 @@ function renderChainTable() {
   renderChainRows(shown, state.chainSpot, emptyLabel);
 }
 
-function renderChain(payload, quote, analysisPayload, options = {}) {
+function renderChain(payload, quote, analysisPayload) {
   const rows = payload.data || []; state.expiration = payload.expiration;
   // 基准价开关切换时要用最近一次快照重算，这里留一份引用。
   state.lastQuote = quote || null;
@@ -1140,10 +1140,7 @@ function renderChain(payload, quote, analysisPayload, options = {}) {
   const analysisRows = analysisPayload?.data?.length ? analysisPayload.data : rows;
   // 记录本次快照时间：压力位/支撑位的合成接口按「标的 + 到期日 + 快照时间」去重请求。
   state.chainFetchedAt = payload.fetched_at || null;
-  const previousDeferLevels = state.deferLevels;
-  state.deferLevels = Boolean(options.deferLevels);
   renderAnalysis(analysisRows, quote?.price, analysisPayload, rows, payload.iv_model || {}, activeBasis(quote));
-  state.deferLevels = previousDeferLevels;
   state.chainRows = rows; state.chainSpot = quote?.price ?? null;
   renderChainTable();
 }
@@ -1170,7 +1167,7 @@ function isCurrentLoad(loadId, expiration) {
 // 快照仍在新鲜期内时不再请求上游接口，只把本地缓存的状态回显给用户。
 function isSnapshotFresh(snapshot) {
   const age = snapshotAgeSeconds(snapshot?.fetchedAt);
-  return Boolean(snapshot?.shown) && age !== null && age < SNAPSHOT_FRESH_SECONDS;
+  return Boolean(snapshot?.shown && snapshot?.quoteReady) && age !== null && age < SNAPSHOT_FRESH_SECONDS;
 }
 
 function showFreshStatus(snapshot) {
@@ -1248,14 +1245,22 @@ async function renderSnapshot(loadId) {
   const [quote, payload, analysis] = await Promise.all(requests);
   if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null };
   applyCachedQuote(quote);
-  if (!payload?.data?.length) return { shown: false, source: payload?.source || quote?.source || null, fetchedAt: payload?.fetched_at || null };
+  if (!payload?.data?.length) return { shown: false, source: payload?.source || quote?.source || null, fetchedAt: payload?.fetched_at || null, quote };
   state.analysisReady = Boolean(analysis?.data?.length) || state.analysisReady;
   renderChain(payload, quote, analysis);
   state.view.lastStatus = payload.source === "sqlite"
     ? `本地缓存 ${formatTime(payload.fetched_at)}`
     : `最近更新 ${formatTime(payload.fetched_at)}`;
   syncPageQuery();
-  return { shown: true, source: payload.source || null, fetchedAt: payload.fetched_at || null };
+  return {
+    shown: true,
+    source: payload.source || null,
+    fetchedAt: payload.fetched_at || null,
+    quote,
+    payload,
+    analysisReady: Boolean(analysis?.data?.length),
+    quoteReady: Number.isFinite(Number(quote?.price)) && Number(quote.price) > 0,
+  };
 }
 
 // 跨期限 Gamma 窗口刷新最慢（SPY 需要串行拉取十余个到期日），放到后台执行：
@@ -1355,9 +1360,8 @@ async function refreshInBackground(loadId) {
       return;
     }
     renderQuote(quote);
-    // Gamma 窗口随后会再次返回并重绘分析；先复用旧分析显示链数据，延后价位请求，
-    // 避免同一次刷新因链快照和跨期限窗口先后落地而重复计算 /api/levels。
-    renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null, { deferLevels: true });
+    // Gamma 窗口继续后台刷新；选中期限的综合价位已在这里与窗口任务并行请求。
+    renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);
     state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
     syncPageQuery();
     refreshAnalysisWindow(loadId, payload, quote);
@@ -1424,7 +1428,14 @@ async function loadChain(options = {}) {
   if (!snapshot.shown) showPending("正在后台获取上游快照…");
   if (options.refresh === false) return;
   // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求上游接口。
-  if (isSnapshotFresh(snapshot)) { showFreshStatus(snapshot); return; }
+  if (isSnapshotFresh(snapshot)) {
+    showFreshStatus(snapshot);
+    // 首次访问可能只有选中期限的缓存，跨期限 Gamma 尚未生成；只补后台分析，不阻塞首屏。
+    if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
+      refreshAnalysisWindow(loadId, snapshot.payload, snapshot.quote);
+    }
+    return;
+  }
   await refreshInBackground(loadId);
 }
 
