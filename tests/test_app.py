@@ -1435,7 +1435,9 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert 'class="level-note-divider"> · </span>' in page
     assert 'const prefix = Number.isFinite(representative) && representative > 0 ? `代表价 ${formatMoney(representative)} · ` : "";' in source
     assert "历史回踩：暂无样本" in source
-    assert "request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}&spot=${encodeURIComponent(spot)}`)" in source
+    assert "const numericSpot = Number(spot);" in source
+    assert 'const spotQuery = Number.isFinite(numericSpot) && numericSpot > 0' in source
+    assert "request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}`)" in source
     assert "loadFactorLevels(points, levelSpot);" in source
     # 基准价：优先盘后价，其次盘前价，最后常规价。
     assert "function levelBasis(quote, fallbackPrice)" in source

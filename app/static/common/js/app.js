@@ -718,7 +718,11 @@ function loadFactorLevels(points, spot) {
   state.levelsPayload = null;
   const encodedSymbol = encodeURIComponent(state.symbol);
   const encodedExpiration = encodeURIComponent(state.expiration);
-  request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}&spot=${encodeURIComponent(spot)}`)
+  const numericSpot = Number(spot);
+  const spotQuery = Number.isFinite(numericSpot) && numericSpot > 0
+    ? `&spot=${encodeURIComponent(numericSpot)}`
+    : "";
+  request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}`)
     .then((payload) => {
       if (state.levelsKey !== key) return; // 期间切换了标的或到期日，丢弃过期结果
       state.levelsPayload = payload;
