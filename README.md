@@ -141,7 +141,7 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 | `REFRESH_INTERVAL_SECONDS` | `60` | 定时刷新间隔 |
 | `RAW_RETENTION_DAYS` | `30` | 历史快照保留天数 |
 | `CLEANUP_INTERVAL_SECONDS` | `86400` | 历史清理间隔 |
-| `DATABASE_MAX_MB` | `0` | SQLite 体积上限，纯数字按 MB 解释，也支持 `300M`、`1G`；`0` 表示不限制 |
+| `DATABASE_MAX_MB` | `256M` | SQLite 体积上限，纯数字按 MB 解释，也支持 `300M`、`1G`；`0` 表示不限制 |
 | `HISTORY_MAX_AGE_SECONDS` | `3600` | 日线历史（斐波那契/筹码分布/承接位）的回源间隔 |
 | `EXTREMES_MAX_AGE_SECONDS` | `86400` | 52 周和历史最高/最低价的回源间隔 |
 | `SCHEDULER_ENABLED` | `true` | 是否启用后台刷新和清理 |
