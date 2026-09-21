@@ -24,6 +24,7 @@ from statistics import median
 from typing import Any, Iterable
 
 from app.gamma import annotate_model_greeks, contract_gex, norm_cdf, years_to_expiry
+from app.buyer_structures import build_buyer_structures
 
 # 每侧展示的条数
 LEVEL_COUNT = 10
@@ -1023,6 +1024,14 @@ def build_levels(
             "trend": None, "recommendation": {"action": "hold", "label": "继续持有", "reason": "缺少有效价格数据"},
             "trade_points": {"buy": None, "sell": None},
             "trade_points_horizon": {"trading_days": TRADE_POINT_TRADING_DAYS, "label": "未来 5 个交易日"},
+            "buyer_structures": {
+                "available": False,
+                "status": "unavailable",
+                "items": [],
+                "horizon_trading_days": TRADE_POINT_TRADING_DAYS,
+                "horizon_label": "未来 5 个交易日",
+                "reason": "缺少有效价格数据",
+            },
             "extremes": extremes,
             "plan": {"buy": [], "add": [], "sell": []},
         }
@@ -1080,6 +1089,16 @@ def build_levels(
     buy_levels, add_levels = split_support_plan(support_all, price)
     recommendation = trade_recommendation(trend, support, resistance, price)
     trade_points = best_trade_points(trend, support_all, resistance_all, price, volatility, TRADE_POINT_TRADING_DAYS)
+    buyer_structures = build_buyer_structures(
+        row_list,
+        price,
+        trend,
+        recommendation,
+        support_all,
+        resistance_all,
+        TRADE_POINT_TRADING_DAYS,
+        iv_model=iv_model,
+    )
     return {
         "spot": price,
         "expiration": expiration,
@@ -1091,6 +1110,7 @@ def build_levels(
         "recommendation": recommendation,
         "trade_points": trade_points,
         "trade_points_horizon": {"trading_days": TRADE_POINT_TRADING_DAYS, "label": "未来 5 个交易日"},
+        "buyer_structures": buyer_structures,
         "history_validation": {
             "method": "holdout_price_action",
             "lookahead_bars": LEVEL_HISTORY_LOOKAHEAD,

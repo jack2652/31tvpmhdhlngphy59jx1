@@ -351,7 +351,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         computed = levels_cache.get_or_compute(
             cache_key,
             lambda: shared_cached(
-                "levels",
+                # 买方结构加入情景收益排序和风险状态后升级缓存命名空间，避免旧结果继续覆盖新算法。
+                "levels-v6",
                 cache_key,
                 lambda: build_levels(
                     history_payload.get("bars") or [],

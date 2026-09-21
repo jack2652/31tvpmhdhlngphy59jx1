@@ -200,8 +200,25 @@ function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emp
     const local = clientToViewBox(event.clientX, event.clientY);
     return Math.max(0, Math.min(points.length - 1, Math.floor((local.x - pad.left) / slot)));
   };
-  chartSvg.addEventListener("pointermove", (event) => showTooltip(pointFromEvent(event), event.clientY));
+  chartSvg.addEventListener("pointermove", (event) => {
+    // 右键按住或拖动时不更新悬浮窗，避免浏览器菜单交互产生异常坐标。
+    if (event.buttons & 2) {
+      hideTooltip();
+      return;
+    }
+    showTooltip(pointFromEvent(event), event.clientY);
+  });
+  chartSvg.addEventListener("pointerdown", (event) => {
+    if (event.button !== 2) return;
+    event.preventDefault();
+    hideTooltip();
+  });
+  chartSvg.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    hideTooltip();
+  });
   chartSvg.addEventListener("pointerleave", hideTooltip);
+  chartSvg.addEventListener("pointercancel", hideTooltip);
   chartSvg.addEventListener("focus", () => showTooltip(0, null));
   chartSvg.addEventListener("blur", hideTooltip);
 }
@@ -362,8 +379,25 @@ function renderLevelsChart(payload) {
     updateTags(item, clientY);
   };
   const hideTooltip = () => { crosshair.setAttribute("visibility", "hidden"); tooltip.hidden = true; crosshairLine.setAttribute("visibility", "hidden"); tagX.setAttribute("visibility", "hidden"); tagY.setAttribute("visibility", "hidden"); };
-  chartSvg.addEventListener("pointermove", (event) => showTooltip(nearestLevel(event.clientX), event.clientY));
+  chartSvg.addEventListener("pointermove", (event) => {
+    // 右键按住或拖动时不更新悬浮窗，避免浏览器菜单交互产生异常坐标。
+    if (event.buttons & 2) {
+      hideTooltip();
+      return;
+    }
+    showTooltip(nearestLevel(event.clientX), event.clientY);
+  });
+  chartSvg.addEventListener("pointerdown", (event) => {
+    if (event.button !== 2) return;
+    event.preventDefault();
+    hideTooltip();
+  });
+  chartSvg.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    hideTooltip();
+  });
   chartSvg.addEventListener("pointerleave", hideTooltip);
+  chartSvg.addEventListener("pointercancel", hideTooltip);
   chartSvg.addEventListener("focus", () => showTooltip(ordered[0], null));
   chartSvg.addEventListener("blur", hideTooltip);
 }

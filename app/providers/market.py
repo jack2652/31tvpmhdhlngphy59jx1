@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -38,6 +38,20 @@ def session_of(moment: datetime) -> str:
     return "overnight"
 
 
+def session_trading_day(moment: datetime) -> date:
+    """返回时段所属的美东交易日，夜盘开盘后的日期归到次日。"""
+    local = localize(moment)
+    minute = local.hour * 60 + local.minute
+    if minute >= 20 * 60:
+        return local.date() + timedelta(days=1)
+    return local.date()
+
+
+def is_session_trading_day(moment: datetime) -> bool:
+    """判断当前时段对应的交易日是否开市，正确处理周末和节假日夜盘。"""
+    return is_trading_day(session_trading_day(moment))
+
+
 def current_session_state(now: datetime, latest_bar: datetime | None) -> str:
     """当前时段：最近一根 K 线足够新时以它所属时段为准，否则按美东时钟判断。
 
@@ -47,10 +61,10 @@ def current_session_state(now: datetime, latest_bar: datetime | None) -> str:
     now = localize(now)
     if latest_bar is not None:
         latest_bar = localize(latest_bar)
-    if not is_trading_day(now):
+    if not is_session_trading_day(now):
         return "CLOSED"
     if latest_bar is not None and abs((now - latest_bar).total_seconds()) <= SESSION_FRESH_SECONDS:
-        return SESSION_STATES[session_of(latest_bar)]
+        return SESSION_STATES[session_of(latest_bar)] if is_session_trading_day(latest_bar) else "CLOSED"
     if not is_regular_session(now):
         bounds = regular_session_bounds(now)
         if bounds is not None and now >= bounds[1] and now.hour < 20:

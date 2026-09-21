@@ -30,6 +30,7 @@ const state = {
     marketState: "等待数据",
     clock: "--:--:--",
     themeLabel: "白天",
+    themeIcon: "el-icon-moon-night",
     refreshNote: "每 60 秒自动更新",
     quoteSymbol: defaultSymbol,
     quotePrice: "--",
@@ -67,6 +68,15 @@ const state = {
       resistanceEmpty: "暂无数据",
       supportEmpty: "暂无数据",
       addEmpty: "暂无数据",
+    },
+    buyer: {
+      available: false,
+      directionLabel: "",
+      horizonLabel: "未来 5 个交易日",
+      target: "",
+      items: [],
+      reason: "等待数据",
+      note: "",
     },
     trend: {
       available: false,
@@ -133,6 +143,7 @@ function applyTheme(theme) {
   const next = theme === "light" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
   state.view.themeLabel = THEME_LABELS[next];
+  state.view.themeIcon = next === "light" ? "el-icon-sunny" : "el-icon-moon-night";
   const button = byId("theme-toggle");
   if (!button) return;
   button.title = next === "dark" ? "切换到白天模式" : "切换到黑夜模式";
@@ -223,6 +234,20 @@ function initChartGroup() {
     defaultExpanded: true,
     // 图表按容器实际尺寸绘制：折叠期间若被后台刷新重绘过（隐藏时只有最小尺寸），展开后必须补一次重绘。
     onChange: (expanded) => { if (expanded) requestAnimationFrame(() => redrawChartsIfResized()); },
+  });
+}
+
+// 买方结构默认折叠，展开状态仅在当前标签页内记忆，避免首屏占用过多空间。
+const BUYER_STRUCTURE_KEY = "option-scope-buyer-structure";
+
+function initBuyerStructureGroup() {
+  bindFoldGroup({
+    headerId: "buyer-structure-header",
+    toggleId: "buyer-structure-toggle",
+    bodyId: "buyer-structure-fold",
+    actionId: "buyer-structure-action",
+    storageKey: BUYER_STRUCTURE_KEY,
+    defaultExpanded: false,
   });
 }
 
@@ -357,6 +382,10 @@ function formatCount(value, digits = 2) {
   if (absolute >= 100000000) return `${sign}${formatNumber(absolute / 100000000, digits)}亿`;
   if (absolute >= 10000) return `${sign}${formatNumber(absolute / 10000, digits)}万`;
   return `${sign}${formatNumber(absolute, 0)}`;
+}
+function formatUsd(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "--";
+  return `$${Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 // 图表数值统一入口：GEX 走中文金额单位，成交量/持仓量走中文计数单位。
 function formatChartValue(value, digits, unit) { return unit === "M" ? formatGex(value, digits) : formatCount(value, digits); }
@@ -661,6 +690,15 @@ function fallbackLevelSeries(picked, valueOf, metricLabel) {
 
 function renderLevels(points, spot) {
   const price = Number(spot);
+  state.view.buyer = {
+    available: false,
+    directionLabel: "",
+    horizonLabel: "未来 5 个交易日",
+    target: "",
+    items: [],
+    reason: "正在计算买方结构…",
+    note: "",
+  };
   state.view.chart.levelsBasis = Number.isFinite(price) && price > 0 ? `基准 ${formatMoney(price)}` : "基准 --";
   if (!points.length || !Number.isFinite(price) || price <= 0) {
     state.view.levels.resistance = [];
@@ -956,8 +994,145 @@ function renderFactorLevels(payload) {
   state.view.levels.resistanceEmpty = "现价这一侧暂无可用价位";
   state.view.levels.supportEmpty = "现价这一侧暂无可用价位";
   OptionScopeCharts.renderLevelsChart(payload);
+  renderBuyerStructures(payload?.buyer_structures, payload?.options_fetched_at || payload?.chain_fetched_at);
   renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);
   renderPlan(payload?.plan, spot);
+}
+
+function formatStructureDelta(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "--";
+  const number = Number(value);
+  return `${number >= 0 ? "+" : ""}${number.toFixed(2)}`;
+}
+
+function formatStructureReturn(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "--";
+  const number = Number(value) * 100;
+  return `${number >= 0 ? "+" : ""}${number.toFixed(1)}%`;
+}
+
+function formatStructureScenarioAmount(value, cost) {
+  const returnValue = Number(value);
+  const costValue = Number(cost);
+  if (!Number.isFinite(returnValue) || !Number.isFinite(costValue)) return "--";
+  const amount = Math.abs(returnValue * costValue);
+  return `${returnValue > 0 ? "+" : returnValue < 0 ? "-" : ""}${formatUsd(amount)}`;
+}
+
+function formatStructureExpiration(value) {
+  const match = String(value || "").match(/^\d{4}-(\d{2})-(\d{2})$/);
+  return match ? `${match[1]}/${match[2]}` : String(value || "--");
+}
+
+function structureContractCode(contractType) {
+  return contractType === "put" ? "P" : "C";
+}
+
+function formatStructureStrike(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "--";
+  return Number(value).toFixed(2).replace(/\.00$/, "");
+}
+
+function structureLegSummary(item) {
+  const legs = Array.isArray(item.legs) ? item.legs : [];
+  return legs.map((leg) => `${leg.action === "sell" ? "卖出" : "买入"}${formatStructureStrike(leg.strike)}${structureContractCode(leg.contract_type)}`).join("，");
+}
+
+function structureNotation(item, strikes) {
+  const expiration = formatStructureExpiration(item.expiration);
+  const suffix = structureContractCode(item.direction);
+  return `${expiration} ${strikes}${suffix}`;
+}
+
+function formatBuyerMethod(value) {
+  return String(value || "模型估算").replace(/Black-Scholes/g, "布莱克-斯科尔斯");
+}
+
+function formatBuyerQuoteMethod(value) {
+  return String(value || "买卖价中间价")
+    .replace(/Bid\/Ask Mid/g, "买卖价中间价")
+    .replace(/Bid\/Ask/g, "买卖价")
+    .replace(/Last/g, "最新成交价");
+}
+
+function renderBuyerStructures(payload, fetchedAt = null) {
+  const empty = {
+    available: false,
+    directionLabel: "",
+    horizonLabel: payload?.horizon_label || "未来 5 个交易日",
+    target: "",
+    items: [],
+    reason: payload?.reason || "等待数据",
+    note: "",
+  };
+  if (!payload?.available || !Array.isArray(payload.items) || !payload.items.length) {
+    state.view.buyer = empty;
+    return;
+  }
+  const targets = payload.targets || {};
+  const callTarget = Number(targets.call?.price);
+  const putTarget = Number(targets.put?.price);
+  const targetText = [
+    Number.isFinite(callTarget) ? `看涨 ${formatMoney(callTarget)}` : null,
+    Number.isFinite(putTarget) ? `看跌 ${formatMoney(putTarget)}` : null,
+  ].filter(Boolean).join(" · ");
+  const buyerMethod = formatBuyerMethod(payload.method);
+  const buyerQuoteMethod = formatBuyerQuoteMethod(payload.quote_method);
+  state.view.buyer = {
+    available: true,
+    directionLabel: payload.direction_label || (payload.direction === "call" ? "买入看涨" : "买入看跌"),
+    horizonLabel: payload.horizon_label || "未来 5 个交易日",
+    target: targetText || "--",
+    reason: "",
+    note: `${buyerMethod} · ${buyerQuoteMethod} · ${fetchedAt ? `数据 ${formatTime(fetchedAt)}` : "数据时间未知"} · 预计盈利/亏损以当前买卖价中间价为成本基准；负数表示目标价虽达到，扣除时间价值后仍未覆盖成本。${payload.disclaimer || "综合评分不是历史胜率"}`,
+    items: payload.items.map((item, index) => {
+      const strikes = (item.strikes || []).map((strike) => formatMoney(strike)).join(" / ");
+      const compactStrikes = (item.strikes || []).map((strike) => formatStructureStrike(strike)).join("/");
+      const scenarioTarget = Number(item.target_price);
+      const scenarioReturn = Number(item.scenario_return);
+      const scenario = formatStructureReturn(scenarioReturn);
+      const hasScenario = Number.isFinite(scenarioReturn);
+      const scenarioAmount = formatStructureScenarioAmount(scenarioReturn, item.cost);
+      const scenarioState = !hasScenario ? "unknown" : scenarioReturn > 0 ? "positive" : scenarioReturn < 0 ? "negative" : "neutral";
+      const scenarioLabel = scenarioState === "positive" ? "预计盈利" : scenarioState === "negative" ? "预计亏损" : scenarioState === "neutral" ? "预计持平" : "无法估算";
+      const spread = Number(item.spread_ratio);
+      const legs = structureLegSummary(item);
+      const isVertical = item.kind === "vertical";
+      const directionLabel = item.direction === "put" ? "看跌" : "看涨";
+      const notation = structureNotation(item, compactStrikes);
+      const planLabel = item.direction_label || `${directionLabel}方案`;
+      const verticalExplanation = item.direction === "put"
+        ? "即买入较高执行价期权、卖出较低执行价期权，收益封顶但权利金较低。"
+        : "即买入较低执行价期权、卖出较高执行价期权，收益封顶但权利金较低。";
+      const title = isVertical
+        ? `${notation}：${legs}。${verticalExplanation}`
+        : `${notation}：${item.label || "买方期权"}，到期日 ${item.expiration}，执行价 ${strikes}。`;
+      return {
+        ...item,
+        key: `${item.kind || "structure"}-${item.expiration || index}-${strikes}`,
+        structure: notation,
+        rowClass: item.direction === "put" ? "buyer-structure-put" : "buyer-structure-call",
+        subtitle: `${planLabel}${item.is_primary ? " · 主方向" : " · 对比方案"} · ${isVertical ? `${directionLabel}价差 · ${legs}` : `${item.label || "买方期权"} · ${item.style || "单腿"}`} · 剩余 ${item.dte} 天`,
+        title: title.replace(/。$/, ""),
+        iv: Number.isFinite(Number(item.iv)) ? `${(Number(item.iv) * 100).toFixed(1)}%` : "--",
+        delta: formatStructureDelta(item.delta),
+        exposure: formatUsd(item.delta_exposure),
+        leverage: Number.isFinite(Number(item.effective_leverage)) ? `${Number(item.effective_leverage).toFixed(1)} 倍` : "--",
+        maxLoss: formatUsd(item.max_loss),
+        score: Number.isFinite(Number(item.score)) ? `${Math.round(Number(item.score) * 100)}/100` : "--",
+        detail: `成本 ${formatUsd(item.cost)} · 盈亏平衡 ${formatMoney(item.breakeven)} · 目标 ${Number.isFinite(scenarioTarget) ? formatMoney(scenarioTarget) : "--"} · 目标价下${scenarioLabel} ${scenario}${hasScenario ? `（约 ${scenarioAmount}）` : ""} · 买卖价差 ${Number.isFinite(spread) ? `${(spread * 100).toFixed(1)}%` : "--"}`,
+        scenarioStatus: scenarioState === "positive"
+          ? "预计盈利 · 已覆盖成本"
+          : scenarioState === "negative"
+            ? "预计亏损 · 未覆盖成本"
+            : scenarioState === "neutral"
+              ? "预计持平 · 接近成本线"
+              : "无法判断 · 缺少有效数据",
+        scenarioClass: `buyer-structure-scenario-${scenarioState}`,
+        risk: item.risk || "请结合报价和到期时间确认风险",
+      };
+    }),
+  };
 }
 
 function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivModel = {}, basis = null) {
@@ -1260,6 +1435,15 @@ function showPending(message) {
   state.view.levels.resistanceEmpty = message;
   state.view.levels.supportEmpty = message;
   state.view.levels.addEmpty = message;
+  state.view.buyer = {
+    available: false,
+    directionLabel: "",
+    horizonLabel: "未来 5 个交易日",
+    target: "",
+    items: [],
+    reason: message,
+    note: "",
+  };
   OptionScopeCharts.showEmpty("levels-chart", message);
   state.view.trend = { ...state.view.trend, available: false, rows: [], opportunities: [], extremes: [], note: "等待数据", empty: message };
   state.view.chainRows = [];
@@ -1624,6 +1808,7 @@ window.optionScopeApp = optionScopeApp;
 initDetailGroup();
 initChainGroup();
 initChartGroup();
+initBuyerStructureGroup();
 setInterval(() => { state.view.clock = new Date().toLocaleTimeString("zh-CN", { hour12: false }); }, 1000);
 // 容器尺寸与上次绘制不一致时按新尺寸重绘图表：窗口缩放、图表折叠组展开后都走这里。
 // 图表是按容器实际像素绘制的，隐藏状态下只能量到最小尺寸，所以展开后必须补一次重绘。

@@ -16,7 +16,7 @@
     <div class="brand"><span class="brand-mark">OS</span><div><strong>OPTION SCOPE</strong><small>美股期权快照</small></div></div>
     <div class="top-actions">
       <div class="top-meta"><span class="live-dot"></span><span id="market-state" v-text="view.marketState">等待数据</span><span class="divider"></span><span id="clock" v-text="view.clock">--:--:--</span></div>
-      <el-button id="theme-toggle" class="theme-toggle" type="text" circle :title="view.themeLabel" aria-pressed="false" @click="toggleTheme"><i class="el-icon-sunny"></i></el-button>
+      <el-button id="theme-toggle" class="theme-toggle" type="text" circle :title="view.themeLabel" aria-pressed="false" @click="toggleTheme"><i :class="view.themeIcon" aria-hidden="true"></i></el-button>
     </div>
   </header>
 
@@ -144,6 +144,47 @@
             <div class="chart-summary" id="oi-summary"></div>
           </article>
         </section>
+      </div>
+    </section>
+
+    <section class="detail-group panel buyer-structure-panel" id="buyer-structure-group">
+      <div class="detail-header" id="buyer-structure-header">
+        <button class="detail-toggle" id="buyer-structure-toggle" type="button" aria-expanded="false" aria-controls="buyer-structure-fold">
+          <span class="detail-caret" aria-hidden="true"></span>
+          <span class="detail-text"><span class="eyebrow">OPTIONS BUYER STRUCTURE</span><span class="detail-title">期权买方结构分析</span><span class="detail-hint">默认折叠，展开查看候选结构</span></span>
+        </button>
+        <span class="detail-action" id="buyer-structure-action">展开</span>
+      </div>
+      <div class="buyer-structure-fold" id="buyer-structure-fold" hidden>
+        <div class="buyer-structure-heading">
+          <p>按当前方向、目标位和报价流动性筛选两侧各最多 5 条结构；结果按未来 5 个交易日到达目标价估算</p>
+          <div class="buyer-structure-meta">
+            <span v-if="view.buyer.available">{{ view.buyer.directionLabel }}</span>
+            <span>{{ view.buyer.horizonLabel }}</span>
+            <span v-if="view.buyer.target">目标 {{ view.buyer.target }}</span>
+          </div>
+        </div>
+        <div v-if="!view.buyer.available" class="buyer-structure-empty">{{ view.buyer.reason }}</div>
+        <div v-else class="buyer-structure-table">
+          <div class="buyer-structure-row buyer-structure-head">
+            <span>结构</span><span>隐含波动率</span><span>方向敏感度 / 敞口</span><span>有效杠杆</span><span>最大亏损</span><span>主要优点</span>
+          </div>
+          <template v-for="item in view.buyer.items">
+            <div :key="item.key" class="buyer-structure-row" :class="item.rowClass">
+              <span class="buyer-structure-name" :title="item.title"><strong>{{ item.structure }}</strong><small>{{ item.subtitle }}</small></span>
+              <span class="buyer-structure-number">{{ item.iv }}</span>
+              <span class="buyer-structure-number"><strong>{{ item.delta }}</strong><small>{{ item.exposure }}</small></span>
+              <span class="buyer-structure-number">{{ item.leverage }}</span>
+              <span class="buyer-structure-number">{{ item.maxLoss }}</span>
+              <span class="buyer-structure-advantage"><strong>{{ item.advantage }}</strong><small>评分 {{ item.score }} · {{ item.liquidity }}</small></span>
+            </div>
+            <div :key="item.key + '-detail'" class="buyer-structure-detail">
+              <span class="buyer-structure-detail-main">{{ item.detail }}</span>
+              <span class="buyer-structure-detail-aside"><span class="buyer-structure-scenario" :class="item.scenarioClass">{{ item.scenarioStatus }}</span><span class="buyer-structure-risk">{{ item.risk }}</span></span>
+            </div>
+          </template>
+        </div>
+        <div v-if="view.buyer.available" class="buyer-structure-note">{{ view.buyer.note }}</div>
       </div>
     </section>
 

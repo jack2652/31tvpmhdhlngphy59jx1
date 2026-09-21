@@ -189,6 +189,44 @@
    这里在窄屏把 auto 外边距还回来（同优先级下靠后生效），保证它与另两个折叠组一样贴右。 */
 @media(max-width:900px){.detail-header .panel-status+.detail-action{margin-left:auto}}
 
+/* 期权买方结构：主行保持截图式六列比较，说明行单独占满整行，手机端自动切为两列数据卡。 */
+.buyer-structure-panel{margin-bottom:16px;overflow:hidden}
+.buyer-structure-fold[hidden]{display:none}
+.buyer-structure-fold{padding:0 0 4px;border-top:1px solid var(--line)}
+.buyer-structure-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:16px 18px 10px}
+.buyer-structure-heading h2{margin:4px 0 0;font-size:18px}
+.buyer-structure-heading p{margin:3px 0 0;color:var(--muted);font-size:12px}
+.buyer-structure-meta{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:7px;color:var(--muted);font-size:12px;text-align:right}
+.buyer-structure-meta span{padding:4px 8px;border:1px solid var(--line);white-space:nowrap}
+.buyer-structure-empty{margin:0 18px 16px;padding:16px;border:1px dashed var(--line);color:var(--muted);font-size:13px;text-align:center}
+.buyer-structure-table{margin:0 18px 8px;overflow:auto}
+.buyer-structure-row{display:grid;grid-template-columns:minmax(190px,1.6fr) minmax(86px,.7fr) minmax(108px,.95fr) minmax(78px,.65fr) minmax(88px,.8fr) minmax(190px,1.7fr);align-items:center;border-bottom:0;min-width:820px}
+.buyer-structure-row>span{min-width:0;padding:10px 10px;text-align:center;font-variant-numeric:tabular-nums}
+.buyer-structure-row>span+span{border-left:1px solid var(--row-line)}
+.buyer-structure-head{color:var(--muted);font-size:11px;letter-spacing:.06em;text-transform:none;background:var(--table-head)}
+.buyer-structure-head{border-bottom:1px solid var(--row-line)}
+.buyer-structure-head>span{padding-block:7px}
+.buyer-structure-name,.buyer-structure-advantage{display:flex;flex-direction:column;align-items:flex-start;gap:3px;text-align:left!important}
+.buyer-structure-name strong{color:var(--text);font-size:13px;line-height:1.3}
+.buyer-structure-call .buyer-structure-name strong{color:var(--up)}
+.buyer-structure-put .buyer-structure-name strong{color:var(--down)}
+.buyer-structure-name small,.buyer-structure-number small,.buyer-structure-advantage small{color:var(--muted);font-size:11px;line-height:1.3}
+.buyer-structure-number{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;color:var(--text);font-size:13px;line-height:1.25}
+.buyer-structure-number strong{font-weight:700}
+.buyer-structure-number small{display:block;white-space:nowrap}
+.buyer-structure-advantage strong{color:var(--text);font-size:12px;line-height:1.35;font-weight:600}
+.buyer-structure-detail{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,.72fr);align-items:center;gap:16px;margin:7px 0 14px;padding:8px 10px 9px;border-top:1px solid var(--row-line);border-bottom:1px solid var(--row-line);background:var(--table-head);color:var(--muted);font-size:11px;line-height:1.4;white-space:normal;overflow-wrap:anywhere}
+.buyer-structure-detail-main{min-width:0}
+.buyer-structure-detail-aside{display:flex;min-width:0;flex-direction:column;align-items:flex-end;gap:2px;padding-left:14px;border-left:1px solid var(--row-line);text-align:right}
+.buyer-structure-scenario{font-weight:600}
+.buyer-structure-scenario-positive{color:var(--up)}
+.buyer-structure-scenario-negative{color:var(--down)}
+.buyer-structure-scenario-neutral,.buyer-structure-scenario-unknown{color:var(--muted)}
+.buyer-structure-risk{color:var(--amber);font-size:10px;line-height:1.35}
+.buyer-structure-note{padding:4px 18px 14px;color:var(--muted);font-size:11px;line-height:1.4}
+@media(max-width:900px){.buyer-structure-heading{flex-direction:column}.buyer-structure-meta{justify-content:flex-start;text-align:left}.buyer-structure-table{overflow:visible}.buyer-structure-row{grid-template-columns:minmax(150px,1.7fr) minmax(60px,.7fr) minmax(94px,1fr);min-width:0}.buyer-structure-head{display:none}.buyer-structure-row>span:nth-child(2)::before{content:"波动率 ";color:var(--muted);font-size:10px}.buyer-structure-row>span:nth-child(3)::before{content:"敏感度 ";color:var(--muted);font-size:10px}.buyer-structure-row>span:nth-child(4),.buyer-structure-row>span:nth-child(5),.buyer-structure-row>span:nth-child(6){border-left:0}.buyer-structure-row>span:nth-child(4)::before{content:"杠杆 ";color:var(--muted);font-size:10px}.buyer-structure-row>span:nth-child(5)::before{content:"亏损 ";color:var(--muted);font-size:10px}.buyer-structure-row>span:nth-child(6){grid-column:1/-1;border-top:1px solid var(--row-line);padding-top:7px}.buyer-structure-detail{grid-template-columns:1fr;gap:4px;padding-inline:10px}.buyer-structure-detail-aside{align-items:flex-start;padding:4px 0 0;border-top:1px solid var(--row-line);border-left:0;text-align:left}.buyer-structure-risk{font-size:10px}}
+@media(max-width:500px){.buyer-structure-heading{padding-inline:14px}.buyer-structure-table{margin-inline:14px}.buyer-structure-row{grid-template-columns:minmax(135px,1.5fr) minmax(56px,.7fr) minmax(84px,1fr)}.buyer-structure-row>span{padding-inline:5px}.buyer-structure-name strong{font-size:12px}.buyer-structure-name small,.buyer-structure-number small,.buyer-structure-advantage small{font-size:10px}.buyer-structure-advantage strong{font-size:11px}.buyer-structure-note{padding-inline:14px}}
+
 /* 访问密钥缺失或错误时使用极简英文 403 视图，样式接近 nginx 默认错误页。 */
 .access-denied-page .topbar,.access-denied-page .shell{display:none}
 .access-denied-view{min-height:100vh;background:var(--plain-bg);color:var(--plain-text);text-align:center;font:16px/1.4 serif;padding:24px 0}

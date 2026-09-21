@@ -26,6 +26,7 @@ from app.providers.market import (
     HybridMarketDataProvider,
     MarketDataProvider,
     current_session_state,
+    is_session_trading_day,
     safe_value,
     summarize_extended_hours,
 )
@@ -415,9 +416,14 @@ def test_summarize_extended_hours_without_data_returns_empty_sessions():
 
 def test_current_session_state_falls_back_to_eastern_clock():
     eastern = ZoneInfo("America/New_York")
-    assert current_session_state(datetime(2026, 9, 18, 21, 0, tzinfo=eastern), None) == "OVERNIGHT"
+    # 周日夜盘属于周一交易日；周五晚间已进入周末，不应继续标成夜盘。
+    assert current_session_state(datetime(2026, 9, 20, 21, 0, tzinfo=eastern), None) == "OVERNIGHT"
+    assert current_session_state(datetime(2026, 9, 18, 21, 0, tzinfo=eastern), None) == "CLOSED"
+    assert current_session_state(datetime(2026, 9, 21, 2, 0, tzinfo=eastern), None) == "OVERNIGHT"
     assert current_session_state(datetime(2026, 9, 18, 18, 0, tzinfo=eastern), None) == "POST"
     assert current_session_state(datetime(2026, 9, 19, 10, 0, tzinfo=eastern), None) == "CLOSED"
+    assert is_session_trading_day(datetime(2026, 9, 20, 21, 0, tzinfo=eastern)) is True
+    assert is_session_trading_day(datetime(2026, 9, 18, 21, 0, tzinfo=eastern)) is False
     # K 线足够新时以 K 线所属时段为准，避免本地时钟与数据源时区口径不一致时误判。
     assert current_session_state(datetime(2026, 9, 18, 12, 0, tzinfo=eastern), datetime(2026, 9, 18, 11, 59, tzinfo=eastern)) == "REGULAR"
     assert current_session_state(datetime(2026, 9, 18, 19, 58, tzinfo=eastern), datetime(2026, 9, 18, 19, 55, tzinfo=eastern)) == "POST"
@@ -594,8 +600,33 @@ def test_chart_tooltip_floats_above_chart_container():
     # 坐标换算改走屏幕矩阵，避免 SVG 等比缩放留白让卡片与十字虚线错位。
     assert "chartSvg.getScreenCTM()" in source
     assert "matrix.inverse()" in source
+    # 右键菜单、右键拖动和指针取消都会清理悬浮窗，避免异常坐标把卡片定位到左上角。
+    assert source.count('if (event.buttons & 2)') == 2
+    assert source.count('event.button !== 2') == 2
+    assert source.count('addEventListener("contextmenu"') == 2
+    assert source.count('addEventListener("pointercancel"') == 2
     # 面板放开裁剪，卡片悬浮到图表上方时不会被面板上沿截断。
     assert ".analysis-panel{overflow:visible}" in styles
+
+
+def test_buyer_structure_scenario_explains_profit_and_loss():
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
+    assert "目标价下${scenarioLabel} ${scenario}" in source
+    assert "formatStructureScenarioAmount" in source
+    assert "预计盈利 · 已覆盖成本" in source
+    assert "预计亏损 · 未覆盖成本" in source
+    assert "扣除时间价值后仍未覆盖成本" in source
+    assert "未来 5 个交易日到达目标价估算" in page
+    assert ".buyer-structure-scenario{font-weight:600}" in styles
+    assert "margin:7px 0 14px" in styles
+    assert "background:var(--table-head)" in styles
+
+
+def test_buyer_structure_title_drops_only_trailing_period():
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    assert 'title: title.replace(/。$/, "")' in source
 
 
 def test_quote_price_follows_current_session():
@@ -654,11 +685,13 @@ def test_theme_defaults_to_dark_with_light_override():
     assert 'if(localStorage.getItem("option-scope-theme")==="light")theme="light";' in html
     assert "catch(error){}document.documentElement.dataset.theme=theme;" in html
     assert 'id="theme-toggle"' in html
+    assert ':class="view.themeIcon"' in html
     # 顶栏切换按钮与主题逻辑。
     assert 'const THEME_KEY = "option-scope-theme";' in source
     assert "function applyTheme(theme)" in source
     assert "function initTheme()" in source
     assert "initTheme();" in source
+    assert 'state.view.themeIcon = next === "light" ? "el-icon-sunny" : "el-icon-moon-night";' in source
     # 正文配色一律走令牌：除前两行 :root 定义外不应残留裸十六进制色值。
     body = "\n".join(line for index, line in enumerate(styles.splitlines(), 1) if index not in (2, 3))
     assert "#" not in body
