@@ -304,8 +304,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
     ) -> dict[str, Any]:
         """压力位/支撑位：技术面与近 45 天多期限期权持仓综合。
 
-        `spot` 是前端传入的基准价（默认取盘后价，避免用盘前冲高/盘中回落的假突破当基准）；
-        缺省时退回快照里的常规价。
+        `spot` 是前端传入的当前展示基准价；候选池固定使用同一快照里的常规价锚点，
+        避免实时价与盘后价切换时因现价分侧而生成两套不同的价位。
         """
         normalized = symbol(stock_symbol)
         quote = database.latest_quote(normalized) or {}
@@ -334,10 +334,17 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             extremes_payload = extremes_future.result()
             beta_payload = beta_future.result()
         resolved_spot = spot if spot is not None else quote.get("price")
+        candidate_spot = quote.get("price")
+        try:
+            if candidate_spot is None or float(candidate_spot) <= 0:
+                candidate_spot = quote.get("previous_close") or resolved_spot
+        except (TypeError, ValueError):
+            candidate_spot = resolved_spot
         cache_key = (
             normalized,
             expiration,
             resolved_spot,
+            candidate_spot,
             profile.get("fetched_at"),
             (selected_chain or {}).get("fetched_at"),
             profile.get("oi_fallback", {}).get("as_of"),
@@ -351,8 +358,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         computed = levels_cache.get_or_compute(
             cache_key,
             lambda: shared_cached(
-                # 买方结构加入情景收益排序和风险状态后升级缓存命名空间，避免旧结果继续覆盖新算法。
-                "levels-v6",
+                # 候选锚点与当前基准价分离后升级缓存命名空间，避免旧结果继续覆盖新算法。
+                "levels-v8",
                 cache_key,
                 lambda: build_levels(
                     history_payload.get("bars") or [],
@@ -360,6 +367,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                     resolved_spot,
                     expiration,
                     extremes_payload.get("extremes"),
+                    candidate_spot,
                 ),
             ),
         )

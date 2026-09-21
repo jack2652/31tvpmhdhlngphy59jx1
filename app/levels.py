@@ -297,7 +297,7 @@ def best_trade_points(
     horizon_years = max(int(horizon_trading_days), 1) / 252.0
 
     def select(rows: Iterable[dict[str, Any]], side: str) -> dict[str, Any] | None:
-        candidates: list[tuple[float, dict[str, Any]]] = []
+        candidates: list[tuple[float, dict[str, Any], float, float]] = []
         for row in rows:
             level_price = _number(row.get("price"))
             if level_price is None or level_price <= 0:
@@ -306,38 +306,67 @@ def best_trade_points(
                 continue
             if side == "sell" and level_price <= price:
                 continue
-            strength = min(1.0, max(0.0, _number(row.get("score")) or 0.0))
+            # merge_candidates 保留未经历史校准的 model_score；最佳点在这里单独融合历史表现，避免历史数据被重复加权。
+            strength = min(1.0, max(0.0, _number(row.get("model_score")) or _number(row.get("score")) or 0.0))
             factors = row.get("factors") if isinstance(row.get("factors"), list) else []
-            factor_agreement = min(1.0, len(factors) / 3.0)
+            factor_groups = {_factor_group(str(factor)) for factor in factors}
+            factor_agreement = min(1.0, len(factor_groups) / 3.0)
             short_touch_probability = touch_probability(level_price, price, volatility, horizon_years)
             fallback_probability = _number(row.get("probability"))
             touch_score = short_touch_probability if short_touch_probability is not None else (fallback_probability if fallback_probability is not None else 0.5)
             distance_ratio = abs(level_price / price - 1)
             proximity = max(0.0, 1.0 - min(distance_ratio / 0.2, 1.0))
             trend_alignment = 1.0 if (side == "buy" and direction == "up") or (side == "sell" and direction == "down") else (0.78 if direction == "range" else 0.62)
-            confidence = (
+            model_confidence = (
                 strength * 0.4
                 + factor_agreement * 0.2
                 + touch_score * 0.15
                 + proximity * 0.1
                 + trend_alignment * 0.15
             )
-            candidates.append((confidence, row))
+            adjusted_hold_rate = _number(row.get("history_adjusted_hold_rate"))
+            hold_rate = adjusted_hold_rate if adjusted_hold_rate is not None else _number(row.get("history_hold_rate"))
+            sample_confidence = min(1.0, max(0.0, _number(row.get("history_confidence")) or 0.0))
+            history_weight = min(0.25, sample_confidence * 0.25) if hold_rate is not None else 0.0
+            # 样本越多，历史守住率对模型分数的影响越大；样本不足时只做轻量修正。
+            historical_score = hold_rate if hold_rate is not None else 0.5
+            confidence = model_confidence * (1.0 - history_weight) + historical_score * history_weight
+            candidates.append((confidence, row, model_confidence, history_weight))
         if not candidates:
             return None
-        confidence, row = max(candidates, key=lambda item: item[0])
+        confidence, row, model_confidence, history_weight = max(candidates, key=lambda item: item[0])
         low = _number(row.get("zone_low")) or _number(row.get("price")) or price
         high = _number(row.get("zone_high")) or _number(row.get("price")) or price
+        adjusted_hold_rate = _number(row.get("history_adjusted_hold_rate"))
+        hold_rate = adjusted_hold_rate if adjusted_hold_rate is not None else _number(row.get("history_hold_rate"))
+        adjusted_break_rate = _number(row.get("history_adjusted_break_rate"))
+        break_rate = adjusted_break_rate if adjusted_break_rate is not None else _number(row.get("history_break_rate"))
+        history_samples = int(_number(row.get("history_samples")) or 0)
         return {
             "price": _number(row.get("price")),
             "zone_low": round(min(low, high), 4),
             "zone_high": round(max(low, high), 4),
             "confidence": round(min(1.0, max(0.0, confidence)), 4),
+            "model_confidence": round(min(1.0, max(0.0, model_confidence)), 4),
+            "history_weight": round(history_weight, 4),
+            "history_samples": history_samples,
+            "history_hold_rate": round(hold_rate, 4) if hold_rate is not None else None,
+            "history_break_rate": round(break_rate, 4) if break_rate is not None else None,
+            "history_sample_confidence": round(min(1.0, max(0.0, _number(row.get("history_confidence")) or 0.0)), 4),
             "factors": list(row.get("factors") or []),
             "reason": "多因子共振" if len(row.get("factors") or []) >= 2 else "单一主因子，需结合行情确认",
         }
 
-    return {"buy": select(support, "buy"), "sell": select(resistance, "sell")}
+    selected = {"buy": select(support, "buy"), "sell": select(resistance, "sell")}
+    buy = selected["buy"]
+    sell = selected["sell"]
+    if buy and sell and buy["price"] < sell["price"]:
+        # 支撑和压力区域各自按 ATR 扩展后可能重叠；用两个代表价的中点分界，
+        # 保留区域自身的稳定边界，同时让买入区和卖出区在展示上互斥。
+        boundary = round((buy["price"] + sell["price"]) / 2, 4)
+        buy["zone_high"] = round(min(buy["zone_high"], boundary), 4)
+        sell["zone_low"] = round(max(sell["zone_low"], boundary), 4)
+    return selected
 
 
 def average_true_ranges(bars: Iterable[dict[str, Any]], period: int = ATR_PERIOD) -> list[float | None]:
@@ -745,11 +774,13 @@ def merge_candidates(
         item["score"] = round(item["score"], 2)
         item["probability"] = touch_probability(item["price"], spot, volatility, years)
         if side == "above":
-            item["zone_low"] = round(max(spot, item["raw_low"] - width), 4)
+            # 区域边界由候选价位和 ATR 宽度决定；不能用现价裁剪，否则现价靠近压力位时下沿会随报价跳动。
+            item["zone_low"] = round(max(0.0, item["raw_low"] - width), 4)
             item["zone_high"] = round(item["raw_high"] + width, 4)
         else:
             item["zone_low"] = round(max(0.0, item["raw_low"] - width), 4)
-            item["zone_high"] = round(min(spot, item["raw_high"] + width), 4)
+            # 支撑区域同样保留自身的上沿，避免现价变化造成区域边界漂移。
+            item["zone_high"] = round(item["raw_high"] + width, 4)
         item.pop("raw_low", None)
         item.pop("raw_high", None)
         item.pop("priority", None)
@@ -1010,8 +1041,13 @@ def build_levels(
     spot: Any,
     expiration: str | None = None,
     extremes: dict[str, Any] | None = None,
+    candidate_spot: Any = None,
 ) -> dict[str, Any]:
-    """综合技术面与多期限期权因子，生成带动态区域的压力位、支撑位和交易计划。"""
+    """综合技术面与多期限期权因子，生成带动态区域的压力位、支撑位和交易计划。
+
+    ``spot`` 是当前展示口径的价格；``candidate_spot`` 是同一快照内稳定的候选锚点。
+    两者分开后，实时价与盘后价切换只会改变距离和概率，不会重复生成两套候选池。
+    """
     bar_list = list(bars or [])
     row_list = list(chain_rows or [])
     price = _number(spot)
@@ -1035,19 +1071,22 @@ def build_levels(
             "extremes": extremes,
             "plan": {"buy": [], "add": [], "sell": []},
         }
+    candidate_price = _number(candidate_spot)
+    if candidate_price is None or candidate_price <= 0:
+        candidate_price = price
     # 模型 IV 由合约价格反解，随后才能按与页面一致的公式计算每张合约的 GEX。
-    iv_model = annotate_model_greeks(row_list, price)
-    points = aggregate_strikes(row_list, price)
-    call_levels, put_levels, metric = option_levels(points, price)
+    iv_model = annotate_model_greeks(row_list, candidate_price)
+    points = aggregate_strikes(row_list, candidate_price)
+    call_levels, put_levels, metric = option_levels(points, candidate_price)
     # 触及概率继续使用页面选中的期限；多期限只参与墙位强度，不改变图表和概率口径。
     volatility = (iv_model.get(expiration) or {}).get("iv") if expiration else None
     years = years_to_expiry(expiration) if expiration else None
     # 技术面候选（斐波那契 / 筹码 / 承接位）按价位落在现价哪一侧归入压力或支撑；
     # 期权候选按惯例对应：看涨持仓计入压力、看跌持仓计入支撑。
     technical: list[Level] = []
-    technical += fibonacci_levels(bar_list, price)
-    technical += chip_peaks(bar_list, price)
-    technical += absorption_levels(bar_list, price)
+    technical += fibonacci_levels(bar_list, candidate_price)
+    technical += chip_peaks(bar_list, candidate_price)
+    technical += absorption_levels(bar_list, candidate_price)
     trend = trend_channel(bar_list)
     if trend and trend["direction"] == "up":
         resistance_weight, support_weight = 0.9, 1.15
@@ -1057,19 +1096,26 @@ def build_levels(
         resistance_weight = support_weight = 1.0
     atr_by_index = average_true_ranges(bar_list)
     atr = average_true_range(bar_list)
-    zone_width = max((atr or 0.0) * ATR_ZONE_RATIO, price * MIN_ZONE_RATIO)
+    zone_width = max((atr or 0.0) * ATR_ZONE_RATIO, candidate_price * MIN_ZONE_RATIO)
     # 公共面板最终展示 10 条，但内部候选池保留 30 条，避免远端强支撑/强压力在选强位前被截掉。
     # 交易计划仍从完整候选池中分出买入和加仓两档。
     candidate_limit = LEVEL_COUNT * 3
-    merge_tolerance = adaptive_merge_tolerance(price, atr)
+    merge_tolerance = adaptive_merge_tolerance(candidate_price, atr)
     resistance_all = merge_candidates(
-        technical + call_levels, price, "above", volatility, years, resistance_weight, zone_width,
+        technical + call_levels, candidate_price, "above", volatility, years, resistance_weight, zone_width,
         limit=candidate_limit, merge_tolerance=merge_tolerance,
     )
     support_all = merge_candidates(
-        technical + put_levels, price, "below", volatility, years, support_weight, zone_width,
+        technical + put_levels, candidate_price, "below", volatility, years, support_weight, zone_width,
         limit=candidate_limit, merge_tolerance=merge_tolerance,
     )
+    # 候选池以稳定锚点生成；当前口径只负责重新分侧和更新触及概率。
+    resistance_all = [item for item in resistance_all if (_number(item.get("price")) or 0.0) > price]
+    support_all = [item for item in support_all if (_number(item.get("price")) or 0.0) < price]
+    resistance_all.sort(key=lambda item: abs((_number(item.get("price")) or price) - price))
+    support_all.sort(key=lambda item: abs((_number(item.get("price")) or price) - price))
+    for item in resistance_all + support_all:
+        item["probability"] = touch_probability(item["price"], price, volatility, years)
     resistance_all = annotate_level_history(
         resistance_all,
         bar_list,
@@ -1101,6 +1147,7 @@ def build_levels(
     )
     return {
         "spot": price,
+        "candidate_spot": candidate_price,
         "expiration": expiration,
         "history_bars": len(bar_list),
         "options_metric": metric,

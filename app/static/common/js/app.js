@@ -19,6 +19,11 @@ const state = {
   levelsKey: "",
   levelsPayload: null,
   levelsRetryTimer: null,
+  tradePointStability: {
+    context: "",
+    stable: { buy: null, sell: null },
+    pending: { buy: null, sell: null },
+  },
   chainFilter: "all",
   chainRows: [],
   chainSpot: null,
@@ -108,6 +113,8 @@ const LEVEL_COUNT = 10;
 const PLAN_COUNT = 10;
 // 强化色只显示后端同时通过模型强度、独立证据和历史回踩验证的价位。
 const STRONG_LEVEL_SCORE = 0.7;
+// 新候选连续两次快照确认后才替换，避免期权链短暂波动造成最佳点闪烁。
+const TRADE_POINT_CONFIRMATIONS = 2;
 // 期权链热力底色：成交量与未平仓各自按本屏最大值归一，得到 0~100 的相对强度；
 // 底色深浅（含白天/黑夜各自的透明度区间）交给 styles.css 的 --heat-floor / --heat-gain 换算。
 // 达到这个强度的格子算「热点」：底色已经很亮，文字换成深色墨色，避免亮底浅字看不清。
@@ -941,8 +948,22 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     const point = tradePoints?.[kind];
     const range = point ? formatLevelRange(point) : "--";
     const confidence = point ? formatProbability(point.confidence) : "--";
+    const modelConfidence = point ? formatProbability(point.model_confidence) : "--";
+    const samples = Number(point?.history_samples);
+    const holdRate = Number(point?.history_hold_rate);
+    const breakRate = Number(point?.history_break_rate);
+    const history = Number.isFinite(holdRate) && samples > 0
+      ? `历史守住 ${(holdRate * 100).toFixed(1)}%（${samples}次）${Number.isFinite(breakRate) ? `，跌破 ${(breakRate * 100).toFixed(1)}%` : ""}`
+      : "历史样本不足";
     const title = point?.reason ? `${label}：${point.reason}` : `${label}暂无可用数据`;
-    return { kind, label, horizon: horizonLabel, range, confidence, title: `${title} · 计算范围：${horizonLabel}` };
+    return {
+      kind,
+      label,
+      horizon: horizonLabel,
+      range,
+      confidence,
+      title: `${title} · 模型评分 ${modelConfidence} · ${history} · 综合评分 ${confidence} · 计算范围：${horizonLabel}`,
+    };
   });
   const meta = historyMeta || {};
   const parts = [
@@ -967,6 +988,40 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     noteTitle: parts.join(" · "),
     empty: "历史行情不足，暂无趋势判断",
   };
+}
+
+function tradePointIdentity(point) {
+  const price = Number(point?.price);
+  return Number.isFinite(price) && price > 0 ? price.toFixed(4) : "";
+}
+
+// 价位候选需要连续两次快照确认；同一代表价只更新评分和说明，不阻塞最新的历史统计。
+function stabilizeTradePoints(points, context) {
+  const incoming = { buy: points?.buy || null, sell: points?.sell || null };
+  const stability = state.tradePointStability;
+  if (stability.context !== context) {
+    stability.context = context;
+    stability.stable = incoming;
+    stability.pending = { buy: null, sell: null };
+    return incoming;
+  }
+  for (const side of ["buy", "sell"]) {
+    const incomingId = tradePointIdentity(incoming[side]);
+    const stableId = tradePointIdentity(stability.stable[side]);
+    if (incomingId === stableId) {
+      stability.stable[side] = incoming[side];
+      stability.pending[side] = null;
+      continue;
+    }
+    const pending = stability.pending[side];
+    const nextCount = pending && pending.id === incomingId ? pending.count + 1 : 1;
+    stability.pending[side] = { id: incomingId, count: nextCount };
+    if (nextCount >= TRADE_POINT_CONFIRMATIONS) {
+      stability.stable[side] = incoming[side];
+      stability.pending[side] = null;
+    }
+  }
+  return { ...stability.stable };
 }
 
 // 交易计划价位表：价位区间 / 距现价 / 触及概率 / 综合依据；强化标签放在说明行。
@@ -1002,7 +1057,9 @@ function renderFactorLevels(payload) {
   state.view.levels.supportEmpty = "现价这一侧暂无可用价位";
   OptionScopeCharts.renderLevelsChart(payload);
   renderBuyerStructures(payload?.buyer_structures, payload?.options_fetched_at || payload?.chain_fetched_at);
-  renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);
+  const tradePointContext = `${state.symbol}|${expiration}|${state.levelBasisMode}`;
+  const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);
+  renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);
   renderPlan(payload?.plan, spot);
 }
 

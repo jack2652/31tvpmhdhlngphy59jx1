@@ -1731,6 +1731,19 @@ def test_merge_candidates_groups_same_price_zone():
     assert [item["price"] for item in picked] == [101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0, 108.0, 109.0, 110.0]
 
 
+def test_merge_candidates_zone_boundaries_do_not_follow_spot():
+    """区域边界由候选价位决定，现价靠近区域时不应把边界裁到现价。"""
+    resistance_near = merge_candidates([(101.0, 1.0, "A")], 100.2, "above", zone_width=1.0)
+    resistance_far = merge_candidates([(101.0, 1.0, "A")], 99.0, "above", zone_width=1.0)
+    support_near = merge_candidates([(99.0, 1.0, "A")], 99.8, "below", zone_width=1.0)
+    support_far = merge_candidates([(99.0, 1.0, "A")], 101.0, "below", zone_width=1.0)
+
+    assert resistance_near[0]["zone_low"] == resistance_far[0]["zone_low"] == 100.0
+    assert resistance_near[0]["zone_high"] == resistance_far[0]["zone_high"] == 102.0
+    assert support_near[0]["zone_low"] == support_far[0]["zone_low"] == 98.0
+    assert support_near[0]["zone_high"] == support_far[0]["zone_high"] == 100.0
+
+
 def test_merge_candidates_score_does_not_depend_on_current_side_peak():
     """稳定综合强度：加入更强的远端候选，不应重新压低已有价位的分数。"""
     base = merge_candidates([(95.0, 0.4, "看跌持仓")], 100.0, "below", limit=10)
@@ -1979,6 +1992,9 @@ def test_levels_endpoint_combines_factors(tmp_path: Path):
             if point is not None:
                 assert point["zone_low"] <= point["price"] <= point["zone_high"]
                 assert 0 <= point["confidence"] <= 1
+                assert 0 <= point["model_confidence"] <= 1
+                assert 0 <= point["history_sample_confidence"] <= 1
+                assert point["history_samples"] >= 0
 
 
 def test_levels_endpoint_reuses_same_snapshot_analysis(tmp_path: Path, monkeypatch):
@@ -2034,12 +2050,10 @@ def test_levels_endpoint_aggregates_multiple_expirations_without_changing_select
         assert {row["expiration"] for row in chain["data"]} == {"2026-12-18"}
 
 
-def test_level_zones_stay_on_their_side_of_spot():
-    """压力区间不能跌破现价，支撑区间不能升过现价。"""
+def test_level_zones_contain_their_representative_price():
+    """压力位和支撑位区间围绕代表价生成，不再被现价裁剪。"""
     payload = build_levels(sample_bars(), sample_option_rows(200.5), 200.5, "2026-12-18")
     assert payload["resistance"] and payload["support"]
-    assert all(item["zone_low"] >= payload["spot"] for item in payload["resistance"])
-    assert all(item["zone_high"] <= payload["spot"] for item in payload["support"])
     assert all(item["zone_low"] <= item["price"] <= item["zone_high"] for side in ("resistance", "support") for item in payload[side])
 
 
@@ -2119,6 +2133,73 @@ def test_best_trade_points_selects_multi_factor_zones():
     assert result["sell"]["zone_high"] == 106
 
 
+def test_best_trade_points_separates_overlapping_buy_and_sell_zones():
+    """近期最佳买卖区间重叠时，按两个代表价的中点切开。"""
+    result = best_trade_points(
+        {"direction": "range"},
+        [{"price": 148, "zone_low": 145.65, "zone_high": 150.47, "score": 0.8, "factors": ["承接位"]}],
+        [{"price": 150, "zone_low": 147.53, "zone_high": 151.25, "score": 0.8, "factors": ["看涨持仓"]}],
+        149.17,
+    )
+    assert result["buy"]["zone_high"] == pytest.approx(149.0)
+    assert result["sell"]["zone_low"] == pytest.approx(149.0)
+    assert result["buy"]["zone_low"] == pytest.approx(145.65)
+    assert result["sell"]["zone_high"] == pytest.approx(151.25)
+
+
+def test_best_trade_points_uses_history_to_calibrate_confidence():
+    """历史样本充分且守住率较高时，最佳点综合评分应高于纯模型评分。"""
+    result = best_trade_points(
+        {"direction": "up"},
+        [{
+            "price": 95,
+            "zone_low": 94,
+            "zone_high": 96,
+            "model_score": 0.7,
+            "history_samples": 12,
+            "history_adjusted_hold_rate": 0.85,
+            "history_adjusted_break_rate": 0.15,
+            "history_confidence": 0.8,
+            "factors": ["承接位", "筹码密集"],
+        }],
+        [],
+        100,
+    )
+    assert result["buy"]["model_confidence"] < result["buy"]["confidence"]
+    assert result["buy"]["history_samples"] == 12
+    assert result["buy"]["history_hold_rate"] == pytest.approx(0.85)
+
+
+def test_frontend_confirms_trade_point_before_replacing_it():
+    """前端候选点需要连续两次快照确认，避免实时刷新导致最佳点闪烁。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "const TRADE_POINT_CONFIRMATIONS = 2;" in source
+    assert "function stabilizeTradePoints(points, context)" in source
+    assert "nextCount >= TRADE_POINT_CONFIRMATIONS" in source
+    assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
+    assert "模型评分 {{ item.confidence }}" in page
+
+
+def test_levels_analysis_cache_namespace_matches_current_scoring_model():
+    """最佳点评分字段变化时必须跳过旧版分析缓存。"""
+    source = Path("app/api.py").read_text(encoding="utf-8")
+    assert '"levels-v8"' in source
+    assert '"levels-v7"' not in source
+
+
+def test_build_levels_reuses_stable_candidate_anchor_across_basis_prices():
+    """实时价和盘后价只改变当前口径评分，不应重建候选价位池。"""
+    rows = sample_option_rows(200.5)
+    live = build_levels(sample_bars(), rows, 200.5, "2026-12-18", candidate_spot=200.5)
+    close = build_levels(sample_bars(), rows, 199.5, "2026-12-18", candidate_spot=200.5)
+
+    assert live["candidate_spot"] == close["candidate_spot"] == pytest.approx(200.5)
+    assert live["trade_points"]["sell"]["price"] == close["trade_points"]["sell"]["price"]
+    assert live["trade_points"]["sell"]["zone_low"] == close["trade_points"]["sell"]["zone_low"]
+    assert live["trade_points"]["sell"]["zone_high"] == close["trade_points"]["sell"]["zone_high"]
+
+
 def test_build_levels_exposes_trend_and_plan():
     """交易计划：买入取最近的支撑、加仓取更深一档支撑、卖出取最近的压力，各最多 10 条。"""
     spot = 200.5
@@ -2161,7 +2242,8 @@ def test_trading_plan_panels_render_under_headline():
     assert "function renderPlanRows(levels, spot)" in source
     assert "function renderPlan(plan, spot)" in source
     assert "const PLAN_COUNT = 10;" in source
-    assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);" in source
+    assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
+    assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints," in source
     assert '"今开"' in source and '"昨收"' in source and '"Beta（2年）"' in source
     assert "基准指数：标普500" in source and "前一个交易日的开盘价" in source
     assert 'trend-beta-sub' not in source
@@ -2266,6 +2348,7 @@ def test_levels_endpoint_accepts_spot_override(tmp_path: Path):
         assert overridden["spot"] == pytest.approx(205.0)
         assert all(item["price"] > 205.0 for item in overridden["resistance"])
         assert all(item["price"] < 205.0 for item in overridden["support"])
+        assert all(item["zone_low"] <= item["price"] <= item["zone_high"] for side in ("resistance", "support") for item in overridden[side])
 
 
 def test_levels_endpoint_degrades_without_history(tmp_path: Path):
@@ -2318,7 +2401,8 @@ def test_trend_channel_renders_extremes_rows():
     assert "function trendExtremeRows(extremes, spot)" in source
     for label in ("52周最高", "52周最低", "历史最高", "历史最低"):
         assert f'["{label}", extremes?.week52?.high]' in source or f'["{label}",' in source
-    assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, payload?.trade_points || null, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null)" in source
+    assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
+    assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints," in source
     # 取不到数据时整组不渲染，趋势行不受影响
     assert "const hasExtremes = extremeRows.some((row) => row.valid);" in source
 
