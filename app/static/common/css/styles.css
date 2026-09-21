@@ -31,6 +31,7 @@
 .plan-grid,.levels-grid{display:contents}
 .levels-panel{min-width:0}
 .levels{padding:0 18px 14px}
+.level-item{display:block}
 .level-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1.6fr);gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid var(--row-line);font-variant-numeric:tabular-nums}
 .level-row:last-child{border-bottom:0}
 .level-row span:not(:first-child){text-align:right}

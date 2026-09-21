@@ -31,6 +31,37 @@ function markerLabelWidth(text, weight = 700) {
   return markerLabelContext.measureText(text).width;
 }
 
+// 鼠标移动事件可能远高于屏幕刷新率；每帧只处理最后一次坐标，避免连续重排 SVG 和提示框。
+function scheduleChartPointerMove(chartSvg, onMove, hideTooltip) {
+  let frameId = null;
+  let pending = null;
+  const useAnimationFrame = typeof window.requestAnimationFrame === "function"
+    && typeof window.cancelAnimationFrame === "function";
+  const run = () => {
+    frameId = null;
+    const event = pending;
+    pending = null;
+    if (event) onMove(event);
+  };
+  const schedule = (event) => {
+    pending = { clientX: event.clientX, clientY: event.clientY, buttons: event.buttons || 0 };
+    if (frameId !== null) return;
+    frameId = useAnimationFrame ? window.requestAnimationFrame(run) : window.setTimeout(run, 16);
+  };
+  const cancel = () => {
+    pending = null;
+    if (frameId === null) return;
+    if (useAnimationFrame) window.cancelAnimationFrame(frameId);
+    else window.clearTimeout(frameId);
+    frameId = null;
+  };
+  chartSvg.addEventListener("pointermove", schedule);
+  const stop = () => { cancel(); hideTooltip(); };
+  chartSvg.addEventListener("pointerleave", stop);
+  chartSvg.addEventListener("pointercancel", stop);
+  return cancel;
+}
+
 function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emptyMessage, options = {}) {
   const target = document.getElementById(targetId);
   if (!points.length || points.every((point) => !(Math.abs(point[positiveKey]) + Math.abs(point[negativeKey])))) { target.innerHTML = `<div class="chart-empty">${emptyMessage}</div>`; return; }
@@ -200,25 +231,25 @@ function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emp
     const local = clientToViewBox(event.clientX, event.clientY);
     return Math.max(0, Math.min(points.length - 1, Math.floor((local.x - pad.left) / slot)));
   };
-  chartSvg.addEventListener("pointermove", (event) => {
+  const cancelPointerMove = scheduleChartPointerMove(chartSvg, (event) => {
     // 右键按住或拖动时不更新悬浮窗，避免浏览器菜单交互产生异常坐标。
     if (event.buttons & 2) {
       hideTooltip();
       return;
     }
     showTooltip(pointFromEvent(event), event.clientY);
-  });
+  }, hideTooltip);
   chartSvg.addEventListener("pointerdown", (event) => {
     if (event.button !== 2) return;
     event.preventDefault();
+    cancelPointerMove();
     hideTooltip();
   });
   chartSvg.addEventListener("contextmenu", (event) => {
     event.preventDefault();
+    cancelPointerMove();
     hideTooltip();
   });
-  chartSvg.addEventListener("pointerleave", hideTooltip);
-  chartSvg.addEventListener("pointercancel", hideTooltip);
   chartSvg.addEventListener("focus", () => showTooltip(0, null));
   chartSvg.addEventListener("blur", hideTooltip);
 }
@@ -379,25 +410,25 @@ function renderLevelsChart(payload) {
     updateTags(item, clientY);
   };
   const hideTooltip = () => { crosshair.setAttribute("visibility", "hidden"); tooltip.hidden = true; crosshairLine.setAttribute("visibility", "hidden"); tagX.setAttribute("visibility", "hidden"); tagY.setAttribute("visibility", "hidden"); };
-  chartSvg.addEventListener("pointermove", (event) => {
+  const cancelPointerMove = scheduleChartPointerMove(chartSvg, (event) => {
     // 右键按住或拖动时不更新悬浮窗，避免浏览器菜单交互产生异常坐标。
     if (event.buttons & 2) {
       hideTooltip();
       return;
     }
     showTooltip(nearestLevel(event.clientX), event.clientY);
-  });
+  }, hideTooltip);
   chartSvg.addEventListener("pointerdown", (event) => {
     if (event.button !== 2) return;
     event.preventDefault();
+    cancelPointerMove();
     hideTooltip();
   });
   chartSvg.addEventListener("contextmenu", (event) => {
     event.preventDefault();
+    cancelPointerMove();
     hideTooltip();
   });
-  chartSvg.addEventListener("pointerleave", hideTooltip);
-  chartSvg.addEventListener("pointercancel", hideTooltip);
   chartSvg.addEventListener("focus", () => showTooltip(ordered[0], null));
   chartSvg.addEventListener("blur", hideTooltip);
 }

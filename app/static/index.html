@@ -15,7 +15,7 @@
   <header class="topbar">
     <div class="brand"><span class="brand-mark">OS</span><div><strong>OPTION SCOPE</strong><small>美股期权快照</small></div></div>
     <div class="top-actions">
-      <div class="top-meta"><span class="live-dot"></span><span id="market-state" v-text="view.marketState">等待数据</span><span class="divider"></span><span id="clock" v-text="view.clock">--:--:--</span></div>
+      <div class="top-meta"><span class="live-dot"></span><span id="market-state" v-text="view.marketState">等待数据</span><span class="divider"></span><span id="clock">--:--:--</span></div>
       <el-button id="theme-toggle" class="theme-toggle" type="text" circle :title="view.themeLabel" aria-pressed="false" @click="toggleTheme"><i :class="view.themeIcon" aria-hidden="true"></i></el-button>
     </div>
   </header>
@@ -84,7 +84,7 @@
             <div class="levels" id="add-levels">
               <div class="level-row level-head level-plan-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>
               <div v-if="!view.levels.add.length" class="levels-empty">{{ view.levels.addEmpty }}</div>
-              <template v-for="level in view.levels.add"><div :key="level.key" class="level-row level-plan-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div :key="level.key + '-note'" class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-support">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></template>
+              <div v-for="level in view.levels.add" :key="level.key" class="level-item"><div class="level-row level-plan-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-support">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></div>
             </div>
           </article>
           </section>
@@ -95,7 +95,7 @@
             <div class="levels" id="support-levels">
               <div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>
               <div v-if="!view.levels.support.length" class="levels-empty">{{ view.levels.supportEmpty }}</div>
-              <template v-for="level in view.levels.support"><div :key="level.key" class="level-row level-factor-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div :key="level.key + '-note'" class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-support">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></template>
+              <div v-for="level in view.levels.support" :key="level.key" class="level-item"><div class="level-row level-factor-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-support">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></div>
             </div>
           </article>
           <article class="panel levels-panel levels-panel-resistance">
@@ -103,7 +103,7 @@
             <div class="levels" id="resistance-levels">
               <div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>
               <div v-if="!view.levels.resistance.length" class="levels-empty">{{ view.levels.resistanceEmpty }}</div>
-              <template v-for="level in view.levels.resistance"><div :key="level.key" class="level-row level-factor-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div :key="level.key + '-note'" class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-resistance">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></template>
+              <div v-for="level in view.levels.resistance" :key="level.key" class="level-item"><div class="level-row level-factor-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-resistance">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></div>
             </div>
           </article>
           </section>
@@ -169,8 +169,8 @@
           <div class="buyer-structure-row buyer-structure-head">
             <span>结构</span><span>隐含波动率</span><span>方向敏感度 / 敞口</span><span>有效杠杆</span><span>最大亏损</span><span>主要优点</span>
           </div>
-          <template v-for="item in view.buyer.items">
-            <div :key="item.key" class="buyer-structure-row" :class="item.rowClass">
+          <div v-for="item in view.buyer.items" :key="item.key" class="buyer-structure-item">
+            <div class="buyer-structure-row" :class="item.rowClass">
               <span class="buyer-structure-name" :title="item.title"><strong>{{ item.structure }}</strong><small>{{ item.subtitle }}</small></span>
               <span class="buyer-structure-number">{{ item.iv }}</span>
               <span class="buyer-structure-number"><strong>{{ item.delta }}</strong><small>{{ item.exposure }}</small></span>
@@ -178,11 +178,11 @@
               <span class="buyer-structure-number">{{ item.maxLoss }}</span>
               <span class="buyer-structure-advantage"><strong>{{ item.advantage }}</strong><small>评分 {{ item.score }} · {{ item.liquidity }}</small></span>
             </div>
-            <div :key="item.key + '-detail'" class="buyer-structure-detail">
+            <div class="buyer-structure-detail">
               <span class="buyer-structure-detail-main">{{ item.detail }}</span>
               <span class="buyer-structure-detail-aside"><span class="buyer-structure-scenario" :class="item.scenarioClass">{{ item.scenarioStatus }}</span><span class="buyer-structure-risk">{{ item.risk }}</span></span>
             </div>
-          </template>
+          </div>
         </div>
         <div v-if="view.buyer.available" class="buyer-structure-note">{{ view.buyer.note }}</div>
       </div>

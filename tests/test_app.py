@@ -604,7 +604,9 @@ def test_chart_tooltip_floats_above_chart_container():
     assert source.count('if (event.buttons & 2)') == 2
     assert source.count('event.button !== 2') == 2
     assert source.count('addEventListener("contextmenu"') == 2
-    assert source.count('addEventListener("pointercancel"') == 2
+    # 两张图表共用按帧调度器，由调度器统一绑定 pointercancel 清理逻辑。
+    assert source.count('addEventListener("pointercancel"') == 1
+    assert 'const stop = () => { cancel(); hideTooltip(); };' in source
     # 面板放开裁剪，卡片悬浮到图表上方时不会被面板上沿截断。
     assert ".analysis-panel{overflow:visible}" in styles
 
@@ -835,6 +837,7 @@ def test_chart_group_collapses_but_defaults_expanded():
     """图表折叠组：Gamma 敞口 / 压力位·支撑位 / 成交量分布 / 持仓量分布四张图，默认展开。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    charts = Path("app/static/common/js/charts.js").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 四张图整块包进一个折叠组，标题栏给出四张图的名字
     assert 'id="chart-group"' in page
@@ -856,6 +859,12 @@ def test_chart_group_collapses_but_defaults_expanded():
     assert "onChange: (expanded) => { if (expanded) requestAnimationFrame(() => redrawChartsIfResized()); }," in source
     assert "function redrawChartsIfResized()" in source
     assert "chartResizeTimer = setTimeout(redrawChartsIfResized, 200);" in source
+    # 高频鼠标移动按帧合并，避免每个 pointermove 都同步重排 SVG；时钟也不应触发 Vue 根实例更新。
+    assert "function scheduleChartPointerMove(chartSvg, onMove, hideTooltip)" in charts
+    assert "const cancelPointerMove = scheduleChartPointerMove(chartSvg" in charts
+    assert "function updateClock()" in source
+    assert "setInterval(updateClock, 1000);" in source
+    assert 'id="clock" v-text=' not in page
     # 样式：内容体沿用折叠组的 .detail-body，内部栅格不再叠加下边距
     assert ".chart-fold .analysis-grid{margin-bottom:0}" in styles
 
@@ -1591,6 +1600,14 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert ".level-strength-5{--level-fill:34%;--level-edge:4px;--level-edge-fill:100%}" in styles
     assert "颜色越深，综合强度越高" in page
     assert "body{font-size:14px}" in styles
+    # Vue 2 在多根 template v-for 发生列表重排时可能访问到空虚拟节点；每条主行和说明行必须由同一个稳定 key 的容器包裹。
+    assert '<div v-for="level in view.levels.add" :key="level.key" class="level-item">' in page
+    assert '<div v-for="level in view.levels.support" :key="level.key" class="level-item">' in page
+    assert '<div v-for="level in view.levels.resistance" :key="level.key" class="level-item">' in page
+    assert '<div v-for="item in view.buyer.items" :key="item.key" class="buyer-structure-item">' in page
+    assert '<template v-for="level in view.levels.' not in page
+    assert '<template v-for="item in view.buyer.items">' not in page
+    assert ".level-item{display:block}" in styles
     assert ".level-note-row{font-size:12px}" in styles
     assert ".level-factors{font-size:13px}" in styles
     assert ".trend-meta{font-size:14px" in styles

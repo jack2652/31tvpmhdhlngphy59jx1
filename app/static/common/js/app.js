@@ -28,7 +28,6 @@ const state = {
   storageAvailable: false,
   view: {
     marketState: "等待数据",
-    clock: "--:--:--",
     themeLabel: "白天",
     themeIcon: "el-icon-moon-night",
     refreshNote: "每 60 秒自动更新",
@@ -1832,7 +1831,13 @@ initDetailGroup();
 initChainGroup();
 initChartGroup();
 initBuyerStructureGroup();
-setInterval(() => { state.view.clock = new Date().toLocaleTimeString("zh-CN", { hour12: false }); }, 1000);
+// 时钟是独立的高频显示，不进入 Vue 响应式树，避免每秒遍历整张期权链的虚拟 DOM。
+function updateClock() {
+  const clock = byId("clock");
+  if (clock) clock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+}
+updateClock();
+setInterval(updateClock, 1000);
 // 容器尺寸与上次绘制不一致时按新尺寸重绘图表：窗口缩放、图表折叠组展开后都走这里。
 // 图表是按容器实际像素绘制的，隐藏状态下只能量到最小尺寸，所以展开后必须补一次重绘。
 function redrawChartsIfResized() {
