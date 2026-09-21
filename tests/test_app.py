@@ -2022,6 +2022,23 @@ def test_levels_endpoint_reuses_same_snapshot_analysis(tmp_path: Path, monkeypat
     assert calls["count"] == 1
 
 
+def test_levels_endpoint_uses_previous_close_as_stable_candidate_anchor(tmp_path: Path):
+    """现价变化时，候选池锚点沿用昨收，避免短时价格波动重建价位簇。"""
+    database = Database(tmp_path / "options.db")
+    quote = sample_quote()
+    quote["previous_close"] = 198.0
+    database.write_snapshot(quote, sample_rows(), iso())
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    service = SnapshotService(database, FakeProvider())
+    router = create_router(database, service, FakeProvider(), settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        lower = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18", "spot": 196.0}).json()
+        higher = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18", "spot": 201.0}).json()
+    assert lower["candidate_spot"] == higher["candidate_spot"] == pytest.approx(198.0)
+
+
 def test_levels_endpoint_aggregates_multiple_expirations_without_changing_selected_chain(tmp_path: Path):
     """价位接口聚合近期期限与选中远期期限；期权链图表接口仍按单一选中期限返回。"""
     database = Database(tmp_path / "options.db")
@@ -2134,15 +2151,15 @@ def test_best_trade_points_selects_multi_factor_zones():
 
 
 def test_best_trade_points_separates_overlapping_buy_and_sell_zones():
-    """近期最佳买卖区间重叠时，按两个代表价的中点切开。"""
+    """近期最佳买卖区间保留各自的原始边界，不因另一侧候选变化而裁剪。"""
     result = best_trade_points(
         {"direction": "range"},
         [{"price": 148, "zone_low": 145.65, "zone_high": 150.47, "score": 0.8, "factors": ["承接位"]}],
         [{"price": 150, "zone_low": 147.53, "zone_high": 151.25, "score": 0.8, "factors": ["看涨持仓"]}],
         149.17,
     )
-    assert result["buy"]["zone_high"] == pytest.approx(149.0)
-    assert result["sell"]["zone_low"] == pytest.approx(149.0)
+    assert result["buy"]["zone_high"] == pytest.approx(150.47)
+    assert result["sell"]["zone_low"] == pytest.approx(147.53)
     assert result["buy"]["zone_low"] == pytest.approx(145.65)
     assert result["sell"]["zone_high"] == pytest.approx(151.25)
 
@@ -2178,7 +2195,8 @@ def test_frontend_confirms_trade_point_before_replacing_it():
     assert "function stabilizeTradePoints(points, context)" in source
     assert "nextCount >= TRADE_POINT_CONFIRMATIONS" in source
     assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
-    assert "模型评分 {{ item.confidence }}" in page
+    assert "综合评分 {{ item.confidence }}" in page
+    assert "{{ item.historySummary }}" in page
 
 
 def test_levels_analysis_cache_namespace_matches_current_scoring_model():
@@ -2244,7 +2262,9 @@ def test_trading_plan_panels_render_under_headline():
     assert "const PLAN_COUNT = 10;" in source
     assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
     assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints," in source
-    assert '"今开"' in source and '"昨收"' in source and '"Beta（2年）"' in source
+    assert '"今开"' in source and '"昨收"' in source and '["Beta", betaText, betaTitle]' in source
+    assert '"Beta（2年）"' not in source
+    assert page.index('class="trend-side"') < page.index('class="trend-core"')
     assert "基准指数：标普500" in source and "前一个交易日的开盘价" in source
     assert 'trend-beta-sub' not in source
     assert '"近期最佳买入点"' in source and '"近期最佳卖出点"' in source
@@ -2252,6 +2272,9 @@ def test_trading_plan_panels_render_under_headline():
     assert "未来 5 个交易日（约 1 周）" not in source
     assert 'class="trend-opportunities"' in page
     assert 'class="trend-layout"' in page and 'class="trend-core"' in page and 'class="trend-side"' in page
+    assert 'v-for="row in view.trend.rows.slice(0, 2)"' in page
+    assert 'v-for="row in view.trend.rows.slice(2)"' in page
+    assert page.index('class="trend-opportunities"') > page.index('class="trend-core"')
     assert 'class="trend-meta trend-current-price" :title="view.trend.priceTitle"' in page
     assert "formatLevelRange(point)" in source and "formatProbability(point.confidence)" in source
     assert 'const priceLabel = state.levelBasisMode === "live" && selectedBasis?.label === "收盘"' in source
@@ -2262,10 +2285,12 @@ def test_trading_plan_panels_render_under_headline():
     assert ".trend-opportunity strong small{color:var(--muted)" in styles
     assert ".trend-opportunities .trend-meta{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;min-width:0;border-bottom:0}" in styles
     assert ".trend-opportunity strong{display:flex;flex-direction:column;align-items:flex-end" in styles
+    assert ".trend-core .trend-opportunities{display:flex;flex-direction:column;min-width:0}" in styles
+    assert ".trend-core .trend-opportunities .trend-meta{flex:0 0 auto;min-height:0;padding-block:9px;line-height:1.35}" in styles
+    assert ".trend-core .trend-opportunity strong{gap:3px;line-height:1.25}" in styles
+    assert ".trend-core .trend-opportunity-label{gap:3px;line-height:1.35}" in styles
     assert ".trend-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 24px;align-items:stretch;flex:1;min-height:0}" in styles
     assert ".trend-side{display:flex;flex-direction:column;min-height:100%}" in styles
-    assert ".trend-side .trend-opportunities{display:flex;flex:0 0 auto;flex-direction:column;grid-template-columns:1fr;column-gap:0;min-height:0}" in styles
-    assert ".trend-side .trend-opportunities:only-child{flex:1}" in styles
     assert ".trend-side>.trend-meta{flex:1;min-height:40px}" in styles
     assert ".trend-core .trend-meta{flex:1;min-height:40px}" in styles
     assert ".trend-panel{display:flex;flex-direction:column;min-height:0}" in styles

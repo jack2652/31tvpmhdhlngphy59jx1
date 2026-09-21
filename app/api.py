@@ -304,8 +304,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
     ) -> dict[str, Any]:
         """压力位/支撑位：技术面与近 45 天多期限期权持仓综合。
 
-        `spot` 是前端传入的当前展示基准价；候选池固定使用同一快照里的常规价锚点，
-        避免实时价与盘后价切换时因现价分侧而生成两套不同的价位。
+        `spot` 是前端传入的当前展示基准价；候选池优先使用快照中的前一交易日收盘价作为
+        日内稳定锚点，避免实时价变化或实时价与盘后价切换时反复生成不同的价位簇。
         """
         normalized = symbol(stock_symbol)
         quote = database.latest_quote(normalized) or {}
@@ -334,10 +334,12 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             extremes_payload = extremes_future.result()
             beta_payload = beta_future.result()
         resolved_spot = spot if spot is not None else quote.get("price")
-        candidate_spot = quote.get("price")
+        # 候选池使用昨收作为日内稳定锚点；最新价只负责当前侧别、距离和触及概率。
+        # 这样盘中价格小幅波动时不会反复重建相邻价位簇，昨收缺失时才回退最新价。
+        candidate_spot = quote.get("previous_close")
         try:
             if candidate_spot is None or float(candidate_spot) <= 0:
-                candidate_spot = quote.get("previous_close") or resolved_spot
+                candidate_spot = quote.get("price") or resolved_spot
         except (TypeError, ValueError):
             candidate_spot = resolved_spot
         cache_key = (

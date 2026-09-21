@@ -143,12 +143,13 @@
 .trend-opportunity.sell strong{color:var(--down)}
 .trend-opportunity strong small{color:var(--muted);font-size:10px;font-weight:500;white-space:nowrap}
 .trend-side{display:flex;flex-direction:column;min-height:100%}
-.trend-side .trend-opportunities{display:flex;flex:0 0 auto;flex-direction:column;grid-template-columns:1fr;column-gap:0;min-height:0}
-.trend-side .trend-opportunities .trend-meta{flex:0 0 auto;min-height:0;padding-block:6px}
-.trend-side .trend-opportunities:only-child{flex:1}
-.trend-side .trend-opportunities:only-child .trend-meta{flex:1;min-height:40px}
 .trend-side>.trend-meta{flex:1;min-height:40px}
-.trend-side .trend-opportunities .trend-meta+.trend-meta{border-left:0;padding-left:0;border-top:1px solid var(--row-line)}
+.trend-core .trend-opportunities{display:flex;flex-direction:column;min-width:0}
+.trend-core .trend-opportunities .trend-meta{flex:0 0 auto;min-height:0;padding-block:9px;line-height:1.35}
+.trend-core .trend-opportunities .trend-meta+.trend-meta{border-left:0;padding-left:0;border-top:1px solid var(--row-line)}
+.trend-core .trend-opportunity strong{gap:3px;line-height:1.25}
+.trend-core .trend-opportunity-label{gap:3px;line-height:1.35}
+.trend-core .trend-opportunity strong small{line-height:1.35;margin-top:1px}
 @media(max-width:560px){.trend-layout{grid-template-columns:1fr;gap:0}.trend-opportunities{grid-template-columns:1fr}.trend-opportunities .trend-meta+.trend-meta{border-left:0;padding-left:0;border-top:1px solid var(--row-line)}}
 /* 折叠组（分析详情 / 期权链 / 图表共用）：一块 panel 里包着若干子面板，标题栏整行可点。
    各自默认状态：分析详情与期权链默认折叠、图表默认展开；caret 展开时旋转 90°；body 用 hidden 控制显隐（[hidden] 在 flex/grid 上下文里会被覆盖，需显式声明）。 */

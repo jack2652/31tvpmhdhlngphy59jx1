@@ -357,16 +357,9 @@ def best_trade_points(
             "reason": "多因子共振" if len(row.get("factors") or []) >= 2 else "单一主因子，需结合行情确认",
         }
 
-    selected = {"buy": select(support, "buy"), "sell": select(resistance, "sell")}
-    buy = selected["buy"]
-    sell = selected["sell"]
-    if buy and sell and buy["price"] < sell["price"]:
-        # 支撑和压力区域各自按 ATR 扩展后可能重叠；用两个代表价的中点分界，
-        # 保留区域自身的稳定边界，同时让买入区和卖出区在展示上互斥。
-        boundary = round((buy["price"] + sell["price"]) / 2, 4)
-        buy["zone_high"] = round(min(buy["zone_high"], boundary), 4)
-        sell["zone_low"] = round(max(sell["zone_low"], boundary), 4)
-    return selected
+    # 买入区和卖出区允许保留各自完整的技术/期权区域；不再用两个代表价的中点
+    # 动态裁剪边界，避免最佳买入点变化时把卖出区间下沿一起推来推去。
+    return {"buy": select(support, "buy"), "sell": select(resistance, "sell")}
 
 
 def average_true_ranges(bars: Iterable[dict[str, Any]], period: int = ATR_PERIOD) -> list[float | None]:

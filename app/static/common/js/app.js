@@ -935,7 +935,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     ["样本", `${Number(trend.bars) || 0} 根日线`, ""],
     ["今开", formatMoney(trendMarket?.today_open), "今日开盘价；盘前、盘后和夜盘缺少当日开盘价时，使用前一个交易日的开盘价"],
     ["昨收", formatMoney(trendMarket?.previous_close), "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"],
-    ["Beta（2年）", betaText, betaTitle],
+    ["Beta", betaText, betaTitle],
   ].map(([label, value, title]) => ({ label, value, title, className: label.startsWith("Beta") ? "trend-beta" : "" })) : [];
   const action = ["buy", "sell", "hold"].includes(recommendation?.action) ? recommendation.action : null;
   const actionLabel = action ? (recommendation.label || "继续持有") : "";
@@ -955,6 +955,9 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     const history = Number.isFinite(holdRate) && samples > 0
       ? `历史守住 ${(holdRate * 100).toFixed(1)}%（${samples}次）${Number.isFinite(breakRate) ? `，跌破 ${(breakRate * 100).toFixed(1)}%` : ""}`
       : "历史样本不足";
+    const historySummary = Number.isFinite(holdRate) && samples > 0
+      ? `守住 ${(holdRate * 100).toFixed(1)}% · ${samples}次`
+      : "暂无历史样本";
     const title = point?.reason ? `${label}：${point.reason}` : `${label}暂无可用数据`;
     return {
       kind,
@@ -962,6 +965,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
       horizon: horizonLabel,
       range,
       confidence,
+      historySummary,
       title: `${title} · 模型评分 ${modelConfidence} · ${history} · 综合评分 ${confidence} · 计算范围：${horizonLabel}`,
     };
   });

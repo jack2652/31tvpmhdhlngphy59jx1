@@ -64,15 +64,16 @@
               <div v-if="view.trend.available" class="trend-content">
                 <div class="trend-signal" :class="[view.trend.directionClass, view.trend.actionClass]"><strong class="trend-label">{{ view.trend.label }}<span v-if="view.trend.action" class="trend-action"> · {{ view.trend.action }}</span></strong><small>{{ view.trend.reason }}</small></div>
                 <div class="trend-layout">
-                  <div class="trend-core">
-                    <div v-for="row in view.trend.rows" :key="row.label" class="trend-meta" :class="row.className" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}<small v-if="row.sub">{{ row.sub }}</small></strong></div>
-                  </div>
                   <div class="trend-side">
                     <div class="trend-meta trend-current-price" :title="view.trend.priceTitle"><span>{{ view.trend.priceLabel }}</span><strong>{{ view.trend.price }}</strong></div>
-                    <div class="trend-opportunities">
-                      <div v-for="item in view.trend.opportunities" :key="item.kind" class="trend-meta trend-opportunity" :class="item.kind" :title="item.title"><span class="trend-opportunity-label"><span>{{ item.label }}</span><small>{{ item.horizon }}</small></span><strong>{{ item.range }}<small>模型评分 {{ item.confidence }}</small></strong></div>
-                    </div>
+                    <div v-for="row in view.trend.rows.slice(0, 2)" :key="row.label" class="trend-meta" :class="row.className" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}<small v-if="row.sub">{{ row.sub }}</small></strong></div>
                     <div v-for="row in view.trend.extremes" :key="row.label" class="trend-meta" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}</strong></div>
+                  </div>
+                  <div class="trend-core">
+                    <div class="trend-opportunities">
+                      <div v-for="item in view.trend.opportunities" :key="item.kind" class="trend-meta trend-opportunity" :class="item.kind" :title="item.title"><span class="trend-opportunity-label"><span>{{ item.label }}</span><small>{{ item.horizon }}</small></span><strong>{{ item.range }}<small>综合评分 {{ item.confidence }}</small><small>{{ item.historySummary }}</small></strong></div>
+                    </div>
+                    <div v-for="row in view.trend.rows.slice(2)" :key="row.label" class="trend-meta" :class="row.className" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}<small v-if="row.sub">{{ row.sub }}</small></strong></div>
                   </div>
                 </div>
               </div>
