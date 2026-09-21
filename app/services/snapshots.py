@@ -44,6 +44,19 @@ def snapshot_age_seconds(fetched_at: str | None) -> float | None:
     return max((datetime.now(timezone.utc) - moment).total_seconds(), 0.0)
 
 
+def has_valid_two_sided_quotes(rows: list[dict[str, Any]] | None) -> bool:
+    """判断期权链是否至少包含一条可用于模型估算的有效买卖价。"""
+    for row in rows or []:
+        try:
+            bid = float(row.get("bid"))
+            ask = float(row.get("ask"))
+        except (TypeError, ValueError):
+            continue
+        if bid > 0 and ask >= bid:
+            return True
+    return False
+
+
 def active_expirations(values: list[str]) -> list[str]:
     """过滤已经过期的到期日，避免页面停留在无法刷新的历史合约上。"""
     today = market_today()
@@ -195,6 +208,8 @@ class SnapshotService:
             or quote.get("price") is None
             or quote_age is None
             or quote_age >= max_age_seconds
+            # 旧版本写入的期权链可能只有成交量/持仓量，没有买卖价；这类缓存不能阻止买方结构自动补抓。
+            or not has_valid_two_sided_quotes(cached.get("data"))
         ):
             return None
         return {

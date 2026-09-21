@@ -558,10 +558,15 @@ function levelBasis(quote, fallbackPrice) {
 // 基准价开关的两个口径：live 实时价（默认）、close 盘后价（沿用旧口径）；常量用于遍历同步按钮状态。
 const BASIS_MODES = { live: "实时价", close: "盘后价" };
 
-// 实时价取当前生效的时段价格：盘中为最新成交价，盘前/盘后取该时段价格，跟随快照刷新；
-// 盘后与夜盘时段两种口径取值相同；盘中则不同——旧口径锚定的是上一交易日的盘后价，突破行情下会明显滞后。
+// 实时价取当前生效的时段价格：盘中为最新成交价，盘前/盘后取该时段价格；
+// 夜盘没有可用的 Yahoo 夜盘价时改用最近一次正常交易日收盘价，避免把常规价误标成夜盘实时价。
 function activeBasis(quote) {
   if (state.levelBasisMode === "close") return levelBasis(quote, quote?.price);
+  // 夜盘没有 Yahoo 的实时标的价时，实时价口径改用最近一次正常交易日收盘价。
+  if (quote?.market_state === "OVERNIGHT") {
+    const close = Number(quote?.previous_close);
+    if (Number.isFinite(close) && close > 0) return { price: close, label: "收盘" };
+  }
   const price = Number(activeSessionQuote(quote)?.price);
   return Number.isFinite(price) && price > 0 ? { price, label: "实时" } : levelBasis(quote, quote?.price);
 }
@@ -570,6 +575,7 @@ function activeBasis(quote) {
 // 支撑位/压力位表、交易计划与压力位/支撑位柱状图都由这一次重绘一起更新。
 function applyBasisMode(mode) {
   state.levelBasisMode = mode === "close" ? "close" : "live";
+  if (state.lastQuote) state.view.quoteMarket = quoteMarketLabel(state.lastQuote);
   for (const key of Object.keys(BASIS_MODES)) {
     const button = byId(key === "live" ? "basis-live" : "basis-close");
     if (button) button.setAttribute("aria-pressed", String(key === state.levelBasisMode));
@@ -910,7 +916,9 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const fallbackPrice = Number(spot);
   const displayedPrice = Number.isFinite(basisPrice) && basisPrice > 0 ? basisPrice : fallbackPrice;
   const validPrice = Number.isFinite(displayedPrice) && displayedPrice > 0;
-  const priceLabel = BASIS_MODES[state.levelBasisMode] || BASIS_MODES.live;
+  const priceLabel = state.levelBasisMode === "live" && selectedBasis?.label === "收盘"
+    ? "收盘价"
+    : (BASIS_MODES[state.levelBasisMode] || BASIS_MODES.live);
   const priceTitle = validPrice
     ? `${priceLabel} ${formatMoney(displayedPrice)} · 数据来源：${selectedBasis?.label || "常规"}`
     : `${priceLabel}暂无数据`;
@@ -1228,7 +1236,7 @@ function renderQuote(quote) {
   // 涨跌色统一走 --up / --down：当前全局口径是绿涨红跌，变量名不再写死颜色。
   state.view.quoteChangeColor = change == null ? "var(--muted)" : (change < 0 ? "var(--down)" : "var(--up)");
   state.view.quoteCurrency = quote?.currency || "USD";
-  state.view.quoteMarket = marketStateLabel(quote?.market_state);
+  state.view.quoteMarket = quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
 }
@@ -1237,6 +1245,12 @@ function renderQuote(quote) {
 function marketStateLabel(value, fallback = "快照") {
   if (!value) return fallback;
   return MARKET_STATE_LABELS[value] || value;
+}
+
+// 夜盘没有实时价：现货卡片的标签跟随分析基准，避免把收盘价继续标成「夜盘」。
+function quoteMarketLabel(quote) {
+  if (quote?.market_state !== "OVERNIGHT") return marketStateLabel(quote?.market_state);
+  return state.levelBasisMode === "close" ? "盘后" : "收盘价";
 }
 
 // 期权链表格里的 Gamma 与 IV 同样优先展示价格反解出的模型值，避免展示数据源里的占位 IV。
@@ -1388,10 +1402,18 @@ function quoteIsReady(quote) {
   return Number.isFinite(price) && price > 0;
 }
 
+function hasValidOptionQuotes(rows) {
+  return (rows || []).some((row) => {
+    const bid = Number(row?.bid);
+    const ask = Number(row?.ask);
+    return Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask >= bid;
+  });
+}
+
 // 快照仍在新鲜期内时不再请求上游接口，只把本地缓存的状态回显给用户。
 function isSnapshotFresh(snapshot) {
   const age = snapshotAgeSeconds(snapshot?.fetchedAt);
-  return Boolean(snapshot?.shown && snapshot?.quoteReady) && age !== null && age < SNAPSHOT_FRESH_SECONDS;
+  return Boolean(snapshot?.shown && snapshot?.quoteReady && snapshot?.optionsQuotesReady) && age !== null && age < SNAPSHOT_FRESH_SECONDS;
 }
 
 function showFreshStatus(snapshot) {
@@ -1496,6 +1518,7 @@ async function renderSnapshot(loadId, fallbackQuote = null) {
     payload,
     analysisReady: Boolean(analysis?.data?.length),
     quoteReady: quoteIsReady(resolvedQuote),
+    optionsQuotesReady: hasValidOptionQuotes(payload.data),
   };
 }
 

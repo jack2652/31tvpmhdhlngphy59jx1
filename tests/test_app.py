@@ -43,7 +43,7 @@ from app.gamma import (
     implied_volatility_from_price,
     years_to_expiry,
 )
-from app.services.snapshots import SnapshotService, active_expirations, market_today
+from app.services.snapshots import SnapshotService, active_expirations, has_valid_two_sided_quotes, market_today
 from app.services.scheduler import Scheduler
 
 
@@ -648,6 +648,10 @@ def test_quote_price_follows_current_session():
     # 时段标签映射与顶栏时段展示保留。
     assert 'const MARKET_STATE_LABELS = { PRE: "盘前", REGULAR: "正常交易", POST: "盘后", OVERNIGHT: "夜盘", CLOSED: "休市" };' in source
     assert 'state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");' in source
+    assert "function quoteMarketLabel(quote)" in source
+    assert 'return state.levelBasisMode === "close" ? "盘后" : "收盘价";' in source
+    assert "state.view.quoteMarket = quoteMarketLabel(quote);" in source
+    assert "if (state.lastQuote) state.view.quoteMarket = quoteMarketLabel(state.lastQuote);" in source
 
 
 def test_palette_uses_green_up_red_down_tokens():
@@ -938,6 +942,31 @@ def test_recent_snapshot_requires_quote_and_chain(tmp_path: Path):
     database.write_snapshot(quote, sample_rows(), iso())
     service = SnapshotService(database, FakeProvider())
     assert service.recent_snapshot("AAPL", "2026-12-18", 60) is None
+
+
+def test_recent_snapshot_requires_bid_ask_for_buyer_structures(tmp_path: Path):
+    """只有成交量/持仓量而没有买卖价的旧缓存必须自动进入补抓流程。"""
+    database = Database(tmp_path / "options.db")
+    rows = [{**row, "bid": None, "ask": None} for row in sample_rows()]
+    database.write_snapshot(sample_quote(), rows, iso())
+    service = SnapshotService(database, FakeProvider())
+    assert has_valid_two_sided_quotes(rows) is False
+    assert service.recent_snapshot("AAPL", "2026-12-18", 60) is None
+    assert has_valid_two_sided_quotes(sample_rows()) is True
+
+
+def test_refresh_backfills_fresh_cache_without_bid_ask(tmp_path: Path):
+    """缓存时间虽新但缺少买卖价时，刷新必须回源写入完整期权链。"""
+    database = Database(tmp_path / "options.db")
+    rows = [{**row, "bid": None, "ask": None} for row in sample_rows()]
+    database.write_snapshot(sample_quote(), rows, iso())
+    service = SnapshotService(database, FakeProvider())
+
+    result = service.refresh("AAPL", "2026-12-18", max_age_seconds=60)
+
+    assert result.get("skipped") is None
+    assert has_valid_two_sided_quotes(database.latest_chain("AAPL", "2026-12-18")["data"]) is True
+
 
 def test_zero_gamma_uses_nearby_expirations_and_regime_root():
     now_price = 330.0
@@ -1356,6 +1385,9 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     assert "if (state.refreshing) return;" in source
     assert "function isSnapshotFresh(snapshot)" in source
     assert "function quoteIsReady(quote)" in source
+    assert "function hasValidOptionQuotes(rows)" in source
+    assert "snapshot?.optionsQuotesReady" in source
+    assert "optionsQuotesReady: hasValidOptionQuotes(payload.data)" in source
     assert "snapshot?.shown && snapshot?.quoteReady" in source
     assert "age !== null && age < SNAPSHOT_FRESH_SECONDS" in source
     assert "if (isSnapshotFresh(snapshot)) {" in source
@@ -2118,7 +2150,7 @@ def test_trading_plan_panels_render_under_headline():
     assert 'class="trend-layout"' in page and 'class="trend-core"' in page and 'class="trend-side"' in page
     assert 'class="trend-meta trend-current-price" :title="view.trend.priceTitle"' in page
     assert "formatLevelRange(point)" in source and "formatProbability(point.confidence)" in source
-    assert 'const priceLabel = BASIS_MODES[state.levelBasisMode] || BASIS_MODES.live;' in source
+    assert 'const priceLabel = state.levelBasisMode === "live" && selectedBasis?.label === "收盘"' in source
     assert 'price: validPrice ? formatMoney(displayedPrice) : "--"' in source
     assert ".trend-opportunity.buy strong{color:var(--up)}" in styles
     assert ".trend-opportunity.sell strong{color:var(--down)}" in styles
@@ -2382,7 +2414,10 @@ def test_basis_price_switch_defaults_to_live():
     assert 'const BASIS_MODES = { live: "实时价", close: "盘后价" };' in source
     assert "function activeBasis(quote)" in source
     assert 'if (state.levelBasisMode === "close") return levelBasis(quote, quote?.price);' in source
+    assert 'if (quote?.market_state === "OVERNIGHT")' in source
+    assert 'return { price: close, label: "收盘" };' in source
     assert "const price = Number(activeSessionQuote(quote)?.price);" in source
+    assert 'state.levelBasisMode === "live" && selectedBasis?.label === "收盘"' in source
     # 默认实时价：state 初始值 + 分析渲染改用 activeBasis。
     assert "levelBasisMode: \"live\"" in source
     assert "}, activeBasis(quote));" in source
