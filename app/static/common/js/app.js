@@ -1642,7 +1642,7 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
     });
 }
 
-async function refreshInBackground(loadId) {
+async function refreshInBackground(loadId, force = false) {
   const symbol = state.symbol;
   const expiration = state.expiration;
   const encodedSymbol = encodeURIComponent(symbol);
@@ -1652,13 +1652,13 @@ async function refreshInBackground(loadId) {
   state.refreshInFlight = symbol;
   try {
     state.view.lastStatus = "正在请求上游快照…";
-    // max_age 交给后端再兜底一次：本地快照仍在新鲜期内时后端会直接返回 skipped，不再打上游接口。
-    const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });
+    // 手动刷新必须强制回源；自动刷新仍复用 60 秒新鲜期，避免定时器重复请求上游。
+    const params = new URLSearchParams({ max_age: String(force ? 0 : SNAPSHOT_FRESH_SECONDS) });
     if (expiration) params.set("expiration", expiration);
     const refreshResult = await request(`/api/refresh/${encodedSymbol}?${params}`, { method: "POST" });
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
     // 后端在标的没有挂牌期权时只写现货快照：走现货渲染分支，避免页面一直停在“后台刷新中”。
-    if (refreshResult?.quote_only) { await loadQuoteOnly(loadId); return; }
+    if (refreshResult?.quote_only) { await loadQuoteOnly(loadId, force); return; }
     if (refreshResult?.skipped) {
       // 首次读取时某个并发请求可能暂时失败，但后端已经确认 SQLite 快照新鲜；
       // 重新读取并使用刷新响应附带的 quote，避免页面停在“股价 -- / Gamma 0”。
@@ -1673,7 +1673,7 @@ async function refreshInBackground(loadId) {
       applyExpirations([refreshResult.expiration], refreshResult.expiration);
     }
     const currentExpiration = state.expiration || refreshResult?.expiration;
-    if (!currentExpiration) { await loadQuoteOnly(loadId); return; }
+    if (!currentExpiration) { await loadQuoteOnly(loadId, force); return; }
     const encodedExpiration = encodeURIComponent(currentExpiration);
     // 先取最新的期权链与现货：跨期限 Gamma 窗口刷新较慢，表格不能跟着一起等。
     const [payload, quote, expirations] = await Promise.all([
@@ -1687,14 +1687,14 @@ async function refreshInBackground(loadId) {
     // 本次调用还占着互斥标记，直接重入会被互斥挡住，先释放再重入。
     if (state.expiration !== currentExpiration) {
       state.refreshInFlight = null;
-      await refreshInBackground(loadId);
+      await refreshInBackground(loadId, force);
       return;
     }
     if (expirations?.expirations?.length) applyExpirations(expirations.expirations, currentExpiration);
     // 选中的到期日已下架（例如当天盘后过期）时，切到最新到期日并重新加载；同样先释放互斥标记再重入。
     if (state.expiration && state.expiration !== currentExpiration) {
       state.refreshInFlight = null;
-      await refreshInBackground(loadId);
+      await refreshInBackground(loadId, force);
       return;
     }
     let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;
@@ -1720,7 +1720,7 @@ async function refreshInBackground(loadId) {
     const dates = fresh?.expirations || [];
     if (dates.length && !dates.includes(state.expiration)) {
       applyExpirations(dates, null);
-      await loadChain({ loadId });
+      await loadChain({ loadId, force });
     }
   } finally {
     if (state.refreshInFlight === symbol) state.refreshInFlight = null;
@@ -1729,7 +1729,7 @@ async function refreshInBackground(loadId) {
 
 // 标的没有挂牌期权（或可用期限已全部到期）时只渲染现货：现货与盘前盘后照常刷新，
 // 期权相关面板统一提示没有期权数据，避免整页停在 “--”。
-async function loadQuoteOnly(loadId) {
+async function loadQuoteOnly(loadId, force = false) {
   const symbol = state.symbol;
   const encodedSymbol = encodeURIComponent(symbol);
   // 现货读本地快照（刷新接口刚写过），到期日必须回源：本地为空只能说明还没抓过，不等于没有期权。
@@ -1743,7 +1743,7 @@ async function loadQuoteOnly(loadId) {
   if (dates.length) {
     applyExpirations(dates, null);
     state.refreshInFlight = null;
-    await refreshInBackground(loadId);
+    await refreshInBackground(loadId, force);
     return;
   }
   applyCachedQuote(quote);
@@ -1766,13 +1766,14 @@ async function loadExpirations(loadId) {
 
 async function loadChain(options = {}) {
   const loadId = options.loadId || state.loadId;
+  const force = options.force === true;
   // 即使本地还没有到期日也要往下走：首次加载某个标的时后端需要回源才能拿到期限列表，
   // 提前 return 会让页面永远停在没有数据的状态。
   const snapshot = await renderSnapshot(loadId);
   if (!snapshot.shown) showPending("正在后台获取上游快照…");
   if (options.refresh === false) return;
   // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求上游接口。
-  if (isSnapshotFresh(snapshot)) {
+  if (!force && isSnapshotFresh(snapshot)) {
     showFreshStatus(snapshot);
     // 首次访问可能只有选中期限的缓存，跨期限 Gamma 尚未生成；只补后台分析，不阻塞首屏。
     if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
@@ -1780,7 +1781,7 @@ async function loadChain(options = {}) {
     }
     return;
   }
-  await refreshInBackground(loadId);
+  await refreshInBackground(loadId, force);
 }
 
 async function loadSymbol() {
@@ -1848,8 +1849,7 @@ function navigateToSymbol() {
   else location.assign(target);
 }
 
-// 手动点击与 60 秒定时刷新共用入口：先读 SQLite（renderSnapshot 只读本地缓存），
-// 快照仍在新鲜期内就直接复用，只有确认过期才请求上游接口；整段流程互斥，连点与定时器不会叠加请求。
+// 手动点击强制刷新上游快照；60 秒定时刷新仍优先复用 SQLite 新鲜缓存，整段流程互斥。
 async function refresh(silent = false) {
   if (state.refreshing) return;
   state.refreshing = true;
@@ -1857,7 +1857,7 @@ async function refresh(silent = false) {
   const loadId = state.loadId;
   try {
     if (!silent) setError("");
-    await loadChain({ loadId, refresh: true });
+    await loadChain({ loadId, force: !silent });
   } catch (error) {
     if (isCurrentLoad(loadId)) setError(error.message);
   } finally {

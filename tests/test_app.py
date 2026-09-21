@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 import app.api as api_module
 from app.api import create_router, install_access_guard, trend_market_data
+from app.buyer_structures import build_buyer_structures
 from app.config import Settings
 from app.db import NO_FLOOR, Database, iso, parse_sessions, utc_now
 from app.levels import absorption_levels, annotate_level_history, average_true_range, average_true_ranges, best_trade_points, build_levels, chip_peaks, fibonacci_levels, level_strength_tier, merge_candidates, option_levels, price_extremes, select_visible_levels, split_support_plan, touch_probability, trade_recommendation, trend_channel
@@ -1327,6 +1328,43 @@ def test_refresh_requests_provider_after_fresh_window(tmp_path: Path):
     assert fresh["skipped"] is True
 
 
+def test_manual_refresh_forces_provider_when_snapshot_is_fresh(tmp_path: Path):
+    """手动刷新传入 max_age=0 时，即使本地快照新鲜也必须回源。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote(), sample_rows(), iso())
+    calls = {"fetch": 0}
+
+    class CountingProvider(FakeProvider):
+        def fetch(self, symbol: str, expiration: str):
+            calls["fetch"] += 1
+            return super().fetch(symbol, expiration)
+
+    service = SnapshotService(database, CountingProvider())
+    result = service.refresh("AAPL", "2026-12-18", max_age_seconds=0)
+
+    assert result.get("skipped") is None
+    assert calls["fetch"] == 1
+
+
+def test_buyer_structures_compare_both_directions_when_signal_is_neutral():
+    """中性趋势不应清空首屏结构分析，仍展示看涨和看跌的对比候选。"""
+    result = build_buyer_structures(
+        sample_option_rows(200.5),
+        200.5,
+        {"direction": "range", "lower": 195.0, "upper": 205.0},
+        {"action": "hold", "label": "继续持有", "reason": "信号未形成共振"},
+        [{"price": 195.0}],
+        [{"price": 205.0}],
+    )
+
+    assert result["available"] is True
+    assert result["direction"] == "neutral"
+    assert result["primary_direction"] is None
+    assert "中性对比" in result["direction_label"]
+    assert {item["direction"] for item in result["items"]} == {"call", "put"}
+    assert not any(item["is_primary"] for item in result["items"])
+
+
 def test_gamma_window_refreshes_fresh_chain_without_open_interest(tmp_path: Path):
     """刚写入但未平仓量全为 0 的链不能阻止 Gamma 窗口补抓。"""
     database = Database(tmp_path / "options.db")
@@ -1389,9 +1427,9 @@ def test_refreshes_from_separate_workers_share_sqlite_lease(tmp_path: Path):
     assert first_database.latest_chain("AAPL", "2026-12-18")["data"]
 
 
-def test_refresh_button_reads_sqlite_before_hitting_upstream():
+def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
-    # 刷新入口先读 SQLite 判断新鲜度，只有过期才请求上游接口，并用 state.refreshing 拦截连点。
+    # 手动刷新必须回源；自动刷新才复用 SQLite 新鲜快照，并用 state.refreshing 拦截连点。
     assert "if (state.refreshing) return;" in source
     assert "function isSnapshotFresh(snapshot)" in source
     assert "function quoteIsReady(quote)" in source
@@ -1400,9 +1438,10 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     assert "optionsQuotesReady: hasValidOptionQuotes(payload.data)" in source
     assert "snapshot?.shown && snapshot?.quoteReady" in source
     assert "age !== null && age < SNAPSHOT_FRESH_SECONDS" in source
-    assert "if (isSnapshotFresh(snapshot)) {" in source
+    assert "if (!force && isSnapshotFresh(snapshot)) {" in source
     assert "showFreshStatus(snapshot);" in source
-    assert 'const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });' in source
+    assert "async function refreshInBackground(loadId, force = false)" in source
+    assert 'const params = new URLSearchParams({ max_age: String(force ? 0 : SNAPSHOT_FRESH_SECONDS) });' in source
     assert "if (refreshResult?.skipped)" in source
     assert "const snapshot = await renderSnapshot(loadId, refreshResult.quote || null);" in source
     assert "let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;" in source
@@ -1410,6 +1449,7 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     assert '@click="refreshNow"' in Path("app/static/index.html").read_text(encoding="utf-8")
     assert ':disabled="refreshing"' in Path("app/static/index.html").read_text(encoding="utf-8")
     assert "setInterval(() => refresh(true), AUTO_REFRESH_SECONDS * 1000);" in source
+    assert "await loadChain({ loadId, force: !silent });" in source
     # 跨期限 Gamma 窗口刷新改为后台任务，表格渲染完成后不再等待窗口。
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
     assert "refreshAnalysisWindow(loadId, payload, resolvedQuote);" in source
@@ -1423,7 +1463,7 @@ def test_refresh_button_reads_sqlite_before_hitting_upstream():
     assert "if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote)" in source
     # 页面加载、手动点击、定时刷新共用同一条刷新链路与网络互斥。
     assert "if (state.refreshInFlight === symbol) return;" in source
-    assert "await loadChain({ loadId, refresh: true });" in source
+    assert "await loadChain({ loadId, force: !silent });" in source
     assert 'id="refresh-note"' in Path("app/static/index.html").read_text(encoding="utf-8")
 
 
@@ -1500,10 +1540,10 @@ def test_frontend_loads_symbol_without_cached_expiration():
     # 首次载入一个从未抓过的标的时本地没有到期日：必须继续走到后台回源，否则页面永远停在无数据状态。
     assert "if (!state.expiration) return;" not in source
     assert "async function loadExpirations(loadId)" in source
-    assert "await refreshInBackground(loadId);" in source
+    assert "await refreshInBackground(loadId, force);" in source
     # 仅现货标的单独一条渲染分支：现货照常画，期权面板统一提示没有期权数据。
-    assert "async function loadQuoteOnly(loadId)" in source
-    assert "if (refreshResult?.quote_only) { await loadQuoteOnly(loadId); return; }" in source
+    assert "async function loadQuoteOnly(loadId, force = false)" in source
+    assert "if (refreshResult?.quote_only) { await loadQuoteOnly(loadId, force); return; }" in source
     assert 'applyExpirations([], null, "无期权到期日");' in source
     # 本地无缓存（source=pending）与「该标的确实没有期权」必须给出不同占位文案。
     assert 'payload.source === "pending" ? "正在获取到期日…" : "该标的没有期权到期日"' in source
@@ -2585,7 +2625,7 @@ def test_expiration_switch_discards_stale_response():
     assert "if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null };" in source
     # 双向防覆盖之二：后台刷新发现期限变了就先还回网络互斥再按新期限重来，避免把用户的选择拽回旧期限。
     assert "if (state.expiration !== currentExpiration) {" in source
-    assert "state.refreshInFlight = null;\n      await refreshInBackground(loadId);" in source
+    assert "state.refreshInFlight = null;\n      await refreshInBackground(loadId, force);" in source
     assert source.index("if (state.expiration !== currentExpiration) {") < source.index("applyExpirations(expirations.expirations, currentExpiration);")
     # 下拉框的禁用兜底：网络卡死时不至于永久禁用。
     assert "const EXPIRATION_SWITCH_TIMEOUT_MS = 20000;" in source

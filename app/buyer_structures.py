@@ -364,10 +364,7 @@ def build_buyer_structures(
     if price is None or price <= 0:
         return _empty("缺少有效现价")
     action = str((recommendation or {}).get("action") or "hold")
-    if action not in {"buy", "sell"}:
-        return _empty("当前方向信号不足，不强行推荐单方向期权")
-    primary_direction = "call" if action == "buy" else "put"
-    comparison_direction = "put" if primary_direction == "call" else "call"
+    primary_direction = "call" if action == "buy" else ("put" if action == "sell" else None)
     rows = [dict(row) for row in (chain_rows or [])]
     groups = _prepare_metrics(rows, price, now, iv_model)
     eligible = [(expiration, group) for expiration, group in groups.items() if any(row["dte"] >= MIN_CANDIDATE_DTE for row in group)]
@@ -438,28 +435,35 @@ def build_buyer_structures(
         )
         return candidates[:DIRECTION_STRUCTURE_LIMIT]
 
-    primary_candidates = build_direction_candidates(primary_direction)
-    comparison_candidates = build_direction_candidates(comparison_direction)
-    unique = primary_candidates + comparison_candidates
+    # 中性行情也提供双向对比方案。此前在 hold 时直接返回空结果，会让首屏在报价完整时
+    # 错误显示“信号不足”；这里只是不指定主方向，不把对比方案误标为交易建议。
+    directions = [primary_direction, "put" if primary_direction == "call" else "call"] if primary_direction else ["call", "put"]
+    candidates_by_direction = {direction: build_direction_candidates(direction) for direction in directions}
+    unique = [item for direction in directions for item in candidates_by_direction[direction]]
     if not unique:
         return _empty("当前期权链没有满足报价和流动性条件的候选结构")
-    primary_target, primary_target_source = _target_price(primary_direction, price, support, resistance, trend)
-    comparison_target, comparison_target_source = _target_price(comparison_direction, price, support, resistance, trend)
+    targets = {direction: _target_price(direction, price, support, resistance, trend) for direction in ("call", "put")}
     for item in unique:
-        item["is_primary"] = item["direction"] == primary_direction
+        item["is_primary"] = primary_direction is not None and item["direction"] == primary_direction
         item["direction_label"] = "看涨方案" if item["direction"] == "call" else "看跌方案"
     return {
         "available": True,
         "status": "ok",
-        "direction": primary_direction,
+        "direction": primary_direction or "neutral",
         "primary_direction": primary_direction,
-        "direction_label": "主方向：买入看涨 · 同时对比买入看跌" if primary_direction == "call" else "主方向：买入看跌 · 同时对比买入看涨",
-        "recommendation": (recommendation or {}).get("reason") or "结合趋势与支撑/压力位",
+        "direction_label": (
+            "主方向：买入看涨 · 同时对比买入看跌"
+            if primary_direction == "call"
+            else "主方向：买入看跌 · 同时对比买入看涨"
+            if primary_direction == "put"
+            else "中性对比：同时观察买入看涨 / 买入看跌"
+        ),
+        "recommendation": (recommendation or {}).get("reason") or ("结合趋势与支撑/压力位" if primary_direction else "当前未形成明确方向，仅作双向结构对比"),
         "horizon_trading_days": horizon_trading_days,
         "horizon_label": f"未来 {horizon_trading_days} 个交易日",
         "targets": {
-            "call": {"price": primary_target if primary_direction == "call" else comparison_target, "source": primary_target_source if primary_direction == "call" else comparison_target_source},
-            "put": {"price": primary_target if primary_direction == "put" else comparison_target, "source": primary_target_source if primary_direction == "put" else comparison_target_source},
+            "call": {"price": targets["call"][0], "source": targets["call"][1]},
+            "put": {"price": targets["put"][0], "source": targets["put"][1]},
         },
         "items": unique[:STRUCTURE_LIMIT],
         "method": "布莱克-斯科尔斯模型估算",

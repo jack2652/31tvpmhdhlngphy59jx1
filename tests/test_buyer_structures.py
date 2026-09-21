@@ -78,7 +78,7 @@ class BuyerStructuresTest(unittest.TestCase):
         self.assertEqual(single["quote_method"], "买卖价中间价")
         self.assertIn("对比买入看跌", result["direction_label"])
 
-    def test_does_not_force_a_structure_when_direction_is_unclear(self):
+    def test_compares_both_directions_when_direction_is_unclear(self):
         result = build_buyer_structures(
             option_rows(),
             100,
@@ -89,8 +89,12 @@ class BuyerStructuresTest(unittest.TestCase):
             now=NOW,
         )
 
-        self.assertFalse(result["available"])
-        self.assertEqual(result["items"], [])
+        self.assertTrue(result["available"])
+        self.assertEqual(result["direction"], "neutral")
+        self.assertIsNone(result["primary_direction"])
+        self.assertIn("中性对比", result["direction_label"])
+        self.assertEqual({item["direction"] for item in result["items"]}, {"call", "put"})
+        self.assertTrue(all(not item["is_primary"] for item in result["items"]))
 
     def test_put_is_primary_when_recommendation_is_sell(self):
         result = build_buyer_structures(
