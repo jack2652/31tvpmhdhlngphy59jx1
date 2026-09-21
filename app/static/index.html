@@ -61,7 +61,7 @@
           <article class="panel plan-panel trend-panel">
             <div class="analysis-heading"><div><span class="eyebrow">TREND CHANNEL</span><h2>趋势通道</h2><p id="trend-note" v-text="view.trend.note" :title="view.trend.noteTitle">等待数据</p></div></div>
             <div class="trend-body" id="trend-body">
-              <template v-if="view.trend.available">
+              <div v-if="view.trend.available" class="trend-content">
                 <div class="trend-signal" :class="[view.trend.directionClass, view.trend.actionClass]"><strong class="trend-label">{{ view.trend.label }}<span v-if="view.trend.action" class="trend-action"> · {{ view.trend.action }}</span></strong><small>{{ view.trend.reason }}</small></div>
                 <div class="trend-layout">
                   <div class="trend-core">
@@ -75,7 +75,7 @@
                     <div v-for="row in view.trend.extremes" :key="row.label" class="trend-meta" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}</strong></div>
                   </div>
                 </div>
-              </template>
+              </div>
               <div v-else class="levels-empty">{{ view.trend.empty }}</div>
             </div>
           </article>

@@ -1116,7 +1116,8 @@ function renderBuyerStructures(payload, fetchedAt = null) {
         : `${notation}：${item.label || "买方期权"}，到期日 ${item.expiration}，执行价 ${strikes}。`;
       return {
         ...item,
-        key: `${item.kind || "structure"}-${item.expiration || index}-${strikes}`,
+        // 同一期限可能同时出现多个相同执行价的候选方案，方向与序号一起纳入 key，避免 Vue 2 列表重排时出现重复 key。
+        key: `${item.kind || "structure"}-${item.direction || "unknown"}-${item.expiration || "unknown"}-${strikes || "unknown"}-${index}`,
         structure: notation,
         rowClass: item.direction === "put" ? "buyer-structure-put" : "buyer-structure-call",
         subtitle: `${planLabel}${item.is_primary ? " · 主方向" : " · 对比方案"} · ${isVertical ? `${directionLabel}价差 · ${legs}` : `${item.label || "买方期权"} · ${item.style || "单腿"}`} · 剩余 ${item.dte} 天`,

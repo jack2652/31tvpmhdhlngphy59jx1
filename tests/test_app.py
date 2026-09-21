@@ -621,6 +621,7 @@ def test_buyer_structure_scenario_explains_profit_and_loss():
     assert "预计亏损 · 未覆盖成本" in source
     assert "扣除时间价值后仍未覆盖成本" in source
     assert "未来 5 个交易日到达目标价估算" in page
+    assert 'key: `${item.kind || "structure"}-${item.direction || "unknown"}-${item.expiration || "unknown"}-${strikes || "unknown"}-${index}`' in source
     assert ".buyer-structure-scenario{font-weight:600}" in styles
     assert "margin:7px 0 14px" in styles
     assert "background:var(--table-head)" in styles
@@ -1608,6 +1609,10 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert '<template v-for="level in view.levels.' not in page
     assert '<template v-for="item in view.buyer.items">' not in page
     assert ".level-item{display:block}" in styles
+    # 趋势可用状态必须也是单根节点，避免 Vue 2 在基准价切换时 patch 多根 template 产生空 vnode。
+    assert '<div v-if="view.trend.available" class="trend-content">' in page
+    assert '<template v-if="view.trend.available">' not in page
+    assert ".trend-content{display:flex;flex:1 1 auto;flex-direction:column;min-height:0}" in styles
     assert ".level-note-row{font-size:12px}" in styles
     assert ".level-factors{font-size:13px}" in styles
     assert ".trend-meta{font-size:14px" in styles

@@ -110,6 +110,7 @@
 .level-strength-swatch.resistance{color:var(--down)}
 .trend-panel{display:flex;flex-direction:column;min-height:0}
 .trend-body{flex:1 1 auto;height:auto;min-height:0;padding:0 18px 14px;display:flex;flex-direction:column}
+.trend-content{display:flex;flex:1 1 auto;flex-direction:column;min-height:0}
 .trend-label{display:block;margin-bottom:10px;font-size:19px;font-weight:700;line-height:1.25}
 .trend-label.up{color:var(--up)}
 .trend-label.down{color:var(--down)}
