@@ -276,7 +276,7 @@ ensure_deps() {
   info "安装项目依赖：pip install -e ."
   # 应用在跑时会一起占内存，小内存机器上容易把 pip 挤到被 OOM 杀掉
   if app_running; then
-    warn "检测到应用正在运行：安装依赖时内存占用会翻倍，若被 Killed 请先执行 ./run.sh 3 停掉应用"
+    warn "检测到应用正在运行：安装依赖时内存占用会翻倍，若被 Killed 请先执行 ./run.sh 6 停掉应用"
   fi
   "$VENV_PIP" install -e "$target" --disable-pip-version-check || pip_status=$?
   if [ "$pip_status" -ne 0 ]; then
@@ -664,7 +664,7 @@ memory_summary() {
 # 内存不足（OOM）时的处理建议，供安装依赖、装系统包两处复用
 oom_advice() {
   printf '        处理办法（按推荐顺序任选一条）：\n'
-  printf '          1) 先停掉正在运行的应用再重试安装（安装时内存占用会翻倍）：./run.sh 3\n'
+  printf '          1) 先停掉正在运行的应用再重试安装（安装时内存占用会翻倍）：./run.sh 6\n'
   printf '          2) 临时加 1G Swap（装完依赖即可保留或删除）：\n'
   printf '             fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile\n'
   printf '             没有 fallocate 时改用：dd if=/dev/zero of=/swapfile bs=1M count=1024\n'
@@ -1226,7 +1226,7 @@ action_doctor() {
     '' | *[!0-9]*) ;;
     *)
       if [ "$mem_avail" -lt 300 ]; then
-        printf '  [注意] 可用内存不足 300M：安装依赖时容易被 OOM 杀掉，先 ./run.sh 3 停应用，或临时加 1G Swap\n'
+        printf '  [注意] 可用内存不足 300M：安装依赖时容易被 OOM 杀掉，先 ./run.sh 6 停应用，或临时加 1G Swap\n'
       fi
       ;;
   esac
@@ -1341,7 +1341,7 @@ Option Scope 运维脚本用法：
   ./run.sh                    打开交互菜单
   ./run.sh 2                  直接执行第 2 项（适合脚本、计划任务调用）
   ./run.sh start|stop|restart|status|doctor|install|config|db
-  ./run.sh update             更新应用：停止 → 拉取最新源码 → 依赖检查 → 重启（菜单第 9 项）
+  ./run.sh update             更新应用：停止 → 拉取最新源码 → 依赖检查 → 重启（菜单第 3 项）
   ./run.sh help               显示本帮助
 从零安装（当前目录下没有源码时先自动拉取，再继续执行）：
   bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
@@ -1353,13 +1353,13 @@ show_menu() {
   printf '\n%s================= Option Scope 运维菜单 =================%s\n' "$C_BOLD" "$C_RESET"
   printf '  1) 检测环境并安装依赖（已安装的步骤自动跳过）\n'
   printf '  2) 启动应用（后台运行 + 看门狗守护）\n'
-  printf '  3) 停止应用（含看门狗）\n'
-  printf '  4) 查看状态与日志\n'
-  printf '  5) 服务管理（重启 / 更新依赖 / 卸载运行环境）\n'
-  printf '  6) 修改配置（.env 交互式编辑）\n'
-  printf '  7) 数据库工具（清理 / 备份 / 统计）\n'
-  printf '  8) 环境自检（doctor）\n'
-  printf '  9) 更新应用（停止 → 拉取最新源码 → 依赖检查 → 重启）\n'
+  printf '  3) 更新应用（停止 → 拉取最新源码 → 依赖检查 → 重启）\n'
+  printf '  4) 服务管理（重启 / 更新依赖 / 卸载运行环境）\n'
+  printf '  5) 修改配置（.env 交互式编辑）\n'
+  printf '  6) 停止应用（含看门狗）\n'
+  printf '  7) 查看状态与日志\n'
+  printf '  8) 数据库工具（清理 / 备份 / 统计）\n'
+  printf '  9) 环境自检（doctor）\n'
   printf '  0) 退出\n'
   printf '%s=========================================================%s\n' "$C_BOLD" "$C_RESET"
 }
@@ -1376,13 +1376,13 @@ menu_loop() {
     case "$choice" in
       1) action_install ;;
       2) action_start ;;
-      3) action_stop ;;
-      4) action_status ;;
-      5) action_service ;;
-      6) action_config ;;
-      7) action_database ;;
-      8) action_doctor ;;
-      9) action_update ;;
+      3) action_update ;;
+      4) action_service ;;
+      5) action_config ;;
+      6) action_stop ;;
+      7) action_status ;;
+      8) action_database ;;
+      9) action_doctor ;;
       0 | q | quit | exit) break ;;
       "") ;;
       *) warn "无效选择：$choice" ;;
@@ -1657,13 +1657,13 @@ main() {
     "") menu_loop ;;
     1 | install) action_install ;;
     2 | start) action_start ;;
-    3 | stop) action_stop ;;
-    4 | status) action_status ;;
-    5 | service) action_service ;;
-    6 | config) action_config ;;
-    7 | db | database) action_database ;;
-    8 | doctor | check) action_doctor ;;
-    9 | update | upgrade) action_update ;;
+    3 | update | upgrade) action_update ;;
+    4 | service) action_service ;;
+    5 | config) action_config ;;
+    6 | stop) action_stop ;;
+    7 | status) action_status ;;
+    8 | db | database) action_database ;;
+    9 | doctor | check) action_doctor ;;
     restart) restart_app ;;
     log | logs) tail_log "$APP_LOG" "${2:-50}" ;;
     -h | --help | help) usage ;;
