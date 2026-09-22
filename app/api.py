@@ -76,7 +76,13 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
     valid.sort(key=lambda item: item["date"])
     latest = valid[-1] if valid else {}
     previous = valid[-2] if len(valid) > 1 else {}
-    latest_is_today = latest.get("date") == market_today().isoformat()
+    # 只有盘中当日日线仍可能继续变化；盘后、夜盘和休市时，最新日线已经是最近一个完整交易日。
+    # 原先只比较日期，导致周一收盘后的夜盘仍把周一当成「今日」，错误返回周五收盘。
+    market_state = str(quote.get("market_state") or "").upper()
+    latest_is_today = (
+        latest.get("date") == market_today().isoformat()
+        and market_state == "REGULAR"
+    )
     today_open = latest.get("open")
     previous_close = previous.get("close") if latest_is_today else latest.get("close")
     if today_open is None:

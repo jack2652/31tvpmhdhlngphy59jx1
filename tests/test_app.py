@@ -634,7 +634,7 @@ def test_buyer_structure_title_drops_only_trailing_period():
 
 
 def test_quote_price_follows_current_session():
-    """现货现价按时段动态取值：盘前用盘前价、盘后/夜盘用盘后价、盘中用常规价；不再单列时段价格卡。"""
+    """现货现价按时段动态取值：盘前/盘后取时段价，夜盘取正式收盘价；不再单列时段价格卡。"""
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
@@ -645,7 +645,9 @@ def test_quote_price_follows_current_session():
     # 现价按时段动态取值，取不到对应时段数据时回退常规价。
     assert "function activeSessionQuote(quote)" in source
     assert 'if (marketState === "PRE" && sessions.pre?.price != null) return sessions.pre;' in source
-    assert 'if ((marketState === "POST" || marketState === "OVERNIGHT") && sessions.post?.price != null) return sessions.post;' in source
+    assert 'if (marketState === "POST" && sessions.post?.price != null) return sessions.post;' in source
+    assert 'if (marketState === "OVERNIGHT") {' in source
+    assert 'if (state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;' in source
     assert "const active = activeSessionQuote(quote);" in source
     assert "const price = active?.price ?? quote?.price;" in source
     assert "const change = active?.change_percent ?? quote?.change_percent;" in source
@@ -653,9 +655,9 @@ def test_quote_price_follows_current_session():
     assert 'const MARKET_STATE_LABELS = { PRE: "盘前", REGULAR: "正常交易", POST: "盘后", OVERNIGHT: "夜盘", CLOSED: "休市" };' in source
     assert 'state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");' in source
     assert "function quoteMarketLabel(quote)" in source
-    assert 'return state.levelBasisMode === "close" ? "盘后" : "收盘价";' in source
+    assert 'return state.levelBasisMode === "close" ? "盘后" : "收盘";' in source
     assert "state.view.quoteMarket = quoteMarketLabel(quote);" in source
-    assert "if (state.lastQuote) state.view.quoteMarket = quoteMarketLabel(state.lastQuote);" in source
+    assert "if (state.lastQuote) renderQuote(state.lastQuote);" in source
 
 
 def test_palette_uses_green_up_red_down_tokens():
@@ -2162,6 +2164,20 @@ def test_trend_market_data_falls_back_to_last_trading_day(monkeypatch):
     assert fallback["today_open"] == 100 and fallback["previous_close"] == 105
 
 
+def test_trend_market_data_uses_completed_close_after_regular_session(monkeypatch):
+    """盘后/夜盘时，当日日线已经完成，昨收应取当天收盘而不是前一交易日。"""
+    monkeypatch.setattr("app.api.market_today", lambda: date(2026, 9, 21))
+    bars = [
+        {"date": "2026-09-18", "open": 100, "close": 105},
+        {"date": "2026-09-21", "open": 110, "close": 120},
+    ]
+    for market_state in ("POST", "OVERNIGHT", "CLOSED"):
+        result = trend_market_data(bars, {"market_state": market_state})
+        assert result["today_open"] == 110
+        assert result["previous_close"] == 120
+        assert result["previous_close_date"] == "2026-09-21"
+
+
 def test_trade_recommendation_combines_trend_and_nearby_levels():
     """操作建议：上行靠近支撑买入，下行靠近压力卖出，信号不明确时持有。"""
     up = {"direction": "up", "lower": 95, "upper": 110}
@@ -2586,7 +2602,8 @@ def test_basis_price_switch_defaults_to_live():
     assert "function activeBasis(quote)" in source
     assert 'if (state.levelBasisMode === "close") return levelBasis(quote, quote?.price);' in source
     assert 'if (quote?.market_state === "OVERNIGHT")' in source
-    assert 'return { price: close, label: "收盘" };' in source
+    assert "function overnightCloseQuote(quote)" in source
+    assert 'const close = overnightCloseQuote(quote);' in source
     assert "const price = Number(activeSessionQuote(quote)?.price);" in source
     assert 'state.levelBasisMode === "live" && selectedBasis?.label === "收盘"' in source
     # 默认实时价：state 初始值 + 分析渲染改用 activeBasis。
@@ -2599,6 +2616,9 @@ def test_basis_price_switch_defaults_to_live():
     assert "state.lastAnalysis = { rows, spot, analysisPayload, expirationRows, ivModel, basis, points };" in source
     assert "state.lastQuote = quote || null;" in source
     assert '${state.levelBasisMode}' in source
+    assert 'if (marketState === "POST" && sessions.post?.price != null) return sessions.post;' in source
+    assert 'if (state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;' in source
+    assert "if (state.lastQuote) renderQuote(state.lastQuote);" in source
     # 开关只在展开时出现；点击开关不会连带折叠，点标题栏其它区域仍然折叠/展开。
     assert 'const modes = byId("detail-modes");' in source
     assert "if (modes) modes.hidden = !expanded;" in source

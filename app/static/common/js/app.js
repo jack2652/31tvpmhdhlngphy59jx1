@@ -570,8 +570,8 @@ function activeBasis(quote) {
   if (state.levelBasisMode === "close") return levelBasis(quote, quote?.price);
   // 夜盘没有 Yahoo 的实时标的价时，实时价口径改用最近一次正常交易日收盘价。
   if (quote?.market_state === "OVERNIGHT") {
-    const close = Number(quote?.previous_close);
-    if (Number.isFinite(close) && close > 0) return { price: close, label: "收盘" };
+    const close = overnightCloseQuote(quote);
+    if (close) return { price: close.price, label: "收盘" };
   }
   const price = Number(activeSessionQuote(quote)?.price);
   return Number.isFinite(price) && price > 0 ? { price, label: "实时" } : levelBasis(quote, quote?.price);
@@ -581,7 +581,8 @@ function activeBasis(quote) {
 // 支撑位/压力位表、交易计划与压力位/支撑位柱状图都由这一次重绘一起更新。
 function applyBasisMode(mode) {
   state.levelBasisMode = mode === "close" ? "close" : "live";
-  if (state.lastQuote) state.view.quoteMarket = quoteMarketLabel(state.lastQuote);
+  // 基准价切换也要立即重绘现货卡片，否则标签变了但价格仍停留在上一次口径。
+  if (state.lastQuote) renderQuote(state.lastQuote);
   for (const key of Object.keys(BASIS_MODES)) {
     const button = byId(key === "live" ? "basis-live" : "basis-close");
     if (button) button.setAttribute("aria-pressed", String(key === state.levelBasisMode));
@@ -1277,13 +1278,32 @@ async function request(path, options = {}) {
   });
 }
 
-// 现价按时段动态取值：盘前显示盘前价，盘后/夜盘显示盘后价，盘中与休市显示常规价。
-// 对应时段没有数据时回退常规价，避免整块行情空掉。
+// 夜盘正式收盘价优先取盘后摘要里的 reference_close；它代表最近一次正常盘收盘，
+// 不能误用 sessions.post.price（那是盘后最新价）。没有扩展时段摘要时再回退行情源的 previous_close。
+function overnightCloseQuote(quote) {
+  const sessions = quote?.sessions || {};
+  const reference = Number(sessions.post?.reference_close ?? sessions.overnight?.reference_close);
+  const previous = Number(quote?.previous_close);
+  const price = Number.isFinite(reference) && reference > 0
+    ? reference
+    : (Number.isFinite(previous) && previous > 0 ? previous : null);
+  if (price == null) return null;
+  const change = Number.isFinite(previous) && previous > 0 ? (price - previous) / previous * 100 : null;
+  return { ...quote, price, change_percent: change };
+}
+
+// 现价按时段动态取值：盘前显示盘前价，盘后显示盘后价，夜盘显示最近正常盘收盘价，
+// 盘中与休市显示常规价。对应时段没有数据时回退常规价，避免整块行情空掉。
 function activeSessionQuote(quote) {
   const sessions = quote?.sessions || {};
   const marketState = quote?.market_state;
   if (marketState === "PRE" && sessions.pre?.price != null) return sessions.pre;
-  if ((marketState === "POST" || marketState === "OVERNIGHT") && sessions.post?.price != null) return sessions.post;
+  if (marketState === "POST" && sessions.post?.price != null) return sessions.post;
+  if (marketState === "OVERNIGHT") {
+    // 盘后价基准明确要求显示盘后最新价；实时价基准仍显示正式收盘价。
+    if (state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;
+    return overnightCloseQuote(quote) || quote;
+  }
   return quote;
 }
 
@@ -1311,7 +1331,7 @@ function marketStateLabel(value, fallback = "快照") {
 // 夜盘没有实时价：现货卡片的标签跟随分析基准，避免把收盘价继续标成「夜盘」。
 function quoteMarketLabel(quote) {
   if (quote?.market_state !== "OVERNIGHT") return marketStateLabel(quote?.market_state);
-  return state.levelBasisMode === "close" ? "盘后" : "收盘价";
+  return state.levelBasisMode === "close" ? "盘后" : "收盘";
 }
 
 // 期权链表格里的 Gamma 与 IV 同样优先展示价格反解出的模型值，避免展示数据源里的占位 IV。
