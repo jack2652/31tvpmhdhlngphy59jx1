@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import time_ns
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -62,7 +63,17 @@ def index():
     page = (static_dir / "index.html").read_text(encoding="utf-8")
     page = page.replace("__DEFAULT_SYMBOL__", settings.default_symbols[0])
     page = page.replace("__ACCESS_KEY_REQUIRED__", "true" if settings.access_key else "false")
-    return HTMLResponse(page)
+    # 每次源码更新后自动生成新的静态资源版本号，避免浏览器继续使用旧版 app.js。
+    # 时间戳只用于缓存键，不参与业务数据计算；使用纳秒可覆盖同一秒内的快速更新。
+    asset_paths = (
+        static_dir / "common/css/styles.css",
+        static_dir / "common/js/request.js",
+        static_dir / "common/js/charts.js",
+        static_dir / "common/js/app.js",
+    )
+    asset_version = max((path.stat().st_mtime_ns for path in asset_paths if path.exists()), default=time_ns())
+    page = page.replace("__ASSET_VERSION__", str(asset_version))
+    return HTMLResponse(page, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health", include_in_schema=False)

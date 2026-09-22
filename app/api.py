@@ -85,6 +85,21 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
     )
     today_open = latest.get("open")
     previous_close = previous.get("close") if latest_is_today else latest.get("close")
+    previous_close_date = previous.get("date") if latest_is_today else latest.get("date")
+    # Yahoo 在盘后/夜盘的 fast_info.previous_close 可能仍停留在前一个交易日。
+    # 扩展时段摘要中的 reference_close 是同一批分钟线对应的最近正常盘收盘价，
+    # 优先使用它，避免日线缓存或上游 previous_close 落后时显示上周五数据。
+    sessions = quote.get("sessions") or {}
+    regular_summary = sessions.get("post") or sessions.get("overnight") or {}
+    try:
+        reference_close = float(regular_summary.get("reference_close"))
+    except (TypeError, ValueError):
+        reference_close = None
+    as_of = str(regular_summary.get("as_of") or "")[:10]
+    history_is_behind_session = bool(as_of and (not latest.get("date") or latest.get("date") < as_of))
+    if market_state != "REGULAR" and history_is_behind_session and reference_close is not None and reference_close > 0:
+        previous_close = reference_close
+        previous_close_date = as_of
     if today_open is None:
         today_open = quote.get("today_open")
     if previous_close is None:
@@ -93,7 +108,7 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
         "today_open": today_open,
         "previous_close": previous_close,
         "today_open_date": latest.get("date"),
-        "previous_close_date": previous.get("date") if latest_is_today else latest.get("date"),
+        "previous_close_date": previous_close_date,
         "market_state": quote.get("market_state"),
     }
 

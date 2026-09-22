@@ -226,6 +226,8 @@ class MarketDataProvider:
             if price is not None and previous not in (None, 0):
                 change = (price - previous) / previous * 100
             extended = self._extended_hours(ticker, normalized)
+            # fast_info.market_state 在非交易时段可能沿用上一个状态；分钟线摘要包含时区和交易日历判断，优先采用它。
+            market_state = extended["state"] or safe_value(info.get("market_state"))
             return {
                 "symbol": normalized,
                 "price": price,
@@ -233,7 +235,7 @@ class MarketDataProvider:
                 "today_open": today_open,
                 "previous_close": previous,
                 "currency": safe_value(info.get("currency")) or "USD",
-                "market_state": safe_value(info.get("market_state")) or extended["state"],
+                "market_state": market_state,
                 "sessions": extended["sessions"],
                 "provider": self.name,
                 "raw": {"last_price": price, "previous_close": previous},

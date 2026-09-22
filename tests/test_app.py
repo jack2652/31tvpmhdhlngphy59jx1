@@ -2178,6 +2178,28 @@ def test_trend_market_data_uses_completed_close_after_regular_session(monkeypatc
         assert result["previous_close_date"] == "2026-09-21"
 
 
+def test_trend_market_data_prefers_extended_session_reference_close(monkeypatch):
+    """日线缓存落后时，非交易时段仍使用分钟线摘要里的正式收盘价。"""
+    monkeypatch.setattr("app.api.market_today", lambda: date(2026, 9, 22))
+    bars = [
+        {"date": "2026-09-18", "open": 100, "close": 147.61},
+    ]
+    quote = {
+        "market_state": "OVERNIGHT",
+        "previous_close": 147.61,
+        "sessions": {
+            "post": {
+                "price": 149.08,
+                "reference_close": 148.60,
+                "as_of": "2026-09-21T19:59:00-04:00",
+            }
+        },
+    }
+    result = trend_market_data(bars, quote)
+    assert result["previous_close"] == pytest.approx(148.60)
+    assert result["previous_close_date"] == "2026-09-21"
+
+
 def test_trade_recommendation_combines_trend_and_nearby_levels():
     """操作建议：上行靠近支撑买入，下行靠近压力卖出，信号不明确时持有。"""
     up = {"direction": "up", "lower": 95, "upper": 110}
