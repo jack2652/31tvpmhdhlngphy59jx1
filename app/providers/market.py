@@ -112,6 +112,97 @@ def summarize_extended_hours(frame: Any, now: datetime | None = None) -> dict[st
     return {"state": current_session_state(moment_now, latest_bar), "sessions": sessions}
 
 
+# 正式昨收和分钟线昨收的相对偏差不超过该比例时，视为同一交易日，优先正式收盘。
+PREVIOUS_CLOSE_AGREEMENT = 0.01
+
+
+def _positive_price(value: Any) -> float | None:
+    """把行情数值收成正的有限价格；缺失或无效时返回 None。"""
+    number = safe_value(value)
+    if isinstance(number, bool) or not isinstance(number, (int, float)):
+        return None
+    number = float(number)
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def _regular_close_map(frame: Any) -> tuple[dict[date, float], datetime | None]:
+    """每个交易日保留最后一笔盘中收盘，并返回全部分钟线里的最后一根时间。"""
+    index = getattr(frame, "index", None)
+    if (
+        frame is None
+        or getattr(frame, "empty", True)
+        or "Close" not in getattr(frame, "columns", [])
+        or not hasattr(index, "tz_convert")
+    ):
+        return {}, None
+    if getattr(index, "tz", None) is None:
+        index = index.tz_localize("UTC")
+    index = index.tz_convert(MARKET_TIMEZONE)
+    closes: dict[date, float] = {}
+    latest_bar: datetime | None = None
+    for stamp, raw_close in zip(index, frame["Close"].tolist()):
+        close = safe_value(raw_close)
+        if close is None:
+            continue
+        latest_bar = stamp.to_pydatetime()
+        if session_of(latest_bar) != "regular":
+            continue
+        closes[session_trading_day(latest_bar)] = float(close)
+    return closes, latest_bar
+
+
+def previous_regular_close(frame: Any, now: datetime | None = None) -> float | None:
+    """最近一个已经走完的盘中收盘价。
+
+    正在进行的盘中没有收盘价，需要排除。盘后和休市则保留当天已经结束的那一笔。
+    """
+    moment_now = now or datetime.now(MARKET_TIMEZONE)
+    closes, latest_bar = _regular_close_map(frame)
+    if not closes or latest_bar is None:
+        return None
+    days = sorted(closes)
+    state = current_session_state(moment_now, latest_bar)
+    if state == "REGULAR" and days[-1] == session_trading_day(moment_now):
+        days = days[:-1]
+    if not days:
+        return None
+    return closes[days[-1]]
+
+
+def prior_session_regular_close(frame: Any, now: datetime | None = None) -> float | None:
+    """对标行情源 previous_close 的上一交易日盘中收盘。
+
+    盘前还没有当天盘中 K 线，最近一笔就是昨收。其余时段数据里的最近一个盘中
+    已经是当前或刚刚结束的交易日，正式昨收指的是它的前一天。
+    """
+    moment_now = now or datetime.now(MARKET_TIMEZONE)
+    closes, latest_bar = _regular_close_map(frame)
+    if not closes or latest_bar is None:
+        return None
+    days = sorted(closes)
+    state = current_session_state(moment_now, latest_bar)
+    if state != "PRE":
+        if len(days) < 2:
+            return None
+        days = days[:-1]
+    return closes[days[-1]]
+
+
+def choose_previous_close(official: Any, minute_close: Any) -> Any:
+    """正式昨收与分钟线昨收接近时用正式昨收，偏离一整根日线时改用分钟线。"""
+    official_number = _positive_price(official)
+    minute_number = _positive_price(minute_close)
+    if minute_number is None:
+        return official if official_number is None else official_number
+    if official_number is None:
+        return minute_number
+    if abs(official_number - minute_number) / minute_number <= PREVIOUS_CLOSE_AGREEMENT:
+        return official_number
+    return minute_number
+
+
 class ProviderError(RuntimeError):
     """供应商返回异常或网络请求失败。"""
 
@@ -143,6 +234,20 @@ def normalize_row(row: Any) -> dict[str, Any]:
     if hasattr(row, "to_dict"):
         row = row.to_dict()
     return {str(key): safe_value(value) for key, value in dict(row).items()}
+
+
+def _read_fast_info(info: Any, key: str) -> Any:
+    """读取 fast_info 字段。
+
+    上游对象的公开键是驼峰，`.get("last_price")` 会直接给出 None；
+    下标访问才同时接受蛇形键。测试用的普通 dict 仍走 `.get`。
+    """
+    if isinstance(info, dict):
+        return safe_value(info.get(key))
+    try:
+        return safe_value(info[key])
+    except Exception:
+        return None
 
 
 def load_upstream_sdk() -> Any:
@@ -216,18 +321,21 @@ class MarketDataProvider:
                     info = ticker.fast_info
             except Exception:
                 info = {}
-            price = safe_value(info.get("last_price"))
-            previous = safe_value(info.get("previous_close"))
-            today_open = safe_value(info.get("open"))
+            price = _read_fast_info(info, "last_price")
+            previous = _read_fast_info(info, "previous_close")
+            today_open = _read_fast_info(info, "open")
             if price is None or previous is None:
                 with self.upstream_gate.slot():
                     price, previous, today_open = self._history_quote(ticker, price, previous, today_open)
+            extended = self._extended_hours(ticker, normalized)
+            # fast_info.market_state 在非交易时段可能沿用上一个状态；分钟线摘要包含时区和交易日历判断，优先采用它。
+            market_state = extended["state"] or _read_fast_info(info, "market_state")
+            # 正式昨收含收盘竞价。它和分钟线上一交易日收盘接近时以它为准；
+            # 日线空掉一根时两者会差出一整段行情，这时改用分钟线，避免涨跌幅被放大。
+            previous = choose_previous_close(previous, extended.get("prior_session_regular_close"))
             change = None
             if price is not None and previous not in (None, 0):
                 change = (price - previous) / previous * 100
-            extended = self._extended_hours(ticker, normalized)
-            # fast_info.market_state 在非交易时段可能沿用上一个状态；分钟线摘要包含时区和交易日历判断，优先采用它。
-            market_state = extended["state"] or safe_value(info.get("market_state"))
             return {
                 "symbol": normalized,
                 "price": price,
@@ -248,7 +356,10 @@ class MarketDataProvider:
         try:
             with self.upstream_gate.slot():
                 frame = ticker.history(period="5d", interval="1m", prepost=True, auto_adjust=False)
-            return summarize_extended_hours(frame)
+            summary = summarize_extended_hours(frame)
+            summary["previous_regular_close"] = previous_regular_close(frame)
+            summary["prior_session_regular_close"] = prior_session_regular_close(frame)
+            return summary
         except Exception as exc:
             logger.warning("获取 %s 盘前盘后行情失败: %s", symbol, exc)
             return {"state": None, "sessions": {}}

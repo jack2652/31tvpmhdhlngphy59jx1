@@ -158,7 +158,7 @@
       </div>
       <div class="buyer-structure-fold" id="buyer-structure-fold" hidden>
         <div class="buyer-structure-heading">
-          <p>按当前方向、目标位和报价流动性筛选两侧各最多 5 条结构；结果按未来 5 个交易日到达目标价估算</p>
+          <p>按当前方向、报价流动性和分析窗口筛选两侧各最多 5 条结构；排序按触及目标的概率加权，预计盈亏按到达目标价估算</p>
           <div class="buyer-structure-meta">
             <span v-if="view.buyer.available">{{ view.buyer.directionLabel }}</span>
             <span>{{ view.buyer.horizonLabel }}</span>

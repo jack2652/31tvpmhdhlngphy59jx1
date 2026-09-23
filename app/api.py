@@ -381,8 +381,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         computed = levels_cache.get_or_compute(
             cache_key,
             lambda: shared_cached(
-                # 候选锚点与当前基准价分离后升级缓存命名空间，避免旧结果继续覆盖新算法。
-                "levels-v8",
+                # 买方结构改为合约波动率、触及概率和 10 到 45 天搜索，升级缓存命名空间。
+                "levels-v10",
                 cache_key,
                 lambda: build_levels(
                     history_payload.get("bars") or [],

@@ -7,9 +7,9 @@ from app.buyer_structures import build_buyer_structures
 NOW = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)
 
 
-def option_rows():
+def option_rows(expirations=("2026-10-02", "2026-10-30")):
     rows = []
-    for expiration in ("2026-10-02", "2026-10-30"):
+    for expiration in expirations:
         for strike, bid, ask in (
             (98, 3.1, 3.3),
             (100, 1.9, 2.1),
@@ -73,7 +73,13 @@ class BuyerStructuresTest(unittest.TestCase):
         self.assertTrue(any(item["kind"] == "vertical" for item in result["items"]))
         call_singles = [item for item in result["items"] if item["kind"] == "single" and item["direction"] == "call"]
         self.assertTrue(any(item["cost"] == 320.0 for item in call_singles))
+        self.assertTrue(all(item["cost"] in {40.0, 320.0} for item in call_singles))
+        self.assertTrue(all(item["dte"] >= 10 for item in result["items"]))
         self.assertTrue(all("scenario_profitable" in item for item in result["items"]))
+        self.assertTrue(all(item["expected_return"] is not None for item in result["items"]))
+        for direction in ("call", "put"):
+            block = [item["expected_return"] for item in result["items"] if item["direction"] == direction]
+            self.assertEqual(block, sorted(block, reverse=True))
         single = call_singles[0]
         self.assertEqual(single["quote_method"], "买卖价中间价")
         self.assertIn("对比买入看跌", result["direction_label"])
@@ -162,6 +168,83 @@ class BuyerStructuresTest(unittest.TestCase):
 
         self.assertFalse(result["available"])
         self.assertIn("流动性", result["reason"])
+
+
+    def test_skips_expirations_inside_the_horizon_and_outside_the_sweet_spot(self):
+        inside = build_buyer_structures(
+            option_rows(("2026-09-23", "2026-09-25")),
+            100,
+            {"direction": "up"},
+            {"action": "buy"},
+            [{"price": 95}],
+            [{"price": 105}],
+            now=NOW,
+        )
+        self.assertFalse(inside["available"])
+        self.assertIn("窗口", inside["reason"])
+
+        preferred = build_buyer_structures(
+            option_rows(("2026-09-28", "2026-10-16")),
+            100,
+            {"direction": "up"},
+            {"action": "buy"},
+            [{"price": 95}],
+            [{"price": 105}],
+            now=NOW,
+        )
+        self.assertTrue(preferred["available"])
+        self.assertTrue(preferred["items"])
+        self.assertTrue(all(item["expiration"] == "2026-10-16" for item in preferred["items"]))
+
+    def test_target_prefers_stronger_reachable_level_over_nearer_weak_level(self):
+        result = build_buyer_structures(
+            option_rows(),
+            100,
+            {"direction": "up", "upper": 110, "lower": 90},
+            {"action": "buy"},
+            [{"price": 96, "score": 0.2}],
+            [{"price": 100.4, "score": 0.15}, {"price": 104, "score": 0.9}],
+            now=NOW,
+        )
+        self.assertEqual(result["targets"]["call"]["price"], 104)
+        self.assertGreater(result["targets"]["call"]["touch_probability"], 0.15)
+        self.assertTrue(all(item["target_price"] == 104 for item in result["items"] if item["direction"] == "call"))
+
+    def test_expensive_otm_uses_its_own_implied_volatility(self):
+        rows = []
+        for contract_type, strike, bid, ask in (
+            ("call", 100, 3.9, 4.1),
+            ("call", 105, 3.4, 3.6),
+            ("put", 100, 3.9, 4.1),
+            ("put", 95, 1.4, 1.5),
+        ):
+            rows.append({
+                "expiration": "2026-10-16",
+                "contract_type": contract_type,
+                "strike": strike,
+                "bid": bid,
+                "ask": ask,
+                "last_price": 0.01,
+                "volume": 500,
+                "open_interest": 800,
+                "implied_volatility": 0.2,
+            })
+        result = build_buyer_structures(
+            rows,
+            100,
+            {"direction": "up"},
+            {"action": "buy"},
+            [{"price": 95}],
+            [{"price": 108}],
+            now=NOW,
+        )
+        atm = next(item for item in result["items"] if item["direction"] == "call" and item["kind"] == "single" and item["strikes"] == [100])
+        rich = next(item for item in result["items"] if item["direction"] == "call" and item["kind"] == "single" and item["strikes"] == [105])
+        self.assertGreater(rich["iv"], atm["iv"] + 0.1)
+        self.assertEqual(rich["model_iv_source"], "合约中间价反解")
+        self.assertGreater(rich["scenario_return"], -0.35)
+
+
 
 
 if __name__ == "__main__":

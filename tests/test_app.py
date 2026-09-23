@@ -379,6 +379,137 @@ def test_market_provider_uses_history_when_fast_info_is_empty():
     assert quote["change_percent"] == pytest.approx(2.5)
 
 
+def test_fast_info_snake_case_is_readable():
+    """上游 fast_info.get('last_price') 会返回 None，下标访问才能读到蛇形键。"""
+
+    class FastInfo:
+        def get(self, key, default=None):
+            return default
+
+        def __getitem__(self, key):
+            return {"last_price": 110.0, "previous_close": 100.0, "open": 101.0, "currency": "USD"}[key]
+
+    class FakeTicker:
+        fast_info = FastInfo()
+
+        def history(self, **kwargs):
+            if kwargs.get("interval") == "1m":
+                return pd.DataFrame()
+            raise AssertionError("现价和昨收已经从 fast_info 读到，不应再回退日线")
+
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("AAPL")
+    assert quote["price"] == 110.0
+    assert quote["previous_close"] == 100.0
+    assert quote["change_percent"] == pytest.approx(10.0)
+
+
+def test_regular_change_uses_previous_session_when_daily_bar_is_missing(monkeypatch):
+    """日线缺掉最近一个交易日时，盘中涨跌幅仍应相对那天的盘中收盘，而不是更早的收盘。"""
+    eastern = ZoneInfo("America/New_York")
+    minutes = pd.DataFrame(
+        {"Close": [250.25, 234.89, 224.27]},
+        index=pd.DatetimeIndex([
+            "2026-09-21 15:59",
+            "2026-09-22 15:59",
+            "2026-09-23 10:30",
+        ]).tz_localize(eastern),
+    )
+    daily = pd.DataFrame(
+        {"Open": [250.5, 236.14], "Close": [250.25, 224.27]},
+        index=pd.DatetimeIndex(["2026-09-21", "2026-09-23"]).tz_localize(eastern),
+    )
+
+    class FakeTicker:
+        fast_info = {"last_price": None, "previous_close": None, "currency": "USD"}
+
+        def history(self, **kwargs):
+            if kwargs.get("interval") == "1m":
+                return minutes
+            return daily
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 9, 23, 10, 30, tzinfo=eastern)
+            if tz is None:
+                return current.replace(tzinfo=None)
+            return current.astimezone(tz)
+
+    monkeypatch.setattr(market, "datetime", FrozenDateTime)
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("RCL")
+    assert quote["market_state"] == "REGULAR"
+    assert quote["price"] == 224.27
+    assert quote["previous_close"] == 234.89
+    assert quote["change_percent"] == pytest.approx((224.27 - 234.89) / 234.89 * 100)
+
+
+def test_regular_change_prefers_official_close_when_minute_bar_agrees(monkeypatch):
+    """正式昨收和分钟线昨收接近时，保留含竞价的正式收盘，不用 15:59 那一笔盖掉它。"""
+    eastern = ZoneInfo("America/New_York")
+    minutes = pd.DataFrame(
+        {"Close": [234.83, 224.27]},
+        index=pd.DatetimeIndex([
+            "2026-09-22 15:59",
+            "2026-09-23 10:30",
+        ]).tz_localize(eastern),
+    )
+
+    class FakeTicker:
+        fast_info = {"last_price": 224.27, "previous_close": 234.89, "currency": "USD"}
+
+        def history(self, **kwargs):
+            assert kwargs.get("interval") == "1m"
+            return minutes
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 9, 23, 10, 30, tzinfo=eastern)
+            if tz is None:
+                return current.replace(tzinfo=None)
+            return current.astimezone(tz)
+
+    monkeypatch.setattr(market, "datetime", FrozenDateTime)
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("RCL")
+    assert quote["market_state"] == "REGULAR"
+    assert quote["previous_close"] == pytest.approx(234.89)
+    assert quote["change_percent"] == pytest.approx((224.27 - 234.89) / 234.89 * 100)
+
+
+def test_post_change_uses_prior_session_when_official_close_skips_a_day(monkeypatch):
+    """盘后同样核对昨收。正式昨收跳到上上个交易日时，用分钟线里的上一交易日盘中收盘。"""
+    eastern = ZoneInfo("America/New_York")
+    minutes = pd.DataFrame(
+        {"Close": [234.89, 224.00, 223.00]},
+        index=pd.DatetimeIndex([
+            "2026-09-22 15:59",
+            "2026-09-23 15:59",
+            "2026-09-23 18:00",
+        ]).tz_localize(eastern),
+    )
+
+    class FakeTicker:
+        fast_info = {"last_price": 223.00, "previous_close": 250.25, "currency": "USD"}
+
+        def history(self, **kwargs):
+            assert kwargs.get("interval") == "1m"
+            return minutes
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 9, 23, 18, 0, tzinfo=eastern)
+            if tz is None:
+                return current.replace(tzinfo=None)
+            return current.astimezone(tz)
+
+    monkeypatch.setattr(market, "datetime", FrozenDateTime)
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("RCL")
+    assert quote["market_state"] == "POST"
+    assert quote["previous_close"] == pytest.approx(234.89)
+    assert quote["change_percent"] == pytest.approx((223.00 - 234.89) / 234.89 * 100)
+
+
 def extended_hours_frame():
     """构造含盘前、盘中、盘后、夜盘的四段分钟线，收盘价 100 是盘前盘后的共同基准。"""
     eastern = ZoneInfo("America/New_York")
@@ -621,7 +752,7 @@ def test_buyer_structure_scenario_explains_profit_and_loss():
     assert "预计盈利 · 已覆盖成本" in source
     assert "预计亏损 · 未覆盖成本" in source
     assert "扣除时间价值后仍未覆盖成本" in source
-    assert "未来 5 个交易日到达目标价估算" in page
+    assert "排序按触及目标的概率加权，预计盈亏按到达目标价估算" in page
     assert 'key: `${item.kind || "structure"}-${item.direction || "unknown"}-${item.expiration || "unknown"}-${strikes || "unknown"}-${index}`' in source
     assert ".buyer-structure-scenario{font-weight:600}" in styles
     assert "margin:7px 0 14px" in styles
@@ -1682,6 +1813,25 @@ def test_fibonacci_levels_follow_swing_leg():
     assert weights["斐波那契 23.6%"] == 0.6
 
 
+def test_fibonacci_levels_ignore_single_wick():
+    """单根插针不参与摆动端点，回撤仍按收盘趋势的高低点计算。"""
+    bars = []
+    for index in range(40):
+        price = 100 + index * 0.5
+        high = 180.0 if index == 20 else price + 0.4
+        bars.append({
+            "date": f"2026-06-{index + 1:02d}",
+            "open": price,
+            "high": high,
+            "low": price - 0.4,
+            "close": price,
+            "volume": 1000.0,
+        })
+    levels = fibonacci_levels(bars, 119.5)
+    assert levels
+    assert max(price for price, _, _ in levels) < 140
+
+
 def test_chip_peaks_find_dense_price_zone():
     """筹码分布：成交集中在 100-104 区间，密集区必须落在这一段而不是零星成交的高位。"""
     bars = []
@@ -1721,6 +1871,25 @@ def test_absorption_levels_keep_held_dips():
     # 越近的承接位排在前面
     assert levels[0][0] == pytest.approx(102.0)
     assert prices.index(102.0) < prices.index(100.0)
+
+
+def test_absorption_levels_scale_rebound_and_break_with_atr():
+    """高波动里大约 1% 的反弹不够确认承接，小于 0.25 ATR 的下探也不算跌破。"""
+    def bar(low, high, close):
+        return {"date": "2026-06-01", "open": close, "high": high, "low": low, "close": close, "volume": 100.0}
+
+    base = [bar(108.0, 116.0, 112.0) for _ in range(12)]
+    dip = bar(100.0, 108.0, 102.0)
+    shallow = base + [dip] + [bar(104.0, 112.0, 103.0) for _ in range(6)]
+    assert all(price != 100.0 for price, _, _ in absorption_levels(shallow, 112.0))
+
+    confirmed = base + [dip] + [bar(104.0, 112.0, 106.0) for _ in range(6)]
+    assert any(price == 100.0 for price, _, _ in absorption_levels(confirmed, 112.0))
+
+    pierced = confirmed[:-1] + [bar(99.0, 112.0, 106.0)]
+    assert any(price == 100.0 for price, _, _ in absorption_levels(pierced, 112.0))
+    broken = confirmed[:-1] + [bar(97.0, 112.0, 106.0)]
+    assert all(price != 100.0 for price, _, _ in absorption_levels(broken, 112.0))
 
 
 def test_touch_probability_uses_volatility_and_horizon():
@@ -1833,6 +2002,29 @@ def test_option_wall_requires_absolute_concentration_not_only_side_peak():
     assert all(tag == "看涨持仓" for _, _, tag in ordinary)
     wall, _, _ = option_levels([point(101, 40), point(102, 10), point(103, 8)], 100.0)
     assert any(tag == "看涨墙" for _, _, tag in wall)
+
+
+def test_option_levels_follow_strike_side_not_contract_type():
+    """绝对持仓按行权价相对现价分侧。上方的看跌持仓进压力，下方的看涨持仓进支撑。"""
+    def point(strike, call_oi, put_oi):
+        return {
+            "strike": strike, "callVolume": 0.0, "putVolume": 0.0,
+            "callOi": call_oi, "putOi": put_oi, "callGex": call_oi, "putGex": -put_oi,
+        }
+
+    above, below, metric = option_levels([
+        point(110, 10, 500),
+        point(108, 20, 40),
+        point(105, 30, 30),
+        point(95, 30, 30),
+        point(92, 40, 20),
+        point(90, 500, 10),
+    ], 100.0)
+    assert metric == "gex"
+    assert any(price == pytest.approx(110) and tag.startswith("看跌") for price, _, tag in above)
+    assert all(price > 100 for price, _, _ in above)
+    assert any(price == pytest.approx(90) and tag.startswith("看涨") for price, _, tag in below)
+    assert all(price < 100 for price, _, _ in below)
 
 
 def test_level_history_validation_requires_hold_samples():
@@ -2280,8 +2472,8 @@ def test_frontend_confirms_trade_point_before_replacing_it():
 def test_levels_analysis_cache_namespace_matches_current_scoring_model():
     """最佳点评分字段变化时必须跳过旧版分析缓存。"""
     source = Path("app/api.py").read_text(encoding="utf-8")
-    assert '"levels-v8"' in source
-    assert '"levels-v7"' not in source
+    assert '"levels-v10"' in source
+    assert '"levels-v9"' not in source
 
 
 def test_build_levels_reuses_stable_candidate_anchor_across_basis_prices():

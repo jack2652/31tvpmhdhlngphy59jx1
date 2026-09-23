@@ -2,10 +2,10 @@
 
 参与合成的四类因子：
 
-- 斐波那契回撤：取回看窗口内的摆动高低点，按 23.6% / 38.2% / 50% / 61.8% / 78.6% 计算回撤位。
+- 斐波那契回撤：用收盘价确认的摆动高低点，按 23.6% / 38.2% / 50% / 61.8% / 78.6% 计算回撤位。单根插针不会重画整组价位。
 - 筹码分布（VPVR 简化）：把每根日线的成交量按当日价格区间做三角分配后汇总成价格剖面，取成交最密集的价位。
-- 承接位：近期被砸下去又被买回、且之后没有被跌破的摆动低点。
-- 期权持仓：多个近期期限按执行价聚合的 GEX（整链没有有效未平仓量时退回成交量），看涨对应压力、看跌对应支撑。
+- 承接位：近期被砸下去又被买回、且之后没有被跌破的摆动低点。反弹和跌破距离按 ATR 缩放。
+- 期权持仓：多个近期期限按执行价聚合的绝对 GEX（整链没有有效未平仓量时退回成交量）。行权价在现价上方视为压力侧磁吸，下方视为支撑侧磁吸，不再把看涨一律当压力、看跌一律当支撑。
 
 合成规则：每类因子输出 (价位, 权重, 标签) 候选，按现价的 MERGE_TOLERANCE 归并同一段价位并累加权重，
 候选先按稳定综合强度 ÷ (1 + 距现价%) 排序；公共面板在固定名额内同时保留近端价位与远端强价位，展示时再按离现价的距离从近到远排序。
@@ -47,16 +47,21 @@ EXTREME_WINDOW_DAYS = 365
 # 斐波那契：回看窗口与回撤比例（比例, 权重；50% 与 61.8% 视为最关键的黄金分割位）
 FIB_WINDOW_BARS = 120
 FIB_RATIOS = ((0.236, 0.6), (0.382, 0.9), (0.5, 1.0), (0.618, 1.0), (0.786, 0.6))
+# 收盘价反向运行达到该距离才承认摆动端点。用真实波幅中位数，避免一根插针把确认距离放大。
+FIB_PIVOT_ATR = 2.0
+FIB_PIVOT_MIN_RATIO = 0.03
 # 筹码分布：回看窗口、价格桶数量、密集区数量上限、低于峰值该比例的桶忽略
 CHIP_WINDOW_BARS = 120
 CHIP_BUCKETS = 240
 CHIP_PEAK_LIMIT = 6
 CHIP_MIN_SHARE = 0.12
-# 承接位：回看窗口、数量上限、反弹幅度、未被跌破的判定容差、放量加成阈值
+# 承接位：回看窗口、数量上限、反弹/跌破按 ATR 缩放，波动数据不足时退回固定比例。
 ABSORPTION_WINDOW_BARS = 60
 ABSORPTION_LIMIT = 4
-ABSORPTION_REBOUND = 1.01
-ABSORPTION_BREAK_TOLERANCE = 0.998
+ABSORPTION_REBOUND_ATR = 0.5
+ABSORPTION_BREAK_ATR = 0.25
+ABSORPTION_REBOUND_FALLBACK = 0.01
+ABSORPTION_BREAK_FALLBACK = 0.002
 ABSORPTION_VOLUME_RATIO = 1.2
 # ATR 区域：使用最近 14 根日线，区域宽度取 ATR 的一部分并设置最小百分比。
 ATR_PERIOD = 14
@@ -420,23 +425,105 @@ def average_true_range(bars: Iterable[dict[str, Any]], period: int = ATR_PERIOD)
     return sum(true_ranges[-period:]) / min(len(true_ranges), period)
 
 
+def _median_true_range(highs: list[float], lows: list[float], closes: list[float]) -> float | None:
+    """真实波幅中位数。不用均值，是为了不让单根插针决定摆动确认距离。"""
+    ranges: list[float] = []
+    previous_close: float | None = None
+    for high, low, close in zip(highs, lows, closes):
+        if previous_close is None or previous_close <= 0:
+            true_range = high - low
+        else:
+            true_range = max(high - low, abs(high - previous_close), abs(low - previous_close))
+        if true_range >= 0 and math.isfinite(true_range):
+            ranges.append(true_range)
+        previous_close = close if close > 0 else previous_close
+    if not ranges:
+        return None
+    ranges.sort()
+    return ranges[len(ranges) // 2]
+
+
+def _closing_pivots(closes: list[float], scale: float) -> list[tuple[int, str]]:
+    """按收盘价做摆动确认。返回 (下标, high/low)，最后一项是尚未反向确认的当前端点。"""
+    if len(closes) < 2 or scale <= 0:
+        return []
+    pivots: list[tuple[int, str]] = []
+    direction: str | None = None
+    extreme_index = 0
+    extreme_close = closes[0]
+    low_index, low_close = 0, closes[0]
+    high_index, high_close = 0, closes[0]
+    for index, close in enumerate(closes):
+        if direction is None:
+            if close <= low_close:
+                low_index, low_close = index, close
+            if close >= high_close:
+                high_index, high_close = index, close
+            up_threshold = max(scale * FIB_PIVOT_ATR, abs(low_close) * FIB_PIVOT_MIN_RATIO)
+            down_threshold = max(scale * FIB_PIVOT_ATR, abs(high_close) * FIB_PIVOT_MIN_RATIO)
+            # 单边行情也要留下起点，否则没有一对端点时会退回窗口极值，插针又会回来。
+            if close - low_close >= up_threshold and close - low_close >= high_close - close:
+                pivots.append((low_index, "low"))
+                direction = "up"
+                extreme_index, extreme_close = index, close
+            elif high_close - close >= down_threshold:
+                pivots.append((high_index, "high"))
+                direction = "down"
+                extreme_index, extreme_close = index, close
+            continue
+        threshold = max(scale * FIB_PIVOT_ATR, abs(extreme_close) * FIB_PIVOT_MIN_RATIO)
+        if direction == "up":
+            if close >= extreme_close:
+                extreme_index, extreme_close = index, close
+            elif extreme_close - close >= threshold:
+                pivots.append((extreme_index, "high"))
+                direction = "down"
+                extreme_index, extreme_close = index, close
+        elif close <= extreme_close:
+            extreme_index, extreme_close = index, close
+        elif close - extreme_close >= threshold:
+            pivots.append((extreme_index, "low"))
+            direction = "up"
+            extreme_index, extreme_close = index, close
+    if direction == "up":
+        pivots.append((extreme_index, "high"))
+    elif direction == "down":
+        pivots.append((extreme_index, "low"))
+    return pivots
+
+
 def fibonacci_levels(bars: Iterable[dict[str, Any]], spot: float) -> list[Level]:
-    """斐波那契回撤位：以回看窗口内的摆动高点/低点为区间，低点在前按高点向下回撤，反之按低点向上反弹。"""
+    """斐波那契回撤位：以确认过的摆动高点/低点为区间，低点在前按高点向下回撤，反之按低点向上反弹。"""
     window = list(bars)[-FIB_WINDOW_BARS:]
     highs = [_number(bar.get("high")) for bar in window]
     lows = [_number(bar.get("low")) for bar in window]
-    if any(value is None for value in highs) or any(value is None for value in lows):
+    closes = [_number(bar.get("close")) for bar in window]
+    if any(value is None for value in highs) or any(value is None for value in lows) or any(value is None for value in closes):
         return []
     if len(window) < 5 or spot <= 0:
         return []
-    high = max(highs)  # type: ignore[arg-type]
-    low = min(lows)  # type: ignore[arg-type]
-    if high <= low:
-        return []
-    # 取两个摆动端点的最后一次出现位置，判定当前处于上涨段还是下跌段。
-    high_index = len(highs) - 1 - highs[::-1].index(high)  # type: ignore[arg-type]
-    low_index = len(lows) - 1 - lows[::-1].index(low)  # type: ignore[arg-type]
-    if high_index == low_index:
+    high_values = [value for value in highs if value is not None]
+    low_values = [value for value in lows if value is not None]
+    close_values = [value for value in closes if value is not None]
+    high_index: int | None = None
+    low_index: int | None = None
+    scale = _median_true_range(high_values, low_values, close_values)
+    if scale is not None and scale > 0:
+        for index, kind in _closing_pivots(close_values, scale):
+            if kind == "high":
+                high_index = index
+            else:
+                low_index = index
+    # 走不出一对摆动端点时退回窗口极值，避免横盘标的直接失去斐波那契因子。
+    if high_index is None or low_index is None or high_index == low_index:
+        high = max(high_values)
+        low = min(low_values)
+        high_index = len(high_values) - 1 - high_values[::-1].index(high)
+        low_index = len(low_values) - 1 - low_values[::-1].index(low)
+    else:
+        high = high_values[high_index]
+        low = low_values[low_index]
+    if high <= low or high_index == low_index:
         return []
     span = high - low
     levels: list[Level] = []
@@ -510,6 +597,13 @@ def chip_peaks(bars: Iterable[dict[str, Any]], spot: float) -> list[Level]:
     return [(low_price + (index + 0.5) * bucket, value / peak_value, "筹码密集") for value, index in picked]
 
 
+def _absorption_distance(price: float, atr: float | None, atr_ratio: float, fallback_ratio: float) -> float:
+    """承接位的反弹或跌破距离。有波动率时按 ATR 缩放，否则退回价格比例。"""
+    if atr is not None and atr > 0:
+        return max(atr * atr_ratio, price * MIN_ZONE_RATIO)
+    return price * fallback_ratio
+
+
 def absorption_levels(bars: Iterable[dict[str, Any]], spot: float) -> list[Level]:
     """承接位：近期被打下去、当天收回或随后反弹，并且之后没有被跌破的摆动低点。"""
     window = list(bars)[-ABSORPTION_WINDOW_BARS:]
@@ -521,6 +615,7 @@ def absorption_levels(bars: Iterable[dict[str, Any]], spot: float) -> list[Level
     volumes = [_number(bar.get("volume")) or 0.0 for bar in window]
     if any(value is None for value in highs) or any(value is None for value in lows) or any(value is None for value in closes):
         return []
+    atr_values = average_true_ranges(window)
     average_volume = sum(volumes) / len(volumes) if volumes else 0.0
     candidates: list[tuple[int, float, float]] = []
     for index in range(2, len(window) - 2):
@@ -532,15 +627,18 @@ def absorption_levels(bars: Iterable[dict[str, Any]], spot: float) -> list[Level
         # 必须明显低于相邻低点：等低平台不算「被打下来」的摆动低点。
         if not others or low >= min(others) * 0.999:
             continue
+        bar_atr = atr_values[index] if index < len(atr_values) else None
+        break_distance = _absorption_distance(low, bar_atr, ABSORPTION_BREAK_ATR, ABSORPTION_BREAK_FALLBACK)
         later = [value for value in lows[index + 1:] if value is not None]
-        if later and min(later) < low * ABSORPTION_BREAK_TOLERANCE:
+        if later and min(later) < low - break_distance:
             continue
         high = highs[index]  # type: ignore[index]
         close = closes[index]  # type: ignore[index]
         recovered = close is not None and high is not None and close >= low + 0.5 * (high - low)
         if not recovered:
+            rebound_distance = _absorption_distance(low, bar_atr, ABSORPTION_REBOUND_ATR, ABSORPTION_REBOUND_FALLBACK)
             later_closes = [value for value in closes[index + 1:index + 6] if value is not None]
-            recovered = any(value >= low * ABSORPTION_REBOUND for value in later_closes)
+            recovered = any(value >= low + rebound_distance for value in later_closes)
         if not recovered:
             continue
         weight = 0.6
@@ -592,41 +690,46 @@ def _percentile(values: Iterable[float], quantile: float) -> float | None:
 
 
 def option_levels(points: list[dict[str, float]], spot: float) -> tuple[list[Level], list[Level], str]:
-    """期权持仓因子：未平仓量有效时按 GEX 排序，否则退回成交量；返回 (看涨候选, 看跌候选, 口径)。
+    """期权持仓因子：未平仓量有效时按绝对 GEX 排序，否则退回成交量。
 
-    候选按现价分侧选取：看涨只取现价上方的执行价、看跌只取现价下方的执行价，
-    避免名额被另一侧的行权价占掉。只有相对于本侧中位数明显突出、且占本侧总量达到最低比例的价位才标为「墙」。
+    返回 (现价上方候选, 现价下方候选, 口径)。持仓当作磁吸位：行权价在哪一侧，
+    就进入哪一侧，不再预设看涨是压力、看跌是支撑。标签仍标明该价位主要是看涨还是看跌。
+    只有相对于本侧中位数明显突出、且占本侧总量达到最低比例的价位才标为「墙」。
     """
     open_interest = sum(point["callOi"] + point["putOi"] for point in points)
     volume = sum(point["callVolume"] + point["putVolume"] for point in points)
     # 未平仓量合计不足成交量 20% 时视为持仓数据不完整（上游盘前会整链返回 0），改用成交量口径。
     by_gex = open_interest > 0 and open_interest >= volume * 0.2
-    result: dict[str, list[Level]] = {"call": [], "put": []}
-    for side in ("call", "put"):
-        values: list[tuple[float, float]] = []
-        for point in points:
-            strike = point["strike"]
-            if by_gex:
-                value = max(point["callGex"], 0.0) if side == "call" else max(-point["putGex"], 0.0)
-            else:
-                value = point["callVolume"] if side == "call" else point["putVolume"]
-            if value > 0 and strike > 0:
-                values.append((value, strike))
-        if not values:
+    grouped: list[tuple[float, float, str, str]] = []
+    for point in points:
+        strike = point["strike"]
+        if by_gex:
+            call_value = max(point["callGex"], 0.0)
+            put_value = max(-point["putGex"], 0.0)
+        else:
+            call_value = point["callVolume"]
+            put_value = point["putVolume"]
+        total = call_value + put_value
+        if total <= 0 or strike <= 0 or strike == spot:
             continue
-        on_side = [item for item in values if (item[1] > spot if side == "call" else item[1] < spot)]
+        side = "above" if strike > spot else "below"
+        dominant = "call" if call_value >= put_value else "put"
+        grouped.append((total, strike, side, dominant))
+    result: dict[str, list[Level]] = {"above": [], "below": []}
+    for side in ("above", "below"):
+        on_side = [item for item in grouped if item[2] == side]
         if not on_side:
             continue
         side_values = [item[0] for item in on_side]
-        peak_value, peak_strike = max(on_side)
+        peak_value, peak_strike, _, _ = max(on_side)
         baseline = median(side_values)
         upper_quartile = _percentile(side_values, 0.75) or baseline
         wall_threshold = max(baseline * OPTION_WALL_MIN_PROMINENCE, upper_quartile * 1.2)
         side_total = sum(side_values)
         selected = sorted(on_side, reverse=True)[:OPTION_LIMIT]
-        for value, strike in selected:
-            wall = "看涨墙" if side == "call" else "看跌墙"
-            holding = "看涨持仓" if side == "call" else "看跌持仓"
+        for value, strike, _, dominant in selected:
+            wall = "看涨墙" if dominant == "call" else "看跌墙"
+            holding = "看涨持仓" if dominant == "call" else "看跌持仓"
             prominence = value / max(baseline, 1e-12)
             share = value / max(side_total, 1e-12)
             is_wall = (
@@ -639,7 +742,7 @@ def option_levels(points: list[dict[str, float]], spot: float) -> tuple[list[Lev
             # 权重同时考虑本侧峰值与本侧总量，避免仅凭单个相对最大值抬高综合分数。
             weight = min(1.0, 0.7 * value / max(peak_value, 1e-12) + 0.3 * share / max(OPTION_WALL_MIN_SHARE, 1e-12))
             result[side].append((strike, weight, wall if is_wall else holding))
-    return result["call"], result["put"], ("gex" if by_gex else "volume")
+    return result["above"], result["below"], ("gex" if by_gex else "volume")
 
 
 def _factor_group(factor: str) -> str:
@@ -1070,12 +1173,11 @@ def build_levels(
     # 模型 IV 由合约价格反解，随后才能按与页面一致的公式计算每张合约的 GEX。
     iv_model = annotate_model_greeks(row_list, candidate_price)
     points = aggregate_strikes(row_list, candidate_price)
-    call_levels, put_levels, metric = option_levels(points, candidate_price)
+    above_levels, below_levels, metric = option_levels(points, candidate_price)
     # 触及概率继续使用页面选中的期限；多期限只参与墙位强度，不改变图表和概率口径。
     volatility = (iv_model.get(expiration) or {}).get("iv") if expiration else None
     years = years_to_expiry(expiration) if expiration else None
-    # 技术面候选（斐波那契 / 筹码 / 承接位）按价位落在现价哪一侧归入压力或支撑；
-    # 期权候选按惯例对应：看涨持仓计入压力、看跌持仓计入支撑。
+    # 技术面和期权候选都按价位落在现价哪一侧归入压力或支撑。期权是磁吸位，不按看涨/看跌预设方向。
     technical: list[Level] = []
     technical += fibonacci_levels(bar_list, candidate_price)
     technical += chip_peaks(bar_list, candidate_price)
@@ -1095,11 +1197,11 @@ def build_levels(
     candidate_limit = LEVEL_COUNT * 3
     merge_tolerance = adaptive_merge_tolerance(candidate_price, atr)
     resistance_all = merge_candidates(
-        technical + call_levels, candidate_price, "above", volatility, years, resistance_weight, zone_width,
+        technical + above_levels, candidate_price, "above", volatility, years, resistance_weight, zone_width,
         limit=candidate_limit, merge_tolerance=merge_tolerance,
     )
     support_all = merge_candidates(
-        technical + put_levels, candidate_price, "below", volatility, years, support_weight, zone_width,
+        technical + below_levels, candidate_price, "below", volatility, years, support_weight, zone_width,
         limit=candidate_limit, merge_tolerance=merge_tolerance,
     )
     # 候选池以稳定锚点生成；当前口径只负责重新分侧和更新触及概率。
