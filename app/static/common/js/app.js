@@ -35,7 +35,6 @@ const state = {
     marketState: "等待数据",
     themeLabel: "白天",
     themeIcon: "el-icon-moon-night",
-    refreshNote: "每 60 秒自动更新",
     quoteSymbol: defaultSymbol,
     quotePrice: "--",
     quoteChange: "涨跌 --",
@@ -113,8 +112,10 @@ let analysisChartSignatureValue = "";
 let forceChartRedraw = false;
 let scopeChartTimer = null;
 let scopeChartToken = 0;
-// 自动刷新间隔（秒）：页面提示文案与定时器共用同一个值。
+// 自动刷新间隔（秒）：页面倒计时与定时器共用同一个值。
 const AUTO_REFRESH_SECONDS = 60;
+// 倒计时终点。只驱动刷新提示文字，不放进 Vue 状态，避免每秒重绘整页。
+let refreshDeadline = 0;
 // 快照已过期但上一轮没写成新数据时的重试间隔，避免再空等一个完整周期。
 const AUTO_REFRESH_RETRY_SECONDS = 15;
 // 本地快照新鲜期（秒）：SQLite 里的快照比它更新时直接复用，不再请求上游接口。
@@ -352,6 +353,8 @@ function initializeAccessKey() {
 
 function showAccessDenied() {
   clearAutoRefresh();
+  refreshDeadline = 0;
+  paintRefreshNote();
   document.body.classList.add("access-denied-page");
   const view = byId("access-denied-view");
   if (view) view.hidden = false;
@@ -379,13 +382,41 @@ function clearAutoRefresh() {
 
 // 下一次自动刷新对准快照年龄，而不是页面打开后的固定节拍。
 // 新鲜快照等到刚好过期；过期却没更新成功时短间隔重试。
+function refreshCountdownSeconds(deadline, now) {
+  const ms = deadline - now;
+  if (!Number.isFinite(ms) || ms <= 0) return 0;
+  // 满 60 秒先显示 59，之后每秒减 1；最后一段保持 1，到点才开始刷新。
+  return Math.max(Math.ceil(ms / 1000) - 1, 1);
+}
+
+function refreshNoteText(now = Date.now()) {
+  if (state.refreshing) return "正在刷新…";
+  if (!refreshDeadline) return `每 ${AUTO_REFRESH_SECONDS} 秒自动更新`;
+  const seconds = refreshCountdownSeconds(refreshDeadline, now);
+  if (seconds <= 0) return "正在刷新…";
+  return `${seconds} 秒后自动更新`;
+}
+
+function paintRefreshNote() {
+  const note = byId("refresh-note");
+  if (!note) return;
+  const text = refreshNoteText();
+  if (note.textContent !== text) note.textContent = text;
+}
+
 function scheduleAutoRefresh() {
   clearAutoRefresh();
-  if (document.body.classList.contains("access-denied-page")) return;
+  if (document.body.classList.contains("access-denied-page")) {
+    refreshDeadline = 0;
+    paintRefreshNote();
+    return;
+  }
   const age = snapshotAgeSeconds(state.chainFetchedAt);
   const remaining = age == null ? AUTO_REFRESH_SECONDS : AUTO_REFRESH_SECONDS - age;
   const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);
+  refreshDeadline = Date.now() + delaySeconds * 1000;
   state.timer = setTimeout(() => { refresh(true); }, delaySeconds * 1000);
+  paintRefreshNote();
 }
 function formatNumber(value, digits = 0) { if (value === null || value === undefined || value === "") return "--"; return Number(value).toLocaleString("en-US", { maximumFractionDigits: digits }); }
 function formatMoney(value) { return value == null ? "--" : Number(value).toFixed(2); }
@@ -425,7 +456,7 @@ function formatChartValue(value, digits, unit) { return unit === "M" ? formatGex
 // 刷新按钮只由「是否正在刷新」决定，避免多条并发路径各自改写 disabled 后被误启用；
 // 没有到期日（标的没有挂牌期权）时同样允许手动刷新现货快照。
 function syncRefreshButton() {
-  state.view.refreshNote = state.refreshing ? "正在刷新…" : `每 ${AUTO_REFRESH_SECONDS} 秒自动更新`;
+  paintRefreshNote();
 }
 function setBusy(busy) { state.loading = busy; syncRefreshButton(); }
 
@@ -2076,6 +2107,8 @@ initBuyerStructureGroup();
 function updateClock() {
   const clock = byId("clock");
   if (clock) clock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  // 倒计时跟时钟同一拍改文字，不写 Vue 数据。
+  paintRefreshNote();
 }
 updateClock();
 setInterval(updateClock, 1000);

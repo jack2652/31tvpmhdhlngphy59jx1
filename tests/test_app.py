@@ -1654,6 +1654,16 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "function scheduleAutoRefresh()" in source
     assert "setTimeout(() => { refresh(true); }, delaySeconds * 1000);" in source
     assert "const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);" in source
+    # 倒计时从 59 数到 1，到点才刷新；文字直接改 DOM，不每秒触发 Vue 重绘。
+    assert "function refreshCountdownSeconds(deadline, now)" in source
+    assert "return Math.max(Math.ceil(ms / 1000) - 1, 1);" in source
+    assert "return `${seconds} 秒后自动更新`;" in source
+    assert "function paintRefreshNote()" in source
+    clock = source[source.index("function updateClock()"):source.index("updateClock();")]
+    assert "paintRefreshNote();" in clock
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert 'v-text="view.refreshNote"' not in page
+    assert 'id="refresh-note" class="refresh-note">每 60 秒自动更新</span>' in page
     assert "await loadChain({ loadId, force: !silent });" in source
     # 跨期限 Gamma 窗口刷新改为后台任务，表格渲染完成后不再等待窗口。
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
@@ -1677,6 +1687,7 @@ def test_refresh_toolbar_places_note_before_button_and_uses_blue_hover():
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     toolbar = page[page.index('<div class="toolbar-actions">') : page.index('</div>', page.index('<div class="toolbar-actions">'))]
     assert toolbar.index('id="refresh-note"') < toolbar.index('id="refresh-button"')
+    assert ".refresh-note{font-size:12px;font-variant-numeric:tabular-nums;display:inline-block;min-width:9.5em;text-align:right;white-space:nowrap}" in styles
     assert ".toolbar-actions .el-button.secondary.el-button--button:hover,.toolbar-actions .el-button.secondary.el-button--button:focus{border-color:var(--blue);background:var(--blue);color:var(--on-blue)}" in styles
 
 

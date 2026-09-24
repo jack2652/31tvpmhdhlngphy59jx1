@@ -248,7 +248,7 @@
 /* 可读性增强：整体放大正文与辅助信息，保留徽标的紧凑感，避免放大后表格失去层级。 */
 body{font-size:14px}
 .brand-mark{font-size:11px}.brand strong{font-size:14px}.brand small{font-size:10px}
-.top-meta,.panel-status,footer{font-size:12px}.control label{font-size:11px}.refresh-note{font-size:12px}
+.top-meta,.panel-status,footer{font-size:12px}.control label{font-size:11px}.refresh-note{font-size:12px;font-variant-numeric:tabular-nums;display:inline-block;min-width:9.5em;text-align:right;white-space:nowrap}
 .eyebrow{font-size:11px}.quote-sub{font-size:12px}.analysis-heading h2{font-size:18px}.analysis-heading p{font-size:12px}.wall-badges span{font-size:12px}
 .chart-label{font-size:11px}.chart-tooltip{font-size:12px}.chart-wall-call-label,.chart-wall-put-label{font-size:11px}.chart-legend{font-size:12px}.chart-summary{font-size:12px}.chart-summary th,.chart-summary td{font-size:12px}.chart-tag text{font-size:11px}
 .chain-filter{font-size:12px}.chain-filter select{font-size:13px}.chain-legend{font-size:12px}th{font-size:11px}
