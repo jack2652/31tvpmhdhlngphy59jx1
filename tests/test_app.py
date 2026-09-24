@@ -1654,6 +1654,10 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "function scheduleAutoRefresh()" in source
     assert "setTimeout(() => { refresh(true); }, delaySeconds * 1000);" in source
     assert "const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);" in source
+    # 新快照落地后按页面时刻重算完整间隔，不能再用上游请求开始时的 fetched_at 把倒计时提前扣短。
+    assert "function armRefreshAnchor(fetchedAt)" in source
+    assert "armRefreshAnchor(payload.fetched_at);" in source
+    assert "Math.min(anchoredAge, snapshotAge)" in source
     # 倒计时从 59 数到 1，到点才刷新；文字直接改 DOM，不每秒触发 Vue 重绘。
     assert "function refreshCountdownSeconds(deadline, now)" in source
     assert "return Math.max(Math.ceil(ms / 1000) - 1, 1);" in source

@@ -122,6 +122,9 @@ function readAutoRefreshSeconds() {
 const AUTO_REFRESH_SECONDS = readAutoRefreshSeconds();
 // 倒计时终点。只驱动刷新提示文字，不放进 Vue 状态，避免每秒重绘整页。
 let refreshDeadline = 0;
+// 新快照落到页面上的时刻。上游 fetched_at 在请求开始时就写了，慢请求不能拿它倒扣倒计时。
+let refreshAnchorAt = 0;
+let refreshAnchorFetchedAt = "";
 // 快照已过期但上一轮没写成新数据时的重试间隔，避免再空等一个完整周期。
 // 间隔短于 15 秒时，重试不再慢于自动刷新本身。
 const AUTO_REFRESH_RETRY_SECONDS = Math.min(15, AUTO_REFRESH_SECONDS);
@@ -387,8 +390,14 @@ function clearAutoRefresh() {
   state.timer = null;
 }
 
-// 下一次自动刷新对准快照年龄，而不是页面打开后的固定节拍。
-// 新鲜快照等到刚好过期；过期却没更新成功时短间隔重试。
+// 刚抓到的新快照从页面落地时刻重新计时；只读到旧缓存时仍按快照年龄补剩余时间。
+// 过期却没更新成功时短间隔重试。
+function armRefreshAnchor(fetchedAt) {
+  if (!fetchedAt) return;
+  refreshAnchorAt = Date.now();
+  refreshAnchorFetchedAt = fetchedAt;
+}
+
 function refreshCountdownSeconds(deadline, now) {
   const ms = deadline - now;
   if (!Number.isFinite(ms) || ms <= 0) return 0;
@@ -418,7 +427,12 @@ function scheduleAutoRefresh() {
     paintRefreshNote();
     return;
   }
-  const age = snapshotAgeSeconds(state.chainFetchedAt);
+  const snapshotAge = snapshotAgeSeconds(state.chainFetchedAt);
+  const anchoredAge = refreshAnchorAt && refreshAnchorFetchedAt === state.chainFetchedAt
+    ? Math.max((Date.now() - refreshAnchorAt) / 1000, 0)
+    : null;
+  // 取更晚的那个时刻：慢请求已经花掉的时间不再从下一轮倒计时里扣。
+  const age = anchoredAge == null || snapshotAge == null ? (anchoredAge ?? snapshotAge) : Math.min(anchoredAge, snapshotAge);
   const remaining = age == null ? AUTO_REFRESH_SECONDS : AUTO_REFRESH_SECONDS - age;
   const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);
   refreshDeadline = Date.now() + delaySeconds * 1000;
@@ -1908,6 +1922,8 @@ async function refreshInBackground(loadId, force = false) {
     renderQuote(resolvedQuote);
     // Gamma 窗口继续后台刷新；选中期限的综合价位已在这里与窗口任务并行请求。
     renderChain(payload, resolvedQuote, state.lastAnalysis?.analysisPayload || null);
+    // 新数据已经显示出来，下一轮倒计时从现在起算完整间隔。
+    armRefreshAnchor(payload.fetched_at);
     state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
     syncPageQuery();
     refreshAnalysisWindow(loadId, payload, resolvedQuote);
