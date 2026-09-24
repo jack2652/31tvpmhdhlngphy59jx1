@@ -1663,7 +1663,7 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "paintRefreshNote();" in clock
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     assert 'v-text="view.refreshNote"' not in page
-    assert 'id="refresh-note" class="refresh-note">每 60 秒自动更新</span>' in page
+    assert 'id="refresh-note" class="refresh-note">每 __AUTO_REFRESH_SECONDS__ 秒自动更新</span>' in page
     assert "await loadChain({ loadId, force: !silent });" in source
     # 跨期限 Gamma 窗口刷新改为后台任务，表格渲染完成后不再等待窗口。
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
@@ -3028,6 +3028,33 @@ def test_page_default_symbol_comes_from_server_config():
     # 注入缺失时才走的前端兜底值同样是 QQQ。
     assert ' : "QQQ"' in source
     assert 'symbol: defaultSymbol' in source
+
+
+def test_auto_refresh_seconds_from_env(monkeypatch):
+    """页面自动刷新间隔默认 60 秒，正整数生效，0 在启动时拒绝。"""
+    monkeypatch.delenv("AUTO_REFRESH_SECONDS", raising=False)
+    assert Settings.from_env().auto_refresh_seconds == 60
+    monkeypatch.setenv("AUTO_REFRESH_SECONDS", "30")
+    assert Settings.from_env().auto_refresh_seconds == 30
+    monkeypatch.setenv("AUTO_REFRESH_SECONDS", "0")
+    with pytest.raises(ValueError, match="AUTO_REFRESH_SECONDS"):
+        Settings.from_env()
+
+
+def test_page_auto_refresh_seconds_comes_from_server_config():
+    """倒计时、新鲜期和 run.sh 菜单都跟着 AUTO_REFRESH_SECONDS，而不是写死 60。"""
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    main = Path("app/main.py").read_text(encoding="utf-8")
+    menu = Path("run.sh").read_text(encoding="utf-8")
+    assert 'name="option-scope-auto-refresh-seconds" content="__AUTO_REFRESH_SECONDS__"' in page
+    assert "function readAutoRefreshSeconds()" in source
+    assert "const AUTO_REFRESH_SECONDS = readAutoRefreshSeconds();" in source
+    assert "const SNAPSHOT_FRESH_SECONDS = AUTO_REFRESH_SECONDS;" in source
+    assert "const AUTO_REFRESH_RETRY_SECONDS = Math.min(15, AUTO_REFRESH_SECONDS);" in source
+    assert 'page.replace("__AUTO_REFRESH_SECONDS__", str(settings.auto_refresh_seconds))' in main
+    assert '17) AUTO_REFRESH_SECONDS' in menu
+    assert 'ask_env_value AUTO_REFRESH_SECONDS "页面自动刷新间隔（秒）"' in menu
 
 
 def test_database_max_mb_parsing(monkeypatch):

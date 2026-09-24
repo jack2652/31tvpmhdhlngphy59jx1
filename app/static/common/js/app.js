@@ -112,14 +112,21 @@ let analysisChartSignatureValue = "";
 let forceChartRedraw = false;
 let scopeChartTimer = null;
 let scopeChartToken = 0;
+// 页面自动刷新间隔来自服务端 AUTO_REFRESH_SECONDS；非法或缺失时回到 60 秒。
+function readAutoRefreshSeconds() {
+  const meta = document.querySelector('meta[name="option-scope-auto-refresh-seconds"]');
+  const value = Number.parseInt(meta?.content || "", 10);
+  return Number.isInteger(value) && value >= 1 ? value : 60;
+}
 // 自动刷新间隔（秒）：页面倒计时与定时器共用同一个值。
-const AUTO_REFRESH_SECONDS = 60;
+const AUTO_REFRESH_SECONDS = readAutoRefreshSeconds();
 // 倒计时终点。只驱动刷新提示文字，不放进 Vue 状态，避免每秒重绘整页。
 let refreshDeadline = 0;
 // 快照已过期但上一轮没写成新数据时的重试间隔，避免再空等一个完整周期。
-const AUTO_REFRESH_RETRY_SECONDS = 15;
-// 本地快照新鲜期（秒）：SQLite 里的快照比它更新时直接复用，不再请求上游接口。
-const SNAPSHOT_FRESH_SECONDS = 60;
+// 间隔短于 15 秒时，重试不再慢于自动刷新本身。
+const AUTO_REFRESH_RETRY_SECONDS = Math.min(15, AUTO_REFRESH_SECONDS);
+// 本地快照新鲜期与页面自动刷新间隔对齐，避免间隔改短后仍被当成新鲜快照跳过。
+const SNAPSHOT_FRESH_SECONDS = AUTO_REFRESH_SECONDS;
 // 压力位/支撑位各展示的条数。
 const LEVEL_COUNT = 10;
 // 交易计划（买入 / 加仓 / 卖出）各自最多展示的条数。
@@ -385,7 +392,7 @@ function clearAutoRefresh() {
 function refreshCountdownSeconds(deadline, now) {
   const ms = deadline - now;
   if (!Number.isFinite(ms) || ms <= 0) return 0;
-  // 满 60 秒先显示 59，之后每秒减 1；最后一段保持 1，到点才开始刷新。
+  // 满一个周期先显示 N-1，之后每秒减 1；最后一段保持 1，到点才开始刷新。
   return Math.max(Math.ceil(ms / 1000) - 1, 1);
 }
 

@@ -1066,20 +1066,21 @@ show_config_summary() {
   printf '  4) ACCESS_KEY=%s\n' "$(mask_access_key "$access_key")"
   printf '  5) MARKET_PROXY=%s\n' "$(read_env_value MARKET_PROXY "（空）")"
   printf '  6) DEFAULT_SYMBOLS=%s\n' "$(read_env_value DEFAULT_SYMBOLS QQQ)"
-  printf '  7) REFRESH_INTERVAL_SECONDS=%s\n' "$(read_env_value REFRESH_INTERVAL_SECONDS 60)"
+  printf '  7) REFRESH_INTERVAL_SECONDS=%s\n' "$(read_env_value REFRESH_INTERVAL_SECONDS 30)"
   printf '  8) RAW_RETENTION_DAYS=%s\n' "$(read_env_value RAW_RETENTION_DAYS 30)"
   printf '  9) CLEANUP_INTERVAL_SECONDS=%s\n' "$(read_env_value CLEANUP_INTERVAL_SECONDS 86400)"
-  printf ' 10) DATABASE_MAX_MB=%s\n' "$(read_env_value DATABASE_MAX_MB 0)"
+  printf ' 10) DATABASE_MAX_MB=%s\n' "$(read_env_value DATABASE_MAX_MB 256M)"
   printf ' 11) HISTORY_MAX_AGE_SECONDS=%s\n' "$(read_env_value HISTORY_MAX_AGE_SECONDS 3600)"
   printf ' 12) EXTREMES_MAX_AGE_SECONDS=%s\n' "$(read_env_value EXTREMES_MAX_AGE_SECONDS 86400)"
   printf ' 13) SCHEDULER_ENABLED=%s\n' "$(read_env_value SCHEDULER_ENABLED true)"
   printf ' 14) UPSTREAM_CONCURRENCY=%s\n' "$(read_env_value UPSTREAM_CONCURRENCY 6)"
   printf ' 15) UPSTREAM_WAIT_SECONDS=%s\n' "$(read_env_value UPSTREAM_WAIT_SECONDS 20)"
-  printf ' 16) WEB_WORKERS=%s\n' "$(read_env_value WEB_WORKERS 2)"
+  printf ' 16) WEB_WORKERS=%s\n' "$(read_env_value WEB_WORKERS 1)"
+  printf ' 17) AUTO_REFRESH_SECONDS=%s\n' "$(read_env_value AUTO_REFRESH_SECONDS 30)"
 }
 
 validate_config_values() {
-  local port limit workers concurrency wait_seconds
+  local port limit workers concurrency wait_seconds auto_refresh
   port="$(read_env_value PORT 8000)"
   case "$port" in
     '' | *[!0-9]*)
@@ -1103,6 +1104,9 @@ validate_config_values() {
   [ "$workers" -ge 1 ] || { fail "WEB_WORKERS 必须大于等于 1"; return 1; }
   [ "$concurrency" -ge 1 ] || { fail "UPSTREAM_CONCURRENCY 必须大于等于 1"; return 1; }
   [ "$wait_seconds" -ge 1 ] || { fail "UPSTREAM_WAIT_SECONDS 必须大于等于 1"; return 1; }
+  auto_refresh="$(read_env_value AUTO_REFRESH_SECONDS 60)"
+  case "$auto_refresh" in '' | *[!0-9]*) fail "AUTO_REFRESH_SECONDS 必须是正整数"; return 1 ;; esac
+  [ "$auto_refresh" -ge 1 ] || { fail "AUTO_REFRESH_SECONDS 必须大于等于 1"; return 1; }
   return 0
 }
 
@@ -1134,6 +1138,7 @@ action_config() {
       14) ask_env_value UPSTREAM_CONCURRENCY "单进程上游最大并发数" ;;
       15) ask_env_value UPSTREAM_WAIT_SECONDS "等待上游并发槽位的最长秒数" ;;
       16) ask_env_value WEB_WORKERS "Web worker 数量（建议 2-4）" ;;
+      17) ask_env_value AUTO_REFRESH_SECONDS "页面自动刷新间隔（秒）" ;;
       0 | "") break ;;
       *) warn "无效选择：$choice" ;;
     esac

@@ -62,6 +62,8 @@ class Settings:
     upstream_concurrency: int = 6
     # 等待上游请求槽位的最长时间，超时后优先回退本地旧数据
     upstream_wait_seconds: int = 20
+    # 页面倒计时和自动刷新新鲜期，单位秒；与后台定时刷新间隔分开配置
+    auto_refresh_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -83,4 +85,5 @@ class Settings:
             access_key=os.getenv("ACCESS_KEY", "").strip(),
             upstream_concurrency=_positive_int("UPSTREAM_CONCURRENCY", 6),
             upstream_wait_seconds=_positive_int("UPSTREAM_WAIT_SECONDS", 20),
+            auto_refresh_seconds=_positive_int("AUTO_REFRESH_SECONDS", 60),
         )
