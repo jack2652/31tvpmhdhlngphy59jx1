@@ -1560,6 +1560,33 @@ def test_refreshes_from_separate_workers_share_sqlite_lease(tmp_path: Path):
     assert first_database.latest_chain("AAPL", "2026-12-18")["data"]
 
 
+def test_refresh_different_expirations_are_not_blocked_by_one_symbol_lock(tmp_path: Path):
+    """Gamma 窗口正在刷新别的到期日时，当前期限仍要能同时回源。"""
+    database = Database(tmp_path / "options.db")
+    entered = threading.Barrier(2)
+    calls = {"fetch": 0}
+    calls_lock = threading.Lock()
+
+    class SlowProvider(FakeProvider):
+        def fetch(self, symbol: str, expiration: str):
+            entered.wait(timeout=2)
+            with calls_lock:
+                calls["fetch"] += 1
+            time.sleep(0.2)
+            return super().fetch(symbol, expiration)
+
+    service = SnapshotService(database, SlowProvider())
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(
+            lambda expiration: service.refresh("AAPL", expiration, max_age_seconds=0),
+            ("2026-12-18", "2027-01-15"),
+        ))
+    assert calls["fetch"] == 2
+    assert not any(result.get("coalesced") for result in results)
+    assert time.monotonic() - started < 0.45
+
+
 def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # 手动刷新必须回源；自动刷新才复用 SQLite 新鲜快照，并用 state.refreshing 拦截连点。
@@ -1581,7 +1608,9 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "?refresh=true`" in source
     assert '@click="refreshNow"' in Path("app/static/index.html").read_text(encoding="utf-8")
     assert ':disabled="refreshing"' in Path("app/static/index.html").read_text(encoding="utf-8")
-    assert "setInterval(() => refresh(true), AUTO_REFRESH_SECONDS * 1000);" in source
+    assert "function scheduleAutoRefresh()" in source
+    assert "setTimeout(() => { refresh(true); }, delaySeconds * 1000);" in source
+    assert "const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);" in source
     assert "await loadChain({ loadId, force: !silent });" in source
     # 跨期限 Gamma 窗口刷新改为后台任务，表格渲染完成后不再等待窗口。
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source

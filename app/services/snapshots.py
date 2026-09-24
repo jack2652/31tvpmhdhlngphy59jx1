@@ -20,10 +20,12 @@ logger = logging.getLogger(__name__)
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 # 跨期限 Gamma 窗口的单到期日新鲜期（秒）：窗口刷新很慢，短期内的重复请求直接跳过。
-WINDOW_FRESH_SECONDS = 120
+# 与页面自动刷新同一口径。120 秒会让 Gamma 窗口比现价多停一轮。
+WINDOW_FRESH_SECONDS = 60
 REFRESH_LOCK_TIMEOUT_SECONDS = 60
 REFRESH_LEASE_SECONDS = 180
-REFRESH_COALESCE_SECONDS = 60
+# 只合并刚刚写完的并发刷新。再留 60 秒会和页面新鲜期叠成一次空刷新。
+REFRESH_COALESCE_SECONDS = 15
 
 
 def market_today() -> date:
@@ -72,9 +74,14 @@ class SnapshotService:
         self._refresh_flight: SingleFlight[tuple[str, str | None, int], dict[str, Any]] = SingleFlight()
         self._owner = uuid4().hex
 
-    def _lock_for(self, symbol: str) -> threading.Lock:
+    @staticmethod
+    def _scope(symbol: str, expiration: str | None) -> str:
+        """不同到期日分开串行，Gamma 窗口刷新其他期限时不再挡住当前页面。"""
+        return f"{symbol}:{expiration or 'nearest'}"
+
+    def _lock_for(self, scope: str) -> threading.Lock:
         with self._locks_guard:
-            return self._locks.setdefault(symbol, threading.Lock())
+            return self._locks.setdefault(scope, threading.Lock())
 
     def refresh(self, symbol: str, expiration: str | None = None, max_age_seconds: int = 0) -> dict[str, Any]:
         """抓取一次快照。
@@ -90,12 +97,13 @@ class SnapshotService:
         )
 
     def _refresh_locked(self, normalized: str, expiration: str | None, max_age_seconds: int) -> dict[str, Any]:
-        """同标的刷新串行化；同一请求键由 SingleFlight 共享结果，不再并发返回 502。"""
-        lock = self._lock_for(normalized)
+        """同一到期日刷新串行化；同一请求键由 SingleFlight 共享结果，不再并发返回 502。"""
+        scope = self._scope(normalized, expiration)
+        lock = self._lock_for(scope)
         waited_for_process_lock = not lock.acquire(blocking=False)
         if waited_for_process_lock and not lock.acquire(timeout=REFRESH_LOCK_TIMEOUT_SECONDS):
             raise RuntimeError(f"{normalized} 刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
-        lease_name = f"snapshot-refresh:{normalized}"
+        lease_name = f"snapshot-refresh:{scope}"
         deadline = time.monotonic() + REFRESH_LOCK_TIMEOUT_SECONDS
         waited_for_database_lease = False
         lease_acquired = False
@@ -107,7 +115,7 @@ class SnapshotService:
                 time.sleep(0.1)
             lease_acquired = True
             try:
-                # 另一个 worker 刚刚完成了同一标的刷新时，复用其新快照；只有真正的独立强制刷新才继续回源。
+                # 另一个 worker 刚刚完成了同一到期日刷新时，复用其新快照；只有真正的独立强制刷新才继续回源。
                 if waited_for_process_lock or waited_for_database_lease:
                     coalesced = self.recent_snapshot(normalized, expiration, REFRESH_COALESCE_SECONDS)
                     if coalesced is not None:

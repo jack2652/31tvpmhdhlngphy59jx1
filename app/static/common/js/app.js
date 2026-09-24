@@ -105,6 +105,8 @@ const state = {
 const GAMMA_MIN_MINUTES = 30;
 // 自动刷新间隔（秒）：页面提示文案与定时器共用同一个值。
 const AUTO_REFRESH_SECONDS = 60;
+// 快照已过期但上一轮没写成新数据时的重试间隔，避免再空等一个完整周期。
+const AUTO_REFRESH_RETRY_SECONDS = 15;
 // 本地快照新鲜期（秒）：SQLite 里的快照比它更新时直接复用，不再请求上游接口。
 const SNAPSHOT_FRESH_SECONDS = 60;
 // 压力位/支撑位各展示的条数。
@@ -339,8 +341,7 @@ function initializeAccessKey() {
 }
 
 function showAccessDenied() {
-  if (state.timer) clearInterval(state.timer);
-  state.timer = null;
+  clearAutoRefresh();
   document.body.classList.add("access-denied-page");
   const view = byId("access-denied-view");
   if (view) view.hidden = false;
@@ -359,6 +360,22 @@ function snapshotAgeSeconds(fetchedAt) {
   if (!fetchedAt) return null;
   const time = new Date(fetchedAt).getTime();
   return Number.isNaN(time) ? null : Math.max((Date.now() - time) / 1000, 0);
+}
+
+function clearAutoRefresh() {
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = null;
+}
+
+// 下一次自动刷新对准快照年龄，而不是页面打开后的固定节拍。
+// 新鲜快照等到刚好过期；过期却没更新成功时短间隔重试。
+function scheduleAutoRefresh() {
+  clearAutoRefresh();
+  if (document.body.classList.contains("access-denied-page")) return;
+  const age = snapshotAgeSeconds(state.chainFetchedAt);
+  const remaining = age == null ? AUTO_REFRESH_SECONDS : AUTO_REFRESH_SECONDS - age;
+  const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);
+  state.timer = setTimeout(() => { refresh(true); }, delaySeconds * 1000);
 }
 function formatNumber(value, digits = 0) { if (value === null || value === undefined || value === "") return "--"; return Number(value).toLocaleString("en-US", { maximumFractionDigits: digits }); }
 function formatMoney(value) { return value == null ? "--" : Number(value).toFixed(2); }
@@ -1443,7 +1460,7 @@ function renderChain(payload, quote, analysisPayload) {
   const snapshotAge = payload.fetched_at ? (Date.now() - new Date(payload.fetched_at).getTime()) / 1000 : null;
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
   const oiFallback = payload.oi_fallback || {};
-  state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < 180 ? "上游新快照" : "SQLite 缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
+  state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < AUTO_REFRESH_SECONDS ? "上游新快照" : "SQLite 缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
   state.view.fetchedAt = `快照时间 ${formatTime(payload.fetched_at)}`;
   state.view.totalCount = formatNumber(rows.length);
   const calls = rows.filter((row) => row.contract_type === "call"); const puts = rows.filter((row) => row.contract_type === "put");
@@ -1785,23 +1802,27 @@ async function loadExpirations(loadId) {
 }
 
 async function loadChain(options = {}) {
-  const loadId = options.loadId || state.loadId;
-  const force = options.force === true;
-  // 即使本地还没有到期日也要往下走：首次加载某个标的时后端需要回源才能拿到期限列表，
-  // 提前 return 会让页面永远停在没有数据的状态。
-  const snapshot = await renderSnapshot(loadId);
-  if (!snapshot.shown) showPending("正在后台获取上游快照…");
-  if (options.refresh === false) return;
-  // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求上游接口。
-  if (!force && isSnapshotFresh(snapshot)) {
-    showFreshStatus(snapshot);
-    // 首次访问可能只有选中期限的缓存，跨期限 Gamma 尚未生成；只补后台分析，不阻塞首屏。
-    if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
-      refreshAnalysisWindow(loadId, snapshot.payload, snapshot.quote);
+  try {
+    const loadId = options.loadId || state.loadId;
+    const force = options.force === true;
+    // 即使本地还没有到期日也要往下走：首次加载某个标的时后端需要回源才能拿到期限列表，
+    // 提前 return 会让页面永远停在没有数据的状态。
+    const snapshot = await renderSnapshot(loadId);
+    if (!snapshot.shown) showPending("正在后台获取上游快照…");
+    if (options.refresh === false) return;
+    // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求上游接口。
+    if (!force && isSnapshotFresh(snapshot)) {
+      showFreshStatus(snapshot);
+      // 首次访问可能只有选中期限的缓存，跨期限 Gamma 尚未生成；只补后台分析，不阻塞首屏。
+      if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
+        refreshAnalysisWindow(loadId, snapshot.payload, snapshot.quote);
+      }
+      return;
     }
-    return;
+    await refreshInBackground(loadId, force);
+  } finally {
+    scheduleAutoRefresh();
   }
-  await refreshInBackground(loadId, force);
 }
 
 async function loadSymbol() {
@@ -1883,6 +1904,7 @@ async function refresh(silent = false) {
   } finally {
     state.refreshing = false;
     syncRefreshButton();
+    scheduleAutoRefresh();
   }
 }
 
@@ -1949,6 +1971,7 @@ if (accessKeyRequired() && !initialAccessKey) {
   showAccessDenied();
 } else {
   // 没有到期日（仅现货标的）也要走刷新链路：后端会返回 quote_only，只更新现货卡片。
-  state.timer = setInterval(() => refresh(true), AUTO_REFRESH_SECONDS * 1000);
+  // 首次按 60 秒排程；首屏读完快照后会按真实年龄提前或推后。
+  scheduleAutoRefresh();
   loadSymbol();
 }
