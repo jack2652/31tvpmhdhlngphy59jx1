@@ -103,6 +103,16 @@ const state = {
   },
 };
 const GAMMA_MIN_MINUTES = 30;
+// Gamma 与图表复用：同一现价、同一分钟内的合约不重复做指数运算；图表绘制延后到下一帧。
+const gammaValueCache = new Map();
+const GAMMA_VALUE_CACHE_LIMIT = 4000;
+const gammaFlipCache = new Map();
+let chainRenderSignature = "";
+let chainBodySignatureValue = "";
+let analysisChartSignatureValue = "";
+let forceChartRedraw = false;
+let scopeChartTimer = null;
+let scopeChartToken = 0;
 // 自动刷新间隔（秒）：页面提示文案与定时器共用同一个值。
 const AUTO_REFRESH_SECONDS = 60;
 // 快照已过期但上一轮没写成新数据时的重试间隔，避免再空等一个完整周期。
@@ -455,6 +465,12 @@ function optionExpiry(expiration) {
   return result;
 }
 
+function rememberGammaValue(cacheKey, value) {
+  gammaValueCache.set(cacheKey, value);
+  if (gammaValueCache.size > GAMMA_VALUE_CACHE_LIMIT) gammaValueCache.delete(gammaValueCache.keys().next().value);
+  return value;
+}
+
 function gammaAtSpot(spot, row, expiration) {
   const spotValue = Number(spot);
   const strike = Number(row.strike);
@@ -462,12 +478,18 @@ function gammaAtSpot(spot, row, expiration) {
   const volatility = Number(row.model_iv ?? row.implied_volatility);
   if (!Number.isFinite(spotValue) || spotValue <= 0 || !Number.isFinite(strike) || strike <= 0) return null;
   if (!Number.isFinite(volatility) || volatility <= 0) return null;
-  const expiry = optionExpiry(row.expiration || expiration);
+  const expiryKey = row.expiration || expiration || "";
+  const expiry = optionExpiry(expiryKey);
   if (!expiry) return null;
+  // 30 秒一档：同一次渲染里的柱状图和期权链表共用结果，刷新时也不把同一批合约再算一遍。
+  const timeBucket = Math.floor(Date.now() / 30000);
+  const cacheKey = `${expiryKey}|${strike}|${row.contract_type || ""}|${volatility}|${spotValue}|${timeBucket}`;
+  if (gammaValueCache.has(cacheKey)) return gammaValueCache.get(cacheKey);
   const timeYears = Math.max((expiry.getTime() - Date.now()) / (365 * 24 * 60 * 60 * 1000), GAMMA_MIN_MINUTES / (365 * 24 * 60));
   const volatilityTime = volatility * Math.sqrt(timeYears);
   const d1 = (Math.log(spotValue / strike) + (0.005 + 0.5 * volatility ** 2) * timeYears) / volatilityTime;
-  return Math.exp(-0.5 * d1 ** 2) / (spotValue * volatilityTime * Math.sqrt(2 * Math.PI));
+  const gamma = Math.exp(-0.5 * d1 ** 2) / (spotValue * volatilityTime * Math.sqrt(2 * Math.PI));
+  return rememberGammaValue(cacheKey, gamma);
 }
 
 // 扫描前的预计算：一次零 Gamma 扫描会在上百个价位上重复求值同一批合约，
@@ -508,16 +530,34 @@ function totalGexAtSpot(prepared, spotValue) {
   return total;
 }
 
+function gammaFlipCacheKey(rows, spot, expiration) {
+  const timeBucket = Math.floor(Date.now() / 30000);
+  let checksum = rows.length;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    checksum = (checksum + Math.round((Number(row.strike) || 0) * 100) + (Number(row.open_interest) || 0) + Math.round((Number(row.model_iv ?? row.implied_volatility) || 0) * 100000)) % 1000000007;
+  }
+  return `${expiration}|${spot}|${timeBucket}|${checksum}`;
+}
+
+function rememberGammaFlip(cacheKey, value) {
+  gammaFlipCache.set(cacheKey, { value });
+  if (gammaFlipCache.size > 24) gammaFlipCache.delete(gammaFlipCache.keys().next().value);
+  return value;
+}
+
 function findGammaFlip(rows, currentSpot, expiration) {
   const strikes = rows.map((row) => Number(row.strike)).filter((strike) => Number.isFinite(strike) && strike > 0);
   const spot = Number(currentSpot);
   if (!strikes.length || !Number.isFinite(spot) || spot <= 0 || !expiration) return null;
+  const cacheKey = gammaFlipCacheKey(rows, spot, expiration);
+  if (gammaFlipCache.has(cacheKey)) return gammaFlipCache.get(cacheKey).value;
   const prepared = prepareGexRows(rows, expiration);
-  if (!prepared.length) return null;
+  if (!prepared.length) return rememberGammaFlip(cacheKey, null);
   // 公开 GEX 实现常用现价 ±15% 的扫描带，避免把远端低信号根误当成交易区间的 Flip。
   const lower = Math.max(Math.min(...strikes), spot * 0.85);
   const upper = Math.min(Math.max(...strikes), spot * 1.15);
-  if (!(upper > lower)) return null;
+  if (!(upper > lower)) return rememberGammaFlip(cacheKey, null);
   const samples = 121;
   const roots = [];
   let previousSpot = lower;
@@ -541,8 +581,8 @@ function findGammaFlip(rows, currentSpot, expiration) {
     previousSpot = nextSpot;
     previousValue = nextValue;
   }
-  if (!roots.length) return null;
-  return { strike: roots.reduce((nearest, root) => Math.abs(root - spot) < Math.abs(nearest - spot) ? root : nearest) };
+  if (!roots.length) return rememberGammaFlip(cacheKey, null);
+  return rememberGammaFlip(cacheKey, { strike: roots.reduce((nearest, root) => Math.abs(root - spot) < Math.abs(nearest - spot) ? root : nearest) });
 }
 
 // 取指定字段数值最大的执行价，用于标注成交量/持仓量里的最高柱。
@@ -812,12 +852,23 @@ function requestFactorLevels(points, spot, key, attempt = 0) {
     });
 }
 
+// 与后端 spot_cache_bucket 同一套半入规则，避免前后端格子边界不一致。
+function spotCacheBucket(value) {
+  const price = Number(value);
+  if (!Number.isFinite(price) || price <= 0) return "";
+  const magnitude = 10 ** Math.floor(Math.log10(price));
+  const step = magnitude / 500;
+  const units = Math.round(price / step);
+  return (units * step).toFixed(6);
+}
+
 // 多因子压力位/支撑位：由后端按「斐波那契回撤 + 筹码密集 + 承接位 + 所选到期日期权持仓」合成，
 // 前端只负责渲染；同一标的、同一到期日、同一快照只请求一次，图表尺寸变化时复用已有结果。
 function loadFactorLevels(points, spot) {
   if (!points.length || !state.expiration) { renderLevels(points, spot); return; }
   // 缓存键带上基准价口径：两个口径取到同一价格时（盘后/夜盘时段）也各自成键，切换必然重绘一次。
-  const key = `${state.symbol}|${state.expiration}|${state.chainFetchedAt || ""}|${state.levelsWindowFetchedAt || ""}|${Number(spot).toFixed(2)}|${state.levelBasisMode}`;
+  // 现价按与后端相同的格子去重：格子内不再请求价位接口，跨出格子才用精确现价重算。
+  const key = `${state.symbol}|${state.expiration}|${state.chainFetchedAt || ""}|${state.levelsWindowFetchedAt || ""}|${spotCacheBucket(spot)}|${state.levelBasisMode}`;
   // 已请求过：窗口尺寸变化时直接用缓存结果重绘，不再打接口。
   if (state.levelsKey === key) {
     if (state.levelsPayload) renderFactorLevels(state.levelsPayload);
@@ -1255,20 +1306,45 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   state.view.chart.putWall = `看跌墙 ${putWall?.putGex ? formatMoney(putWall.strike) : "--"}`;
   // 选中期限的综合价位与 Gamma 窗口并行请求，避免首次加载时趋势/支撑/压力面板长期空白。
   loadFactorLevels(points, levelSpot);
-  OptionScopeCharts.renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "当前期权链未提供 Gamma，暂无法估算 GEX", { spot, gammaFlip, crosshairTags: true, markers: [
-    { point: callWall, className: "chart-wall-call", label: "看涨墙", position: "top" },
-    { point: putWall, className: "chart-wall-put", label: "看跌墙", position: "bottom" },
-  ] });
-  OptionScopeCharts.renderSignedChart("volume-chart", points, "callVolume", "putVolume", "", "暂无成交量分布", { axis: "right", crosshairTags: true, valueLabel: "成交量", markers: [
-    { point: volumeCallPeak, className: "chart-wall-call", label: "看涨", position: "top" },
-    { point: volumePutPeak, className: "chart-wall-put", label: "看跌", position: "bottom" },
-  ] });
-  OptionScopeCharts.renderSignedChart("oi-chart", points, "callOi", "putOi", "", "暂无持仓量分布", { axis: "right", crosshairTags: true, valueLabel: "持仓量", markers: [
-    { point: oiCallPeak, className: "chart-wall-call", label: "看涨", position: "top" },
-    { point: oiPutPeak, className: "chart-wall-put", label: "看跌", position: "bottom" },
-  ] });
-  OptionScopeCharts.renderDistributionSummary(byId("volume-summary"), expirationRows, spot, "volume", "总成交量");
-  OptionScopeCharts.renderDistributionSummary(byId("oi-summary"), expirationRows, spot, "open_interest", "总持仓量");
+  const chartChecksum = points.reduce((sum, point) => sum + point.callGex + point.putGex + point.callVolume + point.putVolume + point.callOi + point.putOi, 0);
+  const chartSignature = `${points.length}|${spot}|${gammaFlip ? gammaFlip.strike : ""}|${scopeText}|${chartChecksum}`;
+  if (!forceChartRedraw && chartSignature === analysisChartSignatureValue) return;
+  analysisChartSignatureValue = chartSignature;
+  // 先让行情和期权链完成绘制，再在下一拍重建 SVG，避免和表格挤在同一次长任务里。
+  scheduleScopeCharts(() => {
+    OptionScopeCharts.renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "当前期权链未提供 Gamma，暂无法估算 GEX", { spot, gammaFlip, crosshairTags: true, markers: [
+      { point: callWall, className: "chart-wall-call", label: "看涨墙", position: "top" },
+      { point: putWall, className: "chart-wall-put", label: "看跌墙", position: "bottom" },
+    ] });
+    OptionScopeCharts.renderSignedChart("volume-chart", points, "callVolume", "putVolume", "", "暂无成交量分布", { axis: "right", crosshairTags: true, valueLabel: "成交量", markers: [
+      { point: volumeCallPeak, className: "chart-wall-call", label: "看涨", position: "top" },
+      { point: volumePutPeak, className: "chart-wall-put", label: "看跌", position: "bottom" },
+    ] });
+    OptionScopeCharts.renderSignedChart("oi-chart", points, "callOi", "putOi", "", "暂无持仓量分布", { axis: "right", crosshairTags: true, valueLabel: "持仓量", markers: [
+      { point: oiCallPeak, className: "chart-wall-call", label: "看涨", position: "top" },
+      { point: oiPutPeak, className: "chart-wall-put", label: "看跌", position: "bottom" },
+    ] });
+    OptionScopeCharts.renderDistributionSummary(byId("volume-summary"), expirationRows, spot, "volume", "总成交量");
+    OptionScopeCharts.renderDistributionSummary(byId("oi-summary"), expirationRows, spot, "open_interest", "总持仓量");
+  });
+}
+
+function scheduleScopeCharts(draw) {
+  const token = ++scopeChartToken;
+  if (scopeChartTimer) clearTimeout(scopeChartTimer);
+  scopeChartTimer = setTimeout(() => {
+    scopeChartTimer = null;
+    if (token !== scopeChartToken) return;
+    draw();
+  }, 0);
+}
+
+function cancelScopeCharts() {
+  scopeChartToken += 1;
+  if (scopeChartTimer) {
+    clearTimeout(scopeChartTimer);
+    scopeChartTimer = null;
+  }
 }
 
 // 所有 AJAX 请求都优先把 key 放进 URL 查询参数，避免浏览器存储策略影响鉴权。
@@ -1403,7 +1479,20 @@ function chainHeatNote(volumePeak, interestPeak) {
 
 // 期权链表格：行权价在最左，文字颜色即类型（看涨绿 / 看跌红，原先单独的「类型」列已并入行权价）；
 // 成交量与未平仓两列按本屏强弱铺底色，另给出 GEX 估值列（与 Gamma 敞口图同口径）。
+function chainRowsFingerprint(rows, spot, emptyLabel) {
+  let checksum = rows.length;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    checksum = (checksum + (Number(row.volume) || 0) + (Number(row.open_interest) || 0) + Math.round((Number(row.strike) || 0) * 100)) % 1000000007;
+  }
+  return `${state.chainFetchedAt}|${spot}|${state.chainFilter}|${emptyLabel}|${checksum}`;
+}
+
 function renderChainRows(rows, spot, emptyLabel = "没有期权数据") {
+  const fingerprint = chainRowsFingerprint(rows, spot, emptyLabel);
+  // 快照和现价都没变时不替换行数组，子组件就不会因为状态文字刷新而重绘整表。
+  if (fingerprint === chainBodySignatureValue) return;
+  chainBodySignatureValue = fingerprint;
   if (!rows.length) {
     state.view.chainRows = [];
     state.view.chainEmpty = emptyLabel;
@@ -1452,7 +1541,29 @@ function renderChainTable() {
 }
 
 function renderChain(payload, quote, analysisPayload) {
-  const rows = payload.data || []; state.expiration = payload.expiration;
+  const rows = payload.data || [];
+  const basis = activeBasis(quote);
+  const signature = [
+    payload?.symbol,
+    payload?.expiration,
+    payload?.fetched_at,
+    rows.length,
+    payload?.oi_fallback?.as_of,
+    payload?.oi_fallback?.restored,
+    quote?.price,
+    quote?.change_percent,
+    quote?.market_state,
+    state.levelBasisMode,
+    basis?.price,
+    basis?.label,
+    analysisPayload?.fetched_at,
+    analysisPayload?.zero_gamma?.price,
+    analysisPayload?.contract_count,
+    analysisPayload?.oi_fallback?.as_of,
+  ].join("|");
+  // 自动刷新经常拿到同一份快照。签名一致时跳过聚合、图表和表格。
+  if (signature === chainRenderSignature && state.view.chainRows.length) return;
+  state.expiration = payload.expiration;
   // 基准价开关切换时要用最近一次快照重算，这里留一份引用。
   state.lastQuote = quote || null;
   state.view.chainTitle = `${payload.symbol} · ${payload.expiration}`;
@@ -1474,6 +1585,7 @@ function renderChain(payload, quote, analysisPayload) {
   renderAnalysis(analysisRows, quote?.price, analysisPayload, rows, payload.iv_model || {}, activeBasis(quote));
   state.chainRows = rows; state.chainSpot = quote?.price ?? null;
   renderChainTable();
+  chainRenderSignature = signature;
 }
 
 // emptyLabel：本地没有到期日时的占位文案，需要区分「还没抓过」（正在获取）和「该标的没有期权」。
@@ -1569,6 +1681,10 @@ function showPending(message) {
   state.view.chainRows = [];
   state.view.chainEmpty = message;
   state.view.chainHeatNote = "等待数据";
+  chainRenderSignature = "";
+  chainBodySignatureValue = "";
+  analysisChartSignatureValue = "";
+  cancelScopeCharts();
 }
 
 function applyCachedQuote(quote) {
@@ -1595,14 +1711,14 @@ async function renderSnapshot(loadId, fallbackQuote = null) {
   const requests = [
     request(`/api/quote/${encodedSymbol}`).catch(() => null),
     expiration ? request(`/api/chain/${encodedSymbol}?expiration=${encodedExpiration}`).catch(() => null) : Promise.resolve(null),
-    request(`/api/gamma/${encodedSymbol}?horizon_days=45`).catch(() => null),
+    request(`/api/gamma/${encodedSymbol}?horizon_days=45&include_rows=false`).catch(() => null),
   ];
   const [quote, payload, analysis] = await Promise.all(requests);
   if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null };
   const resolvedQuote = quoteIsReady(quote) ? quote : fallbackQuote;
   applyCachedQuote(resolvedQuote);
   if (!payload?.data?.length) return { shown: false, source: payload?.source || resolvedQuote?.source || null, fetchedAt: payload?.fetched_at || null, quote: resolvedQuote };
-  state.analysisReady = Boolean(analysis?.data?.length) || state.analysisReady;
+  state.analysisReady = gammaProfileReady(analysis) || state.analysisReady;
   renderChain(payload, resolvedQuote, analysis);
   state.view.lastStatus = payload.source === "sqlite"
     ? `本地缓存 ${formatTime(payload.fetched_at)}`
@@ -1614,7 +1730,7 @@ async function renderSnapshot(loadId, fallbackQuote = null) {
     fetchedAt: payload.fetched_at || null,
     quote: resolvedQuote,
     payload,
-    analysisReady: Boolean(analysis?.data?.length),
+    analysisReady: gammaProfileReady(analysis),
     quoteReady: quoteIsReady(resolvedQuote),
     optionsQuotesReady: hasValidOptionQuotes(payload.data),
   };
@@ -1642,21 +1758,32 @@ async function latestSelectedChain(loadId, symbol, fallbackPayload) {
   return latest?.data?.length ? latest : fallbackPayload;
 }
 
+function gammaProfileReady(analysis) {
+  if (!analysis || analysis.status_only) return false;
+  const count = Number(analysis.contract_count);
+  if (Number.isFinite(count)) return count > 0;
+  return Boolean(analysis.data?.length);
+}
+
 // 后端 Gamma 刷新改为 SQLite 任务协调的后台任务；前端轮询任务状态，期间继续展示旧分析。
 function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt) {
-  request(`/api/gamma/${encodedSymbol}?horizon_days=45&refresh=true`)
-    .then(async (analysis) => {
+  // 任务没完成时只问状态，不把 45 天合约下载下来再解析。
+  request(`/api/gamma/${encodedSymbol}?horizon_days=45&refresh=true&status_only=true`)
+    .then(async (status) => {
       if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
-      if (analysis?.refresh?.status === "running" && attempt < 30) {
+      if (status?.refresh?.status === "running" && attempt < 30) {
         state.analysisRefreshTimer = setTimeout(() => {
           state.analysisRefreshTimer = null;
           pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt + 1);
         }, 1000);
         return;
       }
-      const selectedPayload = await latestSelectedChain(loadId, symbol, payload);
+      const [analysis, selectedPayload] = await Promise.all([
+        request(`/api/gamma/${encodedSymbol}?horizon_days=45&include_rows=false`).catch(() => null),
+        latestSelectedChain(loadId, symbol, payload),
+      ]);
       if (!selectedPayload) return;
-      if (!analysis?.data?.length) {
+      if (!gammaProfileReady(analysis)) {
         // 没有可用的新窗口数据时，至少用旧分析完成一次价位刷新，保持价位与新快照同步。
         renderChain(selectedPayload, quote, state.lastAnalysis?.analysisPayload || null);
         return;
@@ -1911,6 +2038,16 @@ async function refresh(silent = false) {
 initTheme();
 // Element UI 2.x 基于 Vue 2，必须在根实例创建前注册；静态库已经由 index.html 按依赖顺序加载。
 if (window.Vue && window.ELEMENT) Vue.use(ELEMENT);
+// 期权链单独成组件：父页面刷新报价或状态时，行数组引用不变就不重绘这张表。
+if (window.Vue) {
+  Vue.component("chain-table-body", {
+    props: {
+      rows: { type: Array, default: () => [] },
+      empty: { type: String, default: "" },
+    },
+    template: '<tbody id="chain-body"><tr v-if="!rows.length"><td colspan="7" class="empty">{{ empty }}</td></tr><tr v-for="row in rows" :key="row.key" :class="row.rowClass"><td class="num chain-strike" :class="row.typeClass">{{ row.strike }}</td><td class="num chain-heat" :class="row.volumeClass" :style="row.volumeStyle" :title="row.volumeTitle">{{ row.volume }}</td><td class="num chain-heat" :class="row.interestClass" :style="row.interestStyle" :title="row.interestTitle">{{ row.interest }}</td><td class="num">{{ row.gamma }}</td><td class="num" :title="row.gexTitle">{{ row.gex }}</td><td class="num">{{ row.iv }}</td><td :class="row.itmClass">{{ row.itm }}</td></tr></tbody>',
+  });
+}
 const optionScopeApp = new Vue({
   el: "#app",
   data: state,
@@ -1953,7 +2090,9 @@ function redrawChartsIfResized() {
   });
   if (!changed) return;
   const { rows, spot, analysisPayload, expirationRows, ivModel, basis } = state.lastAnalysis;
+  forceChartRedraw = true;
   renderAnalysis(rows, spot, analysisPayload, expirationRows || [], ivModel || {}, basis || null);
+  forceChartRedraw = false;
 }
 
 // 窗口尺寸变化后按新尺寸重绘图表；手机滚动时地址栏收起不会改变图表宽度，此时直接跳过重绘。

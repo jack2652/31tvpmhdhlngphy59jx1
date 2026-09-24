@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import secrets
 from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +40,24 @@ def snapshot_signature(value: Any) -> str:
     """为缓存键生成稳定的输入摘要，避免仅依赖时间戳漏掉同批次数据变化。"""
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.blake2b(encoded, digest_size=16).hexdigest()
+
+
+def spot_cache_bucket(value: Any) -> float | None:
+    """把现价收成稳定格子，供价位缓存复用。
+
+    格子宽度大约是价格数量级的 1/500：200 元附近约 0.2 元。
+    半入规则与前端 Math.round 一致。未命中时仍用本次精确现价重算。
+    """
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    magnitude = 10 ** math.floor(math.log10(price))
+    step = magnitude / 500
+    units = math.floor(price / step + 0.5)
+    return round(units * step, 6)
 
 
 def install_access_guard(app: FastAPI, settings: Settings) -> None:
@@ -118,7 +137,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
     history = HistoryService(
         database, provider, settings.history_max_age_seconds, settings.extremes_max_age_seconds
     )
-    # 只缓存同一份输入快照的计算结果；快照时间或基准价变化时自然失效，不会改变算法口径。
+    # 只缓存同一份输入快照的计算结果。现价按小格子复用，跨出格子才重算；未命中时仍用精确现价。
     levels_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=32)
     gamma_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=16)
     chain_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=32)
@@ -250,8 +269,14 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         background_tasks: BackgroundTasks,
         refresh: bool = Query(default=False),
         horizon_days: int = Query(default=45, ge=1, le=365),
+        status_only: bool = Query(default=False),
+        include_rows: bool = Query(default=True),
     ) -> dict[str, Any]:
-        """返回近期期限的完整链，供 Zero Gamma/Gamma Flip 曲线使用。"""
+        """返回近期期限的链，供 Zero Gamma/Gamma Flip 曲线使用。
+
+        轮询传 status_only 时只回任务状态，避免每秒读取并序列化全部合约。
+        页面展示传 include_rows=false：仍计算零 Gamma 和模型 IV，但不把合约行送到浏览器。
+        """
         normalized = symbol(stock_symbol)
         refresh_result: dict[str, Any] | None = None
         if refresh:
@@ -263,6 +288,16 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                     normalized,
                     horizon_days,
                 )
+        if status_only:
+            job_state = refresh_result or database.analysis_job(normalized, horizon_days)
+            return {
+                "symbol": normalized,
+                "source": "sqlite",
+                "refresh": job_state,
+                "data": [],
+                "contract_count": 0,
+                "status_only": True,
+            }
         profile = database.latest_chains(normalized, horizon_days)
         quote = database.latest_quote(normalized) or {}
         rows = profile.get("data") or []
@@ -290,14 +325,19 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             lambda: shared_cached("gamma", gamma_key, compute_gamma),
         )
         job_state = refresh_result or database.analysis_job(normalized, horizon_days)
+        contracts = gamma_result["data"]
+        # 默认响应保持完整合约；页面展示不需要逐行数据时去掉这一大段，避免浏览器解析整窗合约。
+        profile_meta = {key: value for key, value in profile.items() if key != "data"}
         return {
             "symbol": normalized,
             "iv_model": gamma_result["iv_model"],
-            **profile,
-            "data": gamma_result["data"],
+            **profile_meta,
+            "data": contracts if include_rows else [],
+            "contract_count": len(contracts),
             "source": "sqlite",
             "refresh": job_state,
             "zero_gamma": gamma_result["zero_gamma"],
+            "status_only": False,
         }
 
     @router.post("/refresh/{stock_symbol}")
@@ -366,7 +406,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         cache_key = (
             normalized,
             expiration,
-            resolved_spot,
+            spot_cache_bucket(resolved_spot),
             candidate_spot,
             profile.get("fetched_at"),
             (selected_chain or {}).get("fetched_at"),

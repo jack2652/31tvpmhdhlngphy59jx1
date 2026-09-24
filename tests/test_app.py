@@ -853,9 +853,10 @@ def test_chain_table_drops_contract_column_and_price_columns():
     assert "row.last_price" not in source and "row.bid" not in source and "row.ask" not in source
     # 数据行不再渲染合约代码列。
     assert 'key: row.contract_symbol ||' in source
-    # 空态与数据行的 colspan 与列数一致。
-    assert 'colspan="7"' in html
-    assert html.count('colspan="7"') == 1
+    # 空态 colspan 跟期权链组件模板走，表头仍留在页面里，列数保持 7。
+    assert 'colspan="7"' not in html
+    assert 'colspan="7"' in source
+    assert source.count('colspan="7"') == 1
     # 期权链单元格统一居中（覆盖默认左对齐与 .num 的右对齐）。
     assert ".data-panel table th,.data-panel table td{text-align:center}" in styles
 
@@ -874,7 +875,8 @@ def test_chain_rows_heat_up_by_volume_and_open_interest():
     # 客户端只算 0~100 的相对强度，透明度区间交给 CSS 主题变量（黑夜里必须比白天更实，否则强弱看不出来）
     # 热点阈值按方向分开：绿底更亮，绿色格子更早换深色字（阈值取自两种字色的对比度交叉点）
     assert "const HEAT_HOT_LEVEL = { call: 68, put: 80 };" in source
-    assert ':style="row.volumeStyle"' in html and ':style="row.interestStyle"' in html
+    assert ':style="row.volumeStyle"' in source and ':style="row.interestStyle"' in source
+    assert ':style="row.volumeStyle"' not in html and ':style="row.interestStyle"' not in html
     assert 'style: percent == null ? "" : `--heat:${percent}`' in source
     assert "color-mix(in srgb,var(--heat-tone) calc((var(--heat-floor) + var(--heat-gain) * var(--heat) / 100) * 1%),transparent)" in styles
     assert "--heat-floor:10;--heat-gain:68;--heat-tone-up:#34e0a1;--heat-tone-down:#ff8fa0;--heat-ink:#06211a" in styles
@@ -1397,6 +1399,47 @@ def test_chain_and_gamma_endpoints_expose_model_iv(tmp_path: Path):
         assert profile["data"][0]["model_iv"] > 0
 
 
+def test_gamma_status_only_skips_rows_until_display_request(tmp_path: Path):
+    """Gamma 轮询只回任务状态；展示请求可以不要合约行，默认响应仍保留完整行。"""
+    database = Database(tmp_path / "options.db")
+    service = SnapshotService(database, FakeProvider())
+    service.refresh("AAPL", "2026-12-18")
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    router = create_router(database, service, FakeProvider(), settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        status = client.get("/api/gamma/AAPL", params={"horizon_days": 365, "status_only": True}).json()
+        assert status["status_only"] is True
+        assert status["data"] == []
+        assert status["contract_count"] == 0
+        assert "iv_model" not in status
+        slim = client.get("/api/gamma/AAPL", params={"horizon_days": 365, "include_rows": False}).json()
+        assert slim["status_only"] is False
+        assert slim["data"] == []
+        assert slim["contract_count"] == 2
+        assert slim["iv_model"]["2026-12-18"]["iv"] > 0
+        assert "zero_gamma" in slim
+        full = client.get("/api/gamma/AAPL", params={"horizon_days": 365}).json()
+        assert full["status_only"] is False
+        assert len(full["data"]) == full["contract_count"] == 2
+        assert full["data"][0]["model_iv"] > 0
+
+
+def test_frontend_skips_repeated_chain_and_gamma_work():
+    """前端不再为轮询下载整窗合约，价位键按格子去重，期权链表格独立成组件。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    html = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "status_only=true" in source
+    assert "include_rows=false" in source
+    assert "function spotCacheBucket(value)" in source
+    assert "function gammaProfileReady(analysis)" in source
+    assert 'Vue.component("chain-table-body"' in source
+    assert 'is="chain-table-body"' in html
+    assert "function gammaAtSpot(spot, row, expiration)" in source
+    assert "scheduleScopeCharts" in source
+
+
 def test_analysis_panels_share_selected_expiration():
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     # Gamma 敞口与两张分布图统一只统计上方所选到期日
@@ -1616,7 +1659,7 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
     assert "refreshAnalysisWindow(loadId, payload, resolvedQuote);" in source
     assert "async function latestSelectedChain(loadId, symbol, fallbackPayload)" in source
-    assert "const selectedPayload = await latestSelectedChain(loadId, symbol, payload);" in source
+    assert "latestSelectedChain(loadId, symbol, payload)," in source
     assert "?horizon_days=45&refresh=true" in source
     # 首次拿到选中期限的链后立即请求综合价位，不再等待慢速的跨期限 Gamma 窗口。
     assert "loadFactorLevels(points, levelSpot);" in source
@@ -2260,6 +2303,14 @@ def test_levels_endpoint_combines_factors(tmp_path: Path):
                 assert point["history_samples"] >= 0
 
 
+def test_spot_cache_bucket_groups_nearby_prices():
+    """价位缓存格子：200 元附近约 0.2 元，相邻报价共用一格，离开格子后分开。"""
+    assert api_module.spot_cache_bucket(200.50) == api_module.spot_cache_bucket(200.55)
+    assert api_module.spot_cache_bucket(200.50) != api_module.spot_cache_bucket(199.0)
+    assert api_module.spot_cache_bucket(None) is None
+    assert api_module.spot_cache_bucket(-1) is None
+
+
 def test_levels_endpoint_reuses_same_snapshot_analysis(tmp_path: Path, monkeypatch):
     """同一输入快照重复读取时只执行一次价位合成，快照变化后缓存键会自然失效。"""
     database = Database(tmp_path / "options.db")
@@ -2283,6 +2334,34 @@ def test_levels_endpoint_reuses_same_snapshot_analysis(tmp_path: Path, monkeypat
     assert first.status_code == 200 and second.status_code == 200
     assert first.json()["support"] == second.json()["support"]
     assert calls["count"] == 1
+
+
+def test_levels_endpoint_reuses_nearby_spot_bucket(tmp_path: Path, monkeypatch):
+    """同一格子内的现价只合成一次价位；跨出格子后用本次精确现价重算。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote(), sample_rows(), iso())
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    service = SnapshotService(database, FakeProvider())
+    spots: list[float] = []
+    original = api_module.build_levels
+
+    def counted_build_levels(*args, **kwargs):
+        spots.append(float(args[2]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(api_module, "build_levels", counted_build_levels)
+    router = create_router(database, service, FakeProvider(), settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        near = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18", "spot": 200.50})
+        nearby = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18", "spot": 200.55})
+        outside = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18", "spot": 199.0})
+    assert near.status_code == nearby.status_code == outside.status_code == 200
+    assert spots == pytest.approx([200.50, 199.0])
+    assert near.json()["spot"] == pytest.approx(200.50)
+    assert nearby.json()["spot"] == pytest.approx(200.50)
+    assert outside.json()["spot"] == pytest.approx(199.0)
 
 
 def test_levels_endpoint_uses_previous_close_as_stable_candidate_anchor(tmp_path: Path):
