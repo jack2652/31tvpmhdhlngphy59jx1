@@ -18,6 +18,7 @@ from urllib.parse import quote
 from urllib.request import Request, ProxyHandler, build_opener
 
 from app.providers.market import MARKET_TIMEZONE, ProviderError, MarketDataProvider, current_session_state, safe_value
+from app.runtime import low_memory_enabled
 from app.services.concurrency import SingleFlight, UpstreamBusyError, UpstreamGate
 
 
@@ -124,6 +125,9 @@ class CboeOptionsProvider:
             if not isinstance(data, dict) or not isinstance(data.get("options"), list):
                 raise ProviderError(f"Cboe 返回 {normalized} 的期权链格式无效")
             with self._cache_lock:
+                # 整份延迟链很大。小内存机器只留最近一个标的，避免换标的后旧链还占着堆。
+                if low_memory_enabled():
+                    self._cache.clear()
                 self._cache[normalized] = (monotonic(), payload)
             return payload
 
@@ -211,7 +215,6 @@ class CboeOptionsProvider:
                 "in_the_money": in_the_money,
                 "change_percent": safe_value(raw.get("percent_change")),
                 "provider": self.name,
-                "raw": dict(raw),
             })
         if not rows:
             raise ProviderError(f"Cboe 没有 {normalized} {expiration} 的期权数据")

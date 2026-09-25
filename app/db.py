@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from app.runtime import low_memory_enabled
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,8 @@ class Database:
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 启动时定下来，避免每条 SQL 都再读一次 cgroup。
+        self.low_memory = low_memory_enabled()
         self.initialize()
 
     def connect(self) -> sqlite3.Connection:
@@ -54,7 +58,24 @@ class Database:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA foreign_keys=ON")
+        if self.low_memory:
+            # 页缓存按 KiB 计，-256 是 256KiB。关掉 mmap，临时表落盘，WAL 更早合并。
+            connection.execute("PRAGMA cache_size=-256")
+            connection.execute("PRAGMA mmap_size=0")
+            connection.execute("PRAGMA temp_store=FILE")
+            connection.execute("PRAGMA wal_autocheckpoint=200")
         return connection
+
+    def _passive_checkpoint(self) -> None:
+        """把 WAL 合并回主库，但不为了缩小文件再复制一整份数据库。"""
+        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        try:
+            connection.execute("PRAGMA busy_timeout=30000")
+            connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.Error:
+            logger.warning("PASSIVE checkpoint 失败", exc_info=True)
+        finally:
+            connection.close()
 
     def initialize(self) -> None:
         with self.connect() as connection:
@@ -147,6 +168,12 @@ class Database:
                 );
 
                 CREATE TABLE IF NOT EXISTS beta_snapshots (
+                    symbol TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS earnings_snapshots (
                     symbol TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
                     fetched_at TEXT NOT NULL
@@ -397,6 +424,8 @@ class Database:
                    WHERE excluded.fetched_at >= option_latest_batches.fetched_at""",
                 sorted({(row["symbol"], row["expiration"], fetched_at) for row in option_rows}),
             )
+        if self.low_memory:
+            self._passive_checkpoint()
         return len(option_rows)
 
     def latest_quote(self, symbol: str) -> dict[str, Any] | None:
@@ -507,6 +536,30 @@ class Database:
         if not isinstance(payload, dict):
             return None
         return {"beta": payload, "fetched_at": str(row["fetched_at"])}
+
+    def write_earnings(self, symbol: str, payload: dict[str, Any], fetched_at: str) -> None:
+        """只缓存财报日期。是否落在交易日窗口内由请求时计算，不写进这份缓存。"""
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO earnings_snapshots(symbol, payload, fetched_at) VALUES (?, ?, ?)",
+                (symbol, json.dumps(payload, ensure_ascii=False), fetched_at),
+            )
+
+    def latest_earnings(self, symbol: str) -> dict[str, Any] | None:
+        """返回财报日期缓存；缓存损坏或日期不是列表时按无缓存处理。"""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload, fetched_at FROM earnings_snapshots WHERE symbol=?", (symbol,)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("dates"), list):
+            return None
+        return {"dates": [str(item) for item in payload["dates"]], "fetched_at": str(row["fetched_at"])}
 
     def latest_expirations(self, symbol: str) -> list[str]:
         with self.connect() as connection:
@@ -846,7 +899,12 @@ class Database:
 
         WAL 模式下删除只会在 WAL 里留下可用页，主库文件要等 checkpoint 才会真正缩小，
         因此这里先做一次 checkpoint，VACUUM 之后再 checkpoint 一次把体积落盘。
+        低内存机器通常也是小磁盘，VACUUM 的整库复制可能直接把容器写满或打爆内存。
         """
+        if self.low_memory:
+            self._passive_checkpoint()
+            logger.info("低内存保护：跳过 VACUUM，仅做 PASSIVE checkpoint")
+            return False
         size = self.path.stat().st_size if self.path.exists() else 0
         free = shutil.disk_usage(self.path.parent).free
         if free < size * 1.2:

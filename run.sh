@@ -651,6 +651,40 @@ cgroup_mem_limit_mb() {
   esac
 }
 
+# auto/true 且内存不超过 512MB 时，启动前限制 glibc arena。
+low_memory_requested() {
+  local value limit
+  value="$(read_env_value LOW_MEMORY auto)"
+  value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1 | true | yes | on) return 0 ;;
+    0 | false | no | off) return 1 ;;
+  esac
+  limit="$(cgroup_mem_limit_mb)"
+  if [ -z "$limit" ]; then
+    limit="$(mem_total_mb)"
+  fi
+  case "$limit" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ "$limit" -le 512 ]
+}
+
+# 在子 shell 里导出分配器参数，避免菜单进程自己被这些变量粘住。
+apply_low_memory_allocator() {
+  if low_memory_requested; then
+    export MALLOC_ARENA_MAX=1
+    export MALLOC_TRIM_THRESHOLD_=131072
+    export MALLOC_MMAP_THRESHOLD_=131072
+    export PYTHONDONTWRITEBYTECODE=1
+    export OPTION_SCOPE_LOW_MEMORY_REEXEC=1
+    printf '[%s] 低内存保护：已限制 malloc arena，重任务将串行执行\n' "$(timestamp)" >>"$APP_LOG"
+    return 0
+  fi
+  unset MALLOC_ARENA_MAX MALLOC_TRIM_THRESHOLD_ MALLOC_MMAP_THRESHOLD_ OPTION_SCOPE_LOW_MEMORY_REEXEC
+  return 0
+}
+
 # 一行内存概况：可用 / 总量 / Swap / 容器上限
 memory_summary() {
   local avail total swap limit text
@@ -746,8 +780,9 @@ start_app_internal() {
   fi
   mkdir -p "$RUN_DIR" "$LOG_DIR"
   printf '[%s] 启动应用：%s -m app（端口 %s）\n' "$(timestamp)" "$py" "$port" >>"$APP_LOG"
-  # 工作目录必须是项目根目录：python -m app 与进程识别（/proc/<pid>/cwd）都依赖它
-  ( cd "$PROJECT_DIR" && spawn_detached "$APP_LOG" "$py" -m app )
+  # 工作目录必须是项目根目录：python -m app 与进程识别（/proc/<pid>/cwd）都依赖它。
+  # 分配器环境变量只传给应用进程。
+  ( cd "$PROJECT_DIR" && apply_low_memory_allocator && spawn_detached "$APP_LOG" "$py" -m app )
   while [ "$waited" -lt "$START_TIMEOUT" ]; do
     sleep 1
     waited=$((waited + 1))
@@ -902,7 +937,7 @@ watchdog_loop() {
       rotate_log_if_needed "$APP_LOG"
       pid="$(app_pid 2>/dev/null || true)"
       if [ -z "$pid" ]; then
-        wd_log "应用未在运行，尝试拉起"
+        wd_log "应用未在运行，尝试拉起（$(memory_summary)）"
         fails=0
         if start_app_internal >/dev/null 2>&1; then
           wd_log "应用已恢复"
@@ -1077,10 +1112,11 @@ show_config_summary() {
   printf ' 15) UPSTREAM_WAIT_SECONDS=%s\n' "$(read_env_value UPSTREAM_WAIT_SECONDS 20)"
   printf ' 16) WEB_WORKERS=%s\n' "$(read_env_value WEB_WORKERS 1)"
   printf ' 17) AUTO_REFRESH_SECONDS=%s\n' "$(read_env_value AUTO_REFRESH_SECONDS 30)"
+  printf ' 18) LOW_MEMORY=%s\n' "$(read_env_value LOW_MEMORY auto)"
 }
 
 validate_config_values() {
-  local port limit workers concurrency wait_seconds auto_refresh
+  local port limit workers concurrency wait_seconds auto_refresh low_memory
   port="$(read_env_value PORT 8000)"
   case "$port" in
     '' | *[!0-9]*)
@@ -1095,7 +1131,7 @@ validate_config_values() {
   case "$(printf '%s' "$limit" | tr '[:lower:]' '[:upper:]')" in
     '' | *[!0-9MG]*) warn "DATABASE_MAX_MB=$limit 写法可能不合法，应用启动时会报错" ;;
   esac
-  workers="$(read_env_value WEB_WORKERS 2)"
+  workers="$(read_env_value WEB_WORKERS 1)"
   concurrency="$(read_env_value UPSTREAM_CONCURRENCY 6)"
   wait_seconds="$(read_env_value UPSTREAM_WAIT_SECONDS 20)"
   case "$workers" in '' | *[!0-9]*) fail "WEB_WORKERS 必须是正整数"; return 1 ;; esac
@@ -1107,6 +1143,11 @@ validate_config_values() {
   auto_refresh="$(read_env_value AUTO_REFRESH_SECONDS 60)"
   case "$auto_refresh" in '' | *[!0-9]*) fail "AUTO_REFRESH_SECONDS 必须是正整数"; return 1 ;; esac
   [ "$auto_refresh" -ge 1 ] || { fail "AUTO_REFRESH_SECONDS 必须大于等于 1"; return 1; }
+  low_memory="$(read_env_value LOW_MEMORY auto)"
+  case "$(printf '%s' "$low_memory" | tr '[:upper:]' '[:lower:]')" in
+    '' | auto | true | false | 1 | 0 | yes | no | on | off) ;;
+    *) fail "LOW_MEMORY 只能是 auto、true 或 false"; return 1 ;;
+  esac
   return 0
 }
 
@@ -1137,8 +1178,9 @@ action_config() {
       13) ask_env_value SCHEDULER_ENABLED "是否启用后台刷新和清理（true/false）" ;;
       14) ask_env_value UPSTREAM_CONCURRENCY "单进程上游最大并发数" ;;
       15) ask_env_value UPSTREAM_WAIT_SECONDS "等待上游并发槽位的最长秒数" ;;
-      16) ask_env_value WEB_WORKERS "Web worker 数量（建议 2-4）" ;;
+      16) ask_env_value WEB_WORKERS "Web worker 数量（小内存机器保持 1）" ;;
       17) ask_env_value AUTO_REFRESH_SECONDS "页面自动刷新间隔（秒）" ;;
+      18) ask_env_value LOW_MEMORY "低内存保护（auto/true/false，512MB 及以下自动开启）" ;;
       0 | "") break ;;
       *) warn "无效选择：$choice" ;;
     esac

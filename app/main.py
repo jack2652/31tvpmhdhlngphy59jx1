@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,6 +19,7 @@ from app.db import Database
 from app.http import ETagMiddleware
 from app.providers.market import HybridMarketDataProvider, MarketDataProvider
 from app.providers.cboe import CboeOptionsProvider
+from app.runtime import memory_limit_mb, release_memory
 from app.services.scheduler import Scheduler
 from app.services.concurrency import UpstreamGate
 from app.services.snapshots import SnapshotService
@@ -43,14 +45,26 @@ if not app_logger.handlers:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if settings.low_memory:
+        # 更早回收临时对象，避免期权链和日线在两次刷新之间叠在一起。
+        gc.set_threshold(400, 5, 5)
+        release_memory()
+        limit = memory_limit_mb()
+        app_logger.info(
+            "低内存保护已启用：内存上限 %sMB，重任务串行，分析缓存 %s 条",
+            limit if limit is not None else "未知",
+            settings.analysis_cache_entries,
+        )
     await scheduler.start()
     yield
     await scheduler.stop()
 
 
 app = FastAPI(title="Option Scope", version="0.1.0", lifespan=lifespan)
-app.add_middleware(GZipMiddleware, minimum_size=1024)
-app.add_middleware(ETagMiddleware)
+# gzip 和 ETag 都要先把整份响应收进内存。256MB 机器上这一份拷贝就可能把进程打爆。
+if not settings.low_memory:
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.add_middleware(ETagMiddleware)
 install_access_guard(app, settings)
 app.include_router(create_router(database, snapshots, provider, settings))
 static_dir = Path(__file__).parent / "static"

@@ -19,7 +19,9 @@ from app.db import Database, iso, parse_sessions
 from app.gamma import annotate_model_greeks, find_zero_gamma
 from app.levels import build_levels
 from app.providers.market import ProviderError, MarketDataProvider
-from app.services.concurrency import SingleFlightCache
+from app.runtime import release_memory
+from app.services.concurrency import SingleFlightCache, get_heavy_gate
+from app.services.earnings import summarize_earnings
 from app.services.history import HistoryService
 from app.services.snapshots import SnapshotService, active_expirations, market_today
 
@@ -170,9 +172,10 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         database, provider, settings.history_max_age_seconds, settings.extremes_max_age_seconds
     )
     # 只缓存同一份输入快照的计算结果。现价按小格子复用，跨出格子才重算；未命中时仍用精确现价。
-    levels_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=32)
-    gamma_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=16)
-    chain_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=32)
+    # 低内存机器只留当前标的的计算结果，避免几十份期权链同时待在进程里。
+    levels_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=2 if settings.low_memory else 32)
+    gamma_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=2 if settings.low_memory else 16)
+    chain_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=2 if settings.low_memory else 32)
 
     def shared_cached(
         namespace: str,
@@ -185,7 +188,11 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         if isinstance(stored, dict):
             return stored
         value = callback()
-        database.put_analysis_cache(shared_key, value)
+        bulky = settings.low_memory and (
+            namespace == "chain" or (namespace == "gamma" and bool(value.get("data")))
+        )
+        if not bulky:
+            database.put_analysis_cache(shared_key, value, settings.analysis_cache_entries)
         return value
 
     def run_gamma_refresh(job_key: str, symbol_name: str, horizon_days: int) -> None:
@@ -330,47 +337,80 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 "contract_count": 0,
                 "status_only": True,
             }
-        profile = database.latest_chains(normalized, horizon_days)
-        quote = database.latest_quote(normalized) or {}
-        rows = profile.get("data") or []
-        quote_price = quote.get("price")
-        gamma_key = (
-            normalized,
-            horizon_days,
-            profile.get("fetched_at"),
-            profile.get("oi_fallback", {}).get("as_of"),
-            quote_price,
-            snapshot_signature(rows),
-        )
+        # 整窗合约是小内存机器上最大的一块临时对象。已有刷新时直接降级，连窗口都不再读出来。
+        held_gate = None
+        if settings.low_memory:
+            candidate = get_heavy_gate()
+            if not candidate.acquire(timeout=0):
+                job_state = refresh_result or database.analysis_job(normalized, horizon_days)
+                return {
+                    "symbol": normalized,
+                    "source": "sqlite",
+                    "refresh": job_state,
+                    "data": [],
+                    "contract_count": 0,
+                    "iv_model": {},
+                    "zero_gamma": None,
+                    "status_only": False,
+                    "degraded": True,
+                    "warning": "内存保护：已有刷新在进行，Gamma 窗口稍后计算",
+                }
+            held_gate = candidate
+        try:
+            profile = database.latest_chains(normalized, horizon_days)
+            quote = database.latest_quote(normalized) or {}
+            rows = profile.get("data") or []
+            quote_price = quote.get("price")
+            gamma_key = (
+                normalized,
+                horizon_days,
+                include_rows,
+                profile.get("fetched_at"),
+                profile.get("oi_fallback", {}).get("as_of"),
+                quote_price,
+                snapshot_signature(rows),
+            )
 
-        def compute_gamma() -> dict[str, Any]:
-            analysis_rows = [dict(row) for row in rows]
-            iv_model = annotate_model_greeks(analysis_rows, quote_price)
+            def compute_gamma() -> dict[str, Any]:
+                analysis_rows = [dict(row) for row in rows]
+                iv_model = annotate_model_greeks(analysis_rows, quote_price)
+                zero_gamma = find_zero_gamma(analysis_rows, quote_price)
+                contract_count = len(analysis_rows)
+                # 页面只要汇总时丢掉合约副本，避免精简缓存再留一份整窗期权链。
+                if include_rows:
+                    stored_rows = analysis_rows
+                else:
+                    stored_rows = []
+                    analysis_rows.clear()
+                return {
+                    "data": stored_rows,
+                    "contract_count": contract_count,
+                    "iv_model": iv_model,
+                    "zero_gamma": zero_gamma,
+                }
+
+            gamma_result = gamma_cache.get_or_compute(
+                gamma_key,
+                lambda: shared_cached("gamma", gamma_key, compute_gamma),
+            )
+            job_state = refresh_result or database.analysis_job(normalized, horizon_days)
+            contracts = gamma_result.get("data") or []
+            # 默认响应保持完整合约；页面展示不需要逐行数据时去掉这一大段，避免浏览器解析整窗合约。
+            profile_meta = {key: value for key, value in profile.items() if key != "data"}
             return {
-                "data": analysis_rows,
-                "iv_model": iv_model,
-                "zero_gamma": find_zero_gamma(analysis_rows, quote_price),
+                "symbol": normalized,
+                "iv_model": gamma_result["iv_model"],
+                **profile_meta,
+                "data": contracts if include_rows else [],
+                "contract_count": gamma_result.get("contract_count", len(contracts)),
+                "source": "sqlite",
+                "refresh": job_state,
+                "zero_gamma": gamma_result["zero_gamma"],
+                "status_only": False,
             }
-
-        gamma_result = gamma_cache.get_or_compute(
-            gamma_key,
-            lambda: shared_cached("gamma", gamma_key, compute_gamma),
-        )
-        job_state = refresh_result or database.analysis_job(normalized, horizon_days)
-        contracts = gamma_result["data"]
-        # 默认响应保持完整合约；页面展示不需要逐行数据时去掉这一大段，避免浏览器解析整窗合约。
-        profile_meta = {key: value for key, value in profile.items() if key != "data"}
-        return {
-            "symbol": normalized,
-            "iv_model": gamma_result["iv_model"],
-            **profile_meta,
-            "data": contracts if include_rows else [],
-            "contract_count": len(contracts),
-            "source": "sqlite",
-            "refresh": job_state,
-            "zero_gamma": gamma_result["zero_gamma"],
-            "status_only": False,
-        }
+        finally:
+            if held_gate is not None:
+                held_gate.release()
 
     @router.post("/refresh/{stock_symbol}")
     def refresh(stock_symbol: str, expiration: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"), max_age: int = Query(default=60, ge=0, le=3600)) -> dict[str, Any]:
@@ -383,6 +423,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             cached_quote = database.latest_quote(normalized)
             if cached_quote:
                 result["quote"] = quote_response(cached_quote, "sqlite")
+            # 到期日跟快照一起返回，页面不必再为了下拉框单独回源一次。
+            result["expirations"] = active_expirations(database.latest_expirations(normalized))
             return result
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -420,12 +462,49 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         fetched_values = [value for value in (profile.get("fetched_at"), (selected_chain or {}).get("fetched_at")) if value]
         history_payload = history.bars(normalized)
         # 极值和 Beta 使用不同缓存/锁；并行读取可以缩短首次加载等待。Beta 复用已经取回的两年日线，
-        # 避免同一请求再次向行情源请求同一份标的数据。
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="levels-input") as executor:
-            extremes_future = executor.submit(history.extremes, normalized)
-            beta_future = executor.submit(history.beta, normalized, history_payload.get("bars") or None)
-            extremes_payload = extremes_future.result()
-            beta_payload = beta_future.result()
+        # 避免同一请求再次向行情源请求同一份标的数据。财报日期同样并行，失败不能拖垮价位接口。
+        earnings_payload: dict[str, Any] = {
+            "dates": [],
+            "fetched_at": None,
+            "source": "none",
+            "warning": "财报日期读取失败",
+        }
+
+        def load_level_inputs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+            extremes_value = history.extremes(normalized)
+            beta_value = history.beta(normalized, history_payload.get("bars") or None)
+            earnings_value = {
+                "dates": [],
+                "fetched_at": None,
+                "source": "none",
+                "warning": "财报日期读取失败",
+            }
+            try:
+                loaded_earnings = history.earnings(normalized)
+            except Exception as exc:
+                earnings_value["warning"] = str(exc)
+            else:
+                if isinstance(loaded_earnings, dict):
+                    earnings_value = loaded_earnings
+            return extremes_value, beta_value, earnings_value
+
+        # 三个日线任务各自都会进重任务闸门。低内存时串行，避免线程池把三份结果同时堆在内存里。
+        if settings.low_memory:
+            extremes_payload, beta_payload, earnings_payload = load_level_inputs()
+        else:
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="levels-input") as executor:
+                extremes_future = executor.submit(history.extremes, normalized)
+                beta_future = executor.submit(history.beta, normalized, history_payload.get("bars") or None)
+                earnings_future = executor.submit(history.earnings, normalized)
+                extremes_payload = extremes_future.result()
+                beta_payload = beta_future.result()
+                try:
+                    loaded_earnings = earnings_future.result()
+                except Exception as exc:
+                    earnings_payload["warning"] = str(exc)
+                else:
+                    if isinstance(loaded_earnings, dict):
+                        earnings_payload = loaded_earnings
         resolved_spot = spot if spot is not None else quote.get("price")
         # 候选池使用昨收作为日内稳定锚点；最新价只负责当前侧别、距离和触及概率。
         # 这样盘中价格小幅波动时不会反复重建相邻价位簇，昨收缺失时才回退最新价。
@@ -466,7 +545,19 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 ),
             ),
         )
+        if settings.low_memory:
+            del option_rows
+            release_memory()
         bars = list(history_payload.get("bars") or [])
+        # 窗口内外按本次请求的美东日期判断，挂在缓存结果之后，避免把财报写进 levels 缓存。
+        earnings_dates = earnings_payload.get("dates")
+        earnings = summarize_earnings(
+            earnings_dates if isinstance(earnings_dates, list) else None,
+            market_today(),
+        )
+        earnings["fetched_at"] = earnings_payload.get("fetched_at")
+        earnings["source"] = earnings_payload.get("source")
+        earnings["warning"] = earnings_payload.get("warning")
         return {
             "symbol": normalized,
             "chain_fetched_at": max(fetched_values) if fetched_values else None,
@@ -494,6 +585,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 "warning": beta_payload.get("warning"),
             },
             **computed,
+            "earnings": earnings,
         }
 
     @router.get("/status/{stock_symbol}")

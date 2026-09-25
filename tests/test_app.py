@@ -28,12 +28,14 @@ from app.providers.market import (
     MarketDataProvider,
     current_session_state,
     is_session_trading_day,
+    parse_earnings_dates,
     regular_session_open,
     safe_value,
     summarize_extended_hours,
 )
 from app.providers.cboe import CboeOptionsProvider, parse_occ_option
-from app.services.history import HistoryService, calculate_beta
+from app.services.earnings import summarize_earnings
+from app.services.history import EARNINGS_MAX_AGE_SECONDS, HistoryService, calculate_beta
 from app.services.concurrency import SingleFlight, UpstreamGate
 from app.services.market_calendar import is_regular_session, is_trading_day
 from app.http import ETagMiddleware
@@ -2368,6 +2370,7 @@ def test_levels_endpoint_combines_factors(tmp_path: Path):
         assert payload["trend_market"]["previous_close"] == pytest.approx(sample_bars()[-1]["close"])
         assert payload["beta"]["benchmark"] == "标普500"
         assert payload["beta"]["period_label"] == "2年"
+        assert payload["earnings"]["status"] == "unknown"
         for side in ("resistance", "support"):
             assert 0 < len(payload[side]) <= 10
             for item in payload[side]:
@@ -2704,7 +2707,7 @@ def test_frontend_confirms_trade_point_before_replacing_it():
     assert "function stabilizeTradePoints(points, context)" in source
     assert "nextCount >= TRADE_POINT_CONFIRMATIONS" in source
     assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
-    assert "综合评分 {{ item.confidence }}" in page
+    assert "估算评分 {{ item.confidence }}" in page
     assert "{{ item.historySummary }}" in page
 
 
@@ -3455,3 +3458,176 @@ def test_access_key_supports_browsers_with_disabled_storage():
     assert "state.accessKey = queryKey;" in source
     # 首屏主题脚本也不能因为存储被禁用而抛错。
     assert "catch(error){}document.documentElement.dataset.theme=theme;" in page
+
+
+def test_summarize_earnings_window_includes_holiday_between_sessions():
+    """财报日只要落在未来交易日窗口起止之间就算窗口内，即使当天休市。"""
+    inside = summarize_earnings(["2026-09-30"], date(2026, 9, 25))
+    outside = summarize_earnings(["2026-10-08"], date(2026, 9, 25))
+    unknown = summarize_earnings(["2026-09-01"], date(2026, 9, 25))
+    weekend = summarize_earnings(["2026-09-29"], date(2026, 9, 26))
+    thanksgiving = summarize_earnings(["2026-11-26"], date(2026, 11, 25))
+    assert inside["status"] == "inside"
+    assert inside["date"] == "2026-09-30"
+    assert inside["window_start"] == "2026-09-25"
+    assert inside["window_end"] == "2026-10-01"
+    assert outside["status"] == "outside"
+    assert unknown["status"] == "unknown"
+    assert unknown["date"] is None
+    assert weekend["status"] == "inside"
+    assert weekend["window_start"] == "2026-09-28"
+    assert thanksgiving["status"] == "inside"
+    assert thanksgiving["window_start"] == "2026-11-25"
+    assert thanksgiving["window_end"] == "2026-12-02"
+
+
+def test_parse_earnings_dates_uses_new_york_calendar_day():
+    """尚未公布的 EPS 才保留，并且按美东日期而不是 UTC 日期。"""
+    frame = pd.DataFrame(
+        {"Reported EPS": [float("nan"), 1.25, "-"]},
+        index=pd.to_datetime([
+            "2026-10-08 03:30:00+00:00",
+            "2026-07-30 20:00:00+00:00",
+            "2026-11-05 21:00:00+00:00",
+        ]),
+    )
+    assert parse_earnings_dates(frame) == ["2026-10-07", "2026-11-05"]
+    assert parse_earnings_dates(frame.drop(columns=["Reported EPS"])) == []
+
+
+def test_hybrid_provider_delegates_earnings_dates():
+    """混合行情源不继承主行情类，财报日期必须转给常规适配器。"""
+    class Regular(FakeProvider):
+        def earnings_dates(self, symbol: str) -> list[str]:
+            return ["2026-10-07"]
+
+    provider = HybridMarketDataProvider(Regular(), FakeProvider())
+    assert provider.earnings_dates("aapl") == ["2026-10-07"]
+
+
+def test_history_service_caches_earnings_dates(tmp_path: Path):
+    """财报日期在新鲜期内复用 SQLite；上游失败或缺少方法时不抛错。"""
+    database = Database(tmp_path / "options.db")
+
+    class CountingProvider(FakeProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def earnings_dates(self, symbol: str) -> list[str]:
+            self.calls += 1
+            return ["2026-10-08"]
+
+    provider = CountingProvider()
+    service = HistoryService(database, provider)
+    first = service.earnings("aapl")
+    second = service.earnings("AAPL")
+    assert first["source"] == "upstream"
+    assert first["dates"] == ["2026-10-08"]
+    assert second["source"] == "sqlite"
+    assert provider.calls == 1
+
+    class FailingProvider(FakeProvider):
+        def earnings_dates(self, symbol: str) -> list[str]:
+            raise ProviderError("财报接口不可用")
+
+    stale_at = iso(utc_now() - timedelta(seconds=EARNINGS_MAX_AGE_SECONDS + 60))
+    database.write_earnings("AAPL", {"dates": ["2026-01-02"]}, stale_at)
+    failed = HistoryService(database, FailingProvider()).earnings("AAPL")
+    assert failed["dates"] == ["2026-01-02"]
+    assert failed["source"] == "sqlite"
+    assert failed["warning"]
+
+    missing = HistoryService(database, FakeProvider()).earnings("MSFT")
+    assert missing["source"] == "none"
+    assert missing["dates"] == []
+    assert database.latest_earnings("MSFT") is None
+
+
+def test_earnings_refresh_timeout_returns_without_raising(tmp_path: Path, monkeypatch):
+    """等待财报刷新租约超时时返回空结果，不能把价位接口打成 500。"""
+    database = Database(tmp_path / "options.db")
+    assert database.try_acquire_lease("history:earnings:AAPL", "other", 120) is True
+    monkeypatch.setattr("app.services.history.HISTORY_WAIT_SECONDS", 0)
+
+    class BlockingProvider(FakeProvider):
+        def earnings_dates(self, symbol: str) -> list[str]:
+            raise AssertionError("租约未拿到时不应请求上游")
+
+    result = HistoryService(database, BlockingProvider()).earnings("AAPL")
+    assert result["source"] == "none"
+    assert result["dates"] == []
+    assert "超时" in (result["warning"] or "")
+
+
+def test_levels_endpoint_reports_earnings_inside_window(tmp_path: Path, monkeypatch):
+    """财报日期按请求当天判断窗口，并且第二次请求复用日期缓存。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote(), sample_rows(), iso())
+    today = {"value": date(2026, 9, 25)}
+    monkeypatch.setattr(api_module, "market_today", lambda: today["value"])
+
+    class EarningsProvider(FakeProvider):
+        def __init__(self):
+            self.calls = 0
+
+        def earnings_dates(self, symbol: str) -> list[str]:
+            self.calls += 1
+            return ["2026-09-30"]
+
+    provider = EarningsProvider()
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    router = create_router(database, SnapshotService(database, provider), provider, settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        first = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18"})
+        assert first.status_code == 200
+        payload = first.json()
+        assert payload["earnings"]["status"] == "inside"
+        assert payload["earnings"]["date"] == "2026-09-30"
+        assert payload["earnings"]["source"] == "upstream"
+        today["value"] = date(2026, 8, 3)
+        second = client.get("/api/levels/AAPL", params={"expiration": "2026-12-18"}).json()
+        assert second["earnings"]["status"] == "outside"
+        assert second["earnings"]["source"] == "sqlite"
+        assert provider.calls == 1
+
+
+def test_cleanup_keeps_earnings_snapshots(tmp_path: Path):
+    """保留天数清理不删除财报日期缓存。"""
+    database = Database(tmp_path / "options.db")
+    database.write_earnings("AAPL", {"dates": ["2026-09-30"]}, iso(utc_now() - timedelta(days=40)))
+    deleted = database.cleanup(30)
+    assert "earnings" not in deleted
+    assert database.latest_earnings("AAPL")["dates"] == ["2026-09-30"]
+
+
+def test_frontend_marks_quote_reference_estimates_and_earnings():
+    """现货基准、估算标记和财报提示都要出现在页面上，而且报价刷新不能清掉财报芯片。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
+    assert "function quoteReference(quote)" in source
+    assert "相对昨收" in source
+    assert "相对收盘" in source
+    assert "相对前收" in source
+    assert "sessions.post?.reference_close" in source
+    assert "· 估算" in source
+    assert "财报日期未知" in source
+    assert "估算评分" in page
+    assert "不是胜率" in source
+    assert "规则估算，不是下单指令，也不包含财报跳空" in source
+    assert 'id="quote-reference"' in page
+    assert 'id="quote-earnings"' in page
+    assert "估算 {{ item.score }}" in page
+    factor = source[source.index("function renderFactorLevels"):source.index("function formatStructureDelta")]
+    assert factor.index("applyEarnings(") < factor.index("renderBuyerStructures(")
+    assert factor.index("applyEarnings(") < factor.index("renderTrend(")
+    pending = source[source.index("function showPending"):source.index("function applyCachedQuote")]
+    assert "quoteReference" not in pending
+    assert "resetEarningsChip()" in pending
+    cached = source[source.index("function applyCachedQuote"):source.index("async function renderSnapshot")]
+    assert "quoteReference(null)" in cached
+    assert "resetEarningsChip" not in cached
+    assert ".quote-earnings.inside{color:var(--amber)}" in styles
+    assert ".quote-sub{flex-wrap:wrap;row-gap:4px}" in styles

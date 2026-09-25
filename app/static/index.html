@@ -35,7 +35,7 @@
     </section>
 
     <section class="headline-grid">
-      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
+      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">相对昨收 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">财报日期未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
       <article class="metric panel"><div class="eyebrow">合约总数</div><strong id="total-count" v-text="view.totalCount">--</strong><span>当前到期日</span></article>
       <article class="metric call-metric panel"><div class="eyebrow">看涨成交量</div><strong id="call-volume" v-text="view.callVolume">--</strong><span id="call-interest" v-text="view.callInterest">未平仓 --</span></article>
       <article class="metric put-metric panel"><div class="eyebrow">看跌成交量</div><strong id="put-volume" v-text="view.putVolume">--</strong><span id="put-interest" v-text="view.putInterest">未平仓 --</span></article>
@@ -63,7 +63,7 @@
             <div class="analysis-heading"><div><span class="eyebrow">TREND CHANNEL</span><h2>趋势通道</h2><p id="trend-note" v-text="view.trend.note" :title="view.trend.noteTitle">等待数据</p></div></div>
             <div class="trend-body" id="trend-body">
               <div v-if="view.trend.available" class="trend-content">
-                <div class="trend-signal" :class="[view.trend.directionClass, view.trend.actionClass]"><strong class="trend-label">{{ view.trend.label }}<span v-if="view.trend.action" class="trend-action"> · {{ view.trend.action }}</span></strong><small>{{ view.trend.reason }}</small></div>
+                <div class="trend-signal" :class="[view.trend.directionClass, view.trend.actionClass]" :title="view.trend.signalTitle"><strong class="trend-label">{{ view.trend.label }}<span v-if="view.trend.action" class="trend-action"> · {{ view.trend.action }}</span></strong><small>{{ view.trend.reason }}</small></div>
                 <div class="trend-layout">
                   <div class="trend-side">
                     <div class="trend-meta trend-current-price" :title="view.trend.priceTitle"><span>{{ view.trend.priceLabel }}</span><strong>{{ view.trend.price }}</strong></div>
@@ -72,7 +72,7 @@
                   </div>
                   <div class="trend-core">
                     <div class="trend-opportunities">
-                      <div v-for="item in view.trend.opportunities" :key="item.kind" class="trend-meta trend-opportunity" :class="item.kind" :title="item.title"><span class="trend-opportunity-label"><span>{{ item.label }}</span><small>{{ item.horizon }}</small></span><strong>{{ item.range }}<small>综合评分 {{ item.confidence }}</small><small>{{ item.historySummary }}</small></strong></div>
+                      <div v-for="item in view.trend.opportunities" :key="item.kind" class="trend-meta trend-opportunity" :class="item.kind" :title="item.title"><span class="trend-opportunity-label"><span>{{ item.label }}</span><small>{{ item.horizon }}</small></span><strong>{{ item.range }}<small>估算评分 {{ item.confidence }}</small><small>{{ item.historySummary }}</small></strong></div>
                     </div>
                     <div v-for="row in view.trend.rows.slice(2)" :key="row.label" class="trend-meta" :class="row.className" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}<small v-if="row.sub">{{ row.sub }}</small></strong></div>
                   </div>
@@ -125,7 +125,7 @@
       <div class="detail-body chart-fold" id="chart-fold">
         <section class="analysis-grid">
           <article class="analysis-panel panel">
-            <div class="analysis-heading"><div><span class="eyebrow">GAMMA EXPOSURE</span><h2>Gamma 敞口</h2><p>基于 Black-Scholes 的估算 GEX，正值代表看涨支撑，负值代表看跌压力</p></div><div class="wall-badges"><span id="net-gex" v-text="view.chart.netGex">净 Gamma --</span><span id="gamma-flip" v-text="view.chart.gammaFlip">零 Gamma --</span><span id="call-wall" v-text="view.chart.callWall">看涨墙 --</span><span id="put-wall" v-text="view.chart.putWall">看跌墙 --</span><span id="gamma-scope" v-text="view.chart.gammaScope">Gamma 范围 --</span></div></div>
+            <div class="analysis-heading"><div><span class="eyebrow">GAMMA EXPOSURE</span><h2>Gamma 敞口</h2><p>基于 Black-Scholes 的估算 GEX，正值代表看涨支撑，负值代表看跌压力</p></div><div class="wall-badges"><span id="net-gex" :title="view.chart.netGexTitle" v-text="view.chart.netGex">净 Gamma --</span><span id="gamma-flip" :title="view.chart.gammaFlipTitle" v-text="view.chart.gammaFlip">零 Gamma --</span><span id="call-wall" v-text="view.chart.callWall">看涨墙 --</span><span id="put-wall" v-text="view.chart.putWall">看跌墙 --</span><span id="gamma-scope" v-text="view.chart.gammaScope">Gamma 范围 --</span></div></div>
             <div id="gex-chart" class="chart" aria-label="Gamma 敞口图"></div>
           </article>
           <article class="analysis-panel panel">
@@ -178,7 +178,7 @@
               <span class="buyer-structure-number"><strong>{{ item.delta }}</strong><small>{{ item.exposure }}</small></span>
               <span class="buyer-structure-number">{{ item.leverage }}</span>
               <span class="buyer-structure-number">{{ item.maxLoss }}</span>
-              <span class="buyer-structure-advantage"><strong>{{ item.advantage }}</strong><small>评分 {{ item.score }} · {{ item.liquidity }}</small></span>
+              <span class="buyer-structure-advantage"><strong>{{ item.advantage }}</strong><small>估算 {{ item.score }} · {{ item.liquidity }}</small></span>
             </div>
             <div class="buyer-structure-detail">
               <span class="buyer-structure-detail-main">{{ item.detail }}</span>

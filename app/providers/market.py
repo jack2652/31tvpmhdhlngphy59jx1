@@ -299,6 +299,97 @@ def load_upstream_sdk() -> Any:
     return yf
 
 
+def _earnings_reported(value: Any) -> bool:
+    """已公布的 EPS 才算已知；空值、横线和非法数字都视为尚未公布。"""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        text = value.strip()
+        if text in {"", "-", "--", "—", "nan", "NaN", "None", "null"}:
+            return False
+        try:
+            number = float(text)
+        except ValueError:
+            return False
+        return math.isfinite(number)
+    try:
+        if value != value:
+            return False
+    except Exception:
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number)
+
+
+def _earnings_new_york_date(value: Any) -> str | None:
+    """把财报时间戳转成美东日历日。无时区按 UTC 理解，避免把凌晨场次标到下一天。"""
+    moment: datetime | None = None
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        to_python = getattr(value, "to_pydatetime", None)
+        if callable(to_python):
+            try:
+                converted = to_python()
+            except Exception:
+                converted = None
+            if isinstance(converted, datetime):
+                moment = converted
+        if moment is None:
+            text = str(value).strip()
+            if not text or text.lower() in {"nat", "none", "nan"}:
+                return None
+            try:
+                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    return date.fromisoformat(text[:10]).isoformat()
+                except ValueError:
+                    return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(MARKET_TIMEZONE).date().isoformat()
+
+
+def parse_earnings_dates(frame: Any) -> list[str]:
+    """从财报表取出尚未公布 EPS 的美东日期。
+
+    缺少 Reported EPS 列时返回空列表，避免把历史财报整列当成即将公布。
+    """
+    if frame is None or not hasattr(frame, "columns") or not hasattr(frame, "iterrows"):
+        return []
+    column = None
+    try:
+        names = list(frame.columns)
+    except Exception:
+        return []
+    for name in names:
+        if str(name).strip() == "Reported EPS":
+            column = name
+            break
+    if column is None:
+        return []
+    found: set[str] = set()
+    try:
+        rows = frame.iterrows()
+    except Exception:
+        return []
+    for timestamp, row in rows:
+        try:
+            reported = row[column]
+        except Exception:
+            reported = None
+        if _earnings_reported(reported):
+            continue
+        day = _earnings_new_york_date(timestamp)
+        if day:
+            found.add(day)
+    return sorted(found)
+
+
 class MarketDataProvider:
     # 对外暴露的数据来源标识：只表示「来自上游接口」，不暴露具体供应商
     name = "upstream"
@@ -470,6 +561,17 @@ class MarketDataProvider:
             raise ProviderError(f"获取 {symbol} 日线历史失败: {exc}") from exc
         return self._history_bars(frame, symbol)
 
+    def earnings_dates(self, symbol: str) -> list[str]:
+        """读取尚未公布的财报日期，按美东日历日返回。"""
+        normalized = self.normalize_symbol(symbol)
+        ticker = self._ticker(normalized)
+        try:
+            with self.upstream_gate.slot():
+                frame = ticker.get_earnings_dates(limit=12)
+        except Exception as exc:
+            raise ProviderError(f"获取 {normalized} 财报日期失败: {exc}") from exc
+        return parse_earnings_dates(frame)
+
     @staticmethod
     def estimate_gamma(spot: Any, strike: Any, implied_volatility: Any, expiration: str) -> float | None:
         """用 Black-Scholes 估算单张合约 Gamma；上游期权链通常不返回原始 Gamma。"""
@@ -498,28 +600,32 @@ class MarketDataProvider:
         except Exception as exc:
             raise ProviderError(f"获取 {normalized} {expiration} 期权链失败: {exc}") from exc
         rows: list[dict[str, Any]] = []
-        for contract_type, frame in (("call", options.calls), ("put", options.puts)):
-            for raw in frame.to_dict(orient="records"):
-                item = normalize_row(raw)
-                item.update({
-                    "symbol": normalized,
-                    "expiration": expiration,
-                    "contract_type": contract_type,
-                    "contract_symbol": item.get("contractSymbol") or item.get("contract_symbol") or "",
-                    "strike": item.get("strike"),
-                    "last_price": item.get("lastPrice"),
-                    "bid": item.get("bid"),
-                    "ask": item.get("ask"),
-                    "volume": item.get("volume"),
-                    "open_interest": item.get("openInterest"),
-                    "implied_volatility": item.get("impliedVolatility"),
-                    "gamma": item.get("gamma"),
-                    "in_the_money": item.get("inTheMoney"),
-                    "change_percent": item.get("percentChange"),
-                    "provider": self.name,
-                    "raw": item.copy(),
-                })
-                rows.append(item)
+        try:
+            for contract_type, frame in (("call", options.calls), ("put", options.puts)):
+                records = frame.to_dict(orient="records")
+                for raw in records:
+                    item = normalize_row(raw)
+                    # 只保留入库字段。整行原始字典再复制一份，会让一份期权链在内存里变成三份。
+                    rows.append({
+                        "symbol": normalized,
+                        "expiration": expiration,
+                        "contract_type": contract_type,
+                        "contract_symbol": item.get("contractSymbol") or item.get("contract_symbol") or "",
+                        "strike": item.get("strike"),
+                        "last_price": item.get("lastPrice"),
+                        "bid": item.get("bid"),
+                        "ask": item.get("ask"),
+                        "volume": item.get("volume"),
+                        "open_interest": item.get("openInterest"),
+                        "implied_volatility": item.get("impliedVolatility"),
+                        "gamma": item.get("gamma"),
+                        "in_the_money": item.get("inTheMoney"),
+                        "change_percent": item.get("percentChange"),
+                        "provider": self.name,
+                    })
+                del records
+        finally:
+            del options
         if not rows:
             raise ProviderError(f"{normalized} {expiration} 没有期权数据")
         return rows
@@ -572,6 +678,10 @@ class HybridMarketDataProvider:
 
     def benchmark_history(self, symbol: str = "^GSPC", period: str = "2y") -> list[dict[str, Any]]:
         return self.regular_provider.benchmark_history(symbol, period)
+
+    def earnings_dates(self, symbol: str) -> list[str]:
+        """财报日期走主行情适配器。混合适配器本身不继承主行情类，必须显式转发。"""
+        return self.regular_provider.earnings_dates(symbol)
 
     def chain(self, symbol: str, expiration: str) -> list[dict[str, Any]]:
         provider = self.delayed_provider if self.uses_delayed_options() else self.regular_provider

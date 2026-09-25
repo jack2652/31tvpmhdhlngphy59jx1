@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 
 from dotenv import load_dotenv
-import uvicorn
+
+from app.runtime import low_memory_enabled
 
 
 def primary_lan_ip() -> str | None:
@@ -46,20 +48,58 @@ def access_lines(host: str, port: int, access_key: str = "", lan_ip: str | None 
     return lines
 
 
+def resolve_web_workers(raw: str | None, low_memory: bool) -> int:
+    """解析 worker 数。低内存机器强制单进程，两份解释器会把 256MB 直接撑爆。"""
+    text = (raw or "").strip()
+    try:
+        requested = int(text) if text else 1
+    except ValueError:
+        requested = 1
+    if requested < 1:
+        requested = 1
+    if low_memory and requested > 1:
+        print(f"INFO:     低内存保护：WEB_WORKERS={requested} 已降为 1", flush=True)
+        return 1
+    return requested
+
+
+def ensure_low_memory_allocator() -> None:
+    """glibc 的内存 arena 只能在进程启动前限制，因此低内存模式重新拉起一次自己。"""
+    if os.environ.get("OPTION_SCOPE_LOW_MEMORY_REEXEC") == "1":
+        return
+    if not low_memory_enabled():
+        return
+    os.environ["MALLOC_ARENA_MAX"] = "1"
+    os.environ["MALLOC_TRIM_THRESHOLD_"] = "131072"
+    os.environ["MALLOC_MMAP_THRESHOLD_"] = "131072"
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    os.environ["OPTION_SCOPE_LOW_MEMORY_REEXEC"] = "1"
+    os.execv(sys.executable, [sys.executable, "-m", "app"])
+
+
 def main() -> None:
     """启动 FastAPI 服务，允许通过环境变量覆盖端口。"""
     load_dotenv()
+    ensure_low_memory_allocator()
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
-    workers = max(1, int(os.getenv("WEB_WORKERS", "2")))
+    low_memory = low_memory_enabled()
+    workers = resolve_web_workers(os.getenv("WEB_WORKERS"), low_memory)
     access_key = os.getenv("ACCESS_KEY", "").strip()
     for line in access_lines(host, port, access_key, primary_lan_ip()):
         print(line, flush=True)
+    import uvicorn
+
+    run_kwargs: dict[str, int] = {}
+    if low_memory:
+        # 限制排队连接，避免慢请求把工作线程和响应缓冲一起堆满。
+        run_kwargs = {"limit_concurrency": 12, "backlog": 16, "timeout_keep_alive": 5}
     uvicorn.run(
         "app.main:app",
         host=host,
         port=port,
         workers=workers,
+        **run_kwargs,
     )
 
 

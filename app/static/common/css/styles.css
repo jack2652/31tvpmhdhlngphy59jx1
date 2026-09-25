@@ -306,3 +306,6 @@ body{font-size:14px}
   .toolbar-actions .el-button{min-width:102px}
 }
 :root[data-theme="light"] .el-select-dropdown{background:var(--panel);color:var(--text)}
+/* 现货卡片：涨跌基准和财报提示可能超出一行，允许换行；窗口内财报用琥珀色标出。 */
+.quote-sub{flex-wrap:wrap;row-gap:4px}
+.quote-earnings.inside{color:var(--amber)}

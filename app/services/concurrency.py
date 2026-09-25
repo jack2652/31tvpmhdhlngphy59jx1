@@ -17,6 +17,10 @@ class UpstreamBusyError(RuntimeError):
     """等待上游请求槽位超时。"""
 
 
+class HeavyWorkBusyError(RuntimeError):
+    """已有会占用大量内存的刷新或计算，本次不再叠加。"""
+
+
 @dataclass
 class _Flight(Generic[Value]):
     event: Event
@@ -86,6 +90,50 @@ class SingleFlightCache(Generic[Key, Value]):
             return value
 
         return self._flight.do(key, compute_and_store)
+
+
+class HeavyWorkGate:
+    """限制同时进行的重内存操作。
+
+    期权链、全量日线和 Gamma 窗口叠在一起时，256MB 的机器会直接被杀掉。
+    槽位在归还内存之后才释放，避免下一次刷新叠在尚未还给系统的碎片上。
+    """
+
+    def __init__(self, limit: int = 1):
+        self.limit = max(1, int(limit))
+        self._semaphore = BoundedSemaphore(self.limit)
+
+    def acquire(self, timeout: float = 0.0) -> bool:
+        return self._semaphore.acquire(timeout=max(0.0, float(timeout)))
+
+    def release(self) -> None:
+        # 先回收，再放行下一个重任务。busy() 不能走这里，否则探测本身会触发回收。
+        from app.runtime import low_memory_enabled, release_memory
+
+        if low_memory_enabled():
+            release_memory()
+        self._semaphore.release()
+
+    def busy(self) -> bool:
+        if not self._semaphore.acquire(blocking=False):
+            return True
+        self._semaphore.release()
+        return False
+
+
+_heavy_gate: HeavyWorkGate | None = None
+_heavy_gate_lock = Lock()
+
+
+def get_heavy_gate() -> HeavyWorkGate:
+    """进程内共享的重任务闸门。低内存时只允许一个，其余环境保留有限并行。"""
+    global _heavy_gate
+    with _heavy_gate_lock:
+        if _heavy_gate is None:
+            from app.runtime import low_memory_enabled
+
+            _heavy_gate = HeavyWorkGate(1 if low_memory_enabled() else 4)
+        return _heavy_gate
 
 
 class UpstreamGate:

@@ -1,5 +1,7 @@
 const defaultSymbolValue = (document.getElementById("symbol-input")?.getAttribute("value") || "").trim().toUpperCase();
 const defaultSymbol = /^[A-Z0-9][A-Z0-9.-]{0,9}$/.test(defaultSymbolValue) ? defaultSymbolValue : "QQQ";
+const GAMMA_ESTIMATE_TITLE = "Black-Scholes 估算：看涨为正、看跌为负，假设客户买入期权、做市商方向相反。不是真实做市商库存，也不是成交价。";
+const TREND_SIGNAL_TITLE = "规则估算，不是下单指令，也不包含财报跳空";
 const state = {
   symbol: defaultSymbol,
   symbolInput: defaultSymbol,
@@ -41,6 +43,13 @@ const state = {
     quoteChangeColor: "var(--muted)",
     quoteCurrency: "USD",
     quoteMarket: "--",
+    quoteReference: "相对昨收 --",
+    quoteReferenceTitle: "涨跌幅以最近一个已完成交易日的收盘价为基准",
+    earnings: {
+      status: "unknown",
+      label: "财报日期未知",
+      title: "没有可用的未来财报日期，评分不因财报调整",
+    },
     totalCount: "--",
     callVolume: "--",
     putVolume: "--",
@@ -55,6 +64,8 @@ const state = {
     chart: {
       netGex: "净 Gamma --",
       gammaFlip: "零 Gamma --",
+      netGexTitle: GAMMA_ESTIMATE_TITLE,
+      gammaFlipTitle: GAMMA_ESTIMATE_TITLE,
       callWall: "看涨墙 --",
       putWall: "看跌墙 --",
       gammaScope: "Gamma 范围 --",
@@ -84,6 +95,7 @@ const state = {
     trend: {
       available: false,
       label: "",
+      signalTitle: TREND_SIGNAL_TITLE,
       directionClass: "range",
       action: "",
       actionClass: "hold",
@@ -405,8 +417,13 @@ function refreshCountdownSeconds(deadline, now) {
   return Math.max(Math.ceil(ms / 1000) - 1, 1);
 }
 
+function refreshWorkPending() {
+  return Boolean(state.loading || state.refreshing || state.refreshInFlight || state.analysisRefreshSymbol);
+}
+
 function refreshNoteText(now = Date.now()) {
-  if (state.refreshing) return "正在刷新…";
+  if (state.refreshing || state.loading || state.refreshInFlight) return "正在刷新…";
+  if (state.analysisRefreshSymbol) return "分析计算中，刷新稍后开始";
   if (!refreshDeadline) return `每 ${AUTO_REFRESH_SECONDS} 秒自动更新`;
   const seconds = refreshCountdownSeconds(refreshDeadline, now);
   if (seconds <= 0) return "正在刷新…";
@@ -424,6 +441,13 @@ function scheduleAutoRefresh() {
   clearAutoRefresh();
   if (document.body.classList.contains("access-denied-page")) {
     refreshDeadline = 0;
+    paintRefreshNote();
+    return;
+  }
+  // 首屏、快照或 Gamma 还没结束时不要把倒计时走到 0，否则新标的刚出来就再叠一轮刷新。
+  if (refreshWorkPending()) {
+    refreshDeadline = 0;
+    state.timer = setTimeout(() => { scheduleAutoRefresh(); }, 1000);
     paintRefreshNote();
     return;
   }
@@ -1028,7 +1052,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const extremeRows = trendExtremeRows(extremes, spot);
   const hasExtremes = extremeRows.some((row) => row.valid);
   if (!trend && !hasExtremes) {
-    state.view.trend = { ...state.view.trend, available: false, rows: [], opportunities: [], extremes: [], note: "等待数据" };
+    state.view.trend = { ...state.view.trend, available: false, rows: [], opportunities: [], extremes: [], note: "等待数据", signalTitle: TREND_SIGNAL_TITLE };
     return;
   }
   const className = trend?.direction === "up" ? "up" : (trend?.direction === "down" ? "down" : "range");
@@ -1072,7 +1096,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const action = ["buy", "sell", "hold"].includes(recommendation?.action) ? recommendation.action : null;
   const actionLabel = action ? (recommendation.label || "继续持有") : "";
   const actionReason = action ? (recommendation.reason || "结合当前趋势与价位综合判断") : "";
-  const horizonLabel = tradePointsHorizon?.label || "未来 5 个交易日";
+  const horizonLabel = withEarningsHorizon(tradePointsHorizon?.label || "未来 5 个交易日");
   const opportunityRows = [
     ["buy", "近期最佳买入点"],
     ["sell", "近期最佳卖出点"],
@@ -1098,7 +1122,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
       range,
       confidence,
       historySummary,
-      title: `${title} · 模型评分 ${modelConfidence} · ${history} · 综合评分 ${confidence} · 计算范围：${horizonLabel}`,
+      title: `${title} · 模型评分 ${modelConfidence} · ${history} · 估算评分 ${confidence}，不是胜率 · 计算范围：${horizonLabel}`,
     };
   });
   const meta = historyMeta || {};
@@ -1110,6 +1134,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   state.view.trend = {
     available: true,
     label: trend?.label || "趋势通道",
+    signalTitle: TREND_SIGNAL_TITLE,
     directionClass: className,
     action: actionLabel,
     actionClass: action || "hold",
@@ -1173,6 +1198,7 @@ function renderPlan(plan, spot) {
 }
 
 function renderFactorLevels(payload) {
+  applyEarnings(payload?.earnings);
   const spot = Number(payload?.spot);
   state.view.chart.levelsBasis = Number.isFinite(spot) && spot > 0 ? `基准 ${formatMoney(spot)}` : "基准 --";
   const expiration = payload?.expiration || state.expiration || "--";
@@ -1259,7 +1285,7 @@ function renderBuyerStructures(payload, fetchedAt = null) {
   const empty = {
     available: false,
     directionLabel: "",
-    horizonLabel: payload?.horizon_label || "未来 5 个交易日",
+    horizonLabel: withEarningsHorizon(payload?.horizon_label || "未来 5 个交易日"),
     target: "",
     items: [],
     reason: payload?.reason || "等待数据",
@@ -1281,7 +1307,7 @@ function renderBuyerStructures(payload, fetchedAt = null) {
   state.view.buyer = {
     available: true,
     directionLabel: payload.direction_label || (payload.direction === "call" ? "买入看涨" : "买入看跌"),
-    horizonLabel: payload.horizon_label || "未来 5 个交易日",
+    horizonLabel: withEarningsHorizon(payload.horizon_label || "未来 5 个交易日"),
     target: targetText || "--",
     reason: "",
     note: `${buyerMethod} · ${buyerQuoteMethod} · ${fetchedAt ? `数据 ${formatTime(fetchedAt)}` : "数据时间未知"} · 预计盈利/亏损以当前买卖价中间价为成本基准；负数表示目标价虽达到，扣除时间价值后仍未覆盖成本。${payload.disclaimer || "综合评分不是历史胜率"}`,
@@ -1309,6 +1335,7 @@ function renderBuyerStructures(payload, fetchedAt = null) {
         : `${notation}：${item.label || "买方期权"}，到期日 ${item.expiration}，执行价 ${strikes}。`;
       return {
         ...item,
+        horizon: withEarningsHorizon(item.horizon || payload.horizon_label || "未来 5 个交易日"),
         // 同一期限可能同时出现多个相同执行价的候选方案，方向与序号一起纳入 key，避免 Vue 2 列表重排时出现重复 key。
         key: `${item.kind || "structure"}-${item.direction || "unknown"}-${item.expiration || "unknown"}-${strikes || "unknown"}-${index}`,
         structure: notation,
@@ -1360,8 +1387,10 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   const volumePutPeak = maxPoint(points, "putVolume");
   const oiCallPeak = maxPoint(points, "callOi");
   const oiPutPeak = maxPoint(points, "putOi");
-  state.view.chart.netGex = `净 Gamma ${formatGex(points.reduce((sum, point) => sum + point.callGex + point.putGex, 0), 2)}`;
-  state.view.chart.gammaFlip = `零 Gamma ${gammaFlip ? formatMoney(gammaFlip.strike) : "--"}`;
+  state.view.chart.netGex = `净 Gamma ${formatGex(points.reduce((sum, point) => sum + point.callGex + point.putGex, 0), 2)} · 估算`;
+  state.view.chart.gammaFlip = `零 Gamma ${gammaFlip ? formatMoney(gammaFlip.strike) : "--"} · 估算`;
+  state.view.chart.netGexTitle = GAMMA_ESTIMATE_TITLE;
+  state.view.chart.gammaFlipTitle = GAMMA_ESTIMATE_TITLE;
   state.view.chart.gammaScope = `柱状图 ${scopeText}${scopeSuffix}`;
   const analysisFallback = analysisPayload?.oi_fallback || {};
   if (analysisFallback.restored) state.view.chart.gammaScope += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
@@ -1463,6 +1492,79 @@ function activeSessionQuote(quote) {
   return quote;
 }
 
+function finitePrice(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+// 涨跌幅旁边标出基准价。盘后和夜盘的盘后口径只用正式收盘，不拿昨收填空。
+function quoteReference(quote) {
+  const marketState = quote?.market_state;
+  const sessions = quote?.sessions || {};
+  const previous = finitePrice(quote?.previous_close);
+  let label = "相对昨收";
+  let price = previous;
+  let title = "涨跌幅以最近一个已完成交易日的收盘价为基准";
+  if (marketState === "PRE") {
+    label = "相对昨收";
+    price = finitePrice(sessions.pre?.reference_close) ?? previous;
+    title = "盘前涨跌以盘前开始前最近一次盘中收盘为基准；没有该基准时回退昨收";
+  } else if (marketState === "POST" || (marketState === "OVERNIGHT" && state.levelBasisMode === "close")) {
+    label = "相对收盘";
+    price = finitePrice(sessions.post?.reference_close);
+    title = "盘后涨跌以最近一次正式盘中收盘为基准，不用昨收代替";
+  } else if (marketState === "OVERNIGHT") {
+    label = "相对前收";
+    price = previous;
+    title = "夜盘卡片显示最近一次正式收盘价，涨跌幅相对前一交易日收盘";
+  }
+  return {
+    text: `${label} ${price == null ? "--" : formatMoney(price)}`,
+    title,
+  };
+}
+
+function earningsMonthDay(value) {
+  const match = String(value || "").match(/^\d{4}-(\d{2})-(\d{2})/);
+  return match ? `${match[1]}-${match[2]}` : "";
+}
+
+function resetEarningsChip() {
+  state.view.earnings = {
+    status: "unknown",
+    label: "财报日期未知",
+    title: "没有可用的未来财报日期，评分不因财报调整",
+  };
+}
+
+function applyEarnings(earnings) {
+  const day = earningsMonthDay(earnings?.date);
+  if (earnings?.status === "inside" && day) {
+    state.view.earnings = {
+      status: "inside",
+      label: `财报 ${day} · 5日内`,
+      title: earnings.detail || `下一财报 ${earnings.date} 落在未来 5 个交易日内。只作提示，不改变评分。`,
+    };
+    return;
+  }
+  if (earnings?.status === "outside") {
+    state.view.earnings = {
+      status: "outside",
+      label: "窗口外",
+      title: earnings.detail || (earnings?.date ? `下一财报 ${earnings.date} 不在未来 5 个交易日内。` : "下一财报不在未来 5 个交易日内。"),
+    };
+    return;
+  }
+  resetEarningsChip();
+  if (earnings?.detail) state.view.earnings.title = earnings.detail;
+}
+
+function withEarningsHorizon(label) {
+  const base = label || "未来 5 个交易日";
+  if (state.view.earnings?.status === "inside" && !String(base).includes("含财报")) return `${base} · 含财报`;
+  return base;
+}
+
 function renderQuote(quote) {
   const active = activeSessionQuote(quote);
   const price = active?.price ?? quote?.price;
@@ -1476,6 +1578,9 @@ function renderQuote(quote) {
   state.view.quoteMarket = quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
+  const reference = quoteReference(quote);
+  state.view.quoteReference = reference.text;
+  state.view.quoteReferenceTitle = reference.title;
 }
 
 // 时段标签：数据源若返回未知取值就原样展示，避免换口径时把信息吞掉。
@@ -1695,6 +1800,7 @@ function showFreshStatus(snapshot) {
 }
 
 function showPending(message) {
+  resetEarningsChip();
   state.view.chainTitle = `${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
   state.view.dataSource = "后台刷新中";
   state.view.fetchedAt = "快照时间 --";
@@ -1759,6 +1865,9 @@ function applyCachedQuote(quote) {
     state.view.quoteCurrency = "USD";
     state.view.quoteMarket = "后台刷新";
     state.view.marketState = "后台刷新中";
+    const reference = quoteReference(null);
+    state.view.quoteReference = reference.text;
+    state.view.quoteReferenceTitle = reference.title;
     return;
   }
   renderQuote(quote);
@@ -1893,7 +2002,9 @@ async function refreshInBackground(loadId, force = false) {
       if (snapshot.shown && !snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
         refreshAnalysisWindow(loadId, snapshot.payload, snapshot.quote);
       }
-      state.view.lastStatus = `本地快照 ${formatTime(refreshResult.fetched_at)} 已是最新（${Math.round(Number(refreshResult.age_seconds) || 0)} 秒前）`;
+      state.view.lastStatus = refreshResult.deferred
+        ? "内存保护：本轮刷新已让路，继续使用本地快照"
+        : `本地快照 ${formatTime(refreshResult.fetched_at)} 已是最新（${Math.round(Number(refreshResult.age_seconds) || 0)} 秒前）`;
       return;
     }
     if (!state.expiration && refreshResult?.expiration) {
@@ -1903,10 +2014,13 @@ async function refreshInBackground(loadId, force = false) {
     if (!currentExpiration) { await loadQuoteOnly(loadId, force); return; }
     const encodedExpiration = encodeURIComponent(currentExpiration);
     // 先取最新的期权链与现货：跨期限 Gamma 窗口刷新较慢，表格不能跟着一起等。
+    const expirationRequest = Array.isArray(refreshResult?.expirations)
+      ? Promise.resolve({ expirations: refreshResult.expirations })
+      : request(`/api/expirations/${encodedSymbol}?refresh=true`).catch(() => null);
     const [payload, quote, expirations] = await Promise.all([
       request(`/api/chain/${encodedSymbol}?expiration=${encodedExpiration}`),
       request(`/api/quote/${encodedSymbol}`),
-      request(`/api/expirations/${encodedSymbol}?refresh=true`).catch(() => null),
+      expirationRequest,
     ]);
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
     // 响应期间用户切了到期日：这批结果属于旧期限，整体作废并按新选择重来——
@@ -2019,7 +2133,12 @@ async function loadChain(options = {}) {
 
 async function loadSymbol() {
   const symbol = (state.symbolInput || byId("symbol-input").value).trim().toUpperCase();
-  if (!symbol) return;
+  if (!symbol) {
+    state.loading = false;
+    scheduleAutoRefresh();
+    return;
+  }
+  state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
   state.expiration = parsePageQuery(location.search).expiration || null;
@@ -2027,6 +2146,7 @@ async function loadSymbol() {
   const loadId = ++state.loadId;
   setError("");
   applyCachedQuote(null);
+  resetEarningsChip();
   state.view.lastStatus = "正在读取本地缓存…";
   syncPageQuery();
   try {
@@ -2037,6 +2157,9 @@ async function loadSymbol() {
     state.expirationPlaceholder = "加载失败";
     showPending("暂无数据");
     setError(error.message);
+  } finally {
+    state.loading = false;
+    scheduleAutoRefresh();
   }
 }
 
@@ -2085,6 +2208,10 @@ function navigateToSymbol() {
 // 手动点击强制刷新上游快照；60 秒定时刷新仍优先复用 SQLite 新鲜缓存，整段流程互斥。
 async function refresh(silent = false) {
   if (state.refreshing) return;
+  if (silent && refreshWorkPending()) {
+    scheduleAutoRefresh();
+    return;
+  }
   state.refreshing = true;
   syncRefreshButton();
   const loadId = state.loadId;
@@ -2177,7 +2304,8 @@ if (accessKeyRequired() && !initialAccessKey) {
   showAccessDenied();
 } else {
   // 没有到期日（仅现货标的）也要走刷新链路：后端会返回 quote_only，只更新现货卡片。
-  // 首次按 60 秒排程；首屏读完快照后会按真实年龄提前或推后。
+  // 首屏和 Gamma 窗口结束前不计倒计时，避免刚加载完就立刻再刷一轮。
+  state.loading = true;
   scheduleAutoRefresh();
   loadSymbol();
 }

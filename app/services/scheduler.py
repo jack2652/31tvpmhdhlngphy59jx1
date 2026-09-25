@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.config import Settings
+from app.runtime import effective_database_max_mb
+from app.services.concurrency import get_heavy_gate
 from app.services.snapshots import SnapshotService
 from app.db import Database
 
@@ -23,6 +25,7 @@ class Scheduler:
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._owner = uuid4().hex
+        self._announced_database_cap = False
         self._lease_name = "option-snapshot-scheduler"
         self._lease_seconds = max(120, settings.refresh_interval_seconds * 3)
 
@@ -64,6 +67,14 @@ class Scheduler:
 
     async def _loop(self) -> None:
         await self._guard(self._prune_legacy_raw_json, "启动清理冗余报文")
+        # 小内存机器上，启动立刻刷新会和用户打开的第一个标的抢同一块内存。
+        if self.settings.low_memory:
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+            if self._stop.is_set():
+                return
         await self._guard(self._refresh_once, "定时刷新")
         await self._guard(self._cleanup_by_size, "体积清理")
         elapsed = 0
@@ -104,7 +115,18 @@ class Scheduler:
 
     async def _cleanup_by_size(self) -> None:
         """按体积上限清理数据库。未配置上限时只读取文件大小，开销可忽略。"""
-        max_bytes = self.settings.database_max_mb * 1048576
+        max_mb = effective_database_max_mb(
+            self.settings.database_max_mb,
+            self.settings.database_path,
+            self.settings.low_memory,
+        )
+        max_bytes = max_mb * 1048576
         if max_bytes <= 0:
             return
+        if self.settings.low_memory and get_heavy_gate().busy():
+            logger.info("低内存保护：已有刷新在进行，本轮跳过体积清理")
+            return
+        if max_mb != self.settings.database_max_mb and not self._announced_database_cap:
+            self._announced_database_cap = True
+            logger.info("低内存保护：数据库体积上限按剩余磁盘收紧为 %sMB", max_mb)
         await asyncio.to_thread(self.database.cleanup_by_size, max_bytes)

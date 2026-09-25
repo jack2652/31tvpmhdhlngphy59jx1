@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from app.db import Database, iso, parse_sessions
 from app.providers.market import ProviderError, MarketDataProvider
-from app.services.concurrency import SingleFlight, UpstreamBusyError
+from app.services.concurrency import HeavyWorkGate, SingleFlight, UpstreamBusyError, get_heavy_gate
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +66,15 @@ def active_expirations(values: list[str]) -> list[str]:
 
 
 class SnapshotService:
-    def __init__(self, database: Database, provider: MarketDataProvider | None = None):
+    def __init__(
+        self,
+        database: Database,
+        provider: MarketDataProvider | None = None,
+        heavy_gate: HeavyWorkGate | None = None,
+    ):
         self.database = database
         self.provider = provider or MarketDataProvider()
+        self.heavy_gate = heavy_gate or get_heavy_gate()
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._refresh_flight: SingleFlight[tuple[str, str | None, int], dict[str, Any]] = SingleFlight()
@@ -229,7 +235,41 @@ class SnapshotService:
             "age_seconds": round(max(chain_age, quote_age), 1),
         }
 
+    def _has_saved_chain(self, symbol: str, expiration: str | None) -> bool:
+        """目标到期日已经有链时，忙闸门可以直接沿用，不必再排队抓一份。"""
+        target = expiration
+        if not target:
+            values = active_expirations(self.database.latest_expirations(symbol))
+            target = values[0] if values else None
+        if not target:
+            quote = self.database.latest_quote(symbol) or {}
+            return quote.get("price") is not None
+        cached = self.database.latest_chain(symbol, target)
+        return bool(cached.get("data"))
+
     def _fetch_and_store(self, normalized: str, expiration: str | None) -> dict[str, Any]:
+        """请求上游接口并写入 SQLite。已有重任务时，有本地链就让路，避免内存叠满。"""
+        if self.heavy_gate.acquire(timeout=0.2):
+            try:
+                return self._fetch_upstream(normalized, expiration)
+            finally:
+                self.heavy_gate.release()
+        if self._has_saved_chain(normalized, expiration):
+            stale = self._stale_snapshot(normalized, expiration, "内存保护：已有刷新在进行，本次沿用本地快照")
+            if stale is not None and not (expiration and stale.get("quote_only")):
+                stale["deferred"] = True
+                stale["skipped"] = True
+                logger.info("低内存保护：%s %s 刷新让路，沿用本地快照", normalized, expiration or "最近到期日")
+                return stale
+        # 本地还没有这份链时必须等，否则新标的会一直空白；等待期间不再额外抓取。
+        if not self.heavy_gate.acquire(timeout=20):
+            raise RuntimeError(f"{normalized} 刷新排队超过 20 秒，请稍后重试")
+        try:
+            return self._fetch_upstream(normalized, expiration)
+        finally:
+            self.heavy_gate.release()
+
+    def _fetch_upstream(self, normalized: str, expiration: str | None) -> dict[str, Any]:
         """请求上游接口并写入 SQLite，失败时记录刷新日志后抛出。"""
         run_id = self.database.start_run(normalized)
         try:

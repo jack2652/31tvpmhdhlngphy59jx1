@@ -9,6 +9,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from app.runtime import low_memory_enabled
+
 
 load_dotenv()
 
@@ -64,6 +66,10 @@ class Settings:
     upstream_wait_seconds: int = 20
     # 页面倒计时和自动刷新新鲜期，单位秒；与后台定时刷新间隔分开配置
     auto_refresh_seconds: int = 60
+    # 256MB 级别的机器自动开启；强制串行重任务、缩小缓存，并收紧上游并发
+    low_memory: bool = False
+    # SQLite 共享分析缓存条数。低内存时少留几份，避免大 JSON 反复进出内存
+    analysis_cache_entries: int = 128
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -71,6 +77,11 @@ class Settings:
         symbols = tuple(dict.fromkeys(s.strip().upper() for s in raw_symbols.split(",") if s.strip()))
         if not symbols:
             raise ValueError("DEFAULT_SYMBOLS 至少需要一个标的")
+        low_memory = low_memory_enabled()
+        upstream_concurrency = 1 if low_memory else _positive_int("UPSTREAM_CONCURRENCY", 6)
+        upstream_wait = _positive_int("UPSTREAM_WAIT_SECONDS", 20)
+        if low_memory:
+            upstream_wait = min(upstream_wait, 5)
         return cls(
             database_path=Path(os.getenv("DATABASE_PATH", "data/options.db")),
             proxy_url=os.getenv("MARKET_PROXY", "").strip() or None,
@@ -83,7 +94,9 @@ class Settings:
             extremes_max_age_seconds=_positive_int("EXTREMES_MAX_AGE_SECONDS", 86400),
             database_max_mb=_size_mb("DATABASE_MAX_MB", 0),
             access_key=os.getenv("ACCESS_KEY", "").strip(),
-            upstream_concurrency=_positive_int("UPSTREAM_CONCURRENCY", 6),
-            upstream_wait_seconds=_positive_int("UPSTREAM_WAIT_SECONDS", 20),
+            upstream_concurrency=upstream_concurrency,
+            upstream_wait_seconds=upstream_wait,
             auto_refresh_seconds=_positive_int("AUTO_REFRESH_SECONDS", 60),
+            low_memory=low_memory,
+            analysis_cache_entries=8 if low_memory else 128,
         )
