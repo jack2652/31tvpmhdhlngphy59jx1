@@ -81,6 +81,29 @@ def install_access_guard(app: FastAPI, settings: Settings) -> None:
         return await call_next(request)
 
 
+def _positive_price(value: Any) -> float | None:
+    """把行情数值收成正的有限价格；缺失或无效时返回 None。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def _open_copied_from_previous(current: Any, previous: Any) -> bool:
+    """今开和前一根日线开盘价几乎相同，视为未完成日线把昨开抄了进来。"""
+    current_number = _positive_price(current)
+    previous_number = _positive_price(previous)
+    if current_number is None or previous_number is None:
+        return False
+    tolerance = max(0.01, abs(previous_number) * 1e-4)
+    return abs(current_number - previous_number) <= tolerance
+
+
 def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict[str, Any]:
     """整理趋势面板的今开/昨收；非交易时段缺少当日 K 线时回退最近交易日。"""
     valid = []
@@ -103,6 +126,7 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
         and market_state == "REGULAR"
     )
     today_open = latest.get("open")
+    today_open_date = latest.get("date")
     previous_close = previous.get("close") if latest_is_today else latest.get("close")
     previous_close_date = previous.get("date") if latest_is_today else latest.get("date")
     # Yahoo 在盘后/夜盘的 fast_info.previous_close 可能仍停留在前一个交易日。
@@ -119,14 +143,22 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
     if market_state != "REGULAR" and history_is_behind_session and reference_close is not None and reference_close > 0:
         previous_close = reference_close
         previous_close_date = as_of
-    if today_open is None:
+    quote_open = _positive_price(quote.get("today_open"))
+    calendar_today = market_today().isoformat()
+    # 日线还没滚到今天，或今天的开盘价和前一根日线开盘价相同，都说明今开还不可信。
+    daily_missing_today = latest.get("date") != calendar_today
+    daily_open_copied = (not daily_missing_today) and _open_copied_from_previous(today_open, previous.get("open"))
+    if market_state in {"REGULAR", "POST", "OVERNIGHT"} and quote_open is not None and (daily_missing_today or daily_open_copied):
+        today_open = quote_open
+        today_open_date = calendar_today
+    elif today_open is None:
         today_open = quote.get("today_open")
     if previous_close is None:
         previous_close = quote.get("previous_close")
     return {
         "today_open": today_open,
         "previous_close": previous_close,
-        "today_open_date": latest.get("date"),
+        "today_open_date": today_open_date,
         "previous_close_date": previous_close_date,
         "market_state": quote.get("market_state"),
     }
@@ -421,8 +453,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         computed = levels_cache.get_or_compute(
             cache_key,
             lambda: shared_cached(
-                # 买方结构改为合约波动率、触及概率和 10 到 45 天搜索，升级缓存命名空间。
-                "levels-v10",
+                # 趋势通道增加 RSI(14)，升级缓存命名空间，避免旧结果缺超买超卖。
+                "levels-v11",
                 cache_key,
                 lambda: build_levels(
                     history_payload.get("bars") or [],

@@ -28,6 +28,7 @@ from app.providers.market import (
     MarketDataProvider,
     current_session_state,
     is_session_trading_day,
+    regular_session_open,
     safe_value,
     summarize_extended_hours,
 )
@@ -401,6 +402,7 @@ def test_fast_info_snake_case_is_readable():
     assert quote["price"] == 110.0
     assert quote["previous_close"] == 100.0
     assert quote["change_percent"] == pytest.approx(10.0)
+    assert quote["today_open"] == pytest.approx(101.0)
 
 
 def test_regular_change_uses_previous_session_when_daily_bar_is_missing(monkeypatch):
@@ -474,6 +476,84 @@ def test_regular_change_prefers_official_close_when_minute_bar_agrees(monkeypatc
     assert quote["market_state"] == "REGULAR"
     assert quote["previous_close"] == pytest.approx(234.89)
     assert quote["change_percent"] == pytest.approx((224.27 - 234.89) / 234.89 * 100)
+    # 分钟线只有收盘价时，不能用收盘价冒充今开。
+    assert quote["today_open"] is None
+
+
+
+def test_regular_session_open_uses_first_regular_bar():
+    """今开取最近一个已经开始的盘中交易日的第一根分钟线，不取盘前价，也不用收盘价顶替。"""
+    eastern = ZoneInfo("America/New_York")
+    frame = pd.DataFrame(
+        {
+            "Open": [137.32, 137.50, 138.26, 138.27, 138.40],
+            "Close": [137.40, 139.54, 138.26, 138.40, 138.50],
+        },
+        index=pd.DatetimeIndex([
+            "2026-09-24 09:30",
+            "2026-09-24 09:31",
+            "2026-09-25 09:29",
+            "2026-09-25 09:30",
+            "2026-09-25 09:31",
+        ]).tz_localize(eastern),
+    )
+    opened = datetime(2026, 9, 25, 10, 0, tzinfo=eastern)
+    assert regular_session_open(frame, now=opened) == pytest.approx(138.27)
+    # 当天盘中还没开始时，回退到前一个已经开过盘的交易日，而不是盘前最后一笔。
+    assert regular_session_open(frame, now=datetime(2026, 9, 25, 9, 20, tzinfo=eastern)) == pytest.approx(137.32)
+    assert regular_session_open(frame.drop(columns=["Open"]), now=opened) is None
+
+
+def test_quote_uses_regular_minute_open_after_the_bell(monkeypatch):
+    """盘中用第一根盘中分钟线覆盖错误的 fast_info.open；盘前不覆盖。"""
+    eastern = ZoneInfo("America/New_York")
+
+    def frame(stamps, opens, closes):
+        return pd.DataFrame(
+            {"Open": opens, "Close": closes},
+            index=pd.DatetimeIndex(stamps).tz_localize(eastern),
+        )
+
+    def run(moment, minutes):
+        class FakeTicker:
+            fast_info = {"last_price": 140.11, "previous_close": 139.54, "open": 136.0, "currency": "USD"}
+
+            def history(self, **kwargs):
+                assert kwargs.get("interval") == "1m"
+                return minutes
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return moment.replace(tzinfo=None)
+                return moment.astimezone(tz)
+
+        monkeypatch.setattr(market, "datetime", FrozenDateTime)
+        return MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("ORCL")
+
+    pre = run(
+        datetime(2026, 9, 25, 9, 20, tzinfo=eastern),
+        frame(
+            ["2026-09-24 09:30", "2026-09-24 15:59", "2026-09-25 09:29"],
+            [137.32, 139.20, 138.26],
+            [137.40, 139.54, 138.26],
+        ),
+    )
+    assert pre["market_state"] == "PRE"
+    assert pre["today_open"] == pytest.approx(136.0)
+
+    regular = run(
+        datetime(2026, 9, 25, 10, 0, tzinfo=eastern),
+        frame(
+            ["2026-09-24 09:30", "2026-09-24 15:59", "2026-09-25 09:29", "2026-09-25 09:30", "2026-09-25 10:00"],
+            [137.32, 139.20, 138.26, 138.27, 140.00],
+            [137.40, 139.54, 138.26, 138.40, 140.11],
+        ),
+    )
+    assert regular["market_state"] == "REGULAR"
+    assert regular["today_open"] == pytest.approx(138.27)
+    assert regular["price"] == pytest.approx(140.11)
 
 
 def test_post_change_uses_prior_session_when_official_close_skips_a_day(monkeypatch):
@@ -2441,6 +2521,12 @@ def test_trend_channel_classifies_direction():
     assert trend_channel(flat)["direction"] == "range"
     assert trend_channel(rising[:10]) is None
     assert trend_channel([]) is None
+    # 单边上涨 RSI 顶到 100 记为超买，单边下跌记为超卖，来回震荡留在中性。
+    assert trend_channel(rising)["rsi"] == {"value": 100.0, "period": 14, "state": "overbought", "label": "超买"}
+    assert trend_channel(falling)["rsi"] == {"value": 0.0, "period": 14, "state": "oversold", "label": "超卖"}
+    neutral = trend_channel(flat)["rsi"]
+    assert neutral["state"] == "neutral" and neutral["label"] == "中性"
+    assert 40 <= neutral["value"] <= 60
 
 
 def test_trend_channel_recognizes_confirmed_rebound_after_medium_term_drop():
@@ -2513,6 +2599,36 @@ def test_trend_market_data_prefers_extended_session_reference_close(monkeypatch)
     result = trend_market_data(bars, quote)
     assert result["previous_close"] == pytest.approx(148.60)
     assert result["previous_close_date"] == "2026-09-21"
+
+
+def test_trend_market_data_replaces_daily_open_copied_from_previous_day(monkeypatch):
+    """未完成日线把昨开抄进今开时，盘中及盘后改用行情里的开盘价。"""
+    monkeypatch.setattr("app.api.market_today", lambda: date(2026, 9, 25))
+    copied = [
+        {"date": "2026-09-24", "open": 137.32, "close": 139.54},
+        {"date": "2026-09-25", "open": 137.32000732421875, "close": 140.11},
+    ]
+    result = trend_market_data(copied, {"market_state": "REGULAR", "today_open": 138.27})
+    assert result["today_open"] == pytest.approx(138.27)
+    assert result["today_open_date"] == "2026-09-25"
+    assert result["previous_close"] == pytest.approx(139.54)
+
+    # 日线开盘价和前一天不同，说明它是可信的今开，不用行情值盖掉。
+    distinct = trend_market_data(
+        [
+            {"date": "2026-09-24", "open": 100, "close": 105},
+            {"date": "2026-09-25", "open": 110, "close": 115},
+        ],
+        {"market_state": "REGULAR", "today_open": 138.27},
+    )
+    assert distinct["today_open"] == 110
+    assert trend_market_data(copied, {"market_state": "POST", "today_open": 138.27})["today_open"] == pytest.approx(138.27)
+    assert trend_market_data(copied, {"market_state": "CLOSED", "today_open": 138.27})["today_open"] == pytest.approx(137.32000732421875)
+    # 当天日线还没到，盘中用行情今开；盘前仍显示最近一个交易日的开盘价。
+    assert trend_market_data(copied[:1], {"market_state": "REGULAR", "today_open": 138.27})["today_open"] == pytest.approx(138.27)
+    pre = trend_market_data(copied[:1], {"market_state": "PRE", "today_open": 138.27})
+    assert pre["today_open"] == pytest.approx(137.32)
+    assert pre["today_open_date"] == "2026-09-24"
 
 
 def test_trade_recommendation_combines_trend_and_nearby_levels():
@@ -2595,8 +2711,8 @@ def test_frontend_confirms_trade_point_before_replacing_it():
 def test_levels_analysis_cache_namespace_matches_current_scoring_model():
     """最佳点评分字段变化时必须跳过旧版分析缓存。"""
     source = Path("app/api.py").read_text(encoding="utf-8")
-    assert '"levels-v10"' in source
-    assert '"levels-v9"' not in source
+    assert '"levels-v11"' in source
+    assert '"levels-v10"' not in source
 
 
 def test_build_levels_reuses_stable_candidate_anchor_across_basis_prices():
@@ -2656,9 +2772,12 @@ def test_trading_plan_panels_render_under_headline():
     assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
     assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints," in source
     assert '"今开"' in source and '"昨收"' in source and '["Beta", betaText, betaTitle]' in source
+    assert 'trendMarket?.market_state === "PRE" || trendMarket?.market_state === "OVERNIGHT"' in source
+    assert 'priorSessionOpen ? "昨开" : "今开"' in source
+    assert "夜盘和盘前尚未进入新的常规交易" in source
     assert '"Beta（2年）"' not in source
     assert page.index('class="trend-side"') < page.index('class="trend-core"')
-    assert "基准指数：标普500" in source and "前一个交易日的开盘价" in source
+    assert "基准指数：标普500" in source and "当日第一根盘中分钟线" in source
     assert 'trend-beta-sub' not in source
     assert '"近期最佳买入点"' in source and '"近期最佳卖出点"' in source
     assert "未来 5 个交易日" in source
@@ -2823,6 +2942,11 @@ def test_trend_channel_renders_extremes_rows():
     assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints," in source
     # 取不到数据时整组不渲染，趋势行不受影响
     assert "const hasExtremes = extremeRows.some((row) => row.valid);" in source
+    assert '["相对强弱", rsiText, rsiTitle, `trend-rsi ${rsiState}`]' in source
+    assert "70 及以上为超买，30 及以下为超卖" in source
+    trend_rows = source[source.index("const rows = trend"):source.index("].map(([label, value, title, rowClass])")]
+    assert trend_rows.index('["相对强弱"') < trend_rows.index('["日均斜率"')
+    assert "每个交易日相对均价的平均涨跌百分比" in source
 
 
 def test_history_service_caches_history(tmp_path: Path):

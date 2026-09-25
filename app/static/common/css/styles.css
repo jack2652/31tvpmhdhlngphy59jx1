@@ -132,6 +132,8 @@
 .trend-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--row-line);color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
 .trend-meta:last-child{border-bottom:0}
 .trend-meta strong{color:var(--text);font-weight:600}
+.trend-meta.trend-rsi.overbought strong{color:var(--down)}
+.trend-meta.trend-rsi.oversold strong{color:var(--up)}
 .trend-meta strong small{display:block;color:var(--muted);font-size:11px;font-weight:500;line-height:1.2;margin-top:2px;white-space:nowrap}
 .trend-opportunities{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px;border-bottom:1px solid var(--row-line)}
 .trend-opportunities .trend-meta{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;min-width:0;border-bottom:0}

@@ -101,6 +101,10 @@ TREND_SLOPE_THRESHOLD = 0.05
 # 反转确认：最近窗口同时满足斜率、累计涨跌幅和从局部极值的反弹/回撤幅度。
 TREND_REVERSAL_MIN_CHANGE = 0.05
 TREND_REVERSAL_MIN_REBOUND = 0.08
+# 相对强弱：Wilder RSI(14)。70 及以上视为超买，30 及以下视为超卖。
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70.0
+RSI_OVERSOLD = 30.0
 # 操作建议：价位距离使用现价比例，避免不同价格规模的标的使用同一绝对距离。
 RECOMMENDATION_LEVEL_RATIO = 0.025
 RECOMMENDATION_RANGE_RATIO = 0.015
@@ -170,6 +174,36 @@ def price_extremes(bars: Iterable[dict[str, Any]], window_days: int = EXTREME_WI
     }
 
 
+def relative_strength(values: list[float], period: int = RSI_PERIOD) -> dict[str, Any] | None:
+    """按日线收盘价计算 Wilder RSI，并给出超买 / 超卖 / 中性。"""
+    if period < 1 or len(values) < period + 1:
+        return None
+    gains: list[float] = []
+    losses: list[float] = []
+    for previous, current in zip(values, values[1:]):
+        delta = current - previous
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+    average_gain = sum(gains[:period]) / period
+    average_loss = sum(losses[:period]) / period
+    for gain, loss in zip(gains[period:], losses[period:]):
+        average_gain = (average_gain * (period - 1) + gain) / period
+        average_loss = (average_loss * (period - 1) + loss) / period
+    if average_gain == 0 and average_loss == 0:
+        reading = 50.0
+    elif average_loss == 0:
+        reading = 100.0
+    else:
+        reading = 100.0 - 100.0 / (1.0 + average_gain / average_loss)
+    if reading >= RSI_OVERBOUGHT:
+        state, label = "overbought", "超买"
+    elif reading <= RSI_OVERSOLD:
+        state, label = "oversold", "超卖"
+    else:
+        state, label = "neutral", "中性"
+    return {"value": round(reading, 1), "period": period, "state": state, "label": label}
+
+
 def trend_channel(bars: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
     """用中期通道识别背景，并用最近窗口确认触底反弹或短线转弱。"""
     all_bars = list(bars)
@@ -234,6 +268,7 @@ def trend_channel(bars: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
         "bars": selected["bars"],
         "background_direction": long_direction,
         "reversal_confirmed": selected is recent_fit,
+        "rsi": relative_strength(values),
     }
 
 

@@ -1023,7 +1023,7 @@ function trendExtremeRows(extremes, spot) {
   });
 }
 
-// 趋势通道：展示方向、上下轨、日均斜率、今开/昨收、Beta，以及 52 周 / 历史最高最低价。
+// 趋势通道：展示方向、上下轨、日均斜率、RSI 超买超卖、今开或昨开/昨收、Beta，以及 52 周 / 历史最高最低价。
 function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null) {
   const extremeRows = trendExtremeRows(extremes, spot);
   const hasExtremes = extremeRows.some((row) => row.valid);
@@ -1033,6 +1033,10 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   }
   const className = trend?.direction === "up" ? "up" : (trend?.direction === "down" ? "down" : "range");
   const slope = Number(trend?.slope_percent) || 0;
+  const rsiValue = Number(trend?.rsi?.value);
+  const rsiState = ["overbought", "oversold", "neutral"].includes(trend?.rsi?.state) ? trend.rsi.state : "neutral";
+  const rsiText = Number.isFinite(rsiValue) ? `${rsiValue.toFixed(1)} · ${trend.rsi.label || "中性"}` : "--";
+  const rsiTitle = "相对强弱 RSI(14)，按日线收盘价。70 及以上为超买，30 及以下为超卖，其余为中性";
   const betaValue = Number(beta?.value);
   const betaText = Number.isFinite(betaValue) ? betaValue.toFixed(2) : "--";
   const betaTitle = "基准指数：标普500 · 时间跨度：2年 · Beta（β）衡量股票相对于整个股市的价格波动情况；高 Beta（>1.0）理论上风险更高但潜在回报更高，低 Beta（<1.0）理论上风险较低但潜在回报也较低";
@@ -1049,15 +1053,22 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const priceTitle = validPrice
     ? `${priceLabel} ${formatMoney(displayedPrice)} · 数据来源：${selectedBasis?.label || "常规"}`
     : `${priceLabel}暂无数据`;
+  // 夜盘、盘前还没进入新的常规交易，开盘价属于上一交易日，文案用昨开；盘中和盘后仍是今开。
+  const priorSessionOpen = trendMarket?.market_state === "PRE" || trendMarket?.market_state === "OVERNIGHT";
+  const openLabel = priorSessionOpen ? "昨开" : "今开";
+  const openTitle = priorSessionOpen
+    ? "夜盘和盘前尚未进入新的常规交易，显示最近一个已完成交易日的常规时段开盘价"
+    : "今日常规交易时段的开盘价，取当日第一根盘中分钟线";
   const rows = trend ? [
     ["通道上轨", formatMoney(trend.upper), ""],
     ["通道下轨", formatMoney(trend.lower), ""],
-    ["日均斜率", `${slope >= 0 ? "+" : ""}${slope.toFixed(3)}%`, ""],
+    ["相对强弱", rsiText, rsiTitle, `trend-rsi ${rsiState}`],
+    ["日均斜率", `${slope >= 0 ? "+" : ""}${slope.toFixed(3)}%`, "对样本区间的收盘价做线性回归，得到每个交易日相对均价的平均涨跌百分比。正数为上涨，负数为下跌"],
     ["样本", `${Number(trend.bars) || 0} 根日线`, ""],
-    ["今开", formatMoney(trendMarket?.today_open), "今日开盘价；盘前、盘后和夜盘缺少当日开盘价时，使用前一个交易日的开盘价"],
+    [openLabel, formatMoney(trendMarket?.today_open), openTitle],
     ["昨收", formatMoney(trendMarket?.previous_close), "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"],
     ["Beta", betaText, betaTitle],
-  ].map(([label, value, title]) => ({ label, value, title, className: label.startsWith("Beta") ? "trend-beta" : "" })) : [];
+  ].map(([label, value, title, rowClass]) => ({ label, value, title, className: rowClass || (label.startsWith("Beta") ? "trend-beta" : "") })) : [];
   const action = ["buy", "sell", "hold"].includes(recommendation?.action) ? recommendation.action : null;
   const actionLabel = action ? (recommendation.label || "继续持有") : "";
   const actionReason = action ? (recommendation.reason || "结合当前趋势与价位综合判断") : "";
@@ -1109,7 +1120,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     priceTitle,
     opportunities: opportunityRows,
     extremes: hasExtremes ? extremeRows : [],
-    note: "按最近日线收盘价的线性回归通道；高低点取日线最高/最低价（历史极值用全量历史）",
+    note: "按最近日线收盘价的线性回归通道；相对强弱为 RSI(14)；高低点取日线最高/最低价（历史极值用全量历史）",
     noteTitle: parts.join(" · "),
     empty: "历史行情不足，暂无趋势判断",
   };

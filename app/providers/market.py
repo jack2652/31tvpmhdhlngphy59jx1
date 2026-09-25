@@ -190,6 +190,43 @@ def prior_session_regular_close(frame: Any, now: datetime | None = None) -> floa
     return closes[days[-1]]
 
 
+def regular_session_open(frame: Any, now: datetime | None = None) -> float | None:
+    """最近一个已经开始的盘中交易日里，第一根盘中分钟线的开盘价。
+
+    盘前最后一笔不是开盘价。没有 Open 列时返回 None，不用收盘价顶替。
+    """
+    moment_now = localize(now or datetime.now(MARKET_TIMEZONE))
+    index = getattr(frame, "index", None)
+    columns = getattr(frame, "columns", [])
+    if (
+        frame is None
+        or getattr(frame, "empty", True)
+        or "Open" not in columns
+        or not hasattr(index, "tz_convert")
+    ):
+        return None
+    if getattr(index, "tz", None) is None:
+        index = index.tz_localize("UTC")
+    index = index.tz_convert(MARKET_TIMEZONE)
+    current_day = session_trading_day(moment_now)
+    first_open: dict[date, float] = {}
+    for stamp, raw_open in sorted(zip(index, frame["Open"].tolist()), key=lambda item: item[0]):
+        opening = _positive_price(raw_open)
+        if opening is None:
+            continue
+        bar_time = localize(stamp.to_pydatetime())
+        # 还没走到的 K 线不属于已经开始的交易日。
+        if bar_time > moment_now or session_of(bar_time) != "regular":
+            continue
+        day = session_trading_day(bar_time)
+        if day > current_day or day in first_open:
+            continue
+        first_open[day] = opening
+    if not first_open:
+        return None
+    return first_open[max(first_open)]
+
+
 def choose_previous_close(official: Any, minute_close: Any) -> Any:
     """正式昨收与分钟线昨收接近时用正式昨收，偏离一整根日线时改用分钟线。"""
     official_number = _positive_price(official)
@@ -330,6 +367,10 @@ class MarketDataProvider:
             extended = self._extended_hours(ticker, normalized)
             # fast_info.market_state 在非交易时段可能沿用上一个状态；分钟线摘要包含时区和交易日历判断，优先采用它。
             market_state = extended["state"] or _read_fast_info(info, "market_state")
+            # 未完成日线和 fast_info.open 都会把昨开留在今开上。盘中开始后改用第一根盘中分钟线。
+            regular_open = extended.get("regular_open")
+            if market_state in {"REGULAR", "POST", "OVERNIGHT"} and regular_open is not None:
+                today_open = regular_open
             # 正式昨收含收盘竞价。它和分钟线上一交易日收盘接近时以它为准；
             # 日线空掉一根时两者会差出一整段行情，这时改用分钟线，避免涨跌幅被放大。
             previous = choose_previous_close(previous, extended.get("prior_session_regular_close"))
@@ -359,6 +400,7 @@ class MarketDataProvider:
             summary = summarize_extended_hours(frame)
             summary["previous_regular_close"] = previous_regular_close(frame)
             summary["prior_session_regular_close"] = prior_session_regular_close(frame)
+            summary["regular_open"] = regular_session_open(frame)
             return summary
         except Exception as exc:
             logger.warning("获取 %s 盘前盘后行情失败: %s", symbol, exc)
