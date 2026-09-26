@@ -173,8 +173,8 @@ def test_upstream_gate_limits_concurrent_calls():
     assert active["peak"] <= 2
 
 
-def test_etag_middleware_returns_not_modified_for_same_api_body():
-    """API 条件请求命中 ETag 时不再传输完整 JSON。"""
+def test_api_get_is_not_cached_when_body_is_unchanged():
+    """API JSON 不再回 304。重复请求仍然带回正文，并禁止浏览器缓存。"""
     async def endpoint(scope, receive, send):
         await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
         await send({"type": "http.response.body", "body": b'{"ok":true}'})
@@ -188,11 +188,15 @@ def test_etag_middleware_returns_not_modified_for_same_api_body():
         return sent
 
     first = asyncio.run(run([]))
-    etag = dict(first[0]["headers"])[b"etag"]
-    second = asyncio.run(run([(b"if-none-match", etag)]))
+    second = asyncio.run(run([(b"if-none-match", b'"same"')]))
     assert first[0]["status"] == 200
-    assert second[0]["status"] == 304
-    assert second[1]["body"] == b""
+    assert second[0]["status"] == 200
+    assert second[1]["body"] == b'{"ok":true}'
+    headers = {key.lower(): value for key, value in second[0]["headers"]}
+    assert headers[b"cache-control"] == b"no-store"
+    assert b"etag" not in headers
+    main = Path("app/main.py").read_text(encoding="utf-8")
+    assert "if not settings.low_memory:\n    app.add_middleware(GZipMiddleware, minimum_size=1024)\napp.add_middleware(ETagMiddleware)" in main
 
 
 def test_parse_occ_option_and_map_cboe_chain():
@@ -1481,6 +1485,102 @@ def test_chain_and_gamma_endpoints_expose_model_iv(tmp_path: Path):
         assert profile["data"][0]["model_iv"] > 0
 
 
+def test_stale_analysis_job_can_be_reclaimed(tmp_path: Path):
+    """running 超过 180 秒后允许重新领取，未过期的任务仍然只有一个 worker。"""
+    database = Database(tmp_path / "jobs.db")
+    claimed = database.claim_analysis_job("ORCL", 45)
+    assert claimed["claimed"] is True
+    held = database.claim_analysis_job("ORCL", 45)
+    assert held["claimed"] is False
+    assert held["status"] == "running"
+    stale_at = (utc_now() - timedelta(seconds=181)).isoformat()
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE analysis_refresh_jobs SET started_at=? WHERE job_id=?",
+            (stale_at, claimed["job_id"]),
+        )
+    reclaimed = database.claim_analysis_job("ORCL", 45)
+    assert reclaimed["claimed"] is True
+    assert reclaimed["started_at"] != stale_at
+
+
+def test_orphaned_analysis_job_is_marked_failed(tmp_path: Path):
+    """重启清理把遗留的 running 记成失败，旧线程不能再把它改回完成。"""
+    database = Database(tmp_path / "jobs.db")
+    claimed = database.claim_analysis_job("ORCL", 45)
+    assert database.fail_orphaned_analysis_jobs() == 1
+    job = database.analysis_job("ORCL", 45)
+    assert job["status"] == "failed"
+    assert job["error_message"] == "进程重启，后台分析已中断"
+    assert job["finished_at"]
+    assert database.fail_orphaned_analysis_jobs() == 0
+    assert database.finish_analysis_job(claimed["job_id"], "completed", {"ok": True}, None, claimed["started_at"]) is False
+    assert database.analysis_job("ORCL", 45)["status"] == "failed"
+
+
+def test_finish_analysis_job_keeps_the_newer_attempt(tmp_path: Path):
+    database = Database(tmp_path / "jobs.db")
+    first = database.claim_analysis_job("ORCL", 45)
+    stale_at = (utc_now() - timedelta(seconds=181)).isoformat()
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE analysis_refresh_jobs SET started_at=? WHERE job_id=?",
+            (stale_at, first["job_id"]),
+        )
+    second = database.claim_analysis_job("ORCL", 45)
+    assert second["claimed"] is True
+    assert database.finish_analysis_job(first["job_id"], "failed", None, "late", stale_at) is False
+    current = database.analysis_job("ORCL", 45)
+    assert current["status"] == "running"
+    assert current["started_at"] == second["started_at"]
+
+
+def test_gamma_refresh_returns_before_window_and_times_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """状态接口不能等窗口算完；超时只失败这一轮，晚到的完成不能翻案。"""
+    monkeypatch.setattr(api_module, "GAMMA_JOB_TIMEOUT_SECONDS", 0.05)
+    database = Database(tmp_path / "options.db")
+    service = SnapshotService(database, FakeProvider())
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_window(symbol: str, horizon_days: int = 45) -> dict:
+        entered.set()
+        release.wait(2)
+        return {"symbol": symbol, "horizon_days": horizon_days, "expirations": [], "results": [], "errors": []}
+
+    monkeypatch.setattr(service, "refresh_window", slow_window)
+    settings = Settings(
+        database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",),
+        refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False,
+    )
+    router = create_router(database, service, FakeProvider(), settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        started = time.monotonic()
+        payload = client.get("/api/gamma/AAPL", params={"horizon_days": 45, "refresh": True, "status_only": True}).json()
+        elapsed = time.monotonic() - started
+    assert elapsed < 1
+    assert payload["status_only"] is True
+    assert payload["refresh"]["claimed"] is True
+    assert payload["refresh"]["status"] == "running"
+    assert entered.wait(1)
+    deadline = time.monotonic() + 2
+    job = None
+    while time.monotonic() < deadline:
+        job = database.analysis_job("AAPL", 45)
+        if job and job["status"] == "failed":
+            break
+        time.sleep(0.02)
+    assert job is not None
+    assert job["status"] == "failed"
+    assert job["error_message"] == "分析超时，已停止本轮计算"
+    release.set()
+    time.sleep(0.1)
+    assert database.analysis_job("AAPL", 45)["status"] == "failed"
+    assert database.analysis_job("AAPL", 45)["error_message"] == "分析超时，已停止本轮计算"
+
+
 def test_gamma_status_only_skips_rows_until_display_request(tmp_path: Path):
     """Gamma 轮询只回任务状态；展示请求可以不要合约行，默认响应仍保留完整行。"""
     database = Database(tmp_path / "options.db")
@@ -1732,7 +1832,9 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;" in source
     assert "?refresh=true`" in source
     assert '@click="refreshNow"' in Path("app/static/index.html").read_text(encoding="utf-8")
-    assert ':disabled="refreshing"' in Path("app/static/index.html").read_text(encoding="utf-8")
+    # 进入标的时提示已经是「正在刷新」，按钮不能只看 refreshing，加载和后台请求期间也要禁用。
+    assert ':disabled="busy || !!refreshInFlight"' in Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "if (!silent && (state.loading || state.refreshInFlight)) return;" in source
     assert "function scheduleAutoRefresh()" in source
     assert "setTimeout(() => { refresh(true); }, delaySeconds * 1000);" in source
     assert "const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);" in source
@@ -1757,6 +1859,11 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "async function latestSelectedChain(loadId, symbol, fallbackPayload)" in source
     assert "latestSelectedChain(loadId, symbol, payload)," in source
     assert "?horizon_days=45&refresh=true" in source
+    assert "analysisBlockUntil" in source
+    assert "ANALYSIS_REFRESH_BLOCK_MS = 8000" in source
+    assert "ANALYSIS_POLL_LIMIT = 90" in source
+    assert "function analysisRefreshBlocking(" in source
+    assert "cache: false" in Path("app/static/common/js/request.js").read_text(encoding="utf-8")
     # 首次拿到选中期限的链后立即请求综合价位，不再等待慢速的跨期限 Gamma 窗口。
     assert "loadFactorLevels(points, levelSpot);" in source
     assert "renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);" in source
@@ -1775,6 +1882,7 @@ def test_refresh_toolbar_places_note_before_button_and_uses_blue_hover():
     assert toolbar.index('id="refresh-note"') < toolbar.index('id="refresh-button"')
     assert ".refresh-note{font-size:12px;font-variant-numeric:tabular-nums;display:inline-block;min-width:9.5em;text-align:right;white-space:nowrap}" in styles
     assert ".toolbar-actions .el-button.secondary.el-button--button:hover,.toolbar-actions .el-button.secondary.el-button--button:focus{border-color:var(--blue);background:var(--blue);color:var(--on-blue)}" in styles
+    assert ".toolbar-actions .el-button.secondary.el-button--button.is-disabled,.toolbar-actions .el-button.secondary.el-button--button.is-disabled:hover,.toolbar-actions .el-button.secondary.el-button--button.is-disabled:focus{opacity:.45;cursor:not-allowed;border-color:var(--field-line);background:transparent;color:var(--text)}" in styles
 
 
 def test_symbol_without_expirations_falls_back_to_quote_only(tmp_path: Path):
@@ -1796,6 +1904,8 @@ def test_symbol_without_expirations_falls_back_to_quote_only(tmp_path: Path):
     # 现货仍然要落库：现货卡片与盘前盘后都依赖它。
     assert database.latest_quote("SPCX")["price"] == 200.5
     assert database.latest_expirations("SPCX") == []
+    # 没有期权时不能写入空目录，否则会把该标的以后可能出现的到期日缓存抹掉。
+    assert database.latest_expiration_catalog("SPCX") == []
     # 仅现货的快照同样有新鲜期，定时刷新不再重复打上游接口。
     skipped = service.refresh("SPCX", None, max_age_seconds=60)
     assert skipped["skipped"] is True
@@ -1830,11 +1940,92 @@ def test_refresh_endpoint_returns_quote_only_without_expirations(tmp_path: Path)
         quote = client.get("/api/quote/SPCX").json()
         assert quote["price"] == 200.5
         assert quote["source"] == "sqlite"
+        assert fresh["expirations"] == []
         assert client.get("/api/expirations/SPCX").json()["expirations"] == []
         # 再次刷新命中新鲜期，直接复用本地现货快照。
         skipped = client.post("/api/refresh/SPCX", params={"max_age": 60}).json()
         assert skipped["skipped"] is True
         assert skipped["quote_only"] is True
+        assert skipped["expirations"] == []
+
+
+def test_refresh_publishes_full_expiration_catalog_after_one_chain(tmp_path: Path):
+    """一次刷新只写入选中到期日的链时，下拉框仍要立刻拿到全部未过期日期。"""
+    database = Database(tmp_path / "options.db")
+    today = market_today()
+    past = (today - timedelta(days=2)).isoformat()
+    near = today.isoformat()
+    later = (today + timedelta(days=7)).isoformat()
+    far = (today + timedelta(days=40)).isoformat()
+    calls = {"expirations": 0, "fetch": 0}
+
+    class CountingProvider(FakeProvider):
+        def expirations(self, symbol: str) -> list[str]:
+            calls["expirations"] += 1
+            return [past, near, later, far]
+
+        def fetch(self, symbol: str, expiration: str):
+            calls["fetch"] += 1
+            return sample_quote(symbol), sample_rows(symbol, expiration), iso()
+
+    provider = CountingProvider()
+    settings = Settings(
+        database_path=tmp_path / "options.db",
+        proxy_url=None,
+        default_symbols=("AAPL",),
+        refresh_interval_seconds=60,
+        raw_retention_days=30,
+        cleanup_interval_seconds=86400,
+        scheduler_enabled=False,
+    )
+    service = SnapshotService(database, provider)
+    router = create_router(database, service, provider, settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        fresh = client.post("/api/refresh/AAPL", params={"max_age": 0}).json()
+        assert calls == {"expirations": 1, "fetch": 1}
+        assert fresh["expiration"] == near
+        assert fresh["expirations"] == [near, later, far]
+        # 期权链只落了被选中的那一期，不能再把下拉框收成这一个日期。
+        assert database.latest_expirations("AAPL") == [near]
+        listed = client.get("/api/expirations/AAPL").json()
+        assert listed["source"] == "sqlite"
+        assert listed["expirations"] == [near, later, far]
+        assert calls == {"expirations": 1, "fetch": 1}
+        skipped = client.post("/api/refresh/AAPL", params={"expiration": near, "max_age": 60}).json()
+        assert skipped["skipped"] is True
+        assert skipped["expirations"] == [near, later, far]
+        assert calls == {"expirations": 1, "fetch": 1}
+
+    legacy = Database(tmp_path / "legacy.db")
+    legacy.write_snapshot(sample_quote(), sample_rows("AAPL", near), iso())
+
+    class BlockingProvider(FakeProvider):
+        def expirations(self, symbol: str) -> list[str]:
+            raise AssertionError("旧库没有到期日目录时不应回源")
+
+    legacy_settings = Settings(
+        database_path=tmp_path / "legacy.db",
+        proxy_url=None,
+        default_symbols=("AAPL",),
+        refresh_interval_seconds=60,
+        raw_retention_days=30,
+        cleanup_interval_seconds=86400,
+        scheduler_enabled=False,
+    )
+    legacy_service = SnapshotService(legacy, BlockingProvider())
+    legacy_router = create_router(legacy, legacy_service, BlockingProvider(), legacy_settings)
+    legacy_app = FastAPI()
+    legacy_app.include_router(legacy_router)
+    with TestClient(legacy_app) as client:
+        payload = client.get("/api/expirations/AAPL").json()
+        assert payload["source"] == "sqlite"
+        assert payload["expirations"] == [near]
+        # 目录里只剩已过期日期时，仍退回已经落库且未过期的链。
+        legacy.write_expiration_catalog("AAPL", [past], iso())
+        fallback = client.get("/api/expirations/AAPL").json()
+        assert fallback["expirations"] == [near]
 
 
 def test_frontend_loads_symbol_without_cached_expiration():
@@ -1845,10 +2036,16 @@ def test_frontend_loads_symbol_without_cached_expiration():
     assert "await refreshInBackground(loadId, force);" in source
     # 仅现货标的单独一条渲染分支：现货照常画，期权面板统一提示没有期权数据。
     assert "async function loadQuoteOnly(loadId, force = false)" in source
-    assert "if (refreshResult?.quote_only) { await loadQuoteOnly(loadId, force); return; }" in source
+    # 仅现货响应也不能直接渲染：等待期间到期日变了要重入，没变才结束，避免落到期权链分支。
+    quote_only = source[source.index("if (refreshResult?.quote_only)") : source.index("if (refreshResult?.quote_only)") + 220]
+    assert "const restarted = await loadQuoteOnly(loadId, force);" in quote_only
+    assert "if (!restarted && await restartIfExpirationChanged(expiration)) return;" in quote_only
+    assert quote_only.index("return;") > quote_only.index("loadQuoteOnly")
     assert 'applyExpirations([], null, "无期权到期日");' in source
     # 本地无缓存（source=pending）与「该标的确实没有期权」必须给出不同占位文案。
     assert 'payload.source === "pending" ? "正在获取到期日…" : "该标的没有期权到期日"' in source
+    # 刷新响应里的完整到期日要立刻填进下拉框，不能先只放当前这一期再等下一轮自动刷新。
+    assert "applyExpirations(refreshResult.expirations, state.expiration || refreshResult.expiration);" in source
 
 
 def test_zero_gamma_scan_reuses_expiry_cache():
@@ -2952,7 +3149,98 @@ def test_trend_channel_renders_extremes_rows():
     assert "每个交易日相对均价的平均涨跌百分比" in source
 
 
+def test_trend_channel_shows_zero_skeleton_while_loading():
+    """新标的加载时趋势通道先铺 0 值版式，不再收成一行空白提示。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    placeholder = source[source.index("function placeholderTrend"):source.index("function renderTrend")]
+    for label in (
+        "通道上轨", "通道下轨", "相对强弱", "日均斜率", "样本", "今开", "昨收", "Beta",
+        "52周最高", "52周最低", "历史最高", "历史最低", "近期最佳买入点", "近期最佳卖出点",
+    ):
+        assert label in placeholder
+    assert placeholder.count('"0.00"') >= 8
+    assert '"0.0 · 中性"' in placeholder
+    assert '"+0.000%"' in placeholder
+    assert '"0 根日线"' in placeholder
+    assert 'range: "0.00"' in placeholder
+    assert 'confidence: "0%"' in placeholder
+    assert "available: true" in placeholder
+    assert "placeholder: true" in placeholder
+    assert 'label: "趋势通道"' in placeholder
+    assert 'action: ""' in placeholder
+    assert 'reason: loading ? "正在加载" : status' in placeholder
+    assert 'empty: "历史行情不足，暂无趋势判断"' in placeholder
+    assert "trend: placeholderTrend()" in source
+    pending = source[source.index("function showPending"):source.index("function applyCachedQuote")]
+    assert 'state.view.trend = placeholderTrend(message || "正在加载")' in pending
+    assert "available: false, rows: []" not in pending
+    trend = source[source.index("function renderTrend"):source.index("function tradePointIdentity")]
+    assert 'placeholderTrend("历史行情不足，暂无趋势判断")' in trend
+    assert "available: false, rows: []" not in trend
+    assert "placeholder: false" in trend
+    fallback = source[source.index("function renderFactorFallback"):source.index("function requestFactorLevels")]
+    assert "state.view.trend.available && !state.view.trend.placeholder" in fallback
+
+
+def test_level_tables_show_zero_skeleton_while_loading():
+    """加仓、支撑、压力三张表在新数据回来前先铺 10 行 0 值，不再只剩一句暂无数据。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    placeholder = source[source.index("function placeholderLevelRow"):source.index("function placeholderTrend")]
+    assert 'range: "0.00"' in placeholder
+    assert 'gap: "+0.00%"' in placeholder
+    assert 'probability: "0%"' in placeholder
+    assert 'factors: "0"' in placeholder
+    assert 'detail: "历史回踩：0 次"' in placeholder
+    assert 'title: "正在加载"' in placeholder
+    assert 'placeholder: true' in placeholder
+    assert 'placeholderLevelRows(LEVEL_COUNT, "resistance")' in placeholder
+    assert 'placeholderLevelRows(LEVEL_COUNT, "support")' in placeholder
+    assert 'placeholderLevelRows(PLAN_COUNT, "support", true)' in placeholder
+    assert "levels: placeholderLevels()" in source
+    pending = source[source.index("function showPending"):source.index("function applyCachedQuote")]
+    assert 'state.view.levels = placeholderLevels(message || "正在加载")' in pending
+    assert "state.view.levels.resistance = []" not in pending
+    assert "state.view.levels.support = []" not in pending
+    assert "state.view.levels.add = []" not in pending
+    fallback = source[source.index("function renderFactorFallback"):source.index("function requestFactorLevels")]
+    assert "!state.view.levels.placeholder" in fallback
+    factor = source[source.index("function renderFactorLevels"):source.index("function formatStructureDelta")]
+    assert "state.view.levels.placeholder = false" in factor
+
+
+def test_charts_show_zero_skeleton_while_loading():
+    """四张分布图在快照回来前先铺 0 值坐标和汇总，不再只在空白区放一句加载提示。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    charts = Path("app/static/common/js/charts.js").read_text(encoding="utf-8")
+    assert "function renderChartSkeleton(targetId, options = {})" in charts
+    skeleton_fn = charts[charts.index("function renderChartSkeleton"):charts.index("function showEmpty")]
+    assert 'data-skeleton="1"' in skeleton_fn
+    assert ">0.00</text>" in skeleton_fn
+    assert "看涨 ↑" in skeleton_fn and "看跌 ↓" in skeleton_fn
+    assert "压力 ↑" in skeleton_fn and "支撑 ↓" in skeleton_fn
+    assert "renderChartSkeleton: renderChartSkeleton," in charts
+    show = source[source.index("function showChartSkeletons"):source.index("function showPending")]
+    assert 'OptionScopeCharts.renderChartSkeleton("gex-chart");' in show
+    assert 'OptionScopeCharts.renderChartSkeleton("volume-chart", { axis: "right" });' in show
+    assert 'OptionScopeCharts.renderChartSkeleton("oi-chart", { axis: "right" });' in show
+    assert 'OptionScopeCharts.renderChartSkeleton("levels-chart", { zeroLabel: "0.00", corners: "levels" });' in show
+    assert '净 Gamma 0 · 估算' in show
+    assert '零 Gamma 0.00 · 估算' in show
+    assert '看涨墙 0.00' in show and '看跌墙 0.00' in show
+    assert '基准 0.00' in show
+    assert 'OptionScopeCharts.renderDistributionSummary(byId("volume-summary"), [], null, "volume", "总成交量");' in show
+    assert 'OptionScopeCharts.renderDistributionSummary(byId("oi-summary"), [], null, "open_interest", "总持仓量");' in show
+    pending = source[source.index("function showPending"):source.index("function applyCachedQuote")]
+    assert "showChartSkeletons();" in pending
+    assert "state.lastAnalysis = null;" in pending
+    assert 'OptionScopeCharts.showEmpty("gex-chart"' not in pending
+    assert 'OptionScopeCharts.showEmpty("levels-chart"' not in pending
+    assert "OptionScopeCharts.clearSummary" not in pending
+    assert "showChartSkeletons();\n  loadSymbol();" in source
+
+
 def test_history_service_caches_history(tmp_path: Path):
+
     """日线历史：新鲜期内复用 SQLite，只有过期才回源上游接口。"""
     database = Database(tmp_path / "options.db")
     calls = {"count": 0}
@@ -3106,17 +3394,84 @@ def test_expiration_switch_discards_stale_response():
     assert 'state.expiration = expiration;' in source
     # 双向防覆盖之一：renderSnapshot 用「发起请求时的到期日」做落地校验，不再是只看 loadId。
     assert "const expiration = state.expiration;" in source
-    assert "if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null };" in source
+    assert "if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null, discarded: true };" in source
+    # 作废的快照不能把新期限清成「正在后台获取」，也不能再为旧期限启动刷新。
+    load_chain = source[source.index("async function loadChain"):source.index("async function loadSymbol")]
+    assert "if (snapshot.discarded) return;" in load_chain
+    assert load_chain.index("if (snapshot.discarded) return;") < load_chain.index('showPending("正在后台获取上游快照…")')
     # 双向防覆盖之二：后台刷新发现期限变了就先还回网络互斥再按新期限重来，避免把用户的选择拽回旧期限。
     assert "if (state.expiration !== currentExpiration) {" in source
     assert "state.refreshInFlight = null;\n      await refreshInBackground(loadId, force);" in source
     assert source.index("if (state.expiration !== currentExpiration) {") < source.index("applyExpirations(expirations.expirations, currentExpiration);")
+    # 自动刷新的 POST 还没回来就换了到期日：先重入新期限，再使用旧 POST 的结果去拉链或渲染。
+    refresh_fn = source[source.index("async function refreshInBackground"):source.index("async function loadQuoteOnly")]
+    post = refresh_fn.index('method: "POST"')
+    restart = refresh_fn.index("if (await restartIfExpirationChanged(expiration)) return;", post)
+    current = refresh_fn.index("const currentExpiration = state.expiration || refreshResult?.expiration;")
+    render_old = refresh_fn.index("renderChain(payload, resolvedQuote, state.lastAnalysis?.analysisPayload || null);")
+    assert post < restart < current < render_old
+    assert "async function restartIfExpirationChanged(captured)" in refresh_fn
+    assert "if (payload?.expiration && state.expiration && payload.expiration !== state.expiration) return;" in source
     # 下拉框的禁用兜底：网络卡死时不至于永久禁用。
     assert "const EXPIRATION_SWITCH_TIMEOUT_MS = 20000;" in source
     assert "clearTimeout(releaseTimer);" in source
     # 旧的「静默重载」绑定已删除，切换只走 switchExpiration 一条路径。
     assert 'expirationChanged() { return switchExpiration(this.expiration); }' in source
     assert 'loadChain({ silent: true })' not in source
+    # 菜单打开时暂停倒计时，只绑在到期日下拉框上；关掉且已经到点时才补刷新。
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    expiration_select = page[page.index('id="expiration-select"'):page.index('id="expiration-select"') + 500]
+    assert '@visible-change="expirationMenuChanged"' in expiration_select
+    chain_filter = page[page.index('id="chain-type-filter"'):page.index('id="chain-type-filter"') + 400]
+    assert "visible-change" not in chain_filter
+    assert "function setExpirationMenuOpen(open)" in source
+    assert "expirationMenuChanged(open) { return setExpirationMenuOpen(open); }" in source
+    assert "if (expirationMenuOpen)" in source
+    assert "if (silent && expirationMenuOpen)" in source
+    assert "if (due && !refreshWorkPending() && !document.body.classList.contains(\"access-denied-page\"))" in source
+    assert "refresh(true);" in source
+    assert "const skipGamma = snapshotReadInFlight > 0 || state.refreshInFlight === state.symbol;" in source
+
+
+def test_refresh_cycle_does_not_reread_same_snapshot():
+    """已经展示的快照在自动刷新时不要把 quote、chain、gamma、levels 各请求多遍。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    assert "function displayedSnapshotMatches()" in source
+    assert "function displayedSnapshotIsFresh()" in source
+    assert "let snapshotReadCache = null;" in source
+    assert "function reusableGammaProfile(symbol)" in source
+    assert "chainFresh && !analysis" in source
+    assert "levelsWindowFetchedAt" not in source
+    load_chain = source[source.index("async function loadChain"):source.index("async function loadSymbol")]
+    assert load_chain.index("if (displayedSnapshotMatches())") < load_chain.index("const snapshot = await renderSnapshot(loadId);")
+    assert "await refreshInBackground(loadId, force);" in load_chain
+    refresh_fn = source[source.index("async function refreshInBackground"):source.index("async function loadQuoteOnly")]
+    assert refresh_fn.index("quoteIsReady(refreshResult?.quote)") < refresh_fn.index("request(`/api/quote/${encodedSymbol}`)")
+    assert "Promise.resolve(refreshResult.quote)" in refresh_fn
+    assert "let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;" in refresh_fn
+    chain_fn = source[source.index("async function latestSelectedChain"):source.index("function reusableGammaProfile")]
+    assert "fallbackPayload.expiration === expiration" in chain_fn
+    assert "levelsWindowFetchedAt" not in source
+    levels_key = source[source.index("const key = `${state.symbol}|${state.expiration}|"):source.index("const key = `${state.symbol}|${state.expiration}|") + 220]
+    assert "levelsWindowFetchedAt" not in levels_key
+    assert "state.chainFetchedAt" in levels_key
+    # 服务端仍判定新鲜时，不要把已经显示的同一份快照再读一遍，并按服务端年龄重排倒计时。
+    assert "function displayedSnapshotIsCurrent(fetchedAt)" in source
+    assert "function syncRefreshAnchorToServerAge(result)" in source
+    assert "if (!displayedSnapshotIsCurrent(refreshResult.fetched_at))" in source
+    assert "refreshDeadline - Date.now() > 1500" in source
+    assert "const settledAge = age == null ? null : Math.max(age - 1, 0);" in source
+    assert "function syncedNow()" in source
+    assert "OptionScopeRequest.serverNow" in source
+    poll = source[source.index("function pollGammaWindow"):source.index("async function refreshInBackground")]
+    assert ".finally(" not in poll
+    assert "Promise.resolve(task)" in poll
+    assert "continuePolling" in poll
+    request_js = Path("app/static/common/js/request.js").read_text(encoding="utf-8")
+    assert 'getResponseHeader("Date")' in request_js
+    assert "serverNow: function" in request_js
+    assert "noteServerNow: noteServerNow" in request_js
+    assert "cache: false" in request_js
 
 
 def test_chain_header_matches_other_fold_groups():
@@ -3600,6 +3955,29 @@ def test_cleanup_keeps_earnings_snapshots(tmp_path: Path):
     deleted = database.cleanup(30)
     assert "earnings" not in deleted
     assert database.latest_earnings("AAPL")["dates"] == ["2026-09-30"]
+
+
+def test_cleanup_keeps_expiration_catalog(tmp_path: Path):
+    """到期日目录只服务下拉框，不随期权链的保留天数一起删掉。"""
+    database = Database(tmp_path / "options.db")
+    database.write_expiration_catalog(
+        "AAPL",
+        ["2026-12-18", "not-a-date", "2027-01-15", "2026-12-18"],
+        iso(utc_now() - timedelta(days=40)),
+    )
+    assert database.latest_expiration_catalog("AAPL") == ["2026-12-18", "2027-01-15"]
+    deleted = database.cleanup(30)
+    assert "expirations" not in deleted
+    assert database.latest_expiration_catalog("AAPL") == ["2026-12-18", "2027-01-15"]
+    # 非法或空列表不能覆盖已经记下的完整目录。
+    database.write_expiration_catalog("AAPL", ["still-bad"], iso())
+    assert database.latest_expiration_catalog("AAPL") == ["2026-12-18", "2027-01-15"]
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO expiration_catalog(symbol, payload, fetched_at) VALUES (?, ?, ?)",
+            ("MSFT", "{", iso()),
+        )
+    assert database.latest_expiration_catalog("MSFT") == []
 
 
 def test_frontend_marks_quote_reference_estimates_and_earnings():

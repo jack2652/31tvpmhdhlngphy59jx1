@@ -284,6 +284,7 @@ body{font-size:14px}
 .toolbar-actions .el-button{height:38px;border-radius:2px;font:inherit;font-weight:650}
 .toolbar-actions .el-button--default{border-color:var(--field-line);background:transparent;color:var(--text)}
 .toolbar-actions .el-button.secondary.el-button--button:hover,.toolbar-actions .el-button.secondary.el-button--button:focus{border-color:var(--blue);background:var(--blue);color:var(--on-blue)}
+.toolbar-actions .el-button.secondary.el-button--button.is-disabled,.toolbar-actions .el-button.secondary.el-button--button.is-disabled:hover,.toolbar-actions .el-button.secondary.el-button--button.is-disabled:focus{opacity:.45;cursor:not-allowed;border-color:var(--field-line);background:transparent;color:var(--text)}
 .theme-toggle.el-button{width:38px;height:38px;padding:0;border:1px solid var(--field-line);color:var(--text)}
 .theme-toggle.el-button:hover{border-color:var(--blue);color:var(--blue)}
 .chain-filter .el-select{width:112px;min-width:0}

@@ -7,7 +7,7 @@ import logging
 import shutil
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -24,6 +24,26 @@ SIZE_CLEANUP_TARGET_RATIO = 0.8
 SIZE_CLEANUP_TIME_BUDGET_SECONDS = 120
 # 表示「不设保护期」的哨兵时间戳，比任何写入时间都新，可复用同一套 SQL。
 NO_FLOOR = "9999-12-31T23:59:59+00:00"
+# 后台分析停在 running 超过这个时间，下一轮可以重新领取。进程还活着时由接口侧的看门狗先标记失败。
+ANALYSIS_JOB_STALE_SECONDS = 180
+ORPHANED_ANALYSIS_MESSAGE = "进程重启，后台分析已中断"
+
+
+
+def expiration_dates(values: Iterable[Any]) -> list[str]:
+    """保留合法的 YYYY-MM-DD，并按原顺序去重。"""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str) or item in seen:
+            continue
+        try:
+            date.fromisoformat(item)
+        except ValueError:
+            continue
+        seen.add(item)
+        cleaned.append(item)
+    return cleaned
 
 
 def utc_now() -> datetime:
@@ -179,6 +199,12 @@ class Database:
                     fetched_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS expiration_catalog (
+                    symbol TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS analysis_refresh_jobs (
                     job_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
@@ -258,7 +284,7 @@ class Database:
         symbol: str,
         horizon_days: int,
         cooldown_seconds: int = 30,
-        stale_seconds: int = 600,
+        stale_seconds: int = ANALYSIS_JOB_STALE_SECONDS,
     ) -> dict[str, Any]:
         """跨进程领取 Gamma 后台任务；同一标的窗口只允许一个 worker 执行。"""
         job_id = f"{symbol}:{horizon_days}"
@@ -305,14 +331,35 @@ class Database:
         status: str,
         result: dict[str, Any] | None,
         error_message: str | None,
-    ) -> None:
+        started_at: str,
+    ) -> bool:
+        """只结束这一轮 running。晚到的线程带旧 started_at 时不能覆盖新领取的任务。"""
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """UPDATE analysis_refresh_jobs
                       SET status=?, finished_at=?, result_json=?, error_message=?
-                    WHERE job_id=?""",
-                (status, iso(), json.dumps(result, ensure_ascii=False) if result is not None else None, error_message, job_id),
+                    WHERE job_id=? AND status='running' AND started_at=?""",
+                (
+                    status,
+                    iso(),
+                    json.dumps(result, ensure_ascii=False) if result is not None else None,
+                    error_message,
+                    job_id,
+                    started_at,
+                ),
             )
+            return cursor.rowcount > 0
+
+    def fail_orphaned_analysis_jobs(self, error_message: str = ORPHANED_ANALYSIS_MESSAGE) -> int:
+        """进程重启后，上一轮还停在 running 的分析不会再有线程写回结果。"""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE analysis_refresh_jobs
+                      SET status='failed', finished_at=?, error_message=?
+                    WHERE status='running'""",
+                (iso(), error_message),
+            )
+            return int(cursor.rowcount or 0)
 
     def analysis_job(self, symbol: str, horizon_days: int) -> dict[str, Any] | None:
         job_id = f"{symbol}:{horizon_days}"
@@ -560,6 +607,33 @@ class Database:
         if not isinstance(payload, dict) or not isinstance(payload.get("dates"), list):
             return None
         return {"dates": [str(item) for item in payload["dates"]], "fetched_at": str(row["fetched_at"])}
+
+    def write_expiration_catalog(self, symbol: str, expirations: list[str], fetched_at: str) -> None:
+        """缓存供应商返回的全部到期日。下拉框不能只依赖已经落库的期权链。"""
+        cleaned = expiration_dates(expirations)
+        if not cleaned:
+            return
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO expiration_catalog(symbol, payload, fetched_at) VALUES (?, ?, ?)",
+                (symbol, json.dumps({"expirations": cleaned}, ensure_ascii=False), fetched_at),
+            )
+
+    def latest_expiration_catalog(self, symbol: str) -> list[str]:
+        """返回已缓存的全部到期日；没有缓存或内容损坏时返回空列表。"""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM expiration_catalog WHERE symbol=?", (symbol,)
+            ).fetchone()
+        if not row:
+            return []
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(payload, dict):
+            return []
+        return expiration_dates(payload.get("expirations") or [])
 
     def latest_expirations(self, symbol: str) -> list[str]:
         with self.connect() as connection:

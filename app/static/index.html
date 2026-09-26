@@ -30,8 +30,8 @@
   <main class="shell">
     <section class="toolbar panel">
       <div class="control symbol-control"><label for="symbol-input">标的</label><div class="input-wrap"><span>$</span><el-input id="symbol-input" value="__DEFAULT_SYMBOL__" v-model.trim="symbolInput" maxlength="10" autocomplete="off" @keyup.enter.native="navigateToSymbol"></el-input><el-button id="load-button" type="primary" size="small" @click="navigateToSymbol" :loading="loading" :disabled="busy">载入</el-button></div></div>
-      <div class="control"><label for="expiration-select">到期日</label><el-select id="expiration-select" v-model="expiration" @change="expirationChanged" :disabled="busy || !expirationOptions.length" :placeholder="expirationPlaceholder" filterable><el-option v-for="date in expirationOptions" :key="date" :value="date" :label="date"></el-option></el-select></div>
-      <div class="toolbar-actions"><span id="refresh-note" class="refresh-note">每 __AUTO_REFRESH_SECONDS__ 秒自动更新</span><el-button id="refresh-button" class="secondary" plain size="small" icon="el-icon-refresh" type="button" @click="refreshNow" :loading="refreshing" :disabled="refreshing">刷新快照</el-button></div>
+      <div class="control"><label for="expiration-select">到期日</label><el-select id="expiration-select" v-model="expiration" @change="expirationChanged" @visible-change="expirationMenuChanged" :disabled="busy || !expirationOptions.length" :placeholder="expirationPlaceholder" filterable><el-option v-for="date in expirationOptions" :key="date" :value="date" :label="date"></el-option></el-select></div>
+      <div class="toolbar-actions"><span id="refresh-note" class="refresh-note">每 __AUTO_REFRESH_SECONDS__ 秒自动更新</span><el-button id="refresh-button" class="secondary" plain size="small" icon="el-icon-refresh" type="button" @click="refreshNow" :loading="refreshing" :disabled="busy || !!refreshInFlight">刷新快照</el-button></div>
     </section>
 
     <section class="headline-grid">

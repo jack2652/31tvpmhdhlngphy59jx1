@@ -433,6 +433,42 @@ function renderLevelsChart(payload) {
   chartSvg.addEventListener("blur", hideTooltip);
 }
 
+// 数据还没回来时先铺坐标、零线和 0 刻度，避免四张图各留一大块空白。
+function renderChartSkeleton(targetId, options = {}) {
+  const target = document.getElementById(targetId);
+  if (!target) return;
+  const { width, height } = chartContentBox(target);
+  target.dataset.chartWidth = String(width);
+  target.dataset.chartHeight = String(height);
+  const axisOnRight = options.axis === "right";
+  const pad = axisOnRight ? { left: 16, right: 56, top: 14, bottom: 26 } : { left: 48, right: 12, top: 14, bottom: 26 };
+  const innerWidth = width - pad.left - pad.right;
+  const innerHeight = height - pad.top - pad.bottom;
+  const baseline = pad.top + innerHeight / 2;
+  const gutter = Math.min(44, Math.max(16, innerHeight / 2 - 16));
+  const scaleTop = pad.top + gutter;
+  const scaleBottom = height - pad.bottom - gutter;
+  const halfTop = (scaleTop + baseline) / 2;
+  const halfBottom = (scaleBottom + baseline) / 2;
+  const zero = options.zeroLabel || "0";
+  const axisLabels = axisOnRight
+    ? `<text class="chart-label" x="${width - 6}" y="${scaleTop + 4}" text-anchor="end">${zero}</text><text class="chart-label" x="${width - 6}" y="${halfTop + 4}" text-anchor="end">${zero}</text><text class="chart-label" x="${width - 6}" y="${baseline + 4}" text-anchor="end">${zero}</text><text class="chart-label" x="${width - 6}" y="${halfBottom + 4}" text-anchor="end">${zero}</text><text class="chart-label" x="${width - 6}" y="${scaleBottom + 4}" text-anchor="end">${zero}</text>`
+    : `<text class="chart-label" x="4" y="${scaleTop + 4}">${zero}</text><text class="chart-label" x="4" y="${baseline + 4}">${zero}</text><text class="chart-label" x="4" y="${scaleBottom + 4}">${zero}</text>`;
+  const gridLines = axisOnRight
+    ? `<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${halfTop}" y2="${halfTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${halfBottom}" y2="${halfBottom}"/>`
+    : "";
+  const strikeCount = Math.max(2, Math.floor(innerWidth / 84));
+  const strikes = Array.from({ length: strikeCount }, (_, index) => {
+    const x = pad.left + (index + 0.5) * (innerWidth / strikeCount);
+    return `<text class="chart-label" x="${x}" y="${height - 8}" text-anchor="middle">0.00</text>`;
+  }).join("");
+  const cornerLabels = options.corners === "levels"
+    ? `<text class="chart-label" x="${width - 12}" y="${pad.top + 10}" text-anchor="end">压力 ↑</text><text class="chart-label" x="${width - 12}" y="${height - pad.bottom - 3}" text-anchor="end">支撑 ↓</text>`
+    : (axisOnRight ? "" : `<text class="chart-label" x="${width - 12}" y="${pad.top + 10}" text-anchor="end">看涨 ↑</text><text class="chart-label" x="${width - 12}" y="${height - pad.bottom - 3}" text-anchor="end">看跌 ↓</text>`);
+  const label = target.getAttribute("aria-label") || "图表";
+  target.innerHTML = `<svg data-skeleton="1" viewBox="0 0 ${width} ${height}" role="img" aria-label="${label}">${gridLines}<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleTop}" y2="${scaleTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleBottom}" y2="${scaleBottom}"/><line class="chart-zero" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/>${axisLabels}${strikes}${cornerLabels}</svg>`;
+}
+
 function showEmpty(targetId, message) {
   const target = document.getElementById(targetId);
   if (target) target.innerHTML = `<div class="chart-empty">${message}</div>`;
@@ -448,6 +484,7 @@ window.OptionScopeCharts = {
   renderSignedChart: renderSignedChart,
   renderLevelsChart: renderLevelsChart,
   renderDistributionSummary: renderDistributionSummary,
+  renderChartSkeleton: renderChartSkeleton,
   chartContentBox: chartContentBox,
   showEmpty: showEmpty,
   clearSummary: clearSummary,

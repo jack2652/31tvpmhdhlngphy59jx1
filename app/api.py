@@ -6,7 +6,8 @@ import hashlib
 import json
 import math
 import secrets
-from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, Request
+import threading
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Any
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from app.config import Settings
-from app.db import Database, iso, parse_sessions
+from app.db import Database, expiration_dates, iso, parse_sessions
 from app.gamma import annotate_model_greeks, find_zero_gamma
 from app.levels import build_levels
 from app.providers.market import ProviderError, MarketDataProvider
@@ -24,6 +25,11 @@ from app.services.concurrency import SingleFlightCache, get_heavy_gate
 from app.services.earnings import summarize_earnings
 from app.services.history import HistoryService
 from app.services.snapshots import SnapshotService, active_expirations, market_today
+
+
+# 后台 Gamma 窗口超过这个时间还没写回，只把这一轮标记失败。晚到的线程靠 started_at 避免覆盖新任务。
+GAMMA_JOB_TIMEOUT_SECONDS = 180
+GAMMA_JOB_TIMEOUT_MESSAGE = "分析超时，已停止本轮计算"
 
 
 _FORBIDDEN_PAGE = """<!doctype html>
@@ -195,14 +201,27 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             database.put_analysis_cache(shared_key, value, settings.analysis_cache_entries)
         return value
 
-    def run_gamma_refresh(job_key: str, symbol_name: str, horizon_days: int) -> None:
-        """后台刷新 Gamma 窗口；任务状态写入 SQLite，允许多 worker 共享。"""
+    def run_gamma_refresh(job_key: str, symbol_name: str, horizon_days: int, started_at: str) -> None:
+        """后台刷新 Gamma 窗口；任务状态写入 SQLite，允许多 worker 共享。
+
+        用独立线程而不是请求里的 BackgroundTasks：后者要等任务结束，ASGI 调用才返回，
+        外面的响应缓冲会把 status 接口一起拖住。超时只失败这一轮的 started_at。
+        """
+        def expire() -> None:
+            database.finish_analysis_job(job_key, "failed", None, GAMMA_JOB_TIMEOUT_MESSAGE, started_at)
+
+        timer = threading.Timer(GAMMA_JOB_TIMEOUT_SECONDS, expire)
+        timer.daemon = True
+        timer.start()
         try:
-            result = snapshots.refresh_window(symbol_name, horizon_days)
-        except Exception as exc:  # noqa: BLE001 - 后台任务必须把异常写回状态
-            database.finish_analysis_job(job_key, "failed", None, str(exc))
-            return
-        database.finish_analysis_job(job_key, "completed", result, None)
+            try:
+                result = snapshots.refresh_window(symbol_name, horizon_days)
+            except Exception as exc:  # noqa: BLE001 - 后台任务必须把异常写回状态
+                database.finish_analysis_job(job_key, "failed", None, str(exc), started_at)
+                return
+            database.finish_analysis_job(job_key, "completed", result, None, started_at)
+        finally:
+            timer.cancel()
 
     def symbol(value: str) -> str:
         try:
@@ -251,11 +270,18 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 return pending_quote(normalized)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    def listed_expirations(stock_symbol: str) -> list[str]:
+        """下拉框优先用完整到期日缓存；旧库没有这份缓存时才退回已经落库的链。"""
+        catalog = active_expirations(database.latest_expiration_catalog(stock_symbol))
+        if catalog:
+            return catalog
+        return active_expirations(database.latest_expirations(stock_symbol))
+
     @router.get("/expirations/{stock_symbol}")
     def expirations(stock_symbol: str, refresh: bool = Query(default=False)) -> dict[str, Any]:
         normalized = symbol(stock_symbol)
         # 已过期的到期日不再下发给前端：这类历史合约无法再从上游刷新，会让页面一直停在旧快照。
-        cached = active_expirations(database.latest_expirations(normalized))
+        cached = listed_expirations(normalized)
         if cached and not refresh:
             return {"symbol": normalized, "expirations": cached, "source": "sqlite"}
         if not refresh:
@@ -266,7 +292,11 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             if cached:
                 return {"symbol": normalized, "expirations": cached, "source": "sqlite", "warning": str(exc)}
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"symbol": normalized, "expirations": active_expirations(values), "source": "upstream"}
+        active = active_expirations(values)
+        # 空列表不覆盖已有缓存：没有期权的标的保持「未缓存」，避免把旧的完整列表抹掉。
+        if active:
+            database.write_expiration_catalog(normalized, active, iso())
+        return {"symbol": normalized, "expirations": active, "source": "upstream"}
 
     @router.get("/chain/{stock_symbol}")
     def chain(stock_symbol: str, expiration: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict[str, Any]:
@@ -305,7 +335,6 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
     @router.get("/gamma/{stock_symbol}")
     def gamma_profile(
         stock_symbol: str,
-        background_tasks: BackgroundTasks,
         refresh: bool = Query(default=False),
         horizon_days: int = Query(default=45, ge=1, le=365),
         status_only: bool = Query(default=False),
@@ -321,12 +350,13 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         if refresh:
             refresh_result = database.claim_analysis_job(normalized, horizon_days)
             if refresh_result.get("claimed"):
-                background_tasks.add_task(
-                    run_gamma_refresh,
-                    refresh_result["job_id"],
-                    normalized,
-                    horizon_days,
-                )
+                # 先把状态返回给轮询，窗口刷新放到守护线程里，不占用这次请求。
+                threading.Thread(
+                    target=run_gamma_refresh,
+                    args=(refresh_result["job_id"], normalized, horizon_days, refresh_result["started_at"]),
+                    name=f"gamma-{normalized}-{horizon_days}",
+                    daemon=True,
+                ).start()
         if status_only:
             job_state = refresh_result or database.analysis_job(normalized, horizon_days)
             return {
@@ -423,8 +453,15 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             cached_quote = database.latest_quote(normalized)
             if cached_quote:
                 result["quote"] = quote_response(cached_quote, "sqlite")
-            # 到期日跟快照一起返回，页面不必再为了下拉框单独回源一次。
-            result["expirations"] = active_expirations(database.latest_expirations(normalized))
+            # 本次抓取已经拿到的完整列表优先；跳过回源时用上次缓存，最后才退回已落库的链。
+            provided = result.get("expirations")
+            if result.get("quote_only"):
+                result["expirations"] = []
+            elif isinstance(provided, list) and provided:
+                active = active_expirations(expiration_dates(item for item in provided if isinstance(item, str)))
+                result["expirations"] = active or listed_expirations(normalized)
+            else:
+                result["expirations"] = listed_expirations(normalized)
             return result
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

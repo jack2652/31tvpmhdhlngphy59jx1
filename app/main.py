@@ -55,16 +55,20 @@ async def lifespan(_: FastAPI):
             limit if limit is not None else "未知",
             settings.analysis_cache_entries,
         )
+    interrupted = database.fail_orphaned_analysis_jobs()
+    if interrupted:
+        app_logger.info("已中断 %s 个重启前未完成的后台分析", interrupted)
     await scheduler.start()
     yield
     await scheduler.stop()
 
 
 app = FastAPI(title="Option Scope", version="0.1.0", lifespan=lifespan)
-# gzip 和 ETag 都要先把整份响应收进内存。256MB 机器上这一份拷贝就可能把进程打爆。
+# gzip 要先把整份响应收进内存。256MB 机器上这一份拷贝就可能把进程打爆。
+# API JSON 一律 no-store，低内存机器也要装上：304 会让轮询一直读到旧的 running。
 if not settings.low_memory:
     app.add_middleware(GZipMiddleware, minimum_size=1024)
-    app.add_middleware(ETagMiddleware)
+app.add_middleware(ETagMiddleware)
 install_access_guard(app, settings)
 app.include_router(create_router(database, snapshots, provider, settings))
 static_dir = Path(__file__).parent / "static"

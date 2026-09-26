@@ -269,12 +269,19 @@ class SnapshotService:
         finally:
             self.heavy_gate.release()
 
+    def _remember_expirations(self, symbol: str, values: list[str]) -> list[str]:
+        """记下本次已经拿到的全部未过期到期日，避免为了下拉框再请求一次上游。"""
+        available = active_expirations(values)
+        if available:
+            self.database.write_expiration_catalog(symbol, available, iso())
+        return available
+
     def _fetch_upstream(self, normalized: str, expiration: str | None) -> dict[str, Any]:
         """请求上游接口并写入 SQLite，失败时记录刷新日志后抛出。"""
         run_id = self.database.start_run(normalized)
         try:
             expirations = self.provider.expirations(normalized)
-            available = active_expirations(expirations)
+            available = self._remember_expirations(normalized, expirations)
             # 有些标的（例如 SPCX 这类没有挂牌期权合约的标的）根本没有到期日：此时退化成只抓现货，
             # 现货卡片照常可用，页面其余面板提示没有期权数据，而不是整页无数据。
             if not available:
@@ -292,7 +299,13 @@ class SnapshotService:
             quote, rows, fetched_at = self.provider.fetch(normalized, selected)
             written = self.database.write_snapshot(self._with_cached_sessions(normalized, quote), rows, fetched_at)
             self.database.finish_run(run_id, "success", written)
-            return {"symbol": normalized, "expiration": selected, "fetched_at": fetched_at, "rows": written}
+            return {
+                "symbol": normalized,
+                "expiration": selected,
+                "fetched_at": fetched_at,
+                "rows": written,
+                "expirations": available,
+            }
         except Exception as exc:
             self.database.finish_run(run_id, "failed", 0, str(exc))
             if isinstance(exc, (ValueError, ProviderError, RuntimeError)):
@@ -320,6 +333,8 @@ class SnapshotService:
         """刷新近期期限，供跨到期日 Gamma 曲线使用。"""
         normalized = self.provider.normalize_symbol(symbol)
         expirations = self.provider.expirations(normalized)
+        # 窗口刷新本来就要问一次到期日，顺手更新下拉框缓存；这里存的是全部日期，不是 45 天切片。
+        self._remember_expirations(normalized, expirations)
         today = market_today()
         cutoff = today + timedelta(days=horizon_days)
         selected = [
