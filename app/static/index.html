@@ -69,12 +69,13 @@
                     <div class="trend-meta trend-current-price" :title="view.trend.priceTitle"><span>{{ view.trend.priceLabel }}</span><strong>{{ view.trend.price }}</strong></div>
                     <div v-for="row in view.trend.rows.slice(0, 2)" :key="row.label" class="trend-meta" :class="row.className" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}<small v-if="row.sub">{{ row.sub }}</small></strong></div>
                     <div v-for="row in view.trend.extremes" :key="row.label" class="trend-meta" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}</strong></div>
+                    <div v-for="row in view.trend.rows.filter(row => row.className === 'trend-beta')" :key="row.label" class="trend-meta" :class="row.className" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}<small v-if="row.sub">{{ row.sub }}</small></strong></div>
                   </div>
                   <div class="trend-core">
                     <div class="trend-opportunities">
                       <div v-for="item in view.trend.opportunities" :key="item.kind" class="trend-meta trend-opportunity" :class="item.kind" :title="item.title"><span class="trend-opportunity-label"><span>{{ item.label }}</span><small>{{ item.horizon }}</small></span><strong>{{ item.range }}<small>估算评分 {{ item.confidence }}</small><small>{{ item.historySummary }}</small></strong></div>
                     </div>
-                    <div v-for="row in view.trend.rows.slice(2)" :key="row.label" class="trend-meta" :class="row.className" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}<small v-if="row.sub">{{ row.sub }}</small></strong></div>
+                    <div v-for="row in view.trend.rows.slice(2).filter(row => row.className !== 'trend-beta')" :key="row.label" class="trend-meta" :class="row.className" :title="row.title"><span>{{ row.label }}</span><strong>{{ row.value }}<small v-if="row.sub">{{ row.sub }}</small></strong></div>
                   </div>
                 </div>
               </div>
