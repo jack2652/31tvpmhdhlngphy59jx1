@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from app.config import Settings
 from app.db import Database, iso
 from app.runtime import effective_database_max_mb, low_memory_enabled
 from app.services.concurrency import HeavyWorkGate
-from app.services.snapshots import SnapshotService
+from app.services.snapshots import SnapshotService, market_today
 from tests.test_app import FakeProvider, sample_quote, sample_rows
 
 
@@ -124,6 +125,38 @@ def test_gamma_degrades_while_heavy_gate_is_held(tmp_path: Path, monkeypatch: py
     assert payload["contract_count"] == 0
     assert "内存保护" in payload["warning"]
     gate.release()
+
+
+def test_gamma_window_defers_before_upstream_when_heavy_gate_is_busy(tmp_path: Path):
+    """首屏重任务占用闸门时，Gamma 窗口立即让路，不再排队访问上游。"""
+    database = Database(tmp_path / "options.db")
+    gate = HeavyWorkGate(1)
+    assert gate.acquire(timeout=0)
+    calls = {"expirations": 0, "quote": 0, "fetch": 0}
+    expiration = (market_today() + timedelta(days=7)).isoformat()
+
+    class CountingProvider(FakeProvider):
+        def expirations(self, symbol: str) -> list[str]:
+            calls["expirations"] += 1
+            return [expiration]
+
+        def quote(self, symbol: str) -> dict:
+            calls["quote"] += 1
+            return sample_quote(symbol)
+
+        def fetch(self, symbol: str, requested_expiration: str):
+            calls["fetch"] += 1
+            return sample_quote(symbol), sample_rows(symbol, requested_expiration), iso()
+
+    try:
+        service = SnapshotService(database, CountingProvider(), heavy_gate=gate)
+        result = service.refresh_window("AAPL", horizon_days=45)
+    finally:
+        gate.release()
+
+    assert result["deferred"] is True
+    assert result["results"] == []
+    assert calls == {"expirations": 0, "quote": 0, "fetch": 0}
 
 
 def test_low_memory_settings_cap_upstream(monkeypatch: pytest.MonkeyPatch):

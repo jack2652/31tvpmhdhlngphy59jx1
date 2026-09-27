@@ -219,7 +219,16 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             except Exception as exc:  # noqa: BLE001 - 后台任务必须把异常写回状态
                 database.finish_analysis_job(job_key, "failed", None, str(exc), started_at)
                 return
-            database.finish_analysis_job(job_key, "completed", result, None, started_at)
+            if result.get("deferred"):
+                database.finish_analysis_job(
+                    job_key,
+                    "failed",
+                    result,
+                    result.get("warning") or "内存保护：Gamma 窗口已让路",
+                    started_at,
+                )
+            else:
+                database.finish_analysis_job(job_key, "completed", result, None, started_at)
         finally:
             timer.cancel()
 

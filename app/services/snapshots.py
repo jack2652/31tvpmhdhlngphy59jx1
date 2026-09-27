@@ -77,7 +77,7 @@ class SnapshotService:
         self.heavy_gate = heavy_gate or get_heavy_gate()
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
-        self._refresh_flight: SingleFlight[tuple[str, str | None, int], dict[str, Any]] = SingleFlight()
+        self._refresh_flight: SingleFlight[tuple[str, str | None, int, bool], dict[str, Any]] = SingleFlight()
         self._owner = uuid4().hex
 
     @staticmethod
@@ -89,26 +89,73 @@ class SnapshotService:
         with self._locks_guard:
             return self._locks.setdefault(scope, threading.Lock())
 
-    def refresh(self, symbol: str, expiration: str | None = None, max_age_seconds: int = 0) -> dict[str, Any]:
+    def refresh(
+        self,
+        symbol: str,
+        expiration: str | None = None,
+        max_age_seconds: int = 0,
+        *,
+        expirations_override: list[str] | None = None,
+        quote_override: dict[str, Any] | None = None,
+        heavy_gate_held: bool = False,
+    ) -> dict[str, Any]:
         """抓取一次快照。
 
         max_age_seconds 大于 0 时先读本地快照：仍在新鲜期内直接返回 skipped 结果，不再请求上游接口，
         避免定时刷新与手动刷新对同一份数据反复打接口。
         """
         normalized = self.provider.normalize_symbol(symbol)
-        flight_key = (normalized, expiration, max_age_seconds)
+        # 窗口刷新会顺序处理多个到期日；覆盖值只在本次调用内复用，不放进 key，避免缓存键携带大对象。
+        # 外层已持有 Gamma 闸门的调用不能和普通刷新共享 SingleFlight；否则普通刷新
+        # 可能等待闸门，而 Gamma 又等待它的结果，形成跨任务互相等待。
+        flight_key = (normalized, expiration, max_age_seconds, heavy_gate_held)
         return self._refresh_flight.do(
             flight_key,
-            lambda: self._refresh_locked(normalized, expiration, max_age_seconds),
+            lambda: self._refresh_locked(
+                normalized,
+                expiration,
+                max_age_seconds,
+                expirations_override=expirations_override,
+                quote_override=quote_override,
+                heavy_gate_held=heavy_gate_held,
+            ),
         )
 
-    def _refresh_locked(self, normalized: str, expiration: str | None, max_age_seconds: int) -> dict[str, Any]:
+    def _refresh_locked(
+        self,
+        normalized: str,
+        expiration: str | None,
+        max_age_seconds: int,
+        *,
+        expirations_override: list[str] | None = None,
+        quote_override: dict[str, Any] | None = None,
+        heavy_gate_held: bool = False,
+    ) -> dict[str, Any]:
         """同一到期日刷新串行化；同一请求键由 SingleFlight 共享结果，不再并发返回 502。"""
         scope = self._scope(normalized, expiration)
         lock = self._lock_for(scope)
-        waited_for_process_lock = not lock.acquire(blocking=False)
-        if waited_for_process_lock and not lock.acquire(timeout=REFRESH_LOCK_TIMEOUT_SECONDS):
-            raise RuntimeError(f"{normalized} 刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
+        lock_acquired = False
+        if heavy_gate_held:
+            # Gamma 已占住重任务闸门时不能再持闸等待页面刷新持有的期限锁；否则页面会
+            # 等闸门、Gamma 等期限锁，形成互相等待。该期限本轮让路即可。
+            if not lock.acquire(blocking=False):
+                raise UpstreamBusyError(f"{normalized} {expiration or '最近期限'} 刷新正在进行")
+            lock_acquired = True
+            waited_for_process_lock = False
+        else:
+            waited_for_process_lock = not lock.acquire(blocking=False)
+            if waited_for_process_lock:
+                # Gamma 窗口会在一个标的上连续持有多个期限锁。页面刷新遇到这种情况时，
+                # 若本地已有链应立即沿用旧快照，不能等待 60 秒把 HTTP 请求线程拖住。
+                if self.heavy_gate.busy() and self._has_saved_chain(normalized, expiration):
+                    stale = self._stale_snapshot(normalized, expiration, "内存保护：后台 Gamma 正在刷新，本次沿用本地快照")
+                    if stale is not None:
+                        stale["deferred"] = True
+                        stale["skipped"] = True
+                        return stale
+                if not lock.acquire(timeout=REFRESH_LOCK_TIMEOUT_SECONDS):
+                    raise RuntimeError(f"{normalized} 刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
+            lock_acquired = True
         lease_name = f"snapshot-refresh:{scope}"
         deadline = time.monotonic() + REFRESH_LOCK_TIMEOUT_SECONDS
         waited_for_database_lease = False
@@ -116,6 +163,10 @@ class SnapshotService:
         try:
             while not self.database.try_acquire_lease(lease_name, self._owner, REFRESH_LEASE_SECONDS):
                 waited_for_database_lease = True
+                if heavy_gate_held:
+                    # Gamma 已持有全局重任务槽位，不能占着它等待另一个 worker 的数据库租约；
+                    # 否则页面刷新拿不到闸门，双方会互相拖到超时。
+                    raise UpstreamBusyError(f"{normalized} {expiration or '最近期限'} 跨进程刷新正在进行")
                 if time.monotonic() >= deadline:
                     raise RuntimeError(f"{normalized} 跨进程刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
                 time.sleep(0.1)
@@ -138,7 +189,13 @@ class SnapshotService:
                         )
                         return cached
                 try:
-                    return self._fetch_and_store(normalized, expiration)
+                    return self._fetch_and_store(
+                        normalized,
+                        expiration,
+                        expirations_override=expirations_override,
+                        quote_override=quote_override,
+                        heavy_gate_held=heavy_gate_held,
+                    )
                 except (ProviderError, UpstreamBusyError, RuntimeError) as exc:
                     stale = self._stale_snapshot(normalized, expiration, str(exc))
                     if stale is not None:
@@ -152,7 +209,8 @@ class SnapshotService:
                 finally:
                     lease_acquired = False
         finally:
-            lock.release()
+            if lock_acquired:
+                lock.release()
 
     def _stale_snapshot(self, symbol: str, expiration: str | None, warning: str) -> dict[str, Any] | None:
         """上游拥塞或失败时返回本地旧快照元数据，让调用方继续使用本地链。"""
@@ -247,11 +305,32 @@ class SnapshotService:
         cached = self.database.latest_chain(symbol, target)
         return bool(cached.get("data"))
 
-    def _fetch_and_store(self, normalized: str, expiration: str | None) -> dict[str, Any]:
+    def _fetch_and_store(
+        self,
+        normalized: str,
+        expiration: str | None,
+        *,
+        expirations_override: list[str] | None = None,
+        quote_override: dict[str, Any] | None = None,
+        heavy_gate_held: bool = False,
+    ) -> dict[str, Any]:
         """请求上游接口并写入 SQLite。已有重任务时，有本地链就让路，避免内存叠满。"""
+        if heavy_gate_held:
+            # Gamma 窗口已经在外层持有闸门；BoundedSemaphore 不可重入，不能再次 acquire。
+            return self._fetch_upstream(
+                normalized,
+                expiration,
+                expirations_override=expirations_override,
+                quote_override=quote_override,
+            )
         if self.heavy_gate.acquire(timeout=0.2):
             try:
-                return self._fetch_upstream(normalized, expiration)
+                return self._fetch_upstream(
+                    normalized,
+                    expiration,
+                    expirations_override=expirations_override,
+                    quote_override=quote_override,
+                )
             finally:
                 self.heavy_gate.release()
         if self._has_saved_chain(normalized, expiration):
@@ -265,7 +344,12 @@ class SnapshotService:
         if not self.heavy_gate.acquire(timeout=20):
             raise RuntimeError(f"{normalized} 刷新排队超过 20 秒，请稍后重试")
         try:
-            return self._fetch_upstream(normalized, expiration)
+            return self._fetch_upstream(
+                normalized,
+                expiration,
+                expirations_override=expirations_override,
+                quote_override=quote_override,
+            )
         finally:
             self.heavy_gate.release()
 
@@ -276,16 +360,30 @@ class SnapshotService:
             self.database.write_expiration_catalog(symbol, available, iso())
         return available
 
-    def _fetch_upstream(self, normalized: str, expiration: str | None) -> dict[str, Any]:
+    def _fetch_upstream(
+        self,
+        normalized: str,
+        expiration: str | None,
+        *,
+        expirations_override: list[str] | None = None,
+        quote_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """请求上游接口并写入 SQLite，失败时记录刷新日志后抛出。"""
         run_id = self.database.start_run(normalized)
         try:
-            expirations = self.provider.expirations(normalized)
-            available = self._remember_expirations(normalized, expirations)
+            expirations = expirations_override if expirations_override is not None else self.provider.expirations(normalized)
+            # refresh_window 已在进入循环前写过一次到期日目录；逐期刷新时只过滤，
+            # 避免每个期限都重复写同一条 SQLite 目录记录。
+            available = (
+                active_expirations(expirations)
+                if expirations_override is not None
+                else self._remember_expirations(normalized, expirations)
+            )
             # 有些标的（例如 SPCX 这类没有挂牌期权合约的标的）根本没有到期日：此时退化成只抓现货，
             # 现货卡片照常可用，页面其余面板提示没有期权数据，而不是整页无数据。
             if not available:
-                quote = self._with_cached_sessions(normalized, self.provider.quote(normalized))
+                quote = quote_override or self.provider.quote(normalized)
+                quote = self._with_cached_sessions(normalized, dict(quote))
                 fetched_at = iso()
                 self.database.write_snapshot(quote, [], fetched_at)
                 self.database.finish_run(run_id, "success", 0)
@@ -296,7 +394,20 @@ class SnapshotService:
                 raise ValueError(f"{normalized} 没有到期日 {selected}（最新可用: {available[0]}）")
             if selected not in available:
                 raise ValueError(f"{normalized} 的到期日 {selected} 已过期，最新可用到期日: {available[0]}")
-            quote, rows, fetched_at = self.provider.fetch(normalized, selected)
+            if quote_override is None:
+                quote, rows, fetched_at = self.provider.fetch(normalized, selected)
+            else:
+                # 具体行情适配器支持复用现货快照；测试/第三方适配器仍兼容原有两参数接口。
+                try:
+                    quote, rows, fetched_at = self.provider.fetch(
+                        normalized,
+                        selected,
+                        quote_override=quote_override,
+                    )
+                except TypeError as exc:
+                    if "quote_override" not in str(exc):
+                        raise
+                    quote, rows, fetched_at = self.provider.fetch(normalized, selected)
             written = self.database.write_snapshot(self._with_cached_sessions(normalized, quote), rows, fetched_at)
             self.database.finish_run(run_id, "success", written)
             return {
@@ -332,38 +443,81 @@ class SnapshotService:
     def refresh_window(self, symbol: str, horizon_days: int = 45) -> dict[str, Any]:
         """刷新近期期限，供跨到期日 Gamma 曲线使用。"""
         normalized = self.provider.normalize_symbol(symbol)
-        expirations = self.provider.expirations(normalized)
-        # 窗口刷新本来就要问一次到期日，顺手更新下拉框缓存；这里存的是全部日期，不是 45 天切片。
-        self._remember_expirations(normalized, expirations)
-        today = market_today()
-        cutoff = today + timedelta(days=horizon_days)
-        selected = [
-            value for value in expirations
-            if today <= date.fromisoformat(value) <= cutoff
-        ]
-        results: list[dict[str, Any]] = []
-        errors: list[str] = []
-        for expiration in selected:
-            try:
-                cached = self.database.latest_chain(normalized, expiration)
-                age = snapshot_age_seconds(cached.get("fetched_at"))
-                # 盘前/盘后上游可能先返回整链但未平仓量为 0。此时即使快照刚写入，
-                # 也不能把它当作完整数据跳过，否则首屏 Gamma 会一直是 0，直到手动刷新。
-                has_open_interest = any(
-                    float(row.get("open_interest") or 0) > 0
-                    for row in cached.get("data") or []
-                    if isinstance(row, dict)
-                )
-                if age is not None and age < WINDOW_FRESH_SECONDS and has_open_interest:
-                    continue
-                results.append(self.refresh(normalized, expiration))
-            except Exception as exc:
-                errors.append(f"{expiration}: {exc}")
-                logger.warning("刷新 %s %s 失败: %s", normalized, expiration, exc)
-        return {
-            "symbol": normalized,
-            "horizon_days": horizon_days,
-            "expirations": selected,
-            "results": results,
-            "errors": errors,
-        }
+        # Gamma 是低优先级的跨期限任务。没有空闲重任务槽位时立即让路，避免新标的
+        # 首次快照在闸门上排队 20 秒，也避免整窗临时链与 levels 叠加占用内存。
+        if not self.heavy_gate.acquire(timeout=0):
+            message = "内存保护：已有重任务在进行，Gamma 窗口已让路"
+            logger.info("%s %s", normalized, message)
+            return {
+                "symbol": normalized,
+                "horizon_days": horizon_days,
+                "expirations": [],
+                "results": [],
+                "errors": [message],
+                "deferred": True,
+                "warning": message,
+            }
+        try:
+            expirations = self.provider.expirations(normalized)
+            # 窗口刷新本来就要问一次到期日，顺手更新下拉框缓存；这里存的是全部日期，不是 45 天切片。
+            self._remember_expirations(normalized, expirations)
+            today = market_today()
+            cutoff = today + timedelta(days=horizon_days)
+            selected = [
+                value for value in expirations
+                if today <= date.fromisoformat(value) <= cutoff
+            ]
+            # 窗口内每个期限共用一份现货快照；只有确实需要抓新链时才读取行情。
+            # 所有期限都新鲜时不再额外触发 quote 上游请求。
+            window_quote: dict[str, Any] | None = None
+            quote_loaded = False
+            results: list[dict[str, Any]] = []
+            errors: list[str] = []
+            for expiration in selected:
+                try:
+                    cached = self.database.latest_chain(normalized, expiration)
+                    age = snapshot_age_seconds(cached.get("fetched_at"))
+                    # 盘前/盘后上游可能先返回整链但未平仓量为 0。此时即使快照刚写入，
+                    # 也不能把它当作完整数据跳过，否则首屏 Gamma 会一直是 0，直到手动刷新。
+                    has_open_interest = any(
+                        float(row.get("open_interest") or 0) > 0
+                        for row in cached.get("data") or []
+                        if isinstance(row, dict)
+                    )
+                    if age is not None and age < WINDOW_FRESH_SECONDS and has_open_interest:
+                        continue
+                    if not quote_loaded:
+                        quote_loaded = True
+                        # Gamma 只需要现价估算模型 Greeks；优先复用刚写入 SQLite 的报价，
+                        # 避免窗口刷新再次抓取 5 天 1 分钟扩展时段历史。
+                        cached_quote = self.database.latest_quote(normalized)
+                        if cached_quote and cached_quote.get("price") is not None:
+                            window_quote = cached_quote
+                        else:
+                            try:
+                                window_quote = self.provider.quote(normalized)
+                            except ProviderError as exc:
+                                logger.warning("获取 %s Gamma 窗口现货失败，各期限按适配器自行回退：%s", normalized, exc)
+                    # 一个 Gamma 窗口内复用一次到期日列表和行情快照，避免每期重复请求。
+                    # 外层已经持有重任务闸门，内部绕过 acquire，避免自等待。
+                    results.append(
+                        self.refresh(
+                            normalized,
+                            expiration,
+                            expirations_override=expirations,
+                            quote_override=window_quote,
+                            heavy_gate_held=True,
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(f"{expiration}: {exc}")
+                    logger.warning("刷新 %s %s 失败: %s", normalized, expiration, exc)
+            return {
+                "symbol": normalized,
+                "horizon_days": horizon_days,
+                "expirations": selected,
+                "results": results,
+                "errors": errors,
+            }
+        finally:
+            self.heavy_gate.release()

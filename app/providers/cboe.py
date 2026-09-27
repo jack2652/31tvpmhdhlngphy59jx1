@@ -220,9 +220,15 @@ class CboeOptionsProvider:
             raise ProviderError(f"Cboe 没有 {normalized} {expiration} 的期权数据")
         return rows
 
-    def fetch(self, symbol: str, expiration: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    def fetch(
+        self,
+        symbol: str,
+        expiration: str,
+        *,
+        quote_override: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
         fetched_at = datetime.now(timezone.utc).isoformat()
-        quote = self.quote(symbol)
+        quote = quote_override if quote_override is not None else self.quote(symbol)
         rows = self.chain(symbol, expiration)
         for row in rows:
             if row.get("gamma") is None:

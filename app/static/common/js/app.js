@@ -2194,7 +2194,12 @@ async function applyGammaPollResult(loadId, payload, quote, symbol, pendingText)
 function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt) {
   // 任务没完成时只问状态，不把 45 天合约下载下来再解析。
   let continuePolling = false;
-  const task = request(`/api/gamma/${encodedSymbol}?horizon_days=45&refresh=true&status_only=true`)
+  // 只有第一请求负责领取后台任务；后续轮询只读状态，避免每秒重复 BEGIN IMMEDIATE
+  // 和重复写入分析任务领取日志。
+  const statusUrl = attempt === 0
+    ? `/api/gamma/${encodedSymbol}?horizon_days=45&refresh=true&status_only=true`
+    : `/api/gamma/${encodedSymbol}?horizon_days=45&status_only=true`;
+  const task = request(statusUrl)
     .then(async (status) => {
       try {
         if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;

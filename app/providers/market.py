@@ -24,6 +24,9 @@ MARKET_TIMEZONE = ZoneInfo("America/New_York")
 SESSION_STATES = {"pre": "PRE", "regular": "REGULAR", "post": "POST", "overnight": "OVERNIGHT"}
 # 最近一根 K 线超过该秒数就认为已经离开该时段，改按美东时钟判断。
 SESSION_FRESH_SECONDS = 30 * 60
+# 现货附加分钟线只是展示盘前/盘后摘要。给上游 SDK 一个有限等待时间，避免
+# yfinance 网络异常把请求线程长期挂住，进而叠加期权链和历史任务。
+UPSTREAM_REQUEST_TIMEOUT_SECONDS = 12
 
 
 def session_of(moment: datetime) -> str:
@@ -487,7 +490,13 @@ class MarketDataProvider:
         """盘前 / 盘后 / 夜盘属于附加信息：抓取失败只记日志，不影响行情快照本身。"""
         try:
             with self.upstream_gate.slot():
-                frame = ticker.history(period="5d", interval="1m", prepost=True, auto_adjust=False)
+                frame = ticker.history(
+                    period="5d",
+                    interval="1m",
+                    prepost=True,
+                    auto_adjust=False,
+                    timeout=UPSTREAM_REQUEST_TIMEOUT_SECONDS,
+                )
             summary = summarize_extended_hours(frame)
             summary["previous_regular_close"] = previous_regular_close(frame)
             summary["prior_session_regular_close"] = prior_session_regular_close(frame)
@@ -500,7 +509,7 @@ class MarketDataProvider:
     @staticmethod
     def _history_quote(ticker: Any, price: Any, previous: Any, today_open: Any) -> tuple[Any, Any, Any]:
         """fast_info 缺字段时，使用最近两个交易日日线补齐现价、昨收和今开。"""
-        history = ticker.history(period="5d", auto_adjust=False)
+        history = ticker.history(period="5d", auto_adjust=False, timeout=UPSTREAM_REQUEST_TIMEOUT_SECONDS)
         if history is None or history.empty or "Close" not in history:
             return price, previous, today_open
         rows = []
@@ -524,7 +533,12 @@ class MarketDataProvider:
         ticker = self._ticker(normalized)
         try:
             with self.upstream_gate.slot():
-                frame = ticker.history(period=period, interval="1d", auto_adjust=False)
+                frame = ticker.history(
+                    period=period,
+                    interval="1d",
+                    auto_adjust=False,
+                    timeout=UPSTREAM_REQUEST_TIMEOUT_SECONDS,
+                )
         except Exception as exc:
             raise ProviderError(f"获取 {normalized} 日线历史失败: {exc}") from exc
         return self._history_bars(frame, normalized)
@@ -556,7 +570,12 @@ class MarketDataProvider:
         ticker = self._ticker_raw(symbol)
         try:
             with self.upstream_gate.slot():
-                frame = ticker.history(period=period, interval="1d", auto_adjust=True)
+                frame = ticker.history(
+                    period=period,
+                    interval="1d",
+                    auto_adjust=True,
+                    timeout=UPSTREAM_REQUEST_TIMEOUT_SECONDS,
+                )
         except Exception as exc:
             raise ProviderError(f"获取 {symbol} 日线历史失败: {exc}") from exc
         return self._history_bars(frame, symbol)
@@ -630,9 +649,15 @@ class MarketDataProvider:
             raise ProviderError(f"{normalized} {expiration} 没有期权数据")
         return rows
 
-    def fetch(self, symbol: str, expiration: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    def fetch(
+        self,
+        symbol: str,
+        expiration: str,
+        *,
+        quote_override: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
         fetched_at = datetime.now(timezone.utc).isoformat()
-        quote = self.quote(symbol)
+        quote = quote_override if quote_override is not None else self.quote(symbol)
         rows = self.chain(symbol, expiration)
         for row in rows:
             if row.get("gamma") is None:
@@ -687,15 +712,30 @@ class HybridMarketDataProvider:
         provider = self.delayed_provider if self.uses_delayed_options() else self.regular_provider
         return provider.chain(symbol, expiration)
 
-    def fetch(self, symbol: str, expiration: str) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    def fetch(
+        self,
+        symbol: str,
+        expiration: str,
+        *,
+        quote_override: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
         if not self.uses_delayed_options():
-            return self.regular_provider.fetch(symbol, expiration)
+            if quote_override is None:
+                return self.regular_provider.fetch(symbol, expiration)
+            try:
+                return self.regular_provider.fetch(symbol, expiration, quote_override=quote_override)
+            except TypeError as exc:
+                if "quote_override" not in str(exc):
+                    raise
+                return self.regular_provider.fetch(symbol, expiration)
 
-        try:
-            quote = self.regular_provider.quote(symbol)
-        except ProviderError as exc:
-            logger.warning("非盘中主行情请求失败，改用 Cboe 标的延迟价：%s", exc)
-            quote = self.delayed_provider.quote(symbol)
+        quote = quote_override
+        if quote is None:
+            try:
+                quote = self.regular_provider.quote(symbol)
+            except ProviderError as exc:
+                logger.warning("非盘中主行情请求失败，改用 Cboe 标的延迟价：%s", exc)
+                quote = self.delayed_provider.quote(symbol)
         rows = self.delayed_provider.chain(symbol, expiration)
         if quote.get("price") is None:
             delayed_quote = self.delayed_provider.quote(symbol)
