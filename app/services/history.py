@@ -36,6 +36,9 @@ BETA_BENCHMARK = "^GSPC"
 EARNINGS_MAX_AGE_SECONDS = 21600
 HISTORY_LEASE_SECONDS = 120
 HISTORY_WAIT_SECONDS = 60
+# 低内存实例不能让多个价位请求长时间占住 HTTP 工作线程等待同一份日线租约。
+# 让路后由调用方使用旧缓存或期权口径继续返回，下一次请求再补齐历史数据。
+LOW_MEMORY_HISTORY_WAIT_SECONDS = 3
 
 
 def _normalize_earnings_dates(raw: Any) -> list[str]:
@@ -145,11 +148,24 @@ class HistoryService:
             gate.release()
 
     def _acquire_lease(self, name: str) -> None:
-        deadline = time.monotonic() + HISTORY_WAIT_SECONDS
+        wait_seconds = HISTORY_WAIT_SECONDS
+        if low_memory_enabled():
+            wait_seconds = min(wait_seconds, LOW_MEMORY_HISTORY_WAIT_SECONDS)
+        deadline = time.monotonic() + max(0, wait_seconds)
         while not self.database.try_acquire_lease(name, self._owner, HISTORY_LEASE_SECONDS):
             if time.monotonic() >= deadline:
-                raise ProviderError(f"{name} 历史数据刷新等待超时")
+                raise ProviderError(f"{name} 历史数据刷新等待超时（{wait_seconds:g} 秒）")
             time.sleep(0.1)
+
+    def _try_lock(self, symbol: str) -> tuple[threading.Lock, bool]:
+        """获取标的历史锁；低内存模式不在 HTTP 线程上无限等待。"""
+        lock = self._lock_for(symbol)
+        if low_memory_enabled():
+            acquired = lock.acquire(timeout=LOW_MEMORY_HISTORY_WAIT_SECONDS)
+        else:
+            lock.acquire()
+            acquired = True
+        return lock, acquired
 
     def bars(self, symbol: str) -> dict[str, Any]:
         """返回 {symbol, bars, fetched_at, source, warning}；同一标的的并发请求只回源一次。"""
@@ -157,13 +173,22 @@ class HistoryService:
         cached = self.database.latest_history(normalized)
         if cached and self._is_fresh(cached.get("fetched_at")):
             return self._result(normalized, cached, "sqlite", None)
-        with self._lock_for(normalized):
+        lock, acquired = self._try_lock(normalized)
+        if not acquired:
+            return self._result(normalized, cached, "sqlite" if cached else "none", "低内存保护：日线刷新正在进行")
+        try:
             # 等锁期间可能已有其他请求完成了回源，进入临界区后再确认一次。
             cached = self.database.latest_history(normalized)
             if cached and self._is_fresh(cached.get("fetched_at")):
                 return self._result(normalized, cached, "sqlite", None)
             lease_name = f"history:bars:{normalized}"
-            self._acquire_lease(lease_name)
+            try:
+                self._acquire_lease(lease_name)
+            except ProviderError as exc:
+                # 另一个请求正在刷新同一标的时，不能让当前 API 请求排队到网关超时。
+                # 有旧缓存就直接返回旧数据；没有缓存则返回空结果，后续请求再补齐。
+                logger.warning("日线历史租约忙，%s 让路：%s", normalized, exc)
+                return self._result(normalized, cached, "sqlite" if cached else "none", str(exc))
             try:
                 cached = self.database.latest_history(normalized)
                 if cached and self._is_fresh(cached.get("fetched_at")):
@@ -178,6 +203,8 @@ class HistoryService:
                 return self._result(normalized, {"bars": bars, "fetched_at": fetched_at}, "upstream", None)
             finally:
                 self.database.release_lease(lease_name, self._owner)
+        finally:
+            lock.release()
 
     def extremes(self, symbol: str) -> dict[str, Any]:
         """返回 {symbol, extremes, fetched_at, source, warning}：52 周与历史最高/最低价。
@@ -189,13 +216,47 @@ class HistoryService:
         cached = self.database.latest_extremes(normalized)
         if cached and self._is_fresh(cached.get("fetched_at"), self.extremes_max_age_seconds):
             return self._extremes_result(normalized, cached, "sqlite", None)
+        # ``period=max`` 会在 yfinance 中返回整段历史，峰值内存远高于两年日线。
+        # 低内存实例优先从已经缓存的两年日线计算，至少保证 52 周与价位面板可用；
+        # all_time 字段按缓存窗口给出，并在 warning 中标明降级，避免再次拉取大表。
+        if low_memory_enabled():
+            history_cached = self.database.latest_history(normalized)
+            history_bars = (history_cached or {}).get("bars") or []
+            if history_bars:
+                try:
+                    computed = price_extremes(history_bars)
+                except Exception as exc:  # noqa: BLE001 - 降级数据不能阻塞价位接口
+                    logger.warning("从两年日线计算 %s 极值失败：%s", normalized, exc)
+                else:
+                    fetched_at = (history_cached or {}).get("fetched_at")
+                    if computed and fetched_at:
+                        self.database.write_extremes(normalized, computed, fetched_at)
+                        return self._extremes_result(
+                            normalized,
+                            {"extremes": computed, "fetched_at": fetched_at},
+                            "sqlite",
+                            "低内存保护：历史极值按两年日线计算",
+                        )
+            else:
+                # 首次进入新标的时还没有两年日线；此时不要再发起 ``period=max``
+                # 的整段历史下载。趋势与价位先按期权数据降级，后续刷新再补极值。
+                return self._extremes_result(
+                    normalized,
+                    None,
+                    "none",
+                    "低内存保护：等待日线缓存后再计算历史极值",
+                )
         # 与日线历史分开加锁：两者回源周期不同，互不阻塞。
         with self._lock_for(f"{normalized}:extremes"):
             cached = self.database.latest_extremes(normalized)
             if cached and self._is_fresh(cached.get("fetched_at"), self.extremes_max_age_seconds):
                 return self._extremes_result(normalized, cached, "sqlite", None)
             lease_name = f"history:extremes:{normalized}"
-            self._acquire_lease(lease_name)
+            try:
+                self._acquire_lease(lease_name)
+            except ProviderError as exc:
+                logger.warning("日线极值租约忙，%s 让路：%s", normalized, exc)
+                return self._extremes_result(normalized, cached, "sqlite" if cached else "none", str(exc))
             try:
                 cached = self.database.latest_extremes(normalized)
                 if cached and self._is_fresh(cached.get("fetched_at"), self.extremes_max_age_seconds):
@@ -224,7 +285,11 @@ class HistoryService:
             if cached and self._is_fresh(cached.get("fetched_at"), self.beta_max_age_seconds):
                 return self._beta_result(normalized, cached, "sqlite", None)
             lease_name = f"history:beta:{normalized}"
-            self._acquire_lease(lease_name)
+            try:
+                self._acquire_lease(lease_name)
+            except ProviderError as exc:
+                logger.warning("Beta 租约忙，%s 让路：%s", normalized, exc)
+                return self._beta_result(normalized, cached, "sqlite" if cached else "none", str(exc))
             try:
                 cached = self.database.latest_beta(normalized)
                 if cached and self._is_fresh(cached.get("fetched_at"), self.beta_max_age_seconds):
@@ -267,6 +332,16 @@ class HistoryService:
             cached = None
         if cached and self._is_fresh(cached.get("fetched_at"), self.earnings_max_age_seconds):
             return self._earnings_result(normalized, cached, "sqlite", None)
+        # 财报日期只影响提示标签，不参与价位计算。低内存实例上该 SDK 调用没有可靠的
+        # timeout 参数，网络异常可能把整个 /api/levels 请求挂住；没有旧缓存时直接降级，
+        # 后续页面刷新再尝试补齐，避免为一个可选字段拖垮首屏。
+        if low_memory_enabled() and not cached:
+            return self._earnings_result(
+                normalized,
+                None,
+                "none",
+                "低内存保护：暂跳过财报日期读取",
+            )
         loader = getattr(self.provider, "earnings_dates", None)
         if not callable(loader):
             return self._earnings_result(

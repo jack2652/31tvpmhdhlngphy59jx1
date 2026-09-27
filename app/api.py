@@ -482,8 +482,14 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         stock_symbol: str,
         expiration: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         spot: float | None = Query(default=None, gt=0),
+        raw: bool = Query(default=False),
     ) -> dict[str, Any]:
         """压力位/支撑位：技术面与近 45 天多期限期权持仓综合。
+
+        ``raw=true`` 是轻量客户端计算模式。它只读取已经落库的日线和分析快照，
+        不触发历史、Beta、财报回源，也不执行 ``build_levels``；浏览器可以用这些
+        原始数据计算趋势、极值和基础价位。原始数据不足时，前端再回退到本接口的
+        默认综合模式。
 
         `spot` 是前端传入的当前展示基准价；候选池优先使用快照中的前一交易日收盘价作为
         日内稳定锚点，避免实时价变化或实时价与盘后价切换时反复生成不同的价位簇。
@@ -506,6 +512,76 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                     seen.add(key)
         option_expirations = sorted({str(row.get("expiration")) for row in option_rows if row.get("expiration")})
         fetched_values = [value for value in (profile.get("fetched_at"), (selected_chain or {}).get("fetched_at")) if value]
+
+        resolved_spot = spot if spot is not None else quote.get("price")
+        candidate_spot = quote.get("previous_close")
+        try:
+            if candidate_spot is None or float(candidate_spot) <= 0:
+                candidate_spot = quote.get("price") or resolved_spot
+        except (TypeError, ValueError):
+            candidate_spot = resolved_spot
+
+        if raw:
+            # raw 模式刻意只读 SQLite。首次标的没有历史缓存时返回空数据，前端会
+            # 先显示期权回退价位，并只补发一次默认综合请求，避免每次倒计时都回源。
+            cached_history = database.latest_history(normalized) or {}
+            cached_extremes = database.latest_extremes(normalized) or {}
+            cached_beta = database.latest_beta(normalized) or {}
+            cached_earnings = database.latest_earnings(normalized) or {}
+            raw_bars = list(cached_history.get("bars") or [])
+            earnings_dates = cached_earnings.get("dates")
+            raw_options = [
+                {
+                    "expiration": row.get("expiration"),
+                    "contract_type": row.get("contract_type"),
+                    "strike": row.get("strike"),
+                    "volume": row.get("volume"),
+                    "open_interest": row.get("open_interest"),
+                    "implied_volatility": row.get("implied_volatility"),
+                    "gamma": row.get("gamma"),
+                }
+                for row in option_rows
+            ]
+            return {
+                "raw": True,
+                "symbol": normalized,
+                "expiration": expiration,
+                "spot": resolved_spot,
+                "candidate_spot": candidate_spot,
+                "chain_fetched_at": max(fetched_values) if fetched_values else None,
+                "options_fetched_at": max(fetched_values) if fetched_values else None,
+                "options_expirations": option_expirations,
+                "options_horizon_days": 45,
+                # 原始期权行只在 raw=true 时返回，供浏览器按多期限重新聚合；默认综合
+                # 接口仍只返回压缩后的价位，避免普通页面响应体变大。
+                "options": raw_options,
+                "generated_at": iso(),
+                "bars": raw_bars,
+                "history": {
+                    "bars": len(raw_bars),
+                    "from": raw_bars[0]["date"] if raw_bars else None,
+                    "to": raw_bars[-1]["date"] if raw_bars else None,
+                    "fetched_at": cached_history.get("fetched_at"),
+                    "source": "sqlite" if raw_bars else "none",
+                    "warning": None if raw_bars else "本地没有日线缓存",
+                    "extremes_fetched_at": cached_extremes.get("fetched_at"),
+                    "extremes_source": "sqlite" if cached_extremes.get("extremes") else "none",
+                    "extremes_warning": None if cached_extremes.get("extremes") else "本地没有极值缓存",
+                },
+                "extremes": cached_extremes.get("extremes"),
+                "beta": cached_beta.get("beta"),
+                "beta_meta": {
+                    "fetched_at": cached_beta.get("fetched_at"),
+                    "source": "sqlite" if cached_beta.get("beta") else "none",
+                    "warning": None if cached_beta.get("beta") else "本地没有 Beta 缓存",
+                },
+                "trend_market": trend_market_data(raw_bars, quote),
+                "earnings": summarize_earnings(
+                    earnings_dates if isinstance(earnings_dates, list) else None,
+                    market_today(),
+                ),
+            }
+
         history_payload = history.bars(normalized)
         # 极值和 Beta 使用不同缓存/锁；并行读取可以缩短首次加载等待。Beta 复用已经取回的两年日线，
         # 避免同一请求再次向行情源请求同一份标的数据。财报日期同样并行，失败不能拖垮价位接口。
@@ -551,15 +627,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 else:
                     if isinstance(loaded_earnings, dict):
                         earnings_payload = loaded_earnings
-        resolved_spot = spot if spot is not None else quote.get("price")
         # 候选池使用昨收作为日内稳定锚点；最新价只负责当前侧别、距离和触及概率。
         # 这样盘中价格小幅波动时不会反复重建相邻价位簇，昨收缺失时才回退最新价。
-        candidate_spot = quote.get("previous_close")
-        try:
-            if candidate_spot is None or float(candidate_spot) <= 0:
-                candidate_spot = quote.get("price") or resolved_spot
-        except (TypeError, ValueError):
-            candidate_spot = resolved_spot
         cache_key = (
             normalized,
             expiration,

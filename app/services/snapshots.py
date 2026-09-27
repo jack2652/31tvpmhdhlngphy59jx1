@@ -443,8 +443,9 @@ class SnapshotService:
     def refresh_window(self, symbol: str, horizon_days: int = 45) -> dict[str, Any]:
         """刷新近期期限，供跨到期日 Gamma 曲线使用。"""
         normalized = self.provider.normalize_symbol(symbol)
-        # Gamma 是低优先级的跨期限任务。没有空闲重任务槽位时立即让路，避免新标的
-        # 首次快照在闸门上排队 20 秒，也避免整窗临时链与 levels 叠加占用内存。
+        # Gamma 是低优先级的跨期限任务。它只在每个期限的抓取期间占用闸门，
+        # 不能把整个窗口几十秒锁住，否则 /api/levels 的历史与 Beta 永远只能拿到空回退。
+        # 先用一次短闸门保护到期日目录和现货读取；忙时直接让首屏任务优先。
         if not self.heavy_gate.acquire(timeout=0):
             message = "内存保护：已有重任务在进行，Gamma 窗口已让路"
             logger.info("%s %s", normalized, message)
@@ -473,19 +474,29 @@ class SnapshotService:
             quote_loaded = False
             results: list[dict[str, Any]] = []
             errors: list[str] = []
-            for expiration in selected:
+        finally:
+            # 到期日目录已经读完，马上把闸门交还给首屏历史任务。
+            self.heavy_gate.release()
+
+        for expiration in selected:
+            # 先检查缓存。新鲜期限不需要占用重任务槽位，避免 Gamma 在一串缓存期限上
+            # 快速循环，把真正需要历史回源的首屏任务饿住。
+            cached = self.database.latest_chain(normalized, expiration)
+            age = snapshot_age_seconds(cached.get("fetched_at"))
+            has_open_interest = any(
+                float(row.get("open_interest") or 0) > 0
+                for row in cached.get("data") or []
+                if isinstance(row, dict)
+            )
+            if age is not None and age < WINDOW_FRESH_SECONDS and has_open_interest:
+                continue
+            # 每个期限独立占槽并在请求后释放。这样历史/Beta 可以在期限之间插队，
+            # 也避免某个慢期限把整个 Gamma 窗口拖到超时。
+            if not self.heavy_gate.acquire(timeout=0):
+                errors.append(f"{expiration}: 内存保护：让路给首屏历史数据")
+                continue
+            try:
                 try:
-                    cached = self.database.latest_chain(normalized, expiration)
-                    age = snapshot_age_seconds(cached.get("fetched_at"))
-                    # 盘前/盘后上游可能先返回整链但未平仓量为 0。此时即使快照刚写入，
-                    # 也不能把它当作完整数据跳过，否则首屏 Gamma 会一直是 0，直到手动刷新。
-                    has_open_interest = any(
-                        float(row.get("open_interest") or 0) > 0
-                        for row in cached.get("data") or []
-                        if isinstance(row, dict)
-                    )
-                    if age is not None and age < WINDOW_FRESH_SECONDS and has_open_interest:
-                        continue
                     if not quote_loaded:
                         quote_loaded = True
                         # Gamma 只需要现价估算模型 Greeks；优先复用刚写入 SQLite 的报价，
@@ -512,12 +523,12 @@ class SnapshotService:
                 except Exception as exc:
                     errors.append(f"{expiration}: {exc}")
                     logger.warning("刷新 %s %s 失败: %s", normalized, expiration, exc)
-            return {
-                "symbol": normalized,
-                "horizon_days": horizon_days,
-                "expirations": selected,
-                "results": results,
-                "errors": errors,
-            }
-        finally:
-            self.heavy_gate.release()
+            finally:
+                self.heavy_gate.release()
+        return {
+            "symbol": normalized,
+            "horizon_days": horizon_days,
+            "expirations": selected,
+            "results": results,
+            "errors": errors,
+        }

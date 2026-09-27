@@ -30,6 +30,8 @@ const state = {
   chainFetchedExpiration: "",
   levelsKey: "",
   levelsPayload: null,
+  // 最近一次服务端综合结果；倒计时刷新优先改用客户端 raw 计算时保留复杂字段。
+  serverLevelsPayload: null,
   levelsRetryTimer: null,
   tradePointStability: {
     context: "",
@@ -109,6 +111,8 @@ let analysisChartSignatureValue = "";
 let forceChartRedraw = false;
 let scopeChartTimer = null;
 let scopeChartToken = 0;
+// 每个标的只补一次服务端复杂结果（买方结构、历史回踩、Beta 等），后续倒计时直接复用客户端计算。
+const clientServerFallbackSymbols = new Set();
 // 页面自动刷新间隔来自服务端 AUTO_REFRESH_SECONDS；非法或缺失时回到 60 秒。
 function readAutoRefreshSeconds() {
   const meta = document.querySelector('meta[name="option-scope-auto-refresh-seconds"]');
@@ -945,6 +949,177 @@ function renderLevels(points, spot) {
   renderPlan({ add: planSupportSeries.slice(planSplit, planSplit + PLAN_COUNT) }, price);
 }
 
+// 原始日线到达浏览器后，在本地完成不会产生副作用的计算。这里只保留轻量规则，
+// 复杂历史回踩、买方结构和 Beta 仍由服务端综合接口兜底，避免低配服务器在每次刷新时重算整套模型。
+function clientBars(payload) {
+  return (payload?.bars || []).map((bar) => ({
+    ...bar,
+    high: Number(bar.high),
+    low: Number(bar.low),
+    close: Number(bar.close),
+    volume: Number(bar.volume) || 0,
+  })).filter((bar) => Number.isFinite(bar.high) && Number.isFinite(bar.low) && Number.isFinite(bar.close) && bar.close > 0);
+}
+
+function clientExtremes(bars) {
+  if (!bars.length) return null;
+  const highPoint = (items) => items.reduce((best, bar) => !best || bar.high > best.high ? bar : best, null);
+  const lowPoint = (items) => items.reduce((best, bar) => !best || bar.low < best.low ? bar : best, null);
+  const latestDate = String(bars[bars.length - 1].date || "").slice(0, 10);
+  const cutoff = latestDate ? new Date(`${latestDate}T00:00:00Z`).getTime() - 365 * 86400000 : 0;
+  const window = bars.filter((bar) => !cutoff || new Date(`${String(bar.date).slice(0, 10)}T00:00:00Z`).getTime() >= cutoff);
+  const pack = (items) => {
+    const high = highPoint(items); const low = lowPoint(items);
+    return {
+      high: high ? { price: high.high, date: String(high.date || "").slice(0, 10) } : null,
+      low: low ? { price: low.low, date: String(low.date || "").slice(0, 10) } : null,
+    };
+  };
+  return { week52: pack(window), all_time: pack(bars), window_days: 365, reference_date: latestDate, bars: bars.length, window_bars: window.length };
+}
+
+function clientRsi(values, period = 14) {
+  if (values.length < period + 1) return null;
+  let gain = 0; let loss = 0;
+  for (let index = 1; index <= period; index += 1) {
+    const delta = values[index] - values[index - 1];
+    gain += Math.max(delta, 0); loss += Math.max(-delta, 0);
+  }
+  gain /= period; loss /= period;
+  for (let index = period + 1; index < values.length; index += 1) {
+    const delta = values[index] - values[index - 1];
+    gain = (gain * (period - 1) + Math.max(delta, 0)) / period;
+    loss = (loss * (period - 1) + Math.max(-delta, 0)) / period;
+  }
+  const value = gain === 0 && loss === 0 ? 50 : (loss === 0 ? 100 : 100 - 100 / (1 + gain / loss));
+  const stateName = value >= 70 ? "overbought" : (value <= 30 ? "oversold" : "neutral");
+  return { value: Number(value.toFixed(1)), period, state: stateName, label: stateName === "overbought" ? "超买" : (stateName === "oversold" ? "超卖" : "中性") };
+}
+
+function clientFitChannel(values) {
+  if (values.length < 20) return null;
+  const meanX = (values.length - 1) / 2;
+  const meanY = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const variance = values.reduce((sum, _, index) => sum + (index - meanX) ** 2, 0);
+  if (!(variance > 0) || !(meanY > 0)) return null;
+  const slope = values.reduce((sum, value, index) => sum + (index - meanX) * (value - meanY), 0) / variance;
+  const intercept = meanY - slope * meanX;
+  const deviation = Math.sqrt(values.reduce((sum, value, index) => sum + (value - (intercept + slope * index)) ** 2, 0) / values.length);
+  const fitted = intercept + slope * (values.length - 1);
+  return { slope_percent: slope / meanY * 100, upper: Number((fitted + 1.5 * deviation).toFixed(4)), lower: Number((fitted - 1.5 * deviation).toFixed(4)), bars: values.length };
+}
+
+function clientTrend(bars) {
+  const values = bars.map((bar) => bar.close).filter((value) => Number.isFinite(value) && value > 0);
+  if (values.length < 20) return null;
+  const longValues = values.slice(-60); const recentValues = values.slice(-20);
+  const longFit = clientFitChannel(longValues); const recentFit = clientFitChannel(recentValues);
+  if (!longFit || !recentFit) return null;
+  const longDirection = longFit.slope_percent > 0.05 ? "up" : (longFit.slope_percent < -0.05 ? "down" : "range");
+  const recentChange = recentValues[recentValues.length - 1] / recentValues[0] - 1;
+  const rebound = recentValues[recentValues.length - 1] / Math.min(...recentValues) - 1;
+  const pullback = Math.max(...recentValues) / recentValues[recentValues.length - 1] - 1;
+  const recentUp = recentFit.slope_percent > 0.05; const recentDown = recentFit.slope_percent < -0.05;
+  const reversalUp = recentUp && recentChange >= 0.05 && rebound >= 0.08;
+  const reversalDown = recentDown && recentChange <= -0.05 && pullback >= 0.08;
+  const selected = reversalUp && longDirection !== "up" ? recentFit : (reversalDown && longDirection !== "down" ? recentFit : longFit);
+  const direction = reversalUp && longDirection !== "up" ? "up" : (reversalDown && longDirection !== "down" ? "down" : longDirection);
+  const label = direction === "up" ? (selected === recentFit ? "反弹上行 · 上涨趋势" : "上行通道 · 上涨趋势") : (direction === "down" ? (selected === recentFit ? "短线转弱 · 下跌趋势" : "下行通道 · 下跌趋势") : "区间震荡 · 方向待定");
+  return { direction, label, slope_percent: Number(selected.slope_percent.toFixed(3)), upper: selected.upper, lower: selected.lower, bars: selected.bars, background_direction: longDirection, reversal_confirmed: selected === recentFit, rsi: clientRsi(values) };
+}
+
+function clientTechnicalCandidates(bars, spot) {
+  if (!bars.length || !(spot > 0)) return [];
+  const window = bars.slice(-120); const high = Math.max(...window.map((bar) => bar.high)); const low = Math.min(...window.map((bar) => bar.low));
+  const highIndex = window.map((bar) => bar.high).lastIndexOf(high); const lowIndex = window.map((bar) => bar.low).lastIndexOf(low);
+  const result = [];
+  if (high > low) {
+    [[0.236, 0.6], [0.382, 0.9], [0.5, 1], [0.618, 1], [0.786, 0.6]].forEach(([ratio, score]) => {
+      const price = lowIndex < highIndex ? high - (high - low) * ratio : low + (high - low) * ratio;
+      result.push({ price, score, factors: [`斐波那契 ${ratio * 100}%`] });
+    });
+  }
+  const weighted = window.filter((bar) => bar.volume > 0).reduce((sum, bar) => sum + bar.close * bar.volume, 0);
+  const volume = window.reduce((sum, bar) => sum + Math.max(bar.volume, 0), 0);
+  if (volume > 0 && Number.isFinite(weighted / volume)) result.push({ price: weighted / volume, score: 0.7, factors: ["筹码密集"] });
+  for (let index = 2; index < window.length - 2; index += 1) {
+    const bar = window[index];
+    if (bar.low < spot && bar.low <= window[index - 1].low && bar.low <= window[index + 1].low) result.push({ price: bar.low, score: 0.62, factors: ["承接位"] });
+  }
+  return result;
+}
+
+function clientMergeLevels(points, bars, spot, side) {
+  const openInterest = points.reduce((sum, point) => sum + point.callOi + point.putOi, 0);
+  const volume = points.reduce((sum, point) => sum + point.callVolume + point.putVolume, 0);
+  const byGex = openInterest > 0 && openInterest >= volume * 0.2;
+  const valueOf = side === "resistance" ? (point) => byGex ? Math.max(point.callGex, 0) : point.callVolume : (point) => byGex ? Math.max(-point.putGex, 0) : point.putVolume;
+  const metric = byGex ? "Gamma 敞口" : "成交量";
+  const options = pickLevels(points, spot, side === "resistance" ? "above" : "below", valueOf, LEVEL_COUNT).map((point) => ({ price: point.strike, score: 0.65, factors: [metric] }));
+  const technical = clientTechnicalCandidates(bars, spot).filter((item) => side === "resistance" ? item.price > spot : item.price < spot);
+  const candidates = [...options, ...technical].filter((item) => Number.isFinite(item.price) && item.price > 0);
+  const selected = [];
+  for (const item of candidates.sort((a, b) => Math.abs(a.price - spot) - Math.abs(b.price - spot))) {
+    if (selected.some((other) => Math.abs(other.price - item.price) < spot * 0.005)) {
+      const existing = selected.find((other) => Math.abs(other.price - item.price) < spot * 0.005);
+      existing.factors = [...new Set([...existing.factors, ...item.factors])]; existing.score = Math.min(1, existing.score + 0.08);
+      continue;
+    }
+    selected.push({ ...item, zone_low: item.price * 0.9975, zone_high: item.price * 1.0025 });
+    if (selected.length >= LEVEL_COUNT) break;
+  }
+  return { levels: selected, metric };
+}
+
+function renderClientRaw(payload, points, spot) {
+  const serverPayload = state.serverLevelsPayload;
+  const bars = clientBars(payload); const trend = clientTrend(bars); const extremes = payload?.extremes || clientExtremes(bars);
+  const rawRows = Array.isArray(payload?.options) && payload.options.length ? payload.options : null;
+  const optionPoints = rawRows ? aggregateByStrike(rawRows, Number(spot)) : points;
+  const resistance = clientMergeLevels(optionPoints, bars, Number(spot), "resistance"); const support = clientMergeLevels(optionPoints, bars, Number(spot), "support");
+  const renderSide = (items, side, isAdd = false) => buildFactorViews(items, Number(spot), side, isAdd);
+  state.levelsPayload = payload;
+  applyEarnings(payload?.earnings);
+  state.view.chart.levelsBasis = Number.isFinite(Number(spot)) && Number(spot) > 0 ? `基准 ${formatMoney(Number(spot))}` : "基准 --";
+  state.view.levels.placeholder = false;
+  state.view.levels.resistance = renderSide(resistance.levels, "resistance");
+  state.view.levels.support = renderSide(support.levels, "support");
+  const allSupport = support.levels.slice().sort((a, b) => a.price - b.price);
+  state.view.levels.add = renderSide(allSupport.slice(Math.ceil(allSupport.length / 2), Math.ceil(allSupport.length / 2) + PLAN_COUNT), "support", true);
+  state.view.levels.resistanceNote = `客户端计算 · ${resistance.metric}`;
+  state.view.levels.supportNote = `客户端计算 · ${support.metric}`;
+  state.view.levels.addEmpty = state.view.levels.add.length ? "" : "客户端暂无更深支撑";
+  state.view.levels.resistanceEmpty = "现价这一侧暂无可用价位"; state.view.levels.supportEmpty = "现价这一侧暂无可用价位";
+  if (serverPayload?.buyer_structures) {
+    renderBuyerStructures(serverPayload.buyer_structures, serverPayload.options_fetched_at || serverPayload.chain_fetched_at);
+  } else {
+    state.view.buyer = {
+      available: false,
+      directionLabel: "",
+      horizonLabel: "未来 5 个交易日",
+      target: "",
+      items: [],
+      reason: "买方结构需要服务端综合计算",
+      note: "基础趋势与价位已由客户端计算",
+    };
+  }
+  OptionScopeCharts.renderLevelsChart({ spot, resistance: resistance.levels, support: support.levels });
+  const tradePointContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
+  const stableTradePoints = stabilizeTradePoints(serverPayload?.trade_points || null, tradePointContext);
+  renderTrend(
+    trend,
+    extremes,
+    spot,
+    payload.history,
+    serverPayload?.recommendation || null,
+    stableTradePoints,
+    serverPayload?.trade_points_horizon || null,
+    payload.trend_market,
+    payload.beta || serverPayload?.beta || null,
+  );
+  renderPlan({ add: allSupport.slice(Math.ceil(allSupport.length / 2), Math.ceil(allSupport.length / 2) + PLAN_COUNT) }, spot);
+}
+
 // 综合接口还在计算时，先用已经拿到的当前期限期权分布填充基础价位和图表，避免首屏整块留空。
 // 综合结果回来后会覆盖这份临时结果；已有结果时保留旧值，避免刷新过程中闪回空状态。
 function renderFactorFallback(points, spot) {
@@ -961,7 +1136,7 @@ function renderFactorFallback(points, spot) {
   if (!hasVisibleLevels) renderLevels(points, spot);
 }
 
-function requestFactorLevels(points, spot, key, attempt = 0) {
+function requestServerFactorLevels(points, spot, key, attempt = 0) {
   const encodedSymbol = encodeURIComponent(state.symbol);
   const encodedExpiration = encodeURIComponent(state.expiration);
   const numericSpot = Number(spot);
@@ -971,8 +1146,26 @@ function requestFactorLevels(points, spot, key, attempt = 0) {
   request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}`)
     .then((payload) => {
       if (state.levelsKey !== key) return; // 期间切换了标的、期限或快照，丢弃过期结果
+      // 低内存/后台 Gamma 竞争时，API 可能先返回 200 的期权回退结果，历史字段仍为空。
+      // 这不是最终结果：保留当前可见价位，同时在下一轮让服务器补齐趋势、极值和 Beta。
+      const historyReady = Number(payload?.history?.bars) > 0 || Boolean(payload?.trend?.bars);
+      const hasDeferredHistory = !historyReady && (
+        payload?.history?.warning
+        || payload?.history?.source === "none"
+        || payload?.history?.extremes_source === "none"
+        || payload?.beta_meta?.source === "none"
+      );
       state.levelsPayload = payload;
       renderFactorLevels(payload);
+      state.serverLevelsPayload = payload;
+      if (!hasDeferredHistory) clientServerFallbackSymbols.add(state.symbol);
+      if (hasDeferredHistory && attempt < 2) {
+        clearTimeout(state.levelsRetryTimer);
+        state.levelsRetryTimer = setTimeout(() => {
+          state.levelsRetryTimer = null;
+          if (state.levelsKey === key) requestFactorLevels(points, spot, key, attempt + 1);
+        }, Math.min(2500, 900 * (attempt + 1)));
+      }
     })
     .catch(() => {
       if (state.levelsKey !== key) return;
@@ -986,6 +1179,32 @@ function requestFactorLevels(points, spot, key, attempt = 0) {
         if (state.levelsKey === key) requestFactorLevels(points, spot, key, attempt + 1);
       }, 1200);
     });
+}
+
+function requestFactorLevels(points, spot, key, attempt = 0) {
+  const encodedSymbol = encodeURIComponent(state.symbol);
+  const encodedExpiration = encodeURIComponent(state.expiration);
+  const numericSpot = Number(spot);
+  const spotQuery = Number.isFinite(numericSpot) && numericSpot > 0
+    ? `&spot=${encodeURIComponent(numericSpot)}`
+    : "";
+  // 首选只读原始缓存。历史足够时由浏览器计算趋势、极值和基础价位，
+  // 只有缓存不足才进入原有服务端综合接口。
+  request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}&raw=true`)
+    .then((payload) => {
+      if (state.levelsKey !== key) return;
+      const rawBars = Array.isArray(payload?.bars) ? payload.bars.length : 0;
+      if (payload?.raw && rawBars > 0) {
+        state.levelsPayload = payload;
+        renderClientRaw(payload, points, numericSpot);
+        if (!clientServerFallbackSymbols.has(state.symbol)) {
+          requestServerFactorLevels(points, spot, key, 0);
+        }
+        return;
+      }
+      requestServerFactorLevels(points, spot, key, attempt);
+    })
+    .catch(() => requestServerFactorLevels(points, spot, key, attempt));
 }
 
 // 与后端 spot_cache_bucket 同一套半入规则，避免前后端格子边界不一致。
@@ -1008,7 +1227,8 @@ function loadFactorLevels(points, spot) {
   const key = `${state.symbol}|${state.expiration}|${state.chainFetchedAt || ""}|${spotCacheBucket(spot)}|${state.levelBasisMode}`;
   // 已请求过：窗口尺寸变化时直接用缓存结果重绘，不再打接口。
   if (state.levelsKey === key) {
-    if (state.levelsPayload) renderFactorLevels(state.levelsPayload);
+    if (state.levelsPayload?.raw) renderClientRaw(state.levelsPayload, points, spot);
+    else if (state.levelsPayload) renderFactorLevels(state.levelsPayload);
     else renderLevels(points, spot);
     return;
   }
@@ -1016,6 +1236,7 @@ function loadFactorLevels(points, spot) {
   state.levelsRetryTimer = null;
   state.levelsKey = key;
   state.levelsPayload = null;
+  state.serverLevelsPayload = null;
   renderFactorFallback(points, spot);
   requestFactorLevels(points, spot, key);
 }
@@ -1998,6 +2219,7 @@ function showPending(message) {
   state.levelsRetryTimer = null;
   state.levelsKey = "";
   state.levelsPayload = null;
+  state.serverLevelsPayload = null;
   state.view.levels = placeholderLevels(message || "正在加载");
   state.view.buyer = {
     available: false,
