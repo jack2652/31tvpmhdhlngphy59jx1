@@ -7,6 +7,9 @@ const LEVEL_COUNT = 10;
 const PLAN_COUNT = 10;
 // Gamma 轮询和快照倒计时分开：只在开始后的几秒挡住自动刷新，避免任务卡住时整页停住。
 const ANALYSIS_REFRESH_BLOCK_MS = 8000;
+// Gamma 窗口远慢于单期限快照，不跟着每次 60 秒行情刷新重复下载；十分钟内复用上一份窗口。
+const ANALYSIS_REFRESH_COOLDOWN_SECONDS = 600;
+// 批次运行期间最多读取 90 次状态，每次间隔 3 秒；批次完成后再启动下一批。
 const ANALYSIS_POLL_LIMIT = 90;
 
 const TREND_SIGNAL_TITLE = "规则估算，不是下单指令，也不包含财报跳空";
@@ -32,6 +35,14 @@ const state = {
   levelsPayload: null,
   // 最近一次服务端综合结果；倒计时刷新优先改用客户端 raw 计算时保留复杂字段。
   serverLevelsPayload: null,
+  serverLevelsContext: "",
+  serverLevelsRequestKey: "",
+  serverLevelsPayloadKey: "",
+  serverLevelsInFlightContext: "",
+  serverLevelsCooldownContext: "",
+  serverLevelsCooldownUntil: 0,
+  // 同一快照的实时价/盘后价综合结果分别缓存；切换口径时先复用已有结果，后台再补齐新口径。
+  serverLevelsCache: new Map(),
   levelsRetryTimer: null,
   tradePointStability: {
     context: "",
@@ -111,8 +122,9 @@ let analysisChartSignatureValue = "";
 let forceChartRedraw = false;
 let scopeChartTimer = null;
 let scopeChartToken = 0;
-// 每个标的只补一次服务端复杂结果（买方结构、历史回踩、Beta 等），后续倒计时直接复用客户端计算。
-const clientServerFallbackSymbols = new Set();
+const analysisWindowLastStartedAt = new Map();
+// 最近一次已应用到页面的 Gamma 窗口时间；冷却期内只读任务状态，完成后立即更新图表。
+const analysisWindowLastAppliedAt = new Map();
 // 页面自动刷新间隔来自服务端 AUTO_REFRESH_SECONDS；非法或缺失时回到 60 秒。
 function readAutoRefreshSeconds() {
   const meta = document.querySelector('meta[name="option-scope-auto-refresh-seconds"]');
@@ -514,7 +526,12 @@ function scheduleAutoRefresh() {
   const age = anchoredAge == null || snapshotAge == null ? (anchoredAge ?? snapshotAge) : Math.min(anchoredAge, snapshotAge);
   // 卡在新鲜期边界上会先被服务端跳过，倒计时再走几秒后又回源一次。晚 1 秒，这一轮就直接回源。
   const settledAge = age == null ? null : Math.max(age - 1, 0);
-  const remaining = settledAge == null ? AUTO_REFRESH_SECONDS : AUTO_REFRESH_SECONDS - settledAge;
+  // 新标的或新期限尚未落地快照时，完整周期会让失败后的页面再等 60 秒；
+  // 没有可展示快照就用短重试，已有快照仍按其年龄计算，避免正常刷新形成请求风暴。
+  const hasDisplayedSnapshot = displayedSnapshotMatches();
+  const remaining = !hasDisplayedSnapshot
+    ? AUTO_REFRESH_RETRY_SECONDS
+    : (settledAge == null ? AUTO_REFRESH_SECONDS : AUTO_REFRESH_SECONDS - settledAge);
   const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);
   refreshDeadline = Date.now() + delaySeconds * 1000;
   state.timer = setTimeout(() => { refresh(true); }, delaySeconds * 1000);
@@ -771,7 +788,9 @@ function activeBasis(quote) {
 // 切换基准价口径：同步开关的按下状态，再用已有快照重算压力位/支撑位（不额外请求上游接口）。
 // 支撑位/压力位表、交易计划与压力位/支撑位柱状图都由这一次重绘一起更新。
 function applyBasisMode(mode) {
+  const previousMode = state.levelBasisMode;
   state.levelBasisMode = mode === "close" ? "close" : "live";
+  if (state.levelBasisMode === previousMode) return;
   // 基准价切换也要立即重绘现货卡片，否则标签变了但价格仍停留在上一次口径。
   if (state.lastQuote) renderQuote(state.lastQuote);
   for (const key of Object.keys(BASIS_MODES)) {
@@ -942,15 +961,20 @@ function renderLevels(points, spot) {
   const resistanceSeries = fallbackLevelSeries(resistance, callValue, metricLabel);
   const supportSeries = fallbackLevelSeries(support, putValue, metricLabel);
   OptionScopeCharts.renderLevelsChart({ spot: price, resistance: resistanceSeries, support: supportSeries });
-  // 回退口径没有日线历史，趋势通道留空；交易计划按同一批支撑/压力价位切成三段。
-  renderTrend(null);
+  // 回退口径没有日线历史，趋势通道留空；买卖点先展示期权候选的快速估算。
+  const provisionalTradePoints = clientTradePoints(state.view.levels.support, state.view.levels.resistance, price);
+  if (provisionalTradePoints.buy || provisionalTradePoints.sell) {
+    renderTrend(null, null, price, null, null, provisionalTradePoints);
+  } else {
+    renderTrend(null);
+  }
   const planSupportSeries = fallbackLevelSeries(planSupport, putValue, metricLabel);
   const planSplit = Math.min(PLAN_COUNT, Math.ceil(planSupportSeries.length / 2));
   renderPlan({ add: planSupportSeries.slice(planSplit, planSplit + PLAN_COUNT) }, price);
 }
 
-// 原始日线到达浏览器后，在本地完成不会产生副作用的计算。这里只保留轻量规则，
-// 复杂历史回踩、买方结构和 Beta 仍由服务端综合接口兜底，避免低配服务器在每次刷新时重算整套模型。
+// 原始日线到达浏览器后，在本地完成不会产生副作用的计算。复杂买方结构只有在
+// 已有服务端缓存时展示，避免低配服务器在每次刷新时重算整套模型。
 function clientBars(payload) {
   return (payload?.bars || []).map((bar) => ({
     ...bar,
@@ -1071,24 +1095,109 @@ function clientMergeLevels(points, bars, spot, side) {
   return { levels: selected, metric };
 }
 
+function serverLevelsHasCompleteFields(payload) {
+  const levels = payload && Array.isArray(payload.resistance) && Array.isArray(payload.support)
+    ? [...payload.resistance, ...payload.support]
+    : [];
+  return Boolean(
+    payload
+    && payload.trade_points
+    && levels.length > 0
+    && levels.every((level) => Object.prototype.hasOwnProperty.call(level, "probability")
+      && Object.prototype.hasOwnProperty.call(level, "strength_tier")),
+  );
+}
+
+function serverLevelsNeedsRetry(payload) {
+  const warnings = [
+    payload?.history?.warning,
+    payload?.history?.extremes_warning,
+    payload?.beta_meta?.warning,
+    payload?.earnings?.warning,
+  ].filter(Boolean).map(String);
+  const temporarilyBlocked = warnings.some((warning) => /内存保护|刷新正在进行|租约忙|等待超时|稍后重试/.test(warning));
+  if (!temporarilyBlocked) return false;
+  const betaValue = payload?.beta?.value;
+  const hasBeta = betaValue != null && Number.isFinite(Number(betaValue));
+  return !serverLevelsHasCompleteFields(payload)
+    || Number(payload?.history?.bars) <= 0
+    || !payload?.trend
+    || !hasBeta;
+}
+
+function levelsPayloadForBasis(payload, spot, staleBasis = false) {
+  if (!payload) return null;
+  return { ...payload, spot, _staleBasis: staleBasis };
+}
+
+function rememberServerLevels(key, payload) {
+  if (!key || !serverLevelsHasCompleteFields(payload)) return;
+  state.serverLevelsCache.set(key, payload);
+  // 页面长期停留并切换多个期限时限制内存，保留最近的 12 份口径结果。
+  while (state.serverLevelsCache.size > 12) {
+    state.serverLevelsCache.delete(state.serverLevelsCache.keys().next().value);
+  }
+}
+
+function clientTradePoints(support, resistance, spot) {
+  const price = Number(spot);
+  if (!Number.isFinite(price) || price <= 0) return { buy: null, sell: null };
+  const provisional = (items, side) => {
+    const candidates = (items || [])
+      .filter((item) => Number.isFinite(Number(item?.price)) && Number(item.price) > 0)
+      .map((item) => ({ ...item, distance: Math.abs(Number(item.price) - price) }))
+      .sort((a, b) => (b.score || 0) - (a.score || 0) || a.distance - b.distance);
+    const item = candidates[0];
+    if (!item) return null;
+    const score = Math.max(0, Math.min(1, Number(item.score) || 0));
+    return {
+      price: Number(item.price),
+      zone_low: Number(item.zone_low) || Number(item.price) * 0.9975,
+      zone_high: Number(item.zone_high) || Number(item.price) * 1.0025,
+      confidence: score,
+      model_confidence: score,
+      history_samples: 0,
+      factors: item.factors || [],
+      reason: `客户端快速估算${side === "buy" ? "支撑" : "压力"}候选，服务端综合结果返回后更新`,
+    };
+  };
+  return { buy: provisional(support, "buy"), sell: provisional(resistance, "sell") };
+}
+
 function renderClientRaw(payload, points, spot) {
   const serverPayload = state.serverLevelsPayload;
   const bars = clientBars(payload); const trend = clientTrend(bars); const extremes = payload?.extremes || clientExtremes(bars);
   const rawRows = Array.isArray(payload?.options) && payload.options.length ? payload.options : null;
   const optionPoints = rawRows ? aggregateByStrike(rawRows, Number(spot)) : points;
   const resistance = clientMergeLevels(optionPoints, bars, Number(spot), "resistance"); const support = clientMergeLevels(optionPoints, bars, Number(spot), "support");
+  // raw 结果只包含浏览器可计算的基础价位。上一份同标的、同期限的服务端结果
+  // 在新快照补全期间继续作为临时显示，避免概率、最佳买卖点和强化色闪回为空。
+  const hasServerLevels = Boolean(serverLevelsHasCompleteFields(serverPayload)
+    && serverPayload.expiration === state.expiration
+    && state.serverLevelsContext === `${state.symbol}|${state.expiration}|${state.levelBasisMode}`);
+  const displayedResistance = hasServerLevels ? serverPayload.resistance : resistance.levels;
+  const displayedSupport = hasServerLevels ? serverPayload.support : support.levels;
+  const displayedMetric = hasServerLevels
+    ? (serverPayload.options_metric === "volume" ? "成交量" : "Gamma 敞口")
+    : resistance.metric;
   const renderSide = (items, side, isAdd = false) => buildFactorViews(items, Number(spot), side, isAdd);
   state.levelsPayload = payload;
   applyEarnings(payload?.earnings);
   state.view.chart.levelsBasis = Number.isFinite(Number(spot)) && Number(spot) > 0 ? `基准 ${formatMoney(Number(spot))}` : "基准 --";
   state.view.levels.placeholder = false;
-  state.view.levels.resistance = renderSide(resistance.levels, "resistance");
-  state.view.levels.support = renderSide(support.levels, "support");
-  const allSupport = support.levels.slice().sort((a, b) => a.price - b.price);
-  state.view.levels.add = renderSide(allSupport.slice(Math.ceil(allSupport.length / 2), Math.ceil(allSupport.length / 2) + PLAN_COUNT), "support", true);
-  state.view.levels.resistanceNote = `客户端计算 · ${resistance.metric}`;
-  state.view.levels.supportNote = `客户端计算 · ${support.metric}`;
-  state.view.levels.addEmpty = state.view.levels.add.length ? "" : "客户端暂无更深支撑";
+  state.view.levels.resistance = renderSide(displayedResistance, "resistance");
+  state.view.levels.support = renderSide(displayedSupport, "support");
+  const addLevels = hasServerLevels && Array.isArray(serverPayload.plan?.add)
+    ? serverPayload.plan.add
+    : displayedSupport.slice(Math.ceil(displayedSupport.length / 2), Math.ceil(displayedSupport.length / 2) + PLAN_COUNT);
+  const allSupport = displayedSupport.slice().sort((a, b) => a.price - b.price);
+  state.view.levels.add = renderSide(addLevels, "support", true);
+  const serverNote = hasServerLevels
+    ? (serverPayload?._staleBasis ? "服务端综合结果 · 正在更新基准价，暂用上一份口径" : "服务端综合结果 · 暂用上一份快照")
+    : `客户端计算 · ${displayedMetric}`;
+  state.view.levels.resistanceNote = serverNote;
+  state.view.levels.supportNote = serverNote;
+  state.view.levels.addEmpty = state.view.levels.add.length ? "" : (hasServerLevels ? "暂无可用价位" : "客户端暂无更深支撑");
   state.view.levels.resistanceEmpty = "现价这一侧暂无可用价位"; state.view.levels.supportEmpty = "现价这一侧暂无可用价位";
   if (serverPayload?.buyer_structures) {
     renderBuyerStructures(serverPayload.buyer_structures, serverPayload.options_fetched_at || serverPayload.chain_fetched_at);
@@ -1103,21 +1212,24 @@ function renderClientRaw(payload, points, spot) {
       note: "基础趋势与价位已由客户端计算",
     };
   }
-  OptionScopeCharts.renderLevelsChart({ spot, resistance: resistance.levels, support: support.levels });
+  OptionScopeCharts.renderLevelsChart({ spot, resistance: displayedResistance, support: displayedSupport });
   const tradePointContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
-  const stableTradePoints = stabilizeTradePoints(serverPayload?.trade_points || null, tradePointContext);
+  const provisionalTradePoints = hasServerLevels
+    ? serverPayload.trade_points
+    : clientTradePoints(displayedSupport, displayedResistance, spot);
+  const stableTradePoints = stabilizeTradePoints(provisionalTradePoints, tradePointContext);
   renderTrend(
-    trend,
-    extremes,
+    hasServerLevels && serverPayload.trend ? serverPayload.trend : trend,
+    hasServerLevels && serverPayload.extremes ? serverPayload.extremes : extremes,
     spot,
-    payload.history,
+    hasServerLevels && serverPayload.history ? serverPayload.history : payload.history,
     serverPayload?.recommendation || null,
     stableTradePoints,
     serverPayload?.trade_points_horizon || null,
     payload.trend_market,
     payload.beta || serverPayload?.beta || null,
   );
-  renderPlan({ add: allSupport.slice(Math.ceil(allSupport.length / 2), Math.ceil(allSupport.length / 2) + PLAN_COUNT) }, spot);
+  renderPlan({ add: addLevels }, spot);
 }
 
 // 综合接口还在计算时，先用已经拿到的当前期限期权分布填充基础价位和图表，避免首屏整块留空。
@@ -1131,12 +1243,33 @@ function renderFactorFallback(points, spot) {
   );
   const hasVisibleLevels = Boolean(
     levelRowsReady
-    || (state.view.trend.available && !state.view.trend.placeholder)
+    || (state.view.trend.available && !state.view.trend.placeholder && !state.view.trend.partial)
   );
   if (!hasVisibleLevels) renderLevels(points, spot);
 }
 
 function requestServerFactorLevels(points, spot, key, attempt = 0) {
+  const context = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
+  // 同一快照只补一次综合结果；新快照到来时允许更新，期间保留上一份
+  // 同口径结果作为过渡，避免概率、最佳买卖点和强化色闪回为空。
+  if (state.serverLevelsRequestKey === key
+    || state.serverLevelsPayloadKey === key
+    || state.serverLevelsInFlightContext === context
+    || (state.serverLevelsCooldownContext === context && Date.now() < state.serverLevelsCooldownUntil)) return;
+  // 先让正在进行的行情快照刷新完成，避免综合历史计算抢占首屏快照的重任务闸门。
+  if (state.refreshInFlight === state.symbol) {
+    if (!state.levelsRetryTimer) {
+      state.levelsRetryTimer = setTimeout(() => {
+        state.levelsRetryTimer = null;
+        if (`${state.symbol}|${state.expiration}|${state.levelBasisMode}` !== context || !state.levelsKey) return;
+        const latestSpot = Number(state.lastAnalysis?.basis?.price || state.lastAnalysis?.spot || spot);
+        requestServerFactorLevels(state.lastAnalysis?.points || points, latestSpot, state.levelsKey, attempt);
+      }, 1000);
+    }
+    return;
+  }
+  state.serverLevelsRequestKey = key;
+  state.serverLevelsInFlightContext = context;
   const encodedSymbol = encodeURIComponent(state.symbol);
   const encodedExpiration = encodeURIComponent(state.expiration);
   const numericSpot = Number(spot);
@@ -1145,39 +1278,60 @@ function requestServerFactorLevels(points, spot, key, attempt = 0) {
     : "";
   request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}`)
     .then((payload) => {
-      if (state.levelsKey !== key) return; // 期间切换了标的、期限或快照，丢弃过期结果
-      // 低内存/后台 Gamma 竞争时，API 可能先返回 200 的期权回退结果，历史字段仍为空。
-      // 这不是最终结果：保留当前可见价位，同时在下一轮让服务器补齐趋势、极值和 Beta。
-      const historyReady = Number(payload?.history?.bars) > 0 || Boolean(payload?.trend?.bars);
-      const hasDeferredHistory = !historyReady && (
-        payload?.history?.warning
-        || payload?.history?.source === "none"
-        || payload?.history?.extremes_source === "none"
-        || payload?.beta_meta?.source === "none"
-      );
-      state.levelsPayload = payload;
-      renderFactorLevels(payload);
+      if (`${state.symbol}|${state.expiration}|${state.levelBasisMode}` !== context) return;
+      // 同一上下文可能在新快照到达后发起了更新请求；旧响应只能被丢弃，
+      // 否则它会覆盖新结果并再次触发重复的综合计算。
+      if (state.serverLevelsRequestKey !== key) return;
+      const retry = serverLevelsNeedsRetry(payload) && attempt < 2;
       state.serverLevelsPayload = payload;
-      if (!hasDeferredHistory) clientServerFallbackSymbols.add(state.symbol);
-      if (hasDeferredHistory && attempt < 2) {
+      state.serverLevelsContext = context;
+      state.serverLevelsPayloadKey = retry ? "" : key;
+      rememberServerLevels(key, payload);
+      state.serverLevelsInFlightContext = "";
+      if (retry) {
+        // 闸门或历史租约繁忙会以 HTTP 200 返回空历史；短暂退避后最多再试两次。
+        // 快照期间若已更新，定时器会使用最新快照，而不是重复计算旧键。
+        const delay = 3000 * (attempt + 1);
+        state.serverLevelsRequestKey = "";
+        state.serverLevelsCooldownContext = context;
+        state.serverLevelsCooldownUntil = Date.now() + delay;
         clearTimeout(state.levelsRetryTimer);
         state.levelsRetryTimer = setTimeout(() => {
           state.levelsRetryTimer = null;
-          if (state.levelsKey === key) requestFactorLevels(points, spot, key, attempt + 1);
-        }, Math.min(2500, 900 * (attempt + 1)));
+          if (`${state.symbol}|${state.expiration}|${state.levelBasisMode}` !== context || !state.levelsKey) return;
+          state.serverLevelsCooldownUntil = 0;
+          const latestSpot = Number(state.lastAnalysis?.basis?.price || state.lastAnalysis?.spot || spot);
+          requestServerFactorLevels(state.lastAnalysis?.points || points, latestSpot, state.levelsKey, attempt + 1);
+        }, delay);
+      } else if (serverLevelsNeedsRetry(payload)) {
+        // 两次补试仍遇到资源保护时暂缓后续快照请求，防止低配实例持续承压。
+        state.serverLevelsCooldownContext = context;
+        state.serverLevelsCooldownUntil = Date.now() + 30000;
+      } else {
+        state.serverLevelsCooldownContext = "";
+        state.serverLevelsCooldownUntil = 0;
+      }
+      // 如果请求期间快照已更新，先保存结果，下一次 raw 重绘会复用；不强行覆盖最新现价。
+      if (state.levelsKey === key) {
+        state.levelsPayload = payload;
+        renderFactorLevels(payload);
+      } else if (state.levelsKey && state.levelsKey !== key
+        && !retry
+        && `${state.symbol}|${state.expiration}|${state.levelBasisMode}` === context) {
+        // 当前快照在旧请求期间到达：旧请求完成后再串行补当前快照，避免两个综合计算并发。
+        const latestSpot = Number(state.lastAnalysis?.basis?.price || state.lastAnalysis?.spot);
+        requestServerFactorLevels(state.lastAnalysis?.points || [], latestSpot, state.levelsKey);
       }
     })
     .catch(() => {
-      if (state.levelsKey !== key) return;
-      state.levelsPayload = null;
-      renderFactorFallback(points, spot);
-      // 首次历史数据可能仍在上游或 SQLite 写入链路中，短暂失败时只补一次，避免反复请求。
-      if (attempt >= 1) return;
-      clearTimeout(state.levelsRetryTimer);
-      state.levelsRetryTimer = setTimeout(() => {
-        state.levelsRetryTimer = null;
-        if (state.levelsKey === key) requestFactorLevels(points, spot, key, attempt + 1);
-      }, 1200);
+      // raw 客户端结果已经可用；完整接口失败时不重试，避免弱服务器进入请求风暴。
+      // 保留当前快照的请求标记，下一次 raw 重绘不会再次触发；下一份快照会重新补全。
+      if (`${state.symbol}|${state.expiration}|${state.levelBasisMode}` !== context
+        || state.serverLevelsRequestKey !== key) return;
+      state.serverLevelsRequestKey = key;
+      state.serverLevelsInFlightContext = "";
+      state.serverLevelsCooldownContext = context;
+      state.serverLevelsCooldownUntil = Date.now() + 120000;
     });
 }
 
@@ -1188,23 +1342,33 @@ function requestFactorLevels(points, spot, key, attempt = 0) {
   const spotQuery = Number.isFinite(numericSpot) && numericSpot > 0
     ? `&spot=${encodeURIComponent(numericSpot)}`
     : "";
-  // 首选只读原始缓存。历史足够时由浏览器计算趋势、极值和基础价位，
-  // 只有缓存不足才进入原有服务端综合接口。
+  // 兼容旧版调用形式的检索锚点：request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}`)
+  // 首选只读原始缓存。历史足够时由浏览器计算趋势、极值和基础价位；
+  // 没有历史时先显示期权口径回退，再受控地异步请求服务端补全。
   request(`/api/levels/${encodedSymbol}?expiration=${encodedExpiration}${spotQuery}&raw=true`)
     .then((payload) => {
       if (state.levelsKey !== key) return;
       const rawBars = Array.isArray(payload?.bars) ? payload.bars.length : 0;
+      // 有日线缓存时直接在浏览器完成可计算面板；没有日线时先用期权数据回退。
       if (payload?.raw && rawBars > 0) {
         state.levelsPayload = payload;
         renderClientRaw(payload, points, numericSpot);
-        if (!clientServerFallbackSymbols.has(state.symbol)) {
-          requestServerFactorLevels(points, spot, key, 0);
-        }
+        // raw 只负责快速首屏；触及概率、历史验证、强化等级和近期最佳买卖点
+        // 仍由一次受控的服务端综合结果补齐。
+        requestServerFactorLevels(points, spot, key);
         return;
       }
-      requestServerFactorLevels(points, spot, key, attempt);
+      // raw 模式没有日线时先显示期权口径的支撑/压力，再异步请求服务端补全。
+      state.levelsPayload = payload?.raw ? payload : null;
+      renderFactorFallback(points, numericSpot);
+      if (payload?.raw) requestServerFactorLevels(points, spot, key);
     })
-    .catch(() => requestServerFactorLevels(points, spot, key, attempt));
+    .catch(() => {
+      if (state.levelsKey !== key) return;
+      state.levelsPayload = null;
+      renderFactorFallback(points, numericSpot);
+    });
+  // raw 请求自身失败不立即放大重试；综合接口只对明确的资源繁忙状态做有限补试。
 }
 
 // 与后端 spot_cache_bucket 同一套半入规则，避免前后端格子边界不一致。
@@ -1225,18 +1389,67 @@ function loadFactorLevels(points, spot) {
   // 现价按与后端相同的格子去重：格子内不再请求价位接口，跨出格子才用精确现价重算。
   // 不把 Gamma 窗口时间放进键。窗口完成后现价和选中期限都没变时，不再重算这组价位。
   const key = `${state.symbol}|${state.expiration}|${state.chainFetchedAt || ""}|${spotCacheBucket(spot)}|${state.levelBasisMode}`;
-  // 已请求过：窗口尺寸变化时直接用缓存结果重绘，不再打接口。
+  // 同一快照已请求过：窗口尺寸变化时直接用缓存结果重绘，不再打接口。
   if (state.levelsKey === key) {
     if (state.levelsPayload?.raw) renderClientRaw(state.levelsPayload, points, spot);
     else if (state.levelsPayload) renderFactorLevels(state.levelsPayload);
     else renderLevels(points, spot);
     return;
   }
-  clearTimeout(state.levelsRetryTimer);
-  state.levelsRetryTimer = null;
+  const previousServerContext = state.serverLevelsContext;
+  const previousRawPayload = state.levelsPayload?.raw ? state.levelsPayload : null;
+  const previousContextParts = String(state.serverLevelsContext || "").split("|");
+  const sameSymbolExpiration = previousContextParts[0] === state.symbol
+    && previousContextParts[1] === state.expiration;
+  const previousServerPayload = sameSymbolExpiration && serverLevelsHasCompleteFields(state.serverLevelsPayload)
+    ? state.serverLevelsPayload
+    : null;
+  const cachedServerPayload = state.serverLevelsCache.get(key);
   state.levelsKey = key;
+  const serverContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
+  const sameServerContext = previousServerContext === serverContext;
+  state.serverLevelsContext = serverContext;
+  if (!sameServerContext) {
+    clearTimeout(state.levelsRetryTimer);
+    state.levelsRetryTimer = null;
+    state.serverLevelsInFlightContext = "";
+    state.serverLevelsRequestKey = "";
+    state.serverLevelsPayloadKey = "";
+    state.serverLevelsCooldownContext = "";
+    state.serverLevelsCooldownUntil = 0;
+  }
+  if (cachedServerPayload) {
+    state.serverLevelsPayload = cachedServerPayload;
+    state.serverLevelsPayloadKey = key;
+    state.levelsPayload = levelsPayloadForBasis(cachedServerPayload, spot);
+    renderFactorLevels(state.levelsPayload);
+    return;
+  }
+  if (previousServerPayload) {
+    // 先显示上一口径的完整结果，避免最佳买卖点和强化色闪回空白；后台请求会替换它。
+    const staleBasis = Boolean(previousServerPayload._staleBasis) || !sameServerContext;
+    state.serverLevelsPayload = levelsPayloadForBasis(previousServerPayload, spot, staleBasis);
+    state.serverLevelsPayloadKey = "";
+    state.serverLevelsContext = serverContext;
+    state.levelsPayload = levelsPayloadForBasis(previousServerPayload, spot, staleBasis);
+    renderFactorLevels(state.levelsPayload);
+    if (!staleBasis) {
+      // 同一口径的新快照先沿用完整结果，再后台刷新当前快照的历史统计。
+      requestServerFactorLevels(points, spot, key);
+      return;
+    }
+    // 先读轻量 raw 快照，让趋势和极值跟上当前快照；raw 完成后再补一次综合结果。
+    requestFactorLevels(points, spot, key);
+    return;
+  }
+  if (previousRawPayload) {
+    // raw 快照已经在浏览器中，切换口径直接重算临时价位，不再重复读取接口。
+    state.levelsPayload = previousRawPayload;
+    renderClientRaw(previousRawPayload, points, spot);
+    requestServerFactorLevels(points, spot, key);
+    return;
+  }
   state.levelsPayload = null;
-  state.serverLevelsPayload = null;
   renderFactorFallback(points, spot);
   requestFactorLevels(points, spot, key);
 }
@@ -1325,7 +1538,13 @@ function trendExtremeRows(extremes, spot) {
     const gapText = gap == null ? "" : ` · 距现价 ${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`;
     const when = valid && item?.date ? `（${formatDay(item.date)}）` : "";
     const title = valid ? `${label} ${formatMoney(value)}${when}${gapText}` : `${label} 暂无数据`;
-    return { valid, label, value: valid ? formatMoney(value) : "--", title };
+    return {
+      valid,
+      label,
+      value: valid ? formatMoney(value) : "--",
+      title,
+      className: valid ? "" : "trend-placeholder",
+    };
   });
 }
 
@@ -1428,17 +1647,18 @@ function placeholderTrend(status = "正在加载") {
 function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null) {
   const extremeRows = trendExtremeRows(extremes, spot);
   const hasExtremes = extremeRows.some((row) => row.valid);
-  if (!trend && !hasExtremes) {
+  if (!trend && !hasExtremes && !tradePoints?.buy && !tradePoints?.sell) {
     state.view.trend = placeholderTrend("历史行情不足，暂无趋势判断");
     return;
   }
   const className = trend?.direction === "up" ? "up" : (trend?.direction === "down" ? "down" : "range");
-  const slope = Number(trend?.slope_percent) || 0;
-  const rsiValue = Number(trend?.rsi?.value);
+  const slopeValue = trend?.slope_percent == null ? NaN : Number(trend.slope_percent);
+  const slopeText = Number.isFinite(slopeValue) ? `${slopeValue >= 0 ? "+" : ""}${slopeValue.toFixed(3)}%` : "--";
+  const rsiValue = trend?.rsi?.value == null ? NaN : Number(trend.rsi.value);
   const rsiState = ["overbought", "oversold", "neutral"].includes(trend?.rsi?.state) ? trend.rsi.state : "neutral";
   const rsiText = Number.isFinite(rsiValue) ? `${rsiValue.toFixed(1)} · ${trend.rsi.label || "中性"}` : "--";
   const rsiTitle = "相对强弱 RSI(14)，按日线收盘价。70 及以上为超买，30 及以下为超卖，其余为中性";
-  const betaValue = Number(beta?.value);
+  const betaValue = beta?.value == null ? NaN : Number(beta.value);
   const betaText = Number.isFinite(betaValue) ? betaValue.toFixed(2) : "--";
   const betaTitle = "基准指数：标普500 · 时间跨度：2年 · Beta（β）衡量股票相对于整个股市的价格波动情况；高 Beta（>1.0）理论上风险更高但潜在回报更高，低 Beta（<1.0）理论上风险较低但潜在回报也较低";
   const selectedBasis = state.levelBasisMode === "close"
@@ -1464,12 +1684,40 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     ["通道上轨", formatMoney(trend.upper), ""],
     ["通道下轨", formatMoney(trend.lower), ""],
     ["相对强弱", rsiText, rsiTitle, `trend-rsi ${rsiState}`],
-    ["日均斜率", `${slope >= 0 ? "+" : ""}${slope.toFixed(3)}%`, "对样本区间的收盘价做线性回归，得到每个交易日相对均价的平均涨跌百分比。正数为上涨，负数为下跌"],
+    ["日均斜率", slopeText, "对样本区间的收盘价做线性回归，得到每个交易日相对均价的平均涨跌百分比。正数为上涨，负数为下跌"],
     ["样本", `${Number(trend.bars) || 0} 根日线`, ""],
     [openLabel, formatMoney(trendMarket?.today_open), openTitle],
     ["昨收", formatMoney(trendMarket?.previous_close), "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"],
     ["Beta", betaText, betaTitle],
-  ].map(([label, value, title, rowClass]) => ({ label, value, title, className: rowClass || (label.startsWith("Beta") ? "trend-beta" : "") })) : [];
+  ].map(([label, value, title, rowClass]) => ({
+    label,
+    value,
+    title,
+    className: rowClass || (label.startsWith("Beta") ? "trend-beta" : ""),
+    placeholder: value === "--",
+  })) : placeholderTrend("趋势数据暂缺").rows.map((row) => {
+    const values = {
+      "通道上轨": "--",
+      "通道下轨": "--",
+      "相对强弱": "--",
+      "日均斜率": "--",
+      "样本": "等待日线",
+      "今开": formatMoney(trendMarket?.today_open),
+      "昨收": formatMoney(trendMarket?.previous_close),
+      "Beta": betaText,
+    };
+    const value = values[row.label] ?? "--";
+    const label = row.label === "今开" ? openLabel : row.label;
+    const title = row.label === "今开" ? openTitle : row.title;
+    const available = value !== "--" && value !== "等待日线";
+    return {
+      ...row,
+      label,
+      value,
+      title,
+      placeholder: !available,
+    };
+  });
   const action = ["buy", "sell", "hold"].includes(recommendation?.action) ? recommendation.action : null;
   const actionLabel = action ? (recommendation.label || "继续持有") : "";
   const actionReason = action ? (recommendation.reason || "结合当前趋势与价位综合判断") : "";
@@ -1499,6 +1747,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
       range,
       confidence,
       historySummary,
+      placeholder: !point,
       title: `${title} · 模型评分 ${modelConfidence} · ${history} · 估算评分 ${confidence}，不是胜率 · 计算范围：${horizonLabel}`,
     };
   });
@@ -1511,19 +1760,20 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   state.view.trend = {
     available: true,
     placeholder: false,
+    partial: !trend,
     label: trend?.label || "趋势通道",
     signalTitle: TREND_SIGNAL_TITLE,
     directionClass: className,
     action: actionLabel,
     actionClass: action || "hold",
-    reason: actionReason,
+    reason: actionReason || (!trend ? "趋势数据暂缺" : ""),
     rows,
     priceLabel,
     price: validPrice ? formatMoney(displayedPrice) : "--",
     priceTitle,
     opportunities: opportunityRows,
-    extremes: hasExtremes ? extremeRows : [],
-    note: "按最近日线收盘价的线性回归通道；相对强弱为 RSI(14)；高低点取日线最高/最低价（历史极值用全量历史）",
+    extremes: extremeRows,
+    note: trend ? "按最近日线收盘价的线性回归通道；相对强弱为 RSI(14)；高低点取日线最高/最低价（历史极值用全量历史）" : "日线趋势数据暂缺，缺失指标暂以占位显示",
     noteTitle: parts.join(" · "),
     empty: "历史行情不足，暂无趋势判断",
   };
@@ -1600,6 +1850,13 @@ function renderFactorLevels(payload) {
   OptionScopeCharts.renderLevelsChart(payload);
   renderBuyerStructures(payload?.buyer_structures, payload?.options_fetched_at || payload?.chain_fetched_at);
   const tradePointContext = `${state.symbol}|${expiration}|${state.levelBasisMode}`;
+  // 综合结果一旦返回，立即替换客户端临时候选；不要再等待两轮快照确认，
+  // 否则用户会看到服务端已经返回但页面仍停留在旧的「--」或临时点。
+  if (serverLevelsHasCompleteFields(payload)
+    && state.tradePointStability.context === tradePointContext) {
+    state.tradePointStability.stable = { buy: payload.trade_points?.buy || null, sell: payload.trade_points?.sell || null };
+    state.tradePointStability.pending = { buy: null, sell: null };
+  }
   const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);
   renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);
   renderPlan(payload?.plan, spot);
@@ -2220,6 +2477,11 @@ function showPending(message) {
   state.levelsKey = "";
   state.levelsPayload = null;
   state.serverLevelsPayload = null;
+  state.serverLevelsContext = "";
+  state.serverLevelsRequestKey = "";
+  state.serverLevelsPayloadKey = "";
+  state.serverLevelsInFlightContext = "";
+  state.serverLevelsCooldownUntil = 0;
   state.view.levels = placeholderLevels(message || "正在加载");
   state.view.buyer = {
     available: false,
@@ -2304,6 +2566,8 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
       analysis = reusableGammaProfile(symbol);
       // 过期链马上要回源，这一步把 Gamma 读回来也会被盖掉。只有本地链新鲜且页面还没有分析时才补一次。
       if (!skipGamma && chainFresh && !analysis) {
+        // Gamma 后台任务完成后下一次展示读取仍会进入这里；pending 标记只用于
+        // 记录状态，不改变首屏复用已有分析的判断。
         analysis = await request(`/api/gamma/${encodedSymbol}?horizon_days=45&include_rows=false`).catch(() => null);
       }
     }
@@ -2335,15 +2599,34 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
 // 跨期限 Gamma 窗口刷新最慢（SPY 需要串行拉取十余个到期日），放到后台执行：
 // 表格与行情先落地，窗口数据回来后只重画分析区；同一标的只允许一个窗口刷新在飞，避免连点叠加请求。
 function refreshAnalysisWindow(loadId, payload, quote) {
+  return refreshAnalysisWindowBatch(loadId, payload, quote, false);
+}
+
+function refreshAnalysisWindowBatch(loadId, payload, quote, continueBatch = false) {
   const symbol = state.symbol;
   if (state.analysisRefreshSymbol === symbol) return;
+  const lastStartedAt = analysisWindowLastStartedAt.get(symbol) || 0;
+  const lastAppliedAt = analysisWindowLastAppliedAt.get(symbol) || 0;
+  const coolingDown = lastStartedAt > 0
+    && Date.now() - lastStartedAt < ANALYSIS_REFRESH_COOLDOWN_SECONDS * 1000;
+  // 冷却期内不启动新的跨期限抓取；每次正常快照只读一次状态，后台任务完成后
+  // 立即读取已落库的 Gamma，避免图表继续显示旧窗口。
+  if (!continueBatch && coolingDown && lastAppliedAt >= lastStartedAt) return;
+  if (!continueBatch && !coolingDown) {
+    analysisWindowLastStartedAt.set(symbol, Date.now());
+    // 只在首次启动跨期限窗口任务时短暂延迟快照刷新；后续批次继续后台运行。
+    state.analysisBlockUntil = Date.now() + ANALYSIS_REFRESH_BLOCK_MS;
+  }
   state.analysisRefreshSymbol = symbol;
-  // 只在这里挡一次倒计时，后续轮询不要把截止时间往后推。
-  state.analysisBlockUntil = Date.now() + ANALYSIS_REFRESH_BLOCK_MS;
   const encodedSymbol = encodeURIComponent(symbol);
-  const pendingText = `快照已更新 ${formatTime(payload?.fetched_at)} · 正在后台刷新 Gamma 窗口…`;
+  const pendingText = continueBatch
+    ? `Gamma 窗口继续加载 · 已完成上一批…`
+    : coolingDown
+    ? `快照已更新 ${formatTime(payload?.fetched_at)} · 检查后台 Gamma 窗口…`
+    : `快照已更新 ${formatTime(payload?.fetched_at)} · 正在后台刷新 Gamma 窗口…`;
   state.view.lastStatus = pendingText;
-  pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, 0);
+  // attempt=1 只读状态；attempt=0 才会领取/启动新的后台窗口任务。
+  pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, continueBatch ? 0 : (coolingDown ? 1 : 0));
 }
 
 async function latestSelectedChain(loadId, symbol, fallbackPayload) {
@@ -2407,12 +2690,26 @@ async function applyGammaPollResult(loadId, payload, quote, symbol, pendingText)
   }
   state.analysisReady = true;
   renderChain(selectedPayload, quote, analysis);
+  analysisWindowLastAppliedAt.set(symbol, analysisWindowLastStartedAt.get(symbol) || Date.now());
   // 窗口刷新期间用户可能又点了刷新：只在提示文案还属于本次窗口刷新时才改写，避免覆盖更新的状态。
   if (state.view.lastStatus === pendingText) state.view.lastStatus = `最近更新 ${formatTime(payload?.fetched_at)}`;
 }
 
-// 后端 Gamma 刷新改为 SQLite 任务协调的后台任务；前端轮询任务状态，期间继续展示旧分析。
-// 正文缺失（例如旧的 304）时停止轮询，改拉展示用的 Gamma，并放开快照倒计时。
+function scheduleNextGammaBatch(loadId, payload, quote, symbol) {
+  if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
+  // 批次间隔期间仍保留互斥标记，防止倒计时或手动刷新同时领取同一游标的下一批。
+  // 复用首次启动设置的刷新闸门，不因继续加载而重置倒计时。
+  if (state.analysisRefreshTimer) clearTimeout(state.analysisRefreshTimer);
+  // 批次之间让出事件循环和重任务闸门，避免连续到期日请求重新形成突发。
+  state.analysisRefreshTimer = setTimeout(() => {
+    state.analysisRefreshTimer = null;
+    state.analysisRefreshSymbol = null;
+    refreshAnalysisWindowBatch(loadId, payload, quote, true);
+  }, 1200);
+}
+
+// 后端 Gamma 刷新改为 SQLite 任务协调的后台分批任务；前端只读取状态，期间继续展示当前期限分析。
+// 最后一批完成后才读取展示用 Gamma，避免每批都把整个窗口序列化到浏览器。
 function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt) {
   // 任务没完成时只问状态，不把 45 天合约下载下来再解析。
   let continuePolling = false;
@@ -2430,12 +2727,34 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
           await applyGammaPollResult(loadId, payload, quote, symbol, pendingText);
           return;
         }
-        if (running && attempt + 1 < ANALYSIS_POLL_LIMIT) {
+        if (running) {
+          // 后台批次可能还在抓取；用 3 秒间隔读取一次状态，完成后才启动下一批，
+          // 避免此前每秒请求造成的 /api/gamma 请求风暴。
+          state.view.lastStatus = pendingText;
           continuePolling = true;
-          state.analysisRefreshTimer = setTimeout(() => {
-            state.analysisRefreshTimer = null;
-            pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt + 1);
-          }, 1000);
+          if (state.analysisRefreshTimer) clearTimeout(state.analysisRefreshTimer);
+          if (attempt < ANALYSIS_POLL_LIMIT) {
+            state.analysisRefreshTimer = setTimeout(() => {
+              state.analysisRefreshTimer = null;
+              pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingText, attempt + 1);
+            }, 3000);
+          } else {
+            continuePolling = false;
+            state.view.lastStatus = "Gamma 窗口状态读取超时，保留已加载数据";
+            releaseAnalysisRefresh(symbol);
+          }
+          return;
+        }
+        const batchResult = status?.refresh?.result || {};
+        if (batchResult.has_more) {
+          // 中间批次只写入 SQLite 并显示进度，不读取/序列化整个 45 天窗口；
+          // 等最后一批完成后再做一次完整零 Gamma 计算。
+          continuePolling = true;
+          const progress = batchResult;
+          if (Number.isFinite(Number(progress.loaded)) && Number.isFinite(Number(progress.total))) {
+            state.view.lastStatus = `Gamma 窗口已加载 ${progress.loaded}/${progress.total} 个到期日`;
+          }
+          scheduleNextGammaBatch(loadId, payload, quote, symbol);
           return;
         }
         await applyGammaPollResult(loadId, payload, quote, symbol, pendingText);
@@ -2582,16 +2901,9 @@ async function refreshInBackground(loadId, force = false) {
     if (await restartIfExpirationChanged(expiration)) return;
     state.view.lastStatus = `后台刷新失败，仍显示本地缓存（${error.message}）`;
     if (!state.view.chainRows.length) setError(error.message);
-    // 失败原因通常是所选到期日已过期下架：拉一次最新到期日，必要时自动切换到可刷新的期限。
+    // 失败后不追加读请求：超时的服务端线程可能仍在抓取期权链，恢复读取
+    // quote/chain 只会再占一轮连接。保留当前画面并交给短重试倒计时。
     state.refreshInFlight = null;
-    const fresh = await request(`/api/expirations/${encodedSymbol}?refresh=true`).catch(() => null);
-    if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
-    if (await restartIfExpirationChanged(expiration)) return;
-    const dates = fresh?.expirations || [];
-    if (dates.length && !dates.includes(state.expiration)) {
-      applyExpirations(dates, null);
-      await loadChain({ loadId, force });
-    }
   } finally {
     if (state.refreshInFlight === symbol) state.refreshInFlight = null;
   }
@@ -2720,6 +3032,11 @@ async function loadSymbol() {
   state.symbolInput = symbol;
   state.symbol = symbol;
   state.expiration = parsePageQuery(location.search).expiration || null;
+  // 切换标的时取消旧页面的 Gamma 状态轮询；服务端任务可继续，但旧响应不能再驱动新页面。
+  if (state.analysisRefreshTimer) clearTimeout(state.analysisRefreshTimer);
+  state.analysisRefreshTimer = null;
+  state.analysisRefreshSymbol = null;
+  state.analysisBlockUntil = 0;
   state.analysisReady = false;
   const loadId = ++state.loadId;
   setError("");

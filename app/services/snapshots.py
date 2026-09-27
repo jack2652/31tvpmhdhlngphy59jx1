@@ -22,7 +22,8 @@ MARKET_TIMEZONE = ZoneInfo("America/New_York")
 # 跨期限 Gamma 窗口的单到期日新鲜期（秒）：窗口刷新很慢，短期内的重复请求直接跳过。
 # 与页面自动刷新同一口径。120 秒会让 Gamma 窗口比现价多停一轮。
 WINDOW_FRESH_SECONDS = 60
-REFRESH_LOCK_TIMEOUT_SECONDS = 60
+# 页面请求有明确超时；锁竞争应更早回退，避免请求线程堆积到一分钟以上。
+REFRESH_LOCK_TIMEOUT_SECONDS = 10
 REFRESH_LEASE_SECONDS = 180
 # 只合并刚刚写完的并发刷新。再留 60 秒会和页面新鲜期叠成一次空刷新。
 REFRESH_COALESCE_SECONDS = 15
@@ -153,8 +154,19 @@ class SnapshotService:
                         stale["deferred"] = True
                         stale["skipped"] = True
                         return stale
+                if self.heavy_gate.busy():
+                    # 没有本地链时也不能在期限锁上长时间等待：Gamma 或另一条
+                    # 刷新链可能正持有同一把锁，而浏览器会在更短的请求超时后重入，
+                    # 形成「旧请求继续等锁 + 新请求继续排队」的刷新风暴。让本轮快速
+                    # 失败，前端保留占位/下一轮重试，后台任务完成后即可正常回源。
+                    raise UpstreamBusyError(f"{normalized} {expiration or '最近期限'} 刷新正在进行")
                 if not lock.acquire(timeout=REFRESH_LOCK_TIMEOUT_SECONDS):
-                    raise RuntimeError(f"{normalized} 刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
+                    stale = self._stale_snapshot(normalized, expiration, "同一到期日正在刷新，本次沿用本地快照")
+                    if stale is not None:
+                        stale["deferred"] = True
+                        stale["skipped"] = True
+                        return stale
+                    raise UpstreamBusyError(f"{normalized} 刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
             lock_acquired = True
         lease_name = f"snapshot-refresh:{scope}"
         deadline = time.monotonic() + REFRESH_LOCK_TIMEOUT_SECONDS
@@ -168,7 +180,12 @@ class SnapshotService:
                     # 否则页面刷新拿不到闸门，双方会互相拖到超时。
                     raise UpstreamBusyError(f"{normalized} {expiration or '最近期限'} 跨进程刷新正在进行")
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(f"{normalized} 跨进程刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
+                    stale = self._stale_snapshot(normalized, expiration, "跨进程刷新正在进行，本次沿用本地快照")
+                    if stale is not None:
+                        stale["deferred"] = True
+                        stale["skipped"] = True
+                        return stale
+                    raise UpstreamBusyError(f"{normalized} 跨进程刷新等待超过 {REFRESH_LOCK_TIMEOUT_SECONDS} 秒")
                 time.sleep(0.1)
             lease_acquired = True
             try:
@@ -233,6 +250,10 @@ class SnapshotService:
                     "age_seconds": round(snapshot_age_seconds(cached.get("fetched_at")) or 0.0, 1),
                     "warning": warning,
                 }
+        # 指定到期日没有本地链不代表该标的没有期权；quote-only 会让前端误入
+        # 「重新获取到期日」分支，在锁竞争期间再叠一轮慢请求。
+        if expiration:
+            return None
         quote = cached_quote
         if quote.get("price") is None:
             return None
@@ -340,9 +361,10 @@ class SnapshotService:
                 stale["skipped"] = True
                 logger.info("低内存保护：%s %s 刷新让路，沿用本地快照", normalized, expiration or "最近到期日")
                 return stale
-        # 本地还没有这份链时必须等，否则新标的会一直空白；等待期间不再额外抓取。
-        if not self.heavy_gate.acquire(timeout=20):
-            raise RuntimeError(f"{normalized} 刷新排队超过 20 秒，请稍后重试")
+        # 新标的没有可展示链时也只短暂排队；Gamma 等任务较久时由前端有限重试，
+        # 避免请求线程长时间占住低配服务器。
+        if not self.heavy_gate.acquire(timeout=5):
+            raise UpstreamBusyError(f"{normalized} 刷新排队超过 5 秒，请稍后重试")
         try:
             return self._fetch_upstream(
                 normalized,
@@ -440,9 +462,22 @@ class SnapshotService:
                 continue
         return results
 
-    def refresh_window(self, symbol: str, horizon_days: int = 45) -> dict[str, Any]:
-        """刷新近期期限，供跨到期日 Gamma 曲线使用。"""
+    def refresh_window(
+        self,
+        symbol: str,
+        horizon_days: int = 45,
+        *,
+        batch_size: int = 1,
+        start_after: str | None = None,
+    ) -> dict[str, Any]:
+        """分批刷新近期期限，供跨到期日 Gamma 曲线使用。
+
+        每次最多抓取一个小批次的到期日。批次之间释放重任务闸门，页面可以继续
+        读取当前期限；调用方用 ``next_cursor`` 领取下一批，避免 45 天窗口一次性
+        占满内存和上游连接。
+        """
         normalized = self.provider.normalize_symbol(symbol)
+        batch_size = max(1, min(int(batch_size), 2))
         # Gamma 是低优先级的跨期限任务。它只在每个期限的抓取期间占用闸门，
         # 不能把整个窗口几十秒锁住，否则 /api/levels 的历史与 Beta 永远只能拿到空回退。
         # 先用一次短闸门保护到期日目录和现货读取；忙时直接让首屏任务优先。
@@ -459,15 +494,17 @@ class SnapshotService:
                 "warning": message,
             }
         try:
-            expirations = self.provider.expirations(normalized)
-            # 窗口刷新本来就要问一次到期日，顺手更新下拉框缓存；这里存的是全部日期，不是 45 天切片。
-            self._remember_expirations(normalized, expirations)
+            expirations = self.database.latest_expiration_catalog(normalized)
+            if not expirations:
+                expirations = self.provider.expirations(normalized)
+                # 窗口刷新本来就要问一次到期日，顺手更新下拉框缓存；这里存的是全部日期，不是 45 天切片。
+                self._remember_expirations(normalized, expirations)
             today = market_today()
             cutoff = today + timedelta(days=horizon_days)
-            selected = [
+            selected = sorted([
                 value for value in expirations
                 if today <= date.fromisoformat(value) <= cutoff
-            ]
+            ])
             # 窗口内每个期限共用一份现货快照；只有确实需要抓新链时才读取行情。
             # 所有期限都新鲜时不再额外触发 quote 上游请求。
             window_quote: dict[str, Any] | None = None
@@ -478,7 +515,12 @@ class SnapshotService:
             # 到期日目录已经读完，马上把闸门交还给首屏历史任务。
             self.heavy_gate.release()
 
-        for expiration in selected:
+        candidates = [value for value in selected if not start_after or value > start_after]
+        processed: list[str] = []
+        batch: list[str] = []
+        retry_cursor: str | None = None
+        retry_pending = False
+        for expiration in candidates:
             # 先检查缓存。新鲜期限不需要占用重任务槽位，避免 Gamma 在一串缓存期限上
             # 快速循环，把真正需要历史回源的首屏任务饿住。
             cached = self.database.latest_chain(normalized, expiration)
@@ -489,11 +531,19 @@ class SnapshotService:
                 if isinstance(row, dict)
             )
             if age is not None and age < WINDOW_FRESH_SECONDS and has_open_interest:
+                processed.append(expiration)
                 continue
+            if len(batch) >= batch_size:
+                break
+            batch.append(expiration)
+
+        for expiration in batch:
             # 每个期限独立占槽并在请求后释放。这样历史/Beta 可以在期限之间插队，
             # 也避免某个慢期限把整个 Gamma 窗口拖到超时。
             if not self.heavy_gate.acquire(timeout=0):
                 errors.append(f"{expiration}: 内存保护：让路给首屏历史数据")
+                retry_cursor = start_after
+                retry_pending = True
                 continue
             try:
                 try:
@@ -520,8 +570,11 @@ class SnapshotService:
                             heavy_gate_held=True,
                         )
                     )
+                    processed.append(expiration)
                 except Exception as exc:
                     errors.append(f"{expiration}: {exc}")
+                    # 失败期限也推进游标，避免供应商持续拒绝时反复重试同一批并卡住窗口。
+                    processed.append(expiration)
                     logger.warning("刷新 %s %s 失败: %s", normalized, expiration, exc)
             finally:
                 self.heavy_gate.release()
@@ -531,4 +584,10 @@ class SnapshotService:
             "expirations": selected,
             "results": results,
             "errors": errors,
+            "batch_size": batch_size,
+            "batch_expirations": batch,
+            "next_cursor": retry_cursor if retry_pending else (processed[-1] if processed and processed[-1] != selected[-1] else None),
+            "has_more": retry_pending or bool(processed and processed[-1] != selected[-1]),
+            "loaded": len([value for value in selected if value <= (processed[-1] if processed else start_after or "")]),
+            "total": len(selected),
         }

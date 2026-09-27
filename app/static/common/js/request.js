@@ -27,6 +27,14 @@
       var access = context || {};
       var url = access.withAccessKey(path, access.accessKey || "");
 
+      // 所有页面请求都必须有上限。服务器上游或 SQLite 锁等待时，jQuery 默认会
+      // 无限等待，页面的 refreshInFlight/loading 就永远不释放，倒计时会一直显示
+      // “正在刷新”。刷新接口允许服务端完成一次较慢的上游回源，其余读接口应更快
+      // 失败并回退到本地快照；调用方仍可用 options.timeout 覆盖单个请求。
+      var defaultTimeout = /^\/api\/refresh\//.test(path) ? 45000 : 20000;
+      var timeout = Number(config.timeout);
+      if (!isFinite(timeout) || timeout <= 0) timeout = defaultTimeout;
+
       if (access.required && !access.accessKey) {
         if (access.onDenied) access.onDenied();
         return $.Deferred().reject({ status: 403, responseJSON: { detail: "403 Forbidden" } }).promise();
@@ -39,16 +47,23 @@
         cache: false,
         headers: access.accessKey ? { "X-Access-Key": access.accessKey } : {},
         data: config.data,
-        timeout: config.timeout,
+        timeout: timeout,
       }).then(function (body, textStatus, xhr) {
         rememberServerClock(xhr);
         return body;
-      }, function (xhr) {
+      }, function (xhr, textStatus) {
         rememberServerClock(xhr);
         var body = xhr && xhr.responseJSON ? xhr.responseJSON : {};
-        var message = body.detail || (xhr && xhr.status ? "请求失败 (" + xhr.status + ")" : "网络请求失败");
+        var timedOut = textStatus === "timeout" || (xhr && xhr.statusText === "timeout");
+        var message = body.detail || (timedOut ? "请求超时，请稍后重试" : (xhr && xhr.status ? "请求失败 (" + xhr.status + ")" : "网络请求失败"));
         if (xhr && xhr.status === 403 && access.onDenied) access.onDenied();
-        return $.Deferred().reject(new Error(message)).promise();
+        var error = new Error(message);
+        // 让上层在请求超时后跳过代价较高的“重新获取到期日”补救请求，
+        // 先释放刷新状态，等待下一轮倒计时或用户手动重试。
+        error.code = timedOut ? "timeout" : "http_error";
+        error.timeout = timedOut;
+        error.status = xhr && xhr.status;
+        return $.Deferred().reject(error).promise();
       });
     },
   };

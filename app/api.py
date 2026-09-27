@@ -201,7 +201,13 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             database.put_analysis_cache(shared_key, value, settings.analysis_cache_entries)
         return value
 
-    def run_gamma_refresh(job_key: str, symbol_name: str, horizon_days: int, started_at: str) -> None:
+    def run_gamma_refresh(
+        job_key: str,
+        symbol_name: str,
+        horizon_days: int,
+        started_at: str,
+        start_after: str | None = None,
+    ) -> None:
         """后台刷新 Gamma 窗口；任务状态写入 SQLite，允许多 worker 共享。
 
         用独立线程而不是请求里的 BackgroundTasks：后者要等任务结束，ASGI 调用才返回，
@@ -215,7 +221,11 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         timer.start()
         try:
             try:
-                result = snapshots.refresh_window(symbol_name, horizon_days)
+                if start_after is None:
+                    # 保持旧版测试适配器和第三方 SnapshotService 子类的两参数接口。
+                    result = snapshots.refresh_window(symbol_name, horizon_days)
+                else:
+                    result = snapshots.refresh_window(symbol_name, horizon_days, batch_size=1, start_after=start_after)
             except Exception as exc:  # noqa: BLE001 - 后台任务必须把异常写回状态
                 database.finish_analysis_job(job_key, "failed", None, str(exc), started_at)
                 return
@@ -362,7 +372,13 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 # 先把状态返回给轮询，窗口刷新放到守护线程里，不占用这次请求。
                 threading.Thread(
                     target=run_gamma_refresh,
-                    args=(refresh_result["job_id"], normalized, horizon_days, refresh_result["started_at"]),
+                    args=(
+                        refresh_result["job_id"],
+                        normalized,
+                        horizon_days,
+                        refresh_result["started_at"],
+                        (refresh_result.get("resume_result") or {}).get("next_cursor"),
+                    ),
                     name=f"gamma-{normalized}-{horizon_days}",
                     daemon=True,
                 ).start()
@@ -413,7 +429,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             def compute_gamma() -> dict[str, Any]:
                 analysis_rows = [dict(row) for row in rows]
                 iv_model = annotate_model_greeks(analysis_rows, quote_price)
-                zero_gamma = find_zero_gamma(analysis_rows, quote_price)
+                # 分批窗口每次只对当前已落库的期限求零 Gamma；批次越多，结果越接近完整 45 天窗口。
+                zero_gamma = find_zero_gamma(analysis_rows, quote_price, horizon_days=horizon_days)
                 contract_count = len(analysis_rows)
                 # 页面只要汇总时丢掉合约副本，避免精简缓存再留一份整窗期权链。
                 if include_rows:
@@ -488,8 +505,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
 
         ``raw=true`` 是轻量客户端计算模式。它只读取已经落库的日线和分析快照，
         不触发历史、Beta、财报回源，也不执行 ``build_levels``；浏览器可以用这些
-        原始数据计算趋势、极值和基础价位。原始数据不足时，前端再回退到本接口的
-        默认综合模式。
+        原始数据计算趋势、极值和基础价位。原始数据不足时，前端显示期权分布回退，
+        不在倒计时刷新链路里启动默认综合模式。
 
         `spot` 是前端传入的当前展示基准价；候选池优先使用快照中的前一交易日收盘价作为
         日内稳定锚点，避免实时价变化或实时价与盘后价切换时反复生成不同的价位簇。
@@ -522,8 +539,9 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             candidate_spot = resolved_spot
 
         if raw:
-            # raw 模式刻意只读 SQLite。首次标的没有历史缓存时返回空数据，前端会
-            # 先显示期权回退价位，并只补发一次默认综合请求，避免每次倒计时都回源。
+            # raw 模式严格只读 SQLite；极值、趋势和基础价位交给浏览器计算。
+            # 这里不触发日线、Beta、财报回源，也不执行 build_levels，避免切换新
+            # 标的时和 Gamma/期权刷新叠加成一次重量级请求。
             cached_history = database.latest_history(normalized) or {}
             cached_extremes = database.latest_extremes(normalized) or {}
             cached_beta = database.latest_beta(normalized) or {}
@@ -675,6 +693,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         earnings["warning"] = earnings_payload.get("warning")
         return {
             "symbol": normalized,
+            "expiration": expiration,
             "chain_fetched_at": max(fetched_values) if fetched_values else None,
             "options_fetched_at": max(fetched_values) if fetched_values else None,
             "options_expirations": option_expirations,

@@ -2985,7 +2985,9 @@ def test_trading_plan_panels_render_under_headline():
     assert 'class="trend-opportunities"' in page
     assert 'class="trend-layout"' in page and 'class="trend-core"' in page and 'class="trend-side"' in page
     assert 'v-for="row in view.trend.rows.slice(0, 2)"' in page
-    assert 'v-for="row in view.trend.rows.slice(2)"' in page
+    # Beta 属于左侧历史极值信息；右侧趋势指标必须排除它，避免同一行重复渲染。
+    assert 'v-for="row in view.trend.rows.filter(row => row.className === \'trend-beta\')"' in page
+    assert 'v-for="row in view.trend.rows.slice(2).filter(row => row.className !== \'trend-beta\')"' in page
     assert page.index('class="trend-opportunities"') > page.index('class="trend-core"')
     assert 'class="trend-meta trend-current-price" :title="view.trend.priceTitle"' in page
     assert "formatLevelRange(point)" in source and "formatProbability(point.confidence)" in source
@@ -3368,6 +3370,12 @@ def test_basis_price_switch_defaults_to_live():
     assert "state.lastAnalysis = { rows, spot, analysisPayload, expirationRows, ivModel, basis, points };" in source
     assert "state.lastQuote = quote || null;" in source
     assert '${state.levelBasisMode}' in source
+    # 切换口径先复用已有综合结果，后台补算完成后再替换，避免近期最佳买卖点闪回 --。
+    assert "serverLevelsCache: new Map()" in source
+    assert "function rememberServerLevels(key, payload)" in source
+    assert "const previousServerPayload = sameSymbolExpiration && serverLevelsHasCompleteFields(state.serverLevelsPayload)" in source
+    assert "const provisionalTradePoints = hasServerLevels" in source
+    assert "state.tradePointStability.stable = { buy: payload.trade_points?.buy || null" in source
     assert 'if (marketState === "POST" && sessions.post?.price != null) return sessions.post;' in source
     assert 'if (state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;' in source
     assert "if (state.lastQuote) renderQuote(state.lastQuote);" in source

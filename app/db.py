@@ -294,13 +294,24 @@ class Database:
             row = connection.execute(
                 "SELECT * FROM analysis_refresh_jobs WHERE job_id=?", (job_id,)
             ).fetchone()
+            resume_result: dict[str, Any] | None = None
             if row:
                 current = dict(row)
+                raw_result = current.get("result_json")
+                if raw_result:
+                    try:
+                        parsed_result = json.loads(raw_result)
+                        if isinstance(parsed_result, dict):
+                            resume_result = parsed_result
+                    except (TypeError, ValueError):
+                        resume_result = None
                 running_age = self._age_seconds(current.get("started_at"))
                 finished_age = self._age_seconds(current.get("finished_at"))
                 if current["status"] == "running" and running_age is not None and running_age < stale_seconds:
                     return {"job_id": job_id, "symbol": symbol, "horizon_days": horizon_days, "status": "running", "started_at": current.get("started_at"), "claimed": False}
-                if current["status"] in {"completed", "failed"} and finished_age is not None and finished_age < cooldown_seconds:
+                # 分批 Gamma 任务完成一批后仍可能有下一批；这种中间状态不能被冷却时间挡住。
+                has_more = bool((resume_result or {}).get("has_more"))
+                if current["status"] in {"completed", "failed"} and finished_age is not None and finished_age < cooldown_seconds and not has_more:
                     return {"job_id": job_id, "symbol": symbol, "horizon_days": horizon_days, "status": current["status"], "finished_at": current.get("finished_at"), "claimed": False}
             connection.execute(
                 """INSERT INTO analysis_refresh_jobs
@@ -323,6 +334,7 @@ class Database:
             "status": "running",
             "started_at": now,
             "claimed": True,
+            "resume_result": resume_result,
         }
 
     def finish_analysis_job(
