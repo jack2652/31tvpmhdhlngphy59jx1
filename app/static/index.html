@@ -124,7 +124,7 @@
       <div class="detail-body chart-fold" id="chart-fold">
         <section class="analysis-grid">
           <article class="analysis-panel panel">
-            <div class="analysis-heading"><div><span class="eyebrow">GAMMA EXPOSURE</span><h2>Gamma 敞口</h2><p>基于 Black-Scholes 的估算 GEX，正值代表看涨支撑，负值代表看跌压力</p></div><div class="wall-badges"><span id="net-gex" :title="view.chart.netGexTitle" v-text="view.chart.netGex">净 Gamma --</span><span id="gamma-flip" :title="view.chart.gammaFlipTitle" v-text="view.chart.gammaFlip">零 Gamma --</span><span id="call-wall" v-text="view.chart.callWall">看涨墙 --</span><span id="put-wall" v-text="view.chart.putWall">看跌墙 --</span><span id="gamma-scope" v-text="view.chart.gammaScope">Gamma 范围 --</span></div></div>
+            <div class="analysis-heading"><div><span class="eyebrow">GAMMA EXPOSURE</span><h2>Gamma 敞口</h2><p>基于 Black-Scholes 的估算 GEX，正值代表看涨支撑，负值代表看跌压力</p></div><div class="wall-badges"><span id="net-gex" :title="view.chart.netGexTitle" v-text="view.chart.netGex">净 Gamma --</span><span id="gamma-flip" :title="view.chart.gammaFlipTitle" v-text="view.chart.gammaFlip">零 Gamma --</span><span id="call-wall" v-text="view.chart.callWall">看涨墙 --</span><span id="put-wall" v-text="view.chart.putWall">看跌墙 --</span><span id="gamma-scope-date" v-text="view.chart.gammaScopeDate">柱状图 到期日 --</span><span id="gamma-scope-stats" v-text="view.chart.gammaScopeStats">0 个合约</span></div></div>
             <div id="gex-chart" class="chart" aria-label="Gamma 敞口图"></div>
           </article>
           <article class="analysis-panel panel">

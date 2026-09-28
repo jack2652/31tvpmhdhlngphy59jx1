@@ -94,7 +94,8 @@ const state = {
       gammaFlipTitle: GAMMA_ESTIMATE_TITLE,
       callWall: "看涨墙 0.00",
       putWall: "看跌墙 0.00",
-      gammaScope: "柱状图 到期日 -- · 0 个合约",
+      gammaScopeDate: "柱状图 到期日 --",
+      gammaScopeStats: "0 个合约",
       levelsBasis: "基准 0.00",
       volumeScope: "到期日 -- · 0 个合约",
       oiScope: "到期日 -- · 0 个合约",
@@ -1630,10 +1631,10 @@ function placeholderTrend(status = "正在加载") {
     meta("止损价", "0.00", "在近期买入区间下沿或通道下轨下方预留波动缓冲的参考价", "trend-stop-loss"),
     meta("昨开", "0.00", "最近一个已完成交易日的常规时段开盘价"),
     meta("昨收", "0.00", "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"),
+    meta("Beta", "0.00", betaTitle),
     meta("相对强弱", "0.0 · 中性", rsiTitle, "trend-rsi neutral"),
     meta("日均斜率", "+0.000%", slopeTitle),
     meta("样本", "0 根日线", ""),
-    meta("Beta", "0.00", betaTitle),
     meta("通道上轨", "0.00", ""),
     meta("通道下轨", "0.00", ""),
   ];
@@ -1780,7 +1781,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   });
   const byLabel = new Map(rows.map((row) => [row.label, row]));
   byLabel.set("止损价", stopRow);
-  const leftRows = ["止损价", "昨开", "昨收", "相对强弱", "日均斜率", "样本", "Beta"]
+  const leftRows = ["止损价", "昨开", "昨收", "Beta", "相对强弱", "日均斜率", "样本"]
     .map((label) => byLabel.get(label)).filter(Boolean);
   const rightRows = ["通道上轨", "通道下轨"].map((label) => byLabel.get(label)).filter(Boolean)
     .concat(extremeRows);
@@ -1959,7 +1960,7 @@ function renderFactorLevels(payload) {
     ? `斐波那契 · 筹码密集 · 承接位 · 期权持仓（${metric}，${optionScope}）综合 · 选中期限 ${expiration}`
     : `历史行情不可用，按期权持仓（${metric}，${optionScope}）计算 · 选中期限 ${expiration}`;
   const detail = [hasHistory ? `日线 ${payload.history.bars} 根` : null, payload?.history?.warning ? `历史行情降级：${payload.history.warning}` : null, "触及概率：按选中期限隐含波动率与剩余期限的零漂移首次触及概率", "Gamma、成交量和持仓量图表仍按当前选中期限绘制"].filter(Boolean).join(" · ");
-  const basisNote = Number.isFinite(spot) && spot > 0 ? ` · 基准 ${formatMoney(spot)}（${state.levelBasisLabel || "常规"}）` : "";
+  const basisNote = Number.isFinite(spot) && spot > 0 ? ` · 基准 ${formatMoney(spot)}` : "";
   state.view.levels.placeholder = false;
   state.view.levels.resistanceNote = scope + basisNote;
   state.view.levels.supportNote = scope + basisNote;
@@ -2170,9 +2171,10 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   state.view.chart.gammaFlip = `零 Gamma ${gammaFlip ? formatMoney(gammaFlip.strike) : "--"} · 估算`;
   state.view.chart.netGexTitle = GAMMA_ESTIMATE_TITLE;
   state.view.chart.gammaFlipTitle = GAMMA_ESTIMATE_TITLE;
-  state.view.chart.gammaScope = `柱状图 ${scopeText}${scopeSuffix}`;
+  state.view.chart.gammaScopeDate = `柱状图 到期日 ${state.expiration || "--"}`;
+  state.view.chart.gammaScopeStats = `${expirationRows.length} 个合约${scopeSuffix}`;
   const analysisFallback = analysisPayload?.oi_fallback || {};
-  if (analysisFallback.restored) state.view.chart.gammaScope += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
+  if (analysisFallback.restored) state.view.chart.gammaScopeStats += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
   state.view.chart.callWall = `看涨墙 ${callWall?.callGex ? formatMoney(callWall.strike) : "--"}`;
   state.view.chart.putWall = `看跌墙 ${putWall?.putGex ? formatMoney(putWall.strike) : "--"}`;
   // 选中期限的综合价位与 Gamma 窗口并行请求，避免首次加载时趋势/支撑/压力面板长期空白。
@@ -2593,7 +2595,8 @@ function showChartSkeletons() {
   state.view.chart.gammaFlipTitle = GAMMA_ESTIMATE_TITLE;
   state.view.chart.callWall = "看涨墙 0.00";
   state.view.chart.putWall = "看跌墙 0.00";
-  state.view.chart.gammaScope = "柱状图 到期日 -- · 0 个合约";
+  state.view.chart.gammaScopeDate = "柱状图 到期日 --";
+  state.view.chart.gammaScopeStats = "0 个合约";
   state.view.chart.levelsBasis = "基准 0.00";
   state.view.chart.volumeScope = "到期日 -- · 0 个合约";
   state.view.chart.oiScope = "到期日 -- · 0 个合约";

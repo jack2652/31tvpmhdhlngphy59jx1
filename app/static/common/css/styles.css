@@ -28,6 +28,7 @@
 .chart-tag text{fill:var(--tag-text);font-size:10px;font-weight:700}
 /* 压力位/支撑位面板：现价上下各 5 条，颜色沿用「绿涨红跌」的全局口径。 */
 .analysis-levels-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.analysis-levels-grid{align-items:start}
 .plan-grid,.levels-grid{display:contents}
 .levels-panel{min-width:0}
 .levels{padding:0 18px 14px}

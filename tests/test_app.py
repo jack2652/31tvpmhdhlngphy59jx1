@@ -3003,7 +3003,7 @@ def test_trading_plan_panels_render_under_headline():
     # 左右列显式绑定行数组，避免顺序依赖模板切片。
     assert 'v-for="row in view.trend.leftRows"' in page
     assert 'v-for="row in view.trend.rightRows"' in page
-    assert 'const leftRows = ["止损价", "昨开", "昨收", "相对强弱", "日均斜率", "样本", "Beta"]' in source
+    assert 'const leftRows = ["止损价", "昨开", "昨收", "Beta", "相对强弱", "日均斜率", "样本"]' in source
     assert '"52周最高", "52周最低", "历史最高", "历史最低"' in source
     assert 'label: "止损价"' in source and 'payload?.stop_loss || null' in source
     assert 'class="trend-meta trend-current-price" :title="view.trend.priceTitle"' in page
@@ -3031,6 +3031,7 @@ def test_trading_plan_panels_render_under_headline():
     assert ".trend-signal.down .trend-label{color:var(--down)}" in styles
     assert ".trend-signal .trend-action{font-size:inherit}" in styles
     assert "renderPlan(payload?.plan, spot);" in source
+    assert ".analysis-levels-grid{align-items:start}" in styles
     # 回退口径（合成接口不可用）也要给出趋势占位与三段计划
     assert "renderTrend(null);" in source
     assert "const planSplit = Math.min(PLAN_COUNT, Math.ceil(planSupportSeries.length / 2));" in source
@@ -3165,6 +3166,7 @@ def test_trend_channel_renders_extremes_rows():
     assert "70 及以上为超买，30 及以下为超卖" in source
     trend_rows = source[source.index("const rows = trend"):source.index("].map(([label, value, title, rowClass])")]
     assert trend_rows.index('["相对强弱"') < trend_rows.index('["日均斜率"')
+    assert trend_rows.index('["日均斜率"') < trend_rows.index('["样本"')
     assert "每个交易日相对均价的平均涨跌百分比" in source
 
 
