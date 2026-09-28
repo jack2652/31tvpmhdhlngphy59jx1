@@ -577,6 +577,8 @@ def _empty(reason: str, horizon_trading_days: int = HORIZON_TRADING_DAYS) -> dic
         "items": [],
         "reason": reason,
         "method": "布莱克-斯科尔斯模型估算",
+        "quote_source": "server",
+        "iv_source": "server",
         "quote_method": "仅使用有效买卖价中间价",
     }
 
@@ -769,6 +771,11 @@ def build_buyer_structures(
     for item in unique:
         item["is_primary"] = primary_direction is not None and item["direction"] == primary_direction
         item["direction_label"] = "看涨方案" if item["direction"] == "call" else "看跌方案"
+    model_sources = {str(item.get("model_iv_source") or "") for item in unique}
+    if "到期日模型估算" in model_sources:
+        iv_source = "default" if any((iv_model.get(str(item.get("expiration"))) or {}).get("source") == "default" for item in unique) else "server"
+    else:
+        iv_source = "server_quote"
     return {
         "available": True,
         "status": "ok",
@@ -797,6 +804,8 @@ def build_buyer_structures(
         "reference_iv": volatility,
         "items": unique[:STRUCTURE_LIMIT],
         "method": "布莱克-斯科尔斯模型估算",
+        "quote_source": "server",
+        "iv_source": iv_source,
         "quote_method": "仅使用有效买卖价中间价，不使用最新成交价代替成本",
         "disclaimer": "综合评分不是历史胜率。排序按触及概率加权，并扣掉半档价差；展示的预计盈亏仍以中间价计算，不扣价差。",
     }

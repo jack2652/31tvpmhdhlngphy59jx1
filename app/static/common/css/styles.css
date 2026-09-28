@@ -135,6 +135,7 @@
 .trend-meta.trend-placeholder strong{color:var(--muted);opacity:.62}
 .trend-meta.trend-rsi.overbought strong{color:var(--down)}
 .trend-meta.trend-rsi.oversold strong{color:var(--up)}
+.trend-meta.trend-stop-loss strong{color:var(--down)}
 .trend-meta strong small{display:block;color:var(--muted);font-size:11px;font-weight:500;line-height:1.2;margin-top:2px;white-space:nowrap}
 .trend-opportunities{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:16px;border-bottom:1px solid var(--row-line)}
 .trend-opportunities .trend-meta{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;min-width:0;border-bottom:0}
@@ -154,6 +155,7 @@
 .trend-core .trend-opportunity strong{gap:3px;line-height:1.25}
 .trend-core .trend-opportunity-label{gap:3px;line-height:1.35}
 .trend-core .trend-opportunity strong small{line-height:1.35;margin-top:1px}
+.trend-core>.trend-meta.trend-opportunity{flex:0 0 auto;min-height:0;padding-block:8px}
 @media(max-width:560px){.trend-layout{grid-template-columns:1fr;gap:0}.trend-opportunities{grid-template-columns:1fr}.trend-opportunities .trend-meta+.trend-meta{border-left:0;padding-left:0;border-top:1px solid var(--row-line)}}
 /* 折叠组（分析详情 / 期权链 / 图表共用）：一块 panel 里包着若干子面板，标题栏整行可点。
    各自默认状态：分析详情与期权链默认折叠、图表默认展开；caret 展开时旋转 90°；body 用 hidden 控制显隐（[hidden] 在 flex/grid 上下文里会被覆盖，需显式声明）。 */

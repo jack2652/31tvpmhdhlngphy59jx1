@@ -135,6 +135,11 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
     )
     today_open = latest.get("open")
     today_open_date = latest.get("date")
+    calendar_today = market_today().isoformat()
+    # “昨开”始终指最近一个已完成交易日的常规时段开盘价。
+    previous_open_row = previous if latest_is_today else latest
+    previous_open = previous_open_row.get("open")
+    previous_open_date = previous_open_row.get("date")
     previous_close = previous.get("close") if latest_is_today else latest.get("close")
     previous_close_date = previous.get("date") if latest_is_today else latest.get("date")
     # Yahoo 在盘后/夜盘的 fast_info.previous_close 可能仍停留在前一个交易日。
@@ -152,7 +157,6 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
         previous_close = reference_close
         previous_close_date = as_of
     quote_open = _positive_price(quote.get("today_open"))
-    calendar_today = market_today().isoformat()
     # 日线还没滚到今天，或今天的开盘价和前一根日线开盘价相同，都说明今开还不可信。
     daily_missing_today = latest.get("date") != calendar_today
     daily_open_copied = (not daily_missing_today) and _open_copied_from_previous(today_open, previous.get("open"))
@@ -165,8 +169,10 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
         previous_close = quote.get("previous_close")
     return {
         "today_open": today_open,
+        "previous_open": previous_open,
         "previous_close": previous_close,
         "today_open_date": today_open_date,
+        "previous_open_date": previous_open_date,
         "previous_close_date": previous_close_date,
         "market_state": quote.get("market_state"),
     }
@@ -500,6 +506,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         expiration: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
         spot: float | None = Query(default=None, gt=0),
         raw: bool = Query(default=False),
+        raw_expirations: int = Query(default=4, ge=1, le=8),
     ) -> dict[str, Any]:
         """压力位/支撑位：技术面与近 45 天多期限期权持仓综合。
 
@@ -519,7 +526,12 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         selected_chain: dict[str, Any] | None = None
         # 选中期限已经在 45 天窗口时直接复用窗口查询结果，避免再次读取同一批次。
         # 远期期限不在窗口内时才额外读取，保持切换远期期限后仍能参与合成。
-        if expiration not in profile.get("expirations", []):
+        # 选中日期可能来自旧页面 URL；过期合约不再补读，避免切换旧日期重新拉起无效链。
+        try:
+            expiration_is_active = datetime.fromisoformat(expiration).date() >= market_today()
+        except ValueError:
+            expiration_is_active = False
+        if expiration_is_active and expiration not in profile.get("expirations", []):
             selected_chain = database.latest_chain(normalized, expiration)
             seen = {(str(row.get("expiration")), str(row.get("contract_symbol"))) for row in option_rows}
             for row in selected_chain.get("data") or []:
@@ -548,18 +560,40 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             cached_earnings = database.latest_earnings(normalized) or {}
             raw_bars = list(cached_history.get("bars") or [])
             earnings_dates = cached_earnings.get("dates")
+            # 浏览器首屏只需要选中期限及其最近几期；完整 45 天窗口继续由 Gamma
+            # 后台任务按需加载，避免 raw 响应和浏览器解析一次性膨胀。
+            available_expirations = sorted({str(row.get("expiration")) for row in option_rows if row.get("expiration")})
+            try:
+                selected_index = available_expirations.index(expiration)
+            except ValueError:
+                selected_index = 0
+            start = max(0, min(selected_index, len(available_expirations) - raw_expirations)) if available_expirations else 0
+            scoped_expirations = set(available_expirations[start:start + raw_expirations])
+            scoped_expirations.add(expiration)
             raw_options = [
                 {
+                    "contract_symbol": row.get("contract_symbol"),
                     "expiration": row.get("expiration"),
                     "contract_type": row.get("contract_type"),
                     "strike": row.get("strike"),
+                    "last_price": row.get("last_price"),
+                    "bid": row.get("bid"),
+                    "ask": row.get("ask"),
                     "volume": row.get("volume"),
                     "open_interest": row.get("open_interest"),
                     "implied_volatility": row.get("implied_volatility"),
                     "gamma": row.get("gamma"),
                 }
                 for row in option_rows
+                if str(row.get("expiration")) in scoped_expirations
             ]
+            # raw 也返回按报价反解的到期日模型 IV，浏览器只负责轻量排序与展示。
+            raw_iv_model = annotate_model_greeks(raw_options, candidate_spot or resolved_spot)
+            for row in raw_options:
+                source = (raw_iv_model.get(str(row.get("expiration"))) or {}).get("source")
+                if source:
+                    row["model_iv_source"] = source
+            scoped_expirations = sorted({str(row.get("expiration")) for row in raw_options if row.get("expiration")})
             return {
                 "raw": True,
                 "symbol": normalized,
@@ -568,11 +602,13 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 "candidate_spot": candidate_spot,
                 "chain_fetched_at": max(fetched_values) if fetched_values else None,
                 "options_fetched_at": max(fetched_values) if fetched_values else None,
-                "options_expirations": option_expirations,
+                "options_expirations": scoped_expirations,
+                "options_window_expirations": option_expirations,
                 "options_horizon_days": 45,
                 # 原始期权行只在 raw=true 时返回，供浏览器按多期限重新聚合；默认综合
                 # 接口仍只返回压缩后的价位，避免普通页面响应体变大。
                 "options": raw_options,
+                "iv_model": raw_iv_model,
                 "generated_at": iso(),
                 "bars": raw_bars,
                 "history": {
@@ -665,8 +701,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         computed = levels_cache.get_or_compute(
             cache_key,
             lambda: shared_cached(
-                # 趋势通道增加 RSI(14)，升级缓存命名空间，避免旧结果缺超买超卖。
-                "levels-v11",
+                # 趋势通道增加止损价，升级缓存命名空间以避开旧结果结构。
+                "levels-v12",
                 cache_key,
                 lambda: build_levels(
                     history_payload.get("bars") or [],

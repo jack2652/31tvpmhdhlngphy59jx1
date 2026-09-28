@@ -43,6 +43,9 @@ const state = {
   serverLevelsCooldownUntil: 0,
   // 同一快照的实时价/盘后价综合结果分别缓存；切换口径时先复用已有结果，后台再补齐新口径。
   serverLevelsCache: new Map(),
+  // 买方结构按快照和基准价缓存，避免 renderLevels/renderAnalysis/raw 重复反解 IV。
+  clientBuyerCache: new Map(),
+  buyerContext: "",
   levelsRetryTimer: null,
   tradePointStability: {
     context: "",
@@ -913,15 +916,23 @@ function fallbackLevelSeries(picked, valueOf, metricLabel) {
 
 function renderLevels(points, spot) {
   const price = Number(spot);
-  state.view.buyer = {
-    available: false,
-    directionLabel: "",
-    horizonLabel: "未来 5 个交易日",
-    target: "",
-    items: [],
-    reason: "正在计算买方结构…",
-    note: "",
-  };
+  // 刷新或切换基准价时先保留同一标的/期限的旧结构，避免整块闪回等待状态。
+  // 没有旧结构时才显示轻量等待提示；raw/服务端结果到达后会立即覆盖。
+  const previousBuyer = state.view.buyer;
+  const currentBuyerContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
+  if (state.buyerContext !== currentBuyerContext || !previousBuyer?.available || !previousBuyer.items?.length) {
+    state.view.buyer = {
+      available: false,
+      directionLabel: "",
+      horizonLabel: "未来 5 个交易日",
+      target: "",
+      items: [],
+      reason: "等待期权报价…",
+      note: "",
+    };
+  } else {
+    state.view.buyer = { ...previousBuyer, note: `${previousBuyer.note || ""}${previousBuyer.note ? " · " : ""}正在更新报价` };
+  }
   state.view.chart.levelsBasis = Number.isFinite(price) && price > 0 ? `基准 ${formatMoney(price)}` : "基准 --";
   if (!points.length || !Number.isFinite(price) || price <= 0) {
     state.view.levels.resistance = [];
@@ -973,8 +984,8 @@ function renderLevels(points, spot) {
   renderPlan({ add: planSupportSeries.slice(planSplit, planSplit + PLAN_COUNT) }, price);
 }
 
-// 原始日线到达浏览器后，在本地完成不会产生副作用的计算。复杂买方结构只有在
-// 已有服务端缓存时展示，避免低配服务器在每次刷新时重算整套模型。
+// 原始日线到达浏览器后，在本地完成不会产生副作用的计算。买方结构先使用报价回退，
+// 服务端综合结果返回后再覆盖，避免低配服务器的计算延迟阻塞首屏。
 function clientBars(payload) {
   return (payload?.bars || []).map((bar) => ({
     ...bar,
@@ -1199,18 +1210,34 @@ function renderClientRaw(payload, points, spot) {
   state.view.levels.supportNote = serverNote;
   state.view.levels.addEmpty = state.view.levels.add.length ? "" : (hasServerLevels ? "暂无可用价位" : "客户端暂无更深支撑");
   state.view.levels.resistanceEmpty = "现价这一侧暂无可用价位"; state.view.levels.supportEmpty = "现价这一侧暂无可用价位";
-  if (serverPayload?.buyer_structures) {
+  const hasServerBuyer = Boolean(hasServerLevels && serverPayload?.buyer_structures?.available
+    && Array.isArray(serverPayload.buyer_structures.items)
+    && serverPayload.buyer_structures.items.length);
+  if (hasServerBuyer) {
     renderBuyerStructures(serverPayload.buyer_structures, serverPayload.options_fetched_at || serverPayload.chain_fetched_at);
   } else {
-    state.view.buyer = {
-      available: false,
-      directionLabel: "",
-      horizonLabel: "未来 5 个交易日",
-      target: "",
-      items: [],
-      reason: "买方结构需要服务端综合计算",
-      note: "基础趋势与价位已由客户端计算",
-    };
+    const sameServerContext = state.serverLevelsContext === `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
+    const rawDirection = sameServerContext && serverPayload?.recommendation?.action === "buy"
+      ? "call"
+      : sameServerContext && serverPayload?.recommendation?.action === "sell"
+        ? "put"
+        : trend?.direction === "up"
+          ? "call"
+          : trend?.direction === "down"
+            ? "put"
+            : undefined;
+    renderClientBuyerFallback(rawRows || payload?.options || [], Number(spot), displayedSupport, displayedResistance, rawDirection);
+    if (!state.view.buyer.available) {
+      state.view.buyer = {
+        available: false,
+        directionLabel: "",
+        horizonLabel: "未来 5 个交易日",
+        target: "",
+        items: [],
+        reason: "当前期权链缺少有效买卖报价",
+        note: "基础趋势与价位已由客户端计算",
+      };
+    }
   }
   OptionScopeCharts.renderLevelsChart({ spot, resistance: displayedResistance, support: displayedSupport });
   const tradePointContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
@@ -1223,11 +1250,13 @@ function renderClientRaw(payload, points, spot) {
     hasServerLevels && serverPayload.extremes ? serverPayload.extremes : extremes,
     spot,
     hasServerLevels && serverPayload.history ? serverPayload.history : payload.history,
-    serverPayload?.recommendation || null,
+    hasServerLevels ? serverPayload?.recommendation || null : null,
     stableTradePoints,
     serverPayload?.trade_points_horizon || null,
     payload.trend_market,
-    payload.beta || serverPayload?.beta || null,
+    payload.beta || (hasServerLevels ? serverPayload?.beta : null) || null,
+    hasServerLevels ? serverPayload?.stop_loss || null : null,
+    hasServerLevels ? (serverPayload?.support || []) : displayedSupport,
   );
   renderPlan({ add: addLevels }, spot);
 }
@@ -1349,8 +1378,10 @@ function requestFactorLevels(points, spot, key, attempt = 0) {
     .then((payload) => {
       if (state.levelsKey !== key) return;
       const rawBars = Array.isArray(payload?.bars) ? payload.bars.length : 0;
-      // 有日线缓存时直接在浏览器完成可计算面板；没有日线时先用期权数据回退。
-      if (payload?.raw && rawBars > 0) {
+      const rawOptions = Array.isArray(payload?.options) ? payload.options.length : 0;
+      // raw 只要带回期权行就先在浏览器计算；日线到达后再补趋势和历史因子。
+      // 新标的常见情况是只有期权缓存、还没有日线缓存，不能因此跳过买方结构首屏回退。
+      if (payload?.raw && (rawBars > 0 || rawOptions > 0)) {
         state.levelsPayload = payload;
         renderClientRaw(payload, points, numericSpot);
         // raw 只负责快速首屏；触及概率、历史验证、强化等级和近期最佳买卖点
@@ -1596,14 +1627,15 @@ function placeholderTrend(status = "正在加载") {
     className: rowClass || (String(label).startsWith("Beta") ? "trend-beta" : ""),
   });
   const rows = [
-    meta("通道上轨", "0.00", ""),
-    meta("通道下轨", "0.00", ""),
+    meta("止损价", "0.00", "在近期买入区间下沿或通道下轨下方预留波动缓冲的参考价", "trend-stop-loss"),
+    meta("昨开", "0.00", "最近一个已完成交易日的常规时段开盘价"),
+    meta("昨收", "0.00", "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"),
     meta("相对强弱", "0.0 · 中性", rsiTitle, "trend-rsi neutral"),
     meta("日均斜率", "+0.000%", slopeTitle),
     meta("样本", "0 根日线", ""),
-    meta("今开", "0.00", "今日常规交易时段的开盘价，取当日第一根盘中分钟线"),
-    meta("昨收", "0.00", "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"),
     meta("Beta", "0.00", betaTitle),
+    meta("通道上轨", "0.00", ""),
+    meta("通道下轨", "0.00", ""),
   ];
   const opportunities = [
     ["buy", "近期最佳买入点"],
@@ -1632,6 +1664,8 @@ function placeholderTrend(status = "正在加载") {
     actionClass: "hold",
     reason: loading ? "正在加载" : status,
     rows,
+    leftRows: rows.slice(0, 7),
+    rightRows: [...opportunities, ...rows.slice(7, 9), ...extremes],
     priceLabel: "实时价",
     price: "0.00",
     priceTitle: loading ? "正在加载" : "实时价暂无数据",
@@ -1644,7 +1678,7 @@ function placeholderTrend(status = "正在加载") {
 }
 
 // 趋势通道：展示方向、上下轨、日均斜率、RSI 超买超卖、今开或昨开/昨收、Beta，以及 52 周 / 历史最高最低价。
-function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null) {
+function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null, serverStopLoss = null, stopLossSupports = []) {
   const extremeRows = trendExtremeRows(extremes, spot);
   const hasExtremes = extremeRows.some((row) => row.valid);
   if (!trend && !hasExtremes && !tradePoints?.buy && !tradePoints?.sell) {
@@ -1676,17 +1710,43 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     : `${priceLabel}暂无数据`;
   // 夜盘、盘前还没进入新的常规交易，开盘价属于上一交易日，文案用昨开；盘中和盘后仍是今开。
   const priorSessionOpen = trendMarket?.market_state === "PRE" || trendMarket?.market_state === "OVERNIGHT";
-  const openLabel = priorSessionOpen ? "昨开" : "今开";
-  const openTitle = priorSessionOpen
-    ? "夜盘和盘前尚未进入新的常规交易，显示最近一个已完成交易日的常规时段开盘价"
-    : "今日常规交易时段的开盘价，取当日第一根盘中分钟线";
+  const openTitle = "最近一个已完成交易日的常规时段开盘价";
+  const stopValue = Number(typeof serverStopLoss === "object" ? serverStopLoss?.price : serverStopLoss);
+  const stopBasisPrice = validPrice ? displayedPrice : Number(spot);
+  const buyZoneLow = Number(tradePoints?.buy?.zone_low) || Number(tradePoints?.buy?.price);
+  const trendLower = Number(trend?.lower);
+  const stopAnchors = [
+    [buyZoneLow, "近期最佳买入点下沿"],
+    [trendLower, "通道下轨"],
+    ...(Array.isArray(stopLossSupports) ? stopLossSupports.map((level) => [Number(level?.zone_low) || Number(level?.price), "最近支撑位"]) : []),
+  ].filter(([value]) => Number.isFinite(stopBasisPrice) && stopBasisPrice > 0 && Number.isFinite(value) && value > 0 && value < stopBasisPrice);
+  const [fallbackAnchor, fallbackSource] = stopAnchors.sort((a, b) => b[0] - a[0])[0] || [];
+  const stopPrice = Number.isFinite(stopValue) && stopValue > 0 && Number.isFinite(stopBasisPrice) && stopValue < stopBasisPrice
+    ? stopValue
+    : (Number.isFinite(fallbackAnchor) ? fallbackAnchor * 0.995 : NaN);
+  const stopSource = typeof serverStopLoss === "object" && serverStopLoss?.source
+    ? serverStopLoss.source
+    : fallbackSource;
+  const serverBuffer = Number(typeof serverStopLoss === "object" ? serverStopLoss?.buffer : NaN);
+  const stopBufferNote = Number.isFinite(stopValue) && Number.isFinite(serverBuffer) && serverBuffer > 0
+    ? ` · 波动缓冲 ${formatMoney(serverBuffer)}`
+    : " · 本地估算在锚点下方预留 0.5% 缓冲";
+  const stopRow = {
+    label: "止损价",
+    value: Number.isFinite(stopPrice) && stopPrice > 0 ? formatMoney(stopPrice) : "--",
+    title: Number.isFinite(stopPrice) && stopPrice > 0
+      ? `${Number.isFinite(stopValue) && stopValue > 0 ? "服务端参考止损价" : "本地临时估算止损价"} ${formatMoney(stopPrice)}${stopSource ? ` · 依据：${stopSource}` : ""}${stopBufferNote} · 请结合仓位与风险承受能力判断`
+      : "暂无足够的支撑或趋势数据计算参考止损价",
+    className: "trend-stop-loss",
+    placeholder: !(Number.isFinite(stopPrice) && stopPrice > 0),
+  };
   const rows = trend ? [
     ["通道上轨", formatMoney(trend.upper), ""],
     ["通道下轨", formatMoney(trend.lower), ""],
     ["相对强弱", rsiText, rsiTitle, `trend-rsi ${rsiState}`],
     ["日均斜率", slopeText, "对样本区间的收盘价做线性回归，得到每个交易日相对均价的平均涨跌百分比。正数为上涨，负数为下跌"],
     ["样本", `${Number(trend.bars) || 0} 根日线`, ""],
-    [openLabel, formatMoney(trendMarket?.today_open), openTitle],
+    ["昨开", formatMoney(trendMarket?.previous_open), openTitle],
     ["昨收", formatMoney(trendMarket?.previous_close), "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"],
     ["Beta", betaText, betaTitle],
   ].map(([label, value, title, rowClass]) => ({
@@ -1702,13 +1762,13 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
       "相对强弱": "--",
       "日均斜率": "--",
       "样本": "等待日线",
-      "今开": formatMoney(trendMarket?.today_open),
+      "昨开": formatMoney(trendMarket?.previous_open),
       "昨收": formatMoney(trendMarket?.previous_close),
       "Beta": betaText,
     };
     const value = values[row.label] ?? "--";
-    const label = row.label === "今开" ? openLabel : row.label;
-    const title = row.label === "今开" ? openTitle : row.title;
+    const label = row.label;
+    const title = row.label === "昨开" ? openTitle : row.title;
     const available = value !== "--" && value !== "等待日线";
     return {
       ...row,
@@ -1718,6 +1778,12 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
       placeholder: !available,
     };
   });
+  const byLabel = new Map(rows.map((row) => [row.label, row]));
+  byLabel.set("止损价", stopRow);
+  const leftRows = ["止损价", "昨开", "昨收", "相对强弱", "日均斜率", "样本", "Beta"]
+    .map((label) => byLabel.get(label)).filter(Boolean);
+  const rightRows = ["通道上轨", "通道下轨"].map((label) => byLabel.get(label)).filter(Boolean)
+    .concat(extremeRows);
   const action = ["buy", "sell", "hold"].includes(recommendation?.action) ? recommendation.action : null;
   const actionLabel = action ? (recommendation.label || "继续持有") : "";
   const actionReason = action ? (recommendation.reason || "结合当前趋势与价位综合判断") : "";
@@ -1751,6 +1817,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
       title: `${title} · 模型评分 ${modelConfidence} · ${history} · 估算评分 ${confidence}，不是胜率 · 计算范围：${horizonLabel}`,
     };
   });
+  rightRows.unshift(...opportunityRows);
   const meta = historyMeta || {};
   const parts = [
     meta.extremes_fetched_at ? `高低点快照 ${formatTime(meta.extremes_fetched_at)}` : null,
@@ -1768,6 +1835,8 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     actionClass: action || "hold",
     reason: actionReason || (!trend ? "趋势数据暂缺" : ""),
     rows,
+    leftRows,
+    rightRows,
     priceLabel,
     price: validPrice ? formatMoney(displayedPrice) : "--",
     priceTitle,
@@ -1826,6 +1895,57 @@ function renderPlan(plan, spot) {
   renderPlanRows(plan?.add || [], price);
 }
 
+// 期权报价可能在同一个 fetched_at 批次内被补写；缓存键不能只看行数，否则会继续展示旧的 IV/价差估算。
+function clientBuyerRowsSignature(rows) {
+  let hash = 2166136261;
+  let quoted = 0;
+  for (const row of rows || []) {
+    const bid = Number(row?.bid); const ask = Number(row?.ask); const last = Number(row?.last_price);
+    if ((Number.isFinite(bid) && bid > 0) || (Number.isFinite(ask) && ask > 0) || (Number.isFinite(last) && last > 0)) quoted += 1;
+    const text = [row?.expiration, row?.contract_type, row?.strike, row?.bid, row?.ask, row?.last_price,
+      row?.model_iv, row?.implied_volatility, row?.volume, row?.open_interest].join("|");
+    for (let index = 0; index < text.length; index += 1) hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
+  }
+  return `${rows?.length || 0}:${quoted}:${hash >>> 0}`;
+}
+
+function clientBuyerLevelsSignature(support, resistance) {
+  const prices = [...(support || []), ...(resistance || [])]
+    .map((item) => Number(item?.price))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  return prices.map((value) => value.toFixed(2)).join(",");
+}
+
+function renderClientBuyerFallback(rows, spot, support = [], resistance = [], directionOverride = undefined) {
+  const sameServerContext = state.serverLevelsContext === `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
+  const recommendationAction = sameServerContext ? state.serverLevelsPayload?.recommendation?.action : null;
+  const directionHint = directionOverride === "call" || directionOverride === "put"
+    ? directionOverride
+    : recommendationAction === "buy"
+      ? "call"
+      : recommendationAction === "sell"
+        ? "put"
+        : state.view.trend?.direction === "up"
+          ? "call"
+          : state.view.trend?.direction === "down"
+            ? "put"
+            : null;
+  const priceBucket = Number.isFinite(Number(spot)) ? (Math.round(Number(spot) * 100) / 100).toFixed(2) : "";
+  const key = `${state.symbol}|${state.expiration}|${state.chainFetchedAt || ""}|${priceBucket}|${state.levelBasisMode}|${clientBuyerRowsSignature(rows)}|${clientBuyerLevelsSignature(support, resistance)}|${directionHint || "neutral"}`;
+  const cached = state.clientBuyerCache.get(key);
+  const client = window.OptionScopeBuyerClient;
+  const payload = cached
+    || client?.buildStructures?.(rows, spot, support, resistance, directionHint)
+    || client?.buildSkeleton?.(rows, spot, state.expiration);
+  if (!cached && payload) {
+    state.clientBuyerCache.set(key, payload);
+    while (state.clientBuyerCache.size > 12) state.clientBuyerCache.delete(state.clientBuyerCache.keys().next().value);
+  }
+  if (payload) renderBuyerStructures(payload, null);
+  return payload;
+}
+
 function renderFactorLevels(payload) {
   applyEarnings(payload?.earnings);
   const spot = Number(payload?.spot);
@@ -1848,7 +1968,12 @@ function renderFactorLevels(payload) {
   state.view.levels.resistanceEmpty = "现价这一侧暂无可用价位";
   state.view.levels.supportEmpty = "现价这一侧暂无可用价位";
   OptionScopeCharts.renderLevelsChart(payload);
-  renderBuyerStructures(payload?.buyer_structures, payload?.options_fetched_at || payload?.chain_fetched_at);
+  // 服务端没有返回可用结构时保留 raw 首屏的客户端候选，避免综合接口的空结果把页面清空。
+  if (payload?.buyer_structures?.available
+    && Array.isArray(payload.buyer_structures.items)
+    && payload.buyer_structures.items.length) {
+    renderBuyerStructures(payload.buyer_structures, payload?.options_fetched_at || payload?.chain_fetched_at);
+  }
   const tradePointContext = `${state.symbol}|${expiration}|${state.levelBasisMode}`;
   // 综合结果一旦返回，立即替换客户端临时候选；不要再等待两轮快照确认，
   // 否则用户会看到服务端已经返回但页面仍停留在旧的「--」或临时点。
@@ -1858,7 +1983,7 @@ function renderFactorLevels(payload) {
     state.tradePointStability.pending = { buy: null, sell: null };
   }
   const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);
-  renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null);
+  renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null, payload?.stop_loss || null, payload?.support || []);
   renderPlan(payload?.plan, spot);
 }
 
@@ -1918,6 +2043,14 @@ function formatBuyerQuoteMethod(value) {
     .replace(/Last/g, "最新成交价");
 }
 
+function buyerQuoteSourceLabel(value) {
+  if (value === "last") return "最新成交价估算";
+  if (value === "skeleton") return "结构骨架";
+  if (value === "server") return "服务端综合";
+  if (value === "bid_ask") return "Bid/Ask 中间价估算";
+  return "买卖价中间价";
+}
+
 function renderBuyerStructures(payload, fetchedAt = null) {
   const empty = {
     available: false,
@@ -1941,13 +2074,22 @@ function renderBuyerStructures(payload, fetchedAt = null) {
   ].filter(Boolean).join(" · ");
   const buyerMethod = formatBuyerMethod(payload.method);
   const buyerQuoteMethod = formatBuyerQuoteMethod(payload.quote_method);
+  const sourceLabel = buyerQuoteSourceLabel(payload.quote_source);
+  const ivSource = String(payload.iv_source || "");
+  const ivLabel = ivSource.includes("default")
+    ? "默认 IV 粗略估算"
+    : ivSource.includes("quote")
+      ? "报价反解 IV"
+      : ivSource.includes("price")
+        ? "服务端报价反解 IV"
+      : ivSource.includes("server") ? "服务端模型 IV" : "模型 IV";
   state.view.buyer = {
     available: true,
     directionLabel: payload.direction_label || (payload.direction === "call" ? "买入看涨" : "买入看跌"),
     horizonLabel: withEarningsHorizon(payload.horizon_label || "未来 5 个交易日"),
     target: targetText || "--",
     reason: "",
-    note: `${buyerMethod} · ${buyerQuoteMethod} · ${fetchedAt ? `数据 ${formatTime(fetchedAt)}` : "数据时间未知"} · 预计盈利/亏损以当前买卖价中间价为成本基准；负数表示目标价虽达到，扣除时间价值后仍未覆盖成本。${payload.disclaimer || "综合评分不是历史胜率"}`,
+    note: `${buyerMethod} · ${sourceLabel} · ${buyerQuoteMethod} · ${ivLabel} · ${fetchedAt ? `数据 ${formatTime(fetchedAt)}` : "数据时间未知"} · 预计盈利/亏损以当前买卖价中间价为成本基准；负数表示目标价虽达到，扣除时间价值后仍未覆盖成本。${payload.disclaimer || "综合评分不是历史胜率"}`,
     items: payload.items.map((item, index) => {
       const strikes = (item.strikes || []).map((strike) => formatMoney(strike)).join(" / ");
       const compactStrikes = (item.strikes || []).map((strike) => formatStructureStrike(strike)).join("/");
@@ -1998,6 +2140,7 @@ function renderBuyerStructures(payload, fetchedAt = null) {
       };
     }),
   };
+  state.buyerContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
 }
 
 function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivModel = {}, basis = null) {
@@ -2034,6 +2177,9 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   state.view.chart.putWall = `看跌墙 ${putWall?.putGex ? formatMoney(putWall.strike) : "--"}`;
   // 选中期限的综合价位与 Gamma 窗口并行请求，避免首次加载时趋势/支撑/压力面板长期空白。
   loadFactorLevels(points, levelSpot);
+  if (!state.view.buyer.available && expirationRows.length) {
+    renderClientBuyerFallback(expirationRows, levelSpot, state.view.levels.support, state.view.levels.resistance);
+  }
   const chartChecksum = points.reduce((sum, point) => sum + point.callGex + point.putGex + point.callVolume + point.putVolume + point.callOi + point.putOi, 0);
   const chartSignature = `${points.length}|${spot}|${gammaFlip ? gammaFlip.strike : ""}|${scopeText}|${chartChecksum}`;
   if (!forceChartRedraw && chartSignature === analysisChartSignatureValue) return;
@@ -2492,6 +2638,7 @@ function showPending(message) {
     reason: message,
     note: "",
   };
+  state.buyerContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
   // 压力位图已在 showChartSkeletons 里铺好 0 值坐标，这里不再改回一句加载提示。
   state.view.trend = placeholderTrend(message || "正在加载");
   state.view.chainRows = [];

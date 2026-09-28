@@ -402,6 +402,50 @@ def best_trade_points(
     return {"buy": select(support, "buy"), "sell": select(resistance, "sell")}
 
 
+def stop_loss_level(
+    trend: dict[str, Any] | None,
+    buy_point: dict[str, Any] | None,
+    support: Iterable[dict[str, Any]],
+    spot: float | None,
+    atr: float | None,
+) -> dict[str, Any] | None:
+    """在最近有效支撑下方留出波动缓冲，生成参考止损价。"""
+    price = _number(spot)
+    if price is None or price <= 0:
+        return None
+
+    # 先考虑近期最佳买入区间下沿，再考虑通道下轨和普通支撑，最终取离现价最近的有效锚点。
+    anchors: list[tuple[float, str]] = []
+    if isinstance(buy_point, dict):
+        buy_low = _number(buy_point.get("zone_low")) or _number(buy_point.get("price"))
+        if buy_low is not None and 0 < buy_low < price:
+            anchors.append((buy_low, "近期最佳买入点下沿"))
+
+    channel_lower = _number((trend or {}).get("lower"))
+    if channel_lower is not None and 0 < channel_lower < price:
+        anchors.append((channel_lower, "趋势通道下轨"))
+
+    for level in support:
+        level_price = _number(level.get("zone_low")) or _number(level.get("price"))
+        if level_price is not None and 0 < level_price < price:
+            anchors.append((level_price, "最近支撑位"))
+
+    if not anchors:
+        return None
+    anchor, source = max(anchors, key=lambda item: item[0])
+    buffer = max((_number(atr) or 0.0) * 0.25, price * 0.005)
+    stop_price = anchor - buffer
+    if not math.isfinite(stop_price) or stop_price <= 0 or stop_price >= price:
+        return None
+    return {
+        "price": round(stop_price, 4),
+        "anchor_price": round(anchor, 4),
+        "source": source,
+        "buffer": round(buffer, 4),
+        "reason": f"低于{source}并预留波动缓冲",
+    }
+
+
 def average_true_ranges(bars: Iterable[dict[str, Any]], period: int = ATR_PERIOD) -> list[float | None]:
     """一次性计算每根日线对应的 ATR，保持逐前缀计算的原有口径。"""
     items = list(bars)
@@ -1190,6 +1234,7 @@ def build_levels(
             "history_bars": len(bar_list), "options_metric": "none",
             "trend": None, "recommendation": {"action": "hold", "label": "继续持有", "reason": "缺少有效价格数据"},
             "trade_points": {"buy": None, "sell": None},
+            "stop_loss": None,
             "trade_points_horizon": {"trading_days": TRADE_POINT_TRADING_DAYS, "label": "未来 5 个交易日"},
             "buyer_structures": {
                 "available": False,
@@ -1265,6 +1310,7 @@ def build_levels(
     buy_levels, add_levels = split_support_plan(support_all, price)
     recommendation = trade_recommendation(trend, support, resistance, price)
     trade_points = best_trade_points(trend, support_all, resistance_all, price, volatility, TRADE_POINT_TRADING_DAYS)
+    stop_loss = stop_loss_level(trend, trade_points.get("buy"), support_all, price, atr)
     buyer_structures = build_buyer_structures(
         row_list,
         price,
@@ -1286,6 +1332,7 @@ def build_levels(
         "trend": trend,
         "recommendation": recommendation,
         "trade_points": trade_points,
+        "stop_loss": stop_loss,
         "trade_points_horizon": {"trading_days": TRADE_POINT_TRADING_DAYS, "label": "未来 5 个交易日"},
         "buyer_structures": buyer_structures,
         "history_validation": {

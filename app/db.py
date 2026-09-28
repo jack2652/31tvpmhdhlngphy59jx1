@@ -10,6 +10,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from app.runtime import low_memory_enabled
 
@@ -27,6 +28,7 @@ NO_FLOOR = "9999-12-31T23:59:59+00:00"
 # 后台分析停在 running 超过这个时间，下一轮可以重新领取。进程还活着时由接口侧的看门狗先标记失败。
 ANALYSIS_JOB_STALE_SECONDS = 180
 ORPHANED_ANALYSIS_MESSAGE = "进程重启，后台分析已中断"
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 
 
@@ -706,8 +708,10 @@ class Database:
 
     def latest_chains(self, symbol: str, horizon_days: int = 45) -> dict[str, Any]:
         """返回近期期限的最新期权链，用于跨到期日 Gamma 分析。"""
-        start = utc_now().date().isoformat()
-        end = (utc_now().date() + timedelta(days=horizon_days)).isoformat()
+        # 到期日是美东日历日；服务在 UTC 晚间运行时，不能提前跳过仍在交易中的美东当天合约。
+        market_date = datetime.now(MARKET_TIMEZONE).date()
+        start = market_date.isoformat()
+        end = (market_date + timedelta(days=horizon_days)).isoformat()
         with self.connect() as connection:
             rows = connection.execute(
                 """SELECT current.contract_symbol, current.expiration, current.contract_type,

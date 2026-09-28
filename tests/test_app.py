@@ -19,7 +19,7 @@ from app.api import create_router, install_access_guard, trend_market_data
 from app.buyer_structures import build_buyer_structures
 from app.config import Settings
 from app.db import NO_FLOOR, Database, iso, parse_sessions, utc_now
-from app.levels import absorption_levels, annotate_level_history, average_true_range, average_true_ranges, best_trade_points, build_levels, chip_peaks, fibonacci_levels, level_strength_tier, merge_candidates, option_levels, price_extremes, select_visible_levels, split_support_plan, touch_probability, trade_recommendation, trend_channel
+from app.levels import absorption_levels, annotate_level_history, average_true_range, average_true_ranges, best_trade_points, build_levels, chip_peaks, fibonacci_levels, level_strength_tier, merge_candidates, option_levels, price_extremes, select_visible_levels, split_support_plan, stop_loss_level, touch_probability, trade_recommendation, trend_channel
 from app.providers import market
 from app.providers import cboe
 from app.providers.market import (
@@ -2524,6 +2524,22 @@ def test_build_levels_mixes_factors_and_degrades_without_history():
     assert degraded["resistance"] and degraded["support"]
 
 
+def test_stop_loss_level_uses_nearest_valid_support_and_volatility_buffer():
+    result = stop_loss_level(
+        {"lower": 92},
+        {"zone_low": 96, "price": 98},
+        [{"price": 94}, {"price": 80}],
+        100,
+        4,
+    )
+    assert result["source"] == "近期最佳买入点下沿"
+    assert result["anchor_price"] == 96
+    assert result["buffer"] == 1
+    assert result["price"] == 95
+    assert stop_loss_level({"lower": 100}, None, [], 100, None) is None
+    assert stop_loss_level(None, None, [], None, None) is None
+
+
 def test_build_levels_preserves_trend_bias_in_scores():
     """上行趋势偏向支撑、下行趋势偏向压力，且分数仍限制在 0 到 1。"""
     rising = [{
@@ -2761,8 +2777,10 @@ def test_trend_market_data_falls_back_to_last_trading_day(monkeypatch):
     ]
     current = trend_market_data(bars, {"market_state": "REGULAR"})
     assert current["today_open"] == 110 and current["previous_close"] == 105
+    assert current["previous_open"] == 100
     fallback = trend_market_data(bars[:1], {"market_state": "PRE"})
     assert fallback["today_open"] == 100 and fallback["previous_close"] == 105
+    assert fallback["previous_open"] == 100
 
 
 def test_trend_market_data_uses_completed_close_after_regular_session(monkeypatch):
@@ -2775,6 +2793,7 @@ def test_trend_market_data_uses_completed_close_after_regular_session(monkeypatc
     for market_state in ("POST", "OVERNIGHT", "CLOSED"):
         result = trend_market_data(bars, {"market_state": market_state})
         assert result["today_open"] == 110
+        assert result["previous_open"] == 110
         assert result["previous_close"] == 120
         assert result["previous_close_date"] == "2026-09-21"
 
@@ -2904,15 +2923,16 @@ def test_frontend_confirms_trade_point_before_replacing_it():
     assert "function stabilizeTradePoints(points, context)" in source
     assert "nextCount >= TRADE_POINT_CONFIRMATIONS" in source
     assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
-    assert "估算评分 {{ item.confidence }}" in page
-    assert "{{ item.historySummary }}" in page
+    assert 'v-for="row in view.trend.rightRows"' in page
+    assert "估算评分 {{ row.confidence }}" in page
+    assert "{{ row.historySummary }}" in page
 
 
 def test_levels_analysis_cache_namespace_matches_current_scoring_model():
     """最佳点评分字段变化时必须跳过旧版分析缓存。"""
     source = Path("app/api.py").read_text(encoding="utf-8")
-    assert '"levels-v11"' in source
-    assert '"levels-v10"' not in source
+    assert '"levels-v12"' in source
+    assert '"levels-v11"' not in source
 
 
 def test_build_levels_reuses_stable_candidate_anchor_across_basis_prices():
@@ -2965,30 +2985,27 @@ def test_trading_plan_panels_render_under_headline():
     assert page.index('id="support-levels"') < page.index('id="gex-chart"')
     assert page.index('id="support-levels"') < page.index('id="levels-chart"')
     assert page.index('id="levels-chart"') < page.index('id="chain-body"')
-    assert "function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null)" in source
+    assert "function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null, serverStopLoss = null, stopLossSupports = [])" in source
     assert "function renderPlanRows(levels, spot)" in source
     assert "function renderPlan(plan, spot)" in source
     assert "const PLAN_COUNT = 10;" in source
     assert "const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);" in source
     assert "renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints," in source
-    assert '"今开"' in source and '"昨收"' in source and '["Beta", betaText, betaTitle]' in source
-    assert 'trendMarket?.market_state === "PRE" || trendMarket?.market_state === "OVERNIGHT"' in source
-    assert 'priorSessionOpen ? "昨开" : "今开"' in source
-    assert "夜盘和盘前尚未进入新的常规交易" in source
+    assert '"昨开"' in source and '"昨收"' in source and '["Beta", betaText, betaTitle]' in source
     assert '"Beta（2年）"' not in source
     assert page.index('class="trend-side"') < page.index('class="trend-core"')
-    assert "基准指数：标普500" in source and "当日第一根盘中分钟线" in source
+    assert "基准指数：标普500" in source
     assert 'trend-beta-sub' not in source
     assert '"近期最佳买入点"' in source and '"近期最佳卖出点"' in source
     assert "未来 5 个交易日" in source
     assert "未来 5 个交易日（约 1 周）" not in source
-    assert 'class="trend-opportunities"' in page
     assert 'class="trend-layout"' in page and 'class="trend-core"' in page and 'class="trend-side"' in page
-    assert 'v-for="row in view.trend.rows.slice(0, 2)"' in page
-    # Beta 属于左侧历史极值信息；右侧趋势指标必须排除它，避免同一行重复渲染。
-    assert 'v-for="row in view.trend.rows.filter(row => row.className === \'trend-beta\')"' in page
-    assert 'v-for="row in view.trend.rows.slice(2).filter(row => row.className !== \'trend-beta\')"' in page
-    assert page.index('class="trend-opportunities"') > page.index('class="trend-core"')
+    # 左右列显式绑定行数组，避免顺序依赖模板切片。
+    assert 'v-for="row in view.trend.leftRows"' in page
+    assert 'v-for="row in view.trend.rightRows"' in page
+    assert 'const leftRows = ["止损价", "昨开", "昨收", "相对强弱", "日均斜率", "样本", "Beta"]' in source
+    assert '"52周最高", "52周最低", "历史最高", "历史最低"' in source
+    assert 'label: "止损价"' in source and 'payload?.stop_loss || null' in source
     assert 'class="trend-meta trend-current-price" :title="view.trend.priceTitle"' in page
     assert "formatLevelRange(point)" in source and "formatProbability(point.confidence)" in source
     assert 'const priceLabel = state.levelBasisMode === "live" && selectedBasis?.label === "收盘"' in source
