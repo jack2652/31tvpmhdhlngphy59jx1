@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from app.db import Database, iso, parse_sessions
 from app.providers.market import ProviderError, MarketDataProvider
+from app.runtime import low_memory_enabled
 from app.services.concurrency import HeavyWorkGate, SingleFlight, UpstreamBusyError, get_heavy_gate
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,8 @@ MARKET_TIMEZONE = ZoneInfo("America/New_York")
 WINDOW_FRESH_SECONDS = 60
 # 页面请求有明确超时；锁竞争应更早回退，避免请求线程堆积到一分钟以上。
 REFRESH_LOCK_TIMEOUT_SECONDS = 10
+# 低内存模式仍保持单槽位，但首屏刷新可以短暂等待 Gamma 归还槽位；只等待不叠加内存。
+LOW_MEMORY_REFRESH_WAIT_SECONDS = 3
 REFRESH_LEASE_SECONDS = 180
 # 只合并刚刚写完的并发刷新。再留 60 秒会和页面新鲜期叠成一次空刷新。
 REFRESH_COALESCE_SECONDS = 15
@@ -148,19 +151,28 @@ class SnapshotService:
             if waited_for_process_lock:
                 # Gamma 窗口会在一个标的上连续持有多个期限锁。页面刷新遇到这种情况时，
                 # 若本地已有链应立即沿用旧快照，不能等待 60 秒把 HTTP 请求线程拖住。
-                if self.heavy_gate.busy() and self._has_saved_chain(normalized, expiration):
-                    stale = self._stale_snapshot(normalized, expiration, "内存保护：后台 Gamma 正在刷新，本次沿用本地快照")
-                    if stale is not None:
-                        stale["deferred"] = True
-                        stale["skipped"] = True
-                        return stale
-                if self.heavy_gate.busy():
+                # 只有明确启用低内存保护时才让首屏给 Gamma 让路。普通模式的闸门
+                # 只是并发上限，不能把正常的排队误报成“内存保护”。
+                waited_for_busy_gamma = False
+                if low_memory_enabled() and self.heavy_gate.busy() and self._has_saved_chain(normalized, expiration):
+                    # Gamma 可能正持有当前期限锁。低内存只限制并发数量，不应让首屏
+                    # 在资源空闲时立即放弃；短暂等待仍只有一份期权链在内存中。
+                    if lock.acquire(timeout=LOW_MEMORY_REFRESH_WAIT_SECONDS):
+                        lock_acquired = True
+                        waited_for_busy_gamma = True
+                    else:
+                        stale = self._stale_snapshot(normalized, expiration, "内存保护：后台 Gamma 正在刷新，本次沿用本地快照")
+                        if stale is not None:
+                            stale["deferred"] = True
+                            stale["skipped"] = True
+                            return stale
+                if low_memory_enabled() and self.heavy_gate.busy() and not waited_for_busy_gamma:
                     # 没有本地链时也不能在期限锁上长时间等待：Gamma 或另一条
                     # 刷新链可能正持有同一把锁，而浏览器会在更短的请求超时后重入，
                     # 形成「旧请求继续等锁 + 新请求继续排队」的刷新风暴。让本轮快速
                     # 失败，前端保留占位/下一轮重试，后台任务完成后即可正常回源。
                     raise UpstreamBusyError(f"{normalized} {expiration or '最近期限'} 刷新正在进行")
-                if not lock.acquire(timeout=REFRESH_LOCK_TIMEOUT_SECONDS):
+                if not waited_for_busy_gamma and not lock.acquire(timeout=REFRESH_LOCK_TIMEOUT_SECONDS):
                     stale = self._stale_snapshot(normalized, expiration, "同一到期日正在刷新，本次沿用本地快照")
                     if stale is not None:
                         stale["deferred"] = True
@@ -344,7 +356,9 @@ class SnapshotService:
                 expirations_override=expirations_override,
                 quote_override=quote_override,
             )
-        if self.heavy_gate.acquire(timeout=0.2):
+        if self.heavy_gate.acquire(
+            timeout=LOW_MEMORY_REFRESH_WAIT_SECONDS if low_memory_enabled() else REFRESH_LOCK_TIMEOUT_SECONDS
+        ):
             try:
                 return self._fetch_upstream(
                     normalized,
@@ -354,17 +368,23 @@ class SnapshotService:
                 )
             finally:
                 self.heavy_gate.release()
-        if self._has_saved_chain(normalized, expiration):
+        if low_memory_enabled() and self._has_saved_chain(normalized, expiration):
             stale = self._stale_snapshot(normalized, expiration, "内存保护：已有刷新在进行，本次沿用本地快照")
             if stale is not None and not (expiration and stale.get("quote_only")):
                 stale["deferred"] = True
                 stale["skipped"] = True
                 logger.info("低内存保护：%s %s 刷新让路，沿用本地快照", normalized, expiration or "最近到期日")
                 return stale
-        # 新标的没有可展示链时也只短暂排队；Gamma 等任务较久时由前端有限重试，
-        # 避免请求线程长时间占住低配服务器。
-        if not self.heavy_gate.acquire(timeout=5):
-            raise UpstreamBusyError(f"{normalized} 刷新排队超过 5 秒，请稍后重试")
+        # 普通模式已经等待过完整锁竞争窗口；低内存模式对新标的再短暂排队，
+        # 防止没有本地链时把多个大对象同时拉入内存。
+        wait_seconds = 5 if low_memory_enabled() else REFRESH_LOCK_TIMEOUT_SECONDS
+        if not self.heavy_gate.acquire(timeout=wait_seconds):
+            message = (
+                f"{normalized} 刷新排队超过 {wait_seconds:g} 秒，请稍后重试"
+                if low_memory_enabled()
+                else f"{normalized} 已有刷新进行中，等待 {wait_seconds:g} 秒后仍未完成"
+            )
+            raise UpstreamBusyError(message)
         try:
             return self._fetch_upstream(
                 normalized,
@@ -482,7 +502,11 @@ class SnapshotService:
         # 不能把整个窗口几十秒锁住，否则 /api/levels 的历史与 Beta 永远只能拿到空回退。
         # 先用一次短闸门保护到期日目录和现货读取；忙时直接让首屏任务优先。
         if not self.heavy_gate.acquire(timeout=0):
-            message = "内存保护：已有重任务在进行，Gamma 窗口已让路"
+            message = (
+                "内存保护：已有重任务在进行，Gamma 窗口已让路"
+                if low_memory_enabled()
+                else "已有重任务在进行，Gamma 窗口稍后计算"
+            )
             logger.info("%s %s", normalized, message)
             return {
                 "symbol": normalized,
@@ -541,7 +565,8 @@ class SnapshotService:
             # 每个期限独立占槽并在请求后释放。这样历史/Beta 可以在期限之间插队，
             # 也避免某个慢期限把整个 Gamma 窗口拖到超时。
             if not self.heavy_gate.acquire(timeout=0):
-                errors.append(f"{expiration}: 内存保护：让路给首屏历史数据")
+                reason = "内存保护：让路给首屏历史数据" if low_memory_enabled() else "让路给首屏历史数据"
+                errors.append(f"{expiration}: {reason}")
                 retry_cursor = start_after
                 retry_pending = True
                 continue

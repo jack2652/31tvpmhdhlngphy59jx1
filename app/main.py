@@ -29,7 +29,11 @@ from app.services.snapshots import SnapshotService
 settings = Settings.from_env()
 database = Database(settings.database_path)
 upstream_gate = UpstreamGate(settings.upstream_concurrency, settings.upstream_wait_seconds)
-regular_provider = MarketDataProvider(proxy=settings.proxy_url, upstream_gate=upstream_gate)
+regular_provider = MarketDataProvider(
+    proxy=settings.proxy_url,
+    upstream_gate=upstream_gate,
+    analysis_cache=database,
+)
 delayed_provider = CboeOptionsProvider(proxy=settings.proxy_url, upstream_gate=upstream_gate)
 overnight_provider = AlpacaOvernightProvider(
     settings.alpaca_api_key,
@@ -119,5 +123,6 @@ def index():
 
 
 @app.get("/health", include_in_schema=False)
-def health() -> dict[str, str]:
+async def health() -> dict[str, str]:
+    # 使用 async 健康检查，避免同步 API 线程池被上游慢请求占满时看门狗也被拖住。
     return {"status": "ok"}

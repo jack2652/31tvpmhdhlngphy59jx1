@@ -74,9 +74,23 @@ Gamma 敞口使用 Black-Scholes 根据标的价格、执行价、隐含波动�
 脚本做的四件事与手动命令一一对应：`python -m venv .venv`、`.venv/bin/pip install -e .`、
 `cp .env.example .env`、`.venv/bin/python -m app`；已经做过的步骤会自动跳过
 （依赖指纹变了才重装）。启动后应用与看门狗都以 `setsid` 脱离会话在后台运行，
-看门狗每 60 秒检查一次健康状态，连续 3 次失败或进程消失会自动拉起；
+无 systemd 的环境下看门狗每 15 秒检查一次健康状态，连续 2 次失败或进程消失会自动拉起；
 日志写到 `logs/app.log`、`logs/watchdog.log`，超过 5MB 自动轮转。
 脚本的退出码沿用对应动作的结果（成功 0、失败非 0），可直接用在计划任务或监控里。
+
+生产服务器建议安装 systemd 托管，避免 SSH 断开、服务器重启或 Python 进程被 OOM 杀掉后出现 Cloudflare 521：
+
+```bash
+./run.sh install-service
+./run.sh status
+```
+
+该命令会生成并启用 `option-scope.service`，以项目目录所属的普通用户运行，进程异常后 3 秒自动重启，并设置为开机启动。
+查看服务日志：`journalctl -u option-scope.service -f`。卸载 systemd 托管并恢复 shell 看门狗：`./run.sh remove-service`。
+
+如果仍出现 521，先在服务器本机执行 `curl -fsS http://127.0.0.1:${PORT:-8000}/health`：
+本机失败说明应用或端口没有监听，查看 `systemctl status option-scope.service` 和 `journalctl -u option-scope.service`；
+本机成功而公网失败，则检查 Cloudflare 到源站端口、防火墙、安全组和反向代理配置，521 不是应用代码能单独修复的。
 
 手动启动方式：
 

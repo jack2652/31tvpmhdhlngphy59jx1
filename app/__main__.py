@@ -90,10 +90,15 @@ def main() -> None:
         print(line, flush=True)
     import uvicorn
 
-    run_kwargs: dict[str, int] = {}
+    # 低配机器限制连接排队与 keep-alive，避免大量浏览器轮询把请求堆到进程失去响应。
+    run_kwargs: dict[str, int] = {
+        "limit_concurrency": 32 if low_memory else 64,
+        "backlog": 64 if low_memory else 128,
+        "timeout_keep_alive": 5,
+    }
     if low_memory:
-        # 限制排队连接，避免慢请求把工作线程和响应缓冲一起堆满。
-        run_kwargs = {"limit_concurrency": 12, "backlog": 16, "timeout_keep_alive": 5}
+        # 低内存模式进一步收紧连接上限；重任务本身仍由应用内闸门串行化。
+        run_kwargs.update({"limit_concurrency": 12, "backlog": 16})
     uvicorn.run(
         "app.main:app",
         host=host,

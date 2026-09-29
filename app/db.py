@@ -116,7 +116,20 @@ class Database:
                     raw_json TEXT,
                     sessions_json TEXT,
                     today_open REAL,
-                    previous_close REAL
+                    previous_close REAL,
+                    fair_value REAL,
+                    fair_value_low REAL,
+                    fair_value_high REAL,
+                    fair_value_buy_low REAL,
+                    fair_value_buy_high REAL,
+                    fair_value_source TEXT,
+                    fair_value_model TEXT,
+                    fair_value_forward_eps REAL,
+                    fair_value_forward_eps_source TEXT,
+                    fair_value_safety_margin REAL,
+                    fair_value_confidence TEXT
+                    ,fair_value_defensive_json TEXT
+                    ,fair_value_optimistic_json TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_quote_symbol_time
                     ON quote_snapshots(symbol, fetched_at DESC);
@@ -245,6 +258,32 @@ class Database:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN today_open REAL")
             if "previous_close" not in quote_columns:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN previous_close REAL")
+            if "fair_value" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value REAL")
+            if "fair_value_low" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_low REAL")
+            if "fair_value_high" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_high REAL")
+            if "fair_value_buy_low" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_buy_low REAL")
+            if "fair_value_buy_high" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_buy_high REAL")
+            if "fair_value_source" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_source TEXT")
+            if "fair_value_model" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_model TEXT")
+            if "fair_value_forward_eps" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_forward_eps REAL")
+            if "fair_value_forward_eps_source" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_forward_eps_source TEXT")
+            if "fair_value_safety_margin" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_safety_margin REAL")
+            if "fair_value_confidence" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_confidence TEXT")
+            if "fair_value_defensive_json" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_defensive_json TEXT")
+            if "fair_value_optimistic_json" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_optimistic_json TEXT")
             # 旧库首次升级时建立每个到期日的最新批次索引，后续写入由 write_snapshot 增量维护。
             if connection.execute("SELECT COUNT(*) FROM option_latest_batches").fetchone()[0] == 0:
                 connection.execute(
@@ -418,14 +457,19 @@ class Database:
             connection.execute("DELETE FROM service_leases WHERE name=? AND owner=?", (name, owner))
 
     def get_analysis_cache(self, cache_key: str) -> Any | None:
+        entry = self.get_analysis_cache_entry(cache_key)
+        return entry[0] if entry else None
+
+    def get_analysis_cache_entry(self, cache_key: str) -> tuple[Any, str] | None:
+        """读取共享分析缓存及写入时间，供多 worker 复用稳定结果。"""
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT payload FROM api_analysis_cache WHERE cache_key=?", (cache_key,)
+                "SELECT payload, created_at FROM api_analysis_cache WHERE cache_key=?", (cache_key,)
             ).fetchone()
         if not row:
             return None
         try:
-            return json.loads(row["payload"])
+            return json.loads(row["payload"]), str(row["created_at"])
         except (TypeError, ValueError):
             return None
 
@@ -454,13 +498,14 @@ class Database:
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO quote_snapshots
-                (symbol, fetched_at, price, change_percent, currency, market_state, provider, sessions_json, today_open, previous_close)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol, fetched_at, price, change_percent, currency, market_state, provider, sessions_json, today_open, previous_close, fair_value, fair_value_low, fair_value_high, fair_value_buy_low, fair_value_buy_high, fair_value_source, fair_value_model, fair_value_forward_eps, fair_value_forward_eps_source, fair_value_safety_margin, fair_value_confidence, fair_value_defensive_json, fair_value_optimistic_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     quote["symbol"], fetched_at, quote.get("price"), quote.get("change_percent"),
                     quote.get("currency"), quote.get("market_state"), quote.get("provider", "upstream"),
                     json.dumps(quote.get("sessions") or {}, ensure_ascii=True),
                     quote.get("today_open"), quote.get("previous_close"),
+                    quote.get("fair_value"), quote.get("fair_value_low"), quote.get("fair_value_high"), quote.get("fair_value_buy_low"), quote.get("fair_value_buy_high"), quote.get("fair_value_source"), quote.get("fair_value_model"), quote.get("fair_value_forward_eps"), quote.get("fair_value_forward_eps_source"), quote.get("fair_value_safety_margin"), quote.get("fair_value_confidence"), json.dumps(quote.get("fair_value_defensive") or {}, ensure_ascii=False), json.dumps(quote.get("fair_value_optimistic") or {}, ensure_ascii=False),
                 ),
             )
             connection.executemany(

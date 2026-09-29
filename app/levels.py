@@ -608,7 +608,9 @@ def fibonacci_levels(bars: Iterable[dict[str, Any]], spot: float) -> list[Level]
     levels: list[Level] = []
     for ratio, weight in FIB_RATIOS:
         price = high - span * ratio if low_index < high_index else low + span * ratio
-        levels.append((price, weight, f"斐波那契 {ratio * 100:g}%"))
+        # 百分比只展示一位小数，避免浮点乘法把 23.6 显示成 23.599999999999998。
+        percent_label = f"{ratio * 100:.1f}".rstrip("0").rstrip(".")
+        levels.append((price, weight, f"斐波那契 {percent_label}%"))
     return levels
 
 

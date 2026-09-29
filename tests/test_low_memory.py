@@ -58,6 +58,24 @@ def test_resolve_web_workers_defaults_to_one_and_caps_low_memory(capsys: pytest.
     assert "已降为 1" in capsys.readouterr().out
 
 
+def test_web_server_limits_connection_backlog_for_source_stability():
+    """Uvicorn 连接上限固定，避免轮询/慢请求堆积后让源站失去响应。"""
+    source = Path("app/__main__.py").read_text(encoding="utf-8")
+    assert '"limit_concurrency": 32 if low_memory else 64' in source
+    assert '"backlog": 64 if low_memory else 128' in source
+    assert '"timeout_keep_alive": 5' in source
+
+
+def test_run_script_has_systemd_recovery_path():
+    """部署脚本提供开机启动与崩溃自动恢复，避免只依赖手工启动。"""
+    script = Path("run.sh").read_text(encoding="utf-8")
+    assert 'SYSTEMD_UNIT_NAME="option-scope.service"' in script
+    assert 'Restart=always' in script
+    assert 'RestartSec=3' in script
+    assert 'WantedBy=multi-user.target' in script
+    assert 'install-service | service-install' in script
+
+
 def test_database_cap_uses_free_space_only_in_low_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     database = tmp_path / "options.db"
     database.write_bytes(b"x")
@@ -72,7 +90,10 @@ def test_database_cap_uses_free_space_only_in_low_memory(tmp_path: Path, monkeyp
     assert effective_database_max_mb(0, database, True) == 32
 
 
-def test_busy_gate_defers_when_chain_exists_and_waits_when_missing(tmp_path: Path):
+def test_busy_gate_defers_when_chain_exists_and_waits_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # 这条用例验证的是低内存保护分支；普通模式应等待有限时间并使用普通提示。
+    monkeypatch.setenv("LOW_MEMORY", "true")
+    monkeypatch.setattr("app.services.snapshots.LOW_MEMORY_REFRESH_WAIT_SECONDS", 0.01)
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso())
     busy = HeavyWorkGate(1)
@@ -106,6 +127,21 @@ def test_busy_gate_defers_when_chain_exists_and_waits_when_missing(tmp_path: Pat
     assert fetched.get("deferred") is not True
     assert fetched["rows"] == 2
     assert empty.latest_chain("AAPL", "2026-12-18")["data"]
+
+
+def test_gamma_window_uses_normal_busy_message_when_low_memory_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """普通模式的并发让路不能伪装成内存不足。"""
+    monkeypatch.setenv("LOW_MEMORY", "false")
+    database = Database(tmp_path / "options.db")
+    gate = HeavyWorkGate(1)
+    assert gate.acquire(timeout=0)
+    try:
+        result = SnapshotService(database, FakeProvider(), heavy_gate=gate).refresh_window("AAPL", horizon_days=45)
+    finally:
+        gate.release()
+    assert result["deferred"] is True
+    assert "内存保护" not in result["warning"]
+    assert "Gamma 窗口" in result["warning"]
 
 
 def test_gamma_degrades_while_heavy_gate_is_held(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

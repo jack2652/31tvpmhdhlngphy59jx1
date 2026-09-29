@@ -318,9 +318,22 @@ body{font-size:14px}
 /* 期权流向单独使用一组低对比度层级：内容底略深、表格保持干净白底，避免整块白色挤在一起。 */
 :root{--flow-body:#0d1720;--flow-surface:#111d27;--flow-table:#101a24;--flow-table-head:#172632;--flow-row-alt:rgba(255,255,255,.028);--flow-border:#2b3d4c;--flow-summary:#14232e}
 :root[data-theme="light"]{--flow-body:#eef3f8;--flow-surface:#f8fafc;--flow-table:#ffffff;--flow-table-head:#eaf0f6;--flow-row-alt:#f6f9fc;--flow-border:#d3dee9;--flow-summary:#f4f8fb}
-.headline-grid{grid-template-columns:minmax(240px,2fr) repeat(3,minmax(0,1fr));align-items:stretch}
+.headline-grid{grid-template-columns:minmax(240px,1.8fr) repeat(5,minmax(0,1fr));align-items:stretch}
 .quote,.metric{min-width:0;min-height:126px}
-.metric strong{min-width:0;max-width:100%;overflow-wrap:anywhere;word-break:break-word;line-height:1.08}
+.quote-line{min-width:0}
+.quote-line span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.metric strong{min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.08}
+.fair-value-metric strong{font-size:clamp(18px,2vw,24px);letter-spacing:-.04em}
+.fair-value-metric span:last-child{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fair-defensive-metric strong{color:var(--blue)}
+.fair-optimistic-metric strong{color:var(--amber)}
+.headline-grid{grid-template-columns:minmax(240px,1.8fr) repeat(3,minmax(120px,.85fr)) repeat(2,minmax(220px,1.25fr))}
+.fair-value-metric strong{font-size:clamp(16px,1.65vw,22px);letter-spacing:-.05em}
+.fair-value-metric span:last-child{white-space:normal;line-height:1.3;min-height:28px}
+/* 顶部指标统一三行节奏：标题、数值、说明共用同一行高，避免模型字号较小时数值基线漂移。 */
+.metric{display:grid;grid-template-rows:auto 34px minmax(28px,auto);align-content:space-between;justify-content:initial}
+.metric strong{display:block;height:34px;line-height:34px;align-self:center}
+.metric>span:last-child{min-height:28px;line-height:1.3;align-self:end}
 .option-flow-group{margin-bottom:16px;overflow:hidden}
 .option-flow-fold[hidden]{display:none}
 .option-flow-fold{border-top:1px solid var(--line);background:var(--flow-body)}
@@ -365,11 +378,12 @@ body{font-size:14px}
 .flow-table-call .flow-table-direction strong{color:var(--up)}.flow-table-put .flow-table-direction strong{color:var(--down)}
 .flow-table-strike{font-variant-numeric:tabular-nums}.flow-table-strike strong{display:block;font-size:14px;line-height:1.25}.flow-table-call .flow-table-strike strong{color:var(--up)}.flow-table-put .flow-table-strike strong{color:var(--down)}.flow-table-strike small{display:block;margin-top:3px;color:var(--muted);font-size:10px;font-weight:400;line-height:1.2}
 .flow-direction-value{display:inline-flex;align-items:center;min-height:22px;padding:2px 7px;border-left:3px solid var(--muted);color:var(--muted);font-size:11px;font-weight:650;line-height:1.2}.flow-direction-buy{border-color:var(--up);color:var(--up)}.flow-direction-sell{border-color:var(--amber);color:var(--amber)}.flow-direction-unknown{border-color:var(--muted);color:var(--muted)}
+.flow-volume-buy{color:var(--up)}.flow-volume-sell{color:var(--down)}.flow-volume-unknown{color:var(--muted)}
 .flow-table-volume strong,.flow-table-share span{font-size:14px;font-variant-numeric:tabular-nums}.flow-table-share{text-align:center!important}.flow-table-share span{color:var(--muted);font-size:12px}
 .flow-table-number{display:flex;min-width:0;align-items:flex-start;flex-direction:column;gap:3px}.flow-table-number strong{font-size:17px;line-height:1.2;font-variant-numeric:tabular-nums}.flow-table-number small{color:var(--muted);font-size:10px;line-height:1.25;overflow-wrap:anywhere}.flow-table-net strong{color:var(--text)}
 .flow-method-note{padding:2px 0 0;color:var(--muted);font-size:11px;line-height:1.4}
 .flow-warning{padding-top:2px;color:var(--amber);font-size:11px;line-height:1.35}
-@media(max-width:1150px){.headline-grid{grid-template-columns:minmax(220px,1.7fr) repeat(3,minmax(120px,1fr))}}
+@media(max-width:1250px){.headline-grid{grid-template-columns:minmax(220px,1.5fr) repeat(3,minmax(105px,.8fr)) repeat(2,minmax(180px,1.1fr))}}
 @media(max-width:900px){.headline-grid{grid-template-columns:1fr 1fr}.quote{grid-column:1/-1}.flow-heading{gap:12px}}
 @media(max-width:900px){.flow-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.flow-summary-item:nth-child(2){border-right:0}.flow-summary-item:nth-child(-n+2){border-bottom:1px solid var(--row-line)}}
 @media(max-width:500px){.headline-grid{grid-template-columns:1fr}.quote{grid-column:auto}.option-flow-panel{padding:14px}.flow-heading{flex-direction:column}.flow-signal{align-items:flex-start;text-align:left}.flow-window{flex-direction:column;gap:3px}.flow-window span:last-child{text-align:left}.flow-summary-grid{grid-template-columns:1fr 1fr}.flow-summary-item{padding-inline:10px}.flow-summary-table,.flow-table{min-width:620px}.flow-summary-table th,.flow-summary-table td,.flow-table th,.flow-table td{padding:8px}.flow-table-number strong{font-size:16px}}
@@ -466,10 +480,10 @@ body{font-size:14px}
 .flow-direction-call>header{border-top:3px solid var(--flow-call)}.flow-direction-put>header{border-top:3px solid var(--flow-put)}
 .flow-direction-card>header div{display:flex;align-items:baseline;gap:9px}.flow-direction-card>header strong{font-size:15px;letter-spacing:.08em}.flow-direction-call>header strong{color:var(--flow-call)}.flow-direction-put>header strong{color:var(--flow-put)}.flow-direction-card>header span{color:var(--flow-label);font-size:11px}.flow-direction-card>header b{color:var(--flow-label);font-size:11px;font-weight:500}.flow-direction-card>header em{margin-left:4px;color:var(--text);font-size:14px;font-style:normal;font-variant-numeric:tabular-nums}
 .flow-direction-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-bottom:1px solid var(--flow-line)}.flow-direction-metrics>div{min-width:0;padding:11px 12px;border-right:1px solid var(--flow-line)}.flow-direction-metrics>div:last-child{border-right:0}.flow-direction-metrics span,.flow-direction-metrics small{display:block;color:var(--flow-label);font-size:10px;line-height:1.3}.flow-direction-metrics strong{display:block;margin:4px 0 2px;font-size:17px;font-variant-numeric:tabular-nums}.flow-direction-metrics small{overflow-wrap:anywhere}
-.flow-strikes-title{display:flex;justify-content:space-between;gap:8px;padding:9px 12px;color:var(--text);font-size:11px;font-weight:650;border-bottom:1px solid var(--flow-line)}.flow-strikes-title span{color:var(--flow-label);font-size:10px;font-weight:400}.flow-strikes-empty{padding:18px 12px;color:var(--flow-label);font-size:11px}.flow-strike-row{display:grid;grid-template-columns:minmax(120px,1fr) minmax(75px,.7fr) minmax(54px,.45fr) minmax(44px,.35fr);align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--flow-line)}.flow-strike-row:last-child{border-bottom:0}.flow-strike-row>div{min-width:0}.flow-strike-row strong{display:block;font-size:13px;font-variant-numeric:tabular-nums}.flow-direction-call .flow-strike-row strong{color:var(--flow-call)}.flow-direction-put .flow-strike-row strong{color:var(--flow-put)}.flow-strike-row small{display:block;margin-top:2px;color:var(--flow-label);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.flow-strike-row>b,.flow-strike-row>i{font-size:12px;font-style:normal;text-align:right;font-variant-numeric:tabular-nums}.flow-strike-row>i{color:var(--flow-label)}.flow-strike-row .flow-direction-value{justify-self:start;min-height:20px;padding:2px 6px;font-size:10px}
+.flow-strikes-title{display:flex;justify-content:space-between;gap:8px;padding:9px 12px;color:var(--text);font-size:11px;font-weight:650;border-bottom:1px solid var(--flow-line)}.flow-strikes-title span{color:var(--flow-label);font-size:10px;font-weight:400}.flow-strike-head,.flow-strike-row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));align-items:center;gap:0}.flow-strike-head{padding:7px 12px;color:var(--flow-label);font-size:10px;border-bottom:1px solid var(--flow-line);background:var(--flow-panel-alt)}.flow-strike-head>span:nth-child(n+2){text-align:center}.flow-strike-head>span:nth-child(3),.flow-strike-head>span:nth-child(4){text-align:right}.flow-strikes-empty{padding:18px 12px;color:var(--flow-label);font-size:11px}.flow-strike-row{padding:9px 12px;border-bottom:1px solid var(--flow-line)}.flow-strike-row:last-child{border-bottom:0}.flow-strike-row>div{min-width:0}.flow-strike-row strong{display:block;font-size:13px;font-variant-numeric:tabular-nums}.flow-direction-call .flow-strike-row strong{color:var(--flow-call)}.flow-direction-put .flow-strike-row strong{color:var(--flow-put)}.flow-strike-row small{display:block;margin-top:2px;color:var(--flow-label);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.flow-strike-row>b,.flow-strike-row>i{font-size:12px;font-style:normal;text-align:right;font-variant-numeric:tabular-nums}.flow-strike-row>i{color:var(--flow-label)}.flow-strike-row .flow-direction-value{justify-self:center;min-height:20px;padding:2px 6px;font-size:10px}
 .flow-method-note{padding:10px 2px 0;color:var(--flow-label);font-size:10px;line-height:1.4}.flow-warning{padding:8px 2px 0}
 @media(max-width:900px){.flow-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.flow-kpi-strip>div:nth-child(2){border-right:0}.flow-kpi-strip>div:nth-child(-n+2){border-bottom:1px solid var(--flow-line)}.flow-directions{grid-template-columns:1fr}}
-@media(max-width:500px){.option-flow-fold{padding-inline:10px}.flow-overview{align-items:flex-start;flex-direction:column;gap:10px}.flow-signal{align-items:flex-start}.flow-kpi-strip{grid-template-columns:1fr 1fr}.flow-kpi-strip>div{padding-inline:10px}.flow-strike-row{grid-template-columns:minmax(100px,1fr) minmax(68px,.7fr) minmax(48px,.45fr) minmax(40px,.35fr);gap:5px;padding-inline:8px}}
+@media(max-width:500px){.option-flow-fold{padding-inline:10px}.flow-overview{align-items:flex-start;flex-direction:column;gap:10px}.flow-signal{align-items:flex-start}.flow-kpi-strip{grid-template-columns:1fr 1fr}.flow-kpi-strip>div{padding-inline:10px}.flow-strike-head,.flow-strike-row{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;padding-inline:8px}.flow-strike-head{font-size:9px}.flow-strike-row strong{font-size:12px}.flow-strike-row small{font-size:9px}.flow-strike-row .flow-direction-value{padding-inline:3px;font-size:9px}}
 
 /* 流向折叠面板与其它 detail-group 保持同一外框和背景，内部看板样式不变。 */
 .option-flow-group{margin-bottom:16px;border:1px solid var(--line);background:var(--panel);overflow:hidden}
@@ -477,3 +491,25 @@ body{font-size:14px}
 .option-flow-group .detail-action{color:var(--blue)}
 .option-flow-fold{padding:0 18px 16px;border-top:1px solid var(--line);border-left:0;border-right:0;border-bottom:0;background:var(--panel)}
 @media(max-width:500px){.option-flow-group>.detail-header{padding-inline:14px}.option-flow-fold{padding-inline:10px}}
+
+/* 期权流向与买方结构合并为一个折叠面板；顶部按钮只切换分析视图。 */
+.option-analysis-group{margin-bottom:16px;overflow:hidden}
+.option-analysis-group>.detail-header{padding:12px 18px;background:var(--panel)}
+.option-analysis-tabs{margin-left:6px}
+.option-analysis-tabs .detail-seg{white-space:nowrap}
+.option-analysis-fold{padding:0;border-top:1px solid var(--line)}
+.option-analysis-fold>[data-option-view-panel][hidden]{display:none}
+.option-analysis-fold .option-flow-fold,.option-analysis-fold .buyer-structure-fold{border-top:0}
+/* 流向看板辅助文字提高可读性，保留紧凑布局但不再使用过小的 10px 字号。 */
+.option-analysis-fold .flow-kicker{font-size:12px}
+.option-analysis-fold .flow-overview p{font-size:13px;line-height:1.45}
+.option-analysis-fold .flow-signal strong{font-size:15px}
+.option-analysis-fold .flow-signal span{font-size:12px;line-height:1.45}
+.option-analysis-fold .flow-window{font-size:12px;line-height:1.45}
+.option-analysis-fold .flow-kpi-strip span,.option-analysis-fold .flow-kpi-strip small{font-size:11px}
+.option-analysis-fold .flow-direction-metrics span,.option-analysis-fold .flow-direction-metrics small{font-size:11px;line-height:1.4}
+.option-analysis-fold .flow-strikes-title{font-size:12px}
+.option-analysis-fold .flow-strikes-title span,.option-analysis-fold .flow-strike-row small{font-size:11px}
+.option-analysis-fold .flow-method-note,.option-analysis-fold .flow-warning{font-size:12px;line-height:1.5}
+@media(max-width:900px){.option-analysis-tabs{order:initial;width:auto;margin-left:0}.option-analysis-tabs .detail-segmented{max-width:100%;overflow:auto}.option-analysis-tabs .detail-seg{white-space:nowrap}}
+@media(max-width:500px){.option-analysis-group>.detail-header{padding-inline:14px}.option-analysis-tabs{width:100%;margin-left:32px}.option-analysis-tabs .detail-segmented{max-width:calc(100vw - 70px);overflow:auto}}

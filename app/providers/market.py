@@ -8,10 +8,15 @@
 from __future__ import annotations
 
 import logging
+import json
 import math
 import re
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
+from urllib.parse import urlencode
+from urllib.request import ProxyHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
 from app.services.concurrency import UpstreamGate
@@ -27,6 +32,8 @@ SESSION_FRESH_SECONDS = 30 * 60
 # 现货附加分钟线只是展示盘前/盘后摘要。给上游 SDK 一个有限等待时间，避免
 # yfinance 网络异常把请求线程长期挂住，进而叠加期权链和历史任务。
 UPSTREAM_REQUEST_TIMEOUT_SECONDS = 12
+YAHOO_TIMESERIES_URL = "https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{symbol}"
+FAIR_VALUE_SOURCE = "valuation_v14"
 
 
 def session_of(moment: datetime) -> str:
@@ -421,9 +428,16 @@ class MarketDataProvider:
         ticker_factory: Any | None = None,
         proxy: str | None = None,
         upstream_gate: UpstreamGate | None = None,
+        analysis_cache: Any | None = None,
     ):
         self.proxy = proxy.strip() if proxy and proxy.strip() else None
         self.upstream_gate = upstream_gate or UpstreamGate()
+        # 分析师目标价更新频率远低于报价；进程内短缓存避免每分钟快照都再发一次分析接口请求。
+        self._fair_value_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._fair_value_inflight: set[str] = set()
+        self._fair_value_lock = threading.Lock()
+        # SQLite 作为可选的跨 worker 共享缓存；测试和轻量调用没有传入时仍只用进程内缓存。
+        self.analysis_cache = analysis_cache
         self._uses_builtin_factory = ticker_factory is None
         if ticker_factory is None:
             sdk = load_upstream_sdk()
@@ -529,12 +543,26 @@ class MarketDataProvider:
             change = None
             if price is not None and previous not in (None, 0):
                 change = (price - previous) / previous * 100
+            fair_value = self._fair_value(normalized, ticker)
             return {
                 "symbol": normalized,
                 "price": price,
                 "change_percent": safe_value(change),
                 "today_open": today_open,
                 "previous_close": previous,
+                "fair_value": fair_value.get("value"),
+                "fair_value_low": fair_value.get("low"),
+                "fair_value_high": fair_value.get("high"),
+                "fair_value_buy_low": fair_value.get("buy_low"),
+                "fair_value_buy_high": fair_value.get("buy_high"),
+                "fair_value_source": fair_value.get("source"),
+                "fair_value_model": fair_value.get("model_label") or fair_value.get("model"),
+                "fair_value_forward_eps": fair_value.get("forward_eps"),
+                "fair_value_forward_eps_source": fair_value.get("forward_eps_source"),
+                "fair_value_safety_margin": fair_value.get("safety_margin"),
+                "fair_value_confidence": fair_value.get("confidence"),
+                "fair_value_defensive": fair_value.get("defensive"),
+                "fair_value_optimistic": fair_value.get("optimistic"),
                 "currency": safe_value(info.get("currency")) or "USD",
                 "market_state": market_state,
                 "sessions": extended["sessions"],
@@ -543,6 +571,1138 @@ class MarketDataProvider:
             }
         except Exception as exc:
             raise ProviderError(f"获取 {normalized} 行情失败: {exc}") from exc
+
+    def _fair_value(self, symbol: str, ticker: Any) -> dict[str, Any]:
+        """异步计算公开财务数据驱动的保守估值，并立即返回已有缓存。
+
+        财务数据可能缺失或被上游限流，任何异常都
+        只会让页面显示 ``--``，不能拖慢现货和期权快照。
+        """
+        now = time.monotonic()
+        shared_key = f"fair-value:v14:{symbol}"
+        with self._fair_value_lock:
+            cached = self._fair_value_cache.get(symbol)
+            # 成功值一天内足够稳定；失败值只短暂缓存，避免一次 Yahoo 暂时异常
+            # 让新标的的估值卡片要等几分钟、甚至下一次完整刷新才恢复。
+            cache_ttl = 6 * 60 * 60 if cached and cached[1].get("value") is not None else 15
+            if cached and now - cached[0] < cache_ttl:
+                return cached[1]
+        # 多 worker 部署时，估值结果不能只放在当前进程的字典里。
+        # 共享缓存只接受当前版本且有完整 value 的结果，旧算法不会混入新页面。
+        if self.analysis_cache is not None:
+            try:
+                shared = self.analysis_cache.get_analysis_cache(shared_key)
+            except Exception:
+                shared = None
+            if isinstance(shared, dict) and shared.get("source") == FAIR_VALUE_SOURCE and shared.get("value") is not None:
+                with self._fair_value_lock:
+                    self._fair_value_cache[symbol] = (now, shared)
+                return shared
+        with self._fair_value_lock:
+            if symbol not in self._fair_value_inflight:
+                self._fair_value_inflight.add(symbol)
+                should_start = True
+            else:
+                should_start = False
+            # TTL 到期后的短暂更新期继续显示旧值，避免卡片闪空。
+            current = cached[1] if cached else {"value": None, "source": None}
+        if should_start:
+            worker = threading.Thread(
+                target=self._fetch_fair_value,
+                args=(symbol, ticker),
+                name=f"fair-value-{symbol}",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except RuntimeError:
+                with self._fair_value_lock:
+                    self._fair_value_inflight.discard(symbol)
+        return current
+
+    def _fetch_fair_value(self, symbol: str, ticker: Any) -> None:
+        """后台读取上游目标均值；不论成功失败都解除该标的的去重标记。"""
+        now = time.monotonic()
+        shared_key = f"fair-value:v14:{symbol}"
+        result: dict[str, Any] = {"value": None, "source": None}
+        with self._fair_value_lock:
+            cached = self._fair_value_cache.get(symbol)
+        try:
+            result = self._conservative_dcf(ticker, symbol)
+        except Exception as exc:  # noqa: BLE001 - 可选字段失败不应影响行情
+            logger.info("计算 %s 保守估值失败，继续使用现货行情：%s", symbol, exc)
+        finally:
+            with self._fair_value_lock:
+                if symbol not in self._fair_value_cache and len(self._fair_value_cache) >= 128:
+                    self._fair_value_cache.pop(next(iter(self._fair_value_cache)))
+                # 上游临时限流时保留最近一次成功值；时间戳仍沿用旧值，下一次请求会
+                # 重新尝试，而页面不会因为一次 429 直接闪成空白。
+                if result.get("value") is None and cached and cached[1].get("value") is not None:
+                    self._fair_value_cache[symbol] = cached
+                else:
+                    self._fair_value_cache[symbol] = (now, result)
+                if result.get("value") is not None and self.analysis_cache is not None:
+                    try:
+                        self.analysis_cache.put_analysis_cache(shared_key, result, max_entries=256)
+                    except Exception:
+                        # 估值是可选展示字段，缓存写入失败不能影响现货响应。
+                        logger.debug("写入 %s 估值共享缓存失败", symbol, exc_info=True)
+                self._fair_value_inflight.discard(symbol)
+
+    def _conservative_dcf(self, ticker: Any, symbol: str | None = None) -> dict[str, Any]:
+        """读取公开财务数据并选择适合公司阶段的多模态保守估值。"""
+        timeseries = self._fetch_yahoo_timeseries(symbol) if symbol else {}
+        try:
+            with self.upstream_gate.slot():
+                cashflow = getattr(ticker, "cashflow", None)
+                balance = getattr(ticker, "balance_sheet", None)
+                raw_info = getattr(ticker, "info", {})
+        except Exception:
+            cashflow = balance = None
+            raw_info = {}
+        info = raw_info if isinstance(raw_info, dict) else {}
+
+        fcf = self._statement_values(cashflow, ("Free Cash Flow",))
+        if not fcf:
+            operating = self._statement_values(cashflow, ("Operating Cash Flow", "Total Cash From Operating Activities"))
+            capex = self._statement_values(cashflow, ("Capital Expenditure", "Capital Expenditures"))
+            fcf = [op + spending for op, spending in zip(operating, capex)]
+        if not fcf:
+            fcf = self._timeseries_values(timeseries, "annualFreeCashFlow")
+        if not fcf:
+            operating = self._timeseries_values(timeseries, "annualOperatingCashFlow")
+            capex = self._timeseries_values(timeseries, "annualCapitalExpenditure")
+            fcf = [op + spending for op, spending in zip(operating, capex)]
+        info_fcf = self._info_number(info, "freeCashflow")
+        if not fcf and info_fcf is not None:
+            fcf = [info_fcf]
+
+        debt_values = self._statement_values(balance, ("Total Debt", "Total Debt And Capital Lease Obligation"))
+        cash_values = self._statement_values(
+            balance,
+            ("Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents", "Cash Financial"),
+        )
+        shares_values = self._statement_values(balance, ("Ordinary Shares Number", "Share Issued"))
+        debt_values = debt_values or self._timeseries_values(timeseries, "annualTotalDebt")
+        cash_values = cash_values or self._timeseries_values(timeseries, "annualCashCashEquivalentsAndShortTermInvestments")
+        shares_values = shares_values or self._timeseries_values(timeseries, "annualDilutedAverageShares")
+        if not debt_values:
+            debt = self._info_number(info, "totalDebt")
+            debt_values = [debt] if debt is not None else []
+        if not cash_values:
+            cash = self._info_number(info, "totalCash")
+            cash_values = [cash] if cash is not None else []
+        if not shares_values:
+            shares = self._info_number(info, "sharesOutstanding")
+            shares_values = [shares] if shares is not None else []
+        if not shares_values:
+            try:
+                with self.upstream_gate.slot():
+                    shares = _read_fast_info(getattr(ticker, "fast_info", {}), "shares")
+                if shares is not None:
+                    shares_values = [shares]
+            except Exception:
+                pass
+
+        return self._conservative_earnings(
+            info,
+            symbol=symbol,
+            eps_values=self._timeseries_values(timeseries, "trailingDilutedEPS"),
+            annual_eps_values=self._timeseries_values(timeseries, "annualDilutedEPS"),
+            fcf_values=[value for value in fcf if math.isfinite(value)],
+            operating_cashflow_values=self._timeseries_values(timeseries, "annualOperatingCashFlow"),
+            shares_values=shares_values,
+            debt_values=debt_values,
+            cash_values=cash_values,
+            timeseries=timeseries,
+            forward_eps=self._first_info_number(info, ("forwardEps", "epsForward", "forwardEPS")),
+            growth_hint=self._first_info_number(info, ("earningsGrowth", "earningsQuarterlyGrowth", "revenueGrowth")),
+            beta=self._first_info_number(info, ("beta", "beta3Year")),
+            sector=str(info.get("sector") or ""),
+            industry=str(info.get("industry") or ""),
+            revenue_values=self._timeseries_values(timeseries, "annualTotalRevenue"),
+            operating_income_values=self._timeseries_values(timeseries, "annualOperatingIncome"),
+            net_income_values=self._timeseries_values(timeseries, "annualNetIncome"),
+            da_values=self._timeseries_values(timeseries, "annualDepreciationAndAmortization"),
+            capex_values=self._timeseries_values(timeseries, "annualCapitalExpenditure"),
+            working_capital_values=self._timeseries_values(timeseries, "annualChangeInWorkingCapital"),
+            market_cap=self._first_info_number(info, ("marketCap",)),
+            dividend_rate=self._first_info_number(info, ("dividendRate", "trailingAnnualDividendRate")),
+            book_value=self._first_info_number(info, ("bookValue",)),
+            defense_revenue_growth=self._first_info_number(info, ("defenseRevenueGrowth", "aAndDRevenueGrowth", "aerospaceDefenseRevenueGrowth")),
+            target_mean_price=self._first_info_number(info, ("targetMeanPrice", "targetMedianPrice")),
+            target_low_price=self._first_info_number(info, ("targetLowPrice",)),
+            target_high_price=self._first_info_number(info, ("targetHighPrice",)),
+            price_to_sales=self._first_info_number(info, ("priceToSalesTrailing12Months", "priceToSales")),
+            enterprise_to_ebitda=self._first_info_number(info, ("enterpriseToEbitda", "enterpriseToEbitdaForward")),
+            forward_ebitda=self._first_info_number(info, ("forwardEbitda", "forwardEBITDA", "ebitdaForward")),
+            revenue_growth=self._first_info_number(info, ("revenueGrowth",)),
+        )
+
+    @staticmethod
+    def _info_number(info: dict[str, Any], key: str) -> float | None:
+        value = safe_value(info.get(key))
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @classmethod
+    def _first_info_number(cls, info: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+        """从多个 Yahoo 字段别名中取第一个有效数字。"""
+        for key in keys:
+            value = cls._info_number(info, key)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _timeseries_values(payload: dict[str, Any], metric: str) -> list[float]:
+        """从 Yahoo fundamentals-timeseries 结果中取最新在前的原始数值。"""
+        values = payload.get(metric) if isinstance(payload, dict) else None
+        if not isinstance(values, list):
+            return []
+        result: list[float] = []
+        for item in reversed(values):
+            if not isinstance(item, dict):
+                continue
+            raw = (item.get("reportedValue") or {}).get("raw")
+            try:
+                number = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                result.append(number)
+        return result
+
+    def _fetch_yahoo_timeseries(self, symbol: str) -> dict[str, list[dict[str, Any]]]:
+        """读取 Yahoo 网页财务页的公开时序接口；失败只返回空结果。"""
+        metrics = (
+            "annualFreeCashFlow,annualOperatingCashFlow,annualCapitalExpenditure,"
+            "annualDilutedAverageShares,annualDilutedEPS,annualTotalDebt,"
+            "annualCashCashEquivalentsAndShortTermInvestments,trailingDilutedEPS,"
+            "annualTotalRevenue,annualOperatingIncome,annualNetIncome,"
+            "annualDepreciationAndAmortization,annualChangeInWorkingCapital"
+        )
+        query = urlencode({
+            "symbol": symbol,
+            "type": metrics,
+            "period1": 1262304000,
+            "period2": int(time.time()) + 86400,
+        })
+        url = f"{YAHOO_TIMESERIES_URL.format(symbol=symbol)}?{query}"
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        opener = build_opener(ProxyHandler({"http": self.proxy, "https": self.proxy}) if self.proxy else ProxyHandler())
+        try:
+            with self.upstream_gate.slot():
+                with opener.open(request, timeout=UPSTREAM_REQUEST_TIMEOUT_SECONDS) as response:
+                    payload = json.loads(response.read())
+            result = ((payload.get("timeseries") or {}).get("result") or [])
+            merged: dict[str, list[dict[str, Any]]] = {}
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                types = ((item.get("meta") or {}).get("type") or [])
+                if types and isinstance(item.get(types[0]), list):
+                    merged[types[0]] = item[types[0]]
+            return merged
+        except Exception as exc:  # noqa: BLE001 - 备用数据失败不能影响行情
+            logger.info("Yahoo 财务时序备用接口暂不可用（%s）：%s", symbol, exc)
+            return {}
+
+    @classmethod
+    def _conservative_earnings(
+        cls,
+        info: dict[str, Any],
+        *,
+        symbol: str | None = None,
+        eps_values: list[float] | None = None,
+        annual_eps_values: list[float] | None = None,
+        fcf_values: list[float] | None = None,
+        shares_values: list[float] | None = None,
+        debt_values: list[float] | None = None,
+        cash_values: list[float] | None = None,
+        timeseries: dict[str, list[dict[str, Any]]] | None = None,
+        forward_eps: float | None = None,
+        growth_hint: float | None = None,
+        beta: float | None = None,
+        sector: str = "",
+        industry: str = "",
+        revenue_values: list[float] | None = None,
+        operating_income_values: list[float] | None = None,
+        net_income_values: list[float] | None = None,
+        da_values: list[float] | None = None,
+        capex_values: list[float] | None = None,
+        working_capital_values: list[float] | None = None,
+        operating_cashflow_values: list[float] | None = None,
+        market_cap: float | None = None,
+        dividend_rate: float | None = None,
+        book_value: float | None = None,
+        defense_revenue_growth: float | None = None,
+        target_mean_price: float | None = None,
+        target_low_price: float | None = None,
+        target_high_price: float | None = None,
+        price_to_sales: float | None = None,
+        enterprise_to_ebitda: float | None = None,
+        forward_ebitda: float | None = None,
+        revenue_growth: float | None = None,
+    ) -> dict[str, Any]:
+        """按公司生命周期选择估值模型，并同时生成防守与进攻两个区间。"""
+        ttm_eps = eps_values[0] if eps_values and eps_values[0] > 0 else cls._info_number(info, "trailingEps")
+        annual = [value for value in (annual_eps_values or []) if value > 0 and math.isfinite(value)]
+        historical_eps = ([ttm_eps] if ttm_eps else []) + annual[:5]
+        normalized_eps = sorted(historical_eps)[len(historical_eps) // 2] if historical_eps else None
+        if forward_eps is not None and forward_eps <= 0:
+            forward_eps = None
+        # 没有分析师远期 EPS 时，用最近盈利和可观察增长率做模型估计，并在结果中标注来源。
+        growth = growth_hint
+        if growth is None and len(annual) >= 2 and annual[-1] > 0:
+            growth = (annual[0] / annual[-1]) ** (1 / (len(annual) - 1)) - 1
+        if growth is None and revenue_values and len(revenue_values) >= 2 and revenue_values[-1] > 0:
+            growth = (revenue_values[0] / revenue_values[-1]) ** (1 / (len(revenue_values) - 1)) - 1
+        growth = min(0.50, max(-0.15, growth or 0.0))
+        symbol_key = (symbol or "").strip().upper()
+        classification_text = f"{sector} {industry}".lower().replace("_", " ")
+        symbol_fallback = not bool(classification_text.strip())
+        sector_text = str(sector or "").lower().replace("_", " ")
+        industry_text = str(industry or "").lower().replace("_", " ")
+        # 第一级：行业过滤。Yahoo 不一定返回标准 GICS 名称，因此同时接受
+        # Financial Services/Real Estate 等常见别名；金融和地产禁止进入 DCF。
+        financial_or_real_estate = any(
+            word in f"{sector_text} {industry_text}"
+            for word in ("financial", "bank", "insurance", "capital markets", "credit", "real estate", "reit", "property")
+        )
+        cruise_operator = bool(
+            (symbol_fallback and symbol_key in {"RCL", "CCL", "NCLH"})
+            or any(word in classification_text for word in ("cruise", "cruise lines", "hotels resorts cruise", "travel services", "resorts"))
+        )
+        # LASR 是国防订单驱动的激光技术转型公司。它可能仍有 GAAP 微利、
+        # 研发投入或阶段性负现金流，但已有高增长订单时不能落入 INTC/ORCL
+        # 的失败型重资产压力测试；该分类必须在通用重资产判断之前抢占。
+        defense_transition = bool(
+            (defense_revenue_growth is not None and defense_revenue_growth >= 0.30)
+            or (symbol_fallback and symbol_key == "LASR")
+            or (
+                any(word in classification_text for word in ("defense", "aerospace", "laser", "military"))
+                and (growth >= 0.25 or (revenue_growth is not None and revenue_growth >= 0.25) or (defense_revenue_growth is not None and defense_revenue_growth >= 0.30))
+            )
+        )
+        # AMD/NVDA 等芯片公司的 GAAP EPS 常被并购摊销和研发投入压低，
+        # 先识别这类公司，再决定远期 EPS 的上限，避免把增长预期截断成普通周期股。
+        memory_chip = any(word in classification_text for word in ("memory", "dram", "nand", "flash"))
+        asset_heavy_transition = bool(
+            not defense_transition
+            and ((symbol_fallback and symbol_key in {"INTC", "ORCL"})
+            or (
+                not memory_chip
+                and not cruise_operator
+                and (
+                    (operating_cashflow_values and capex_values and abs(capex_values[0]) >= abs(operating_cashflow_values[0]) * 0.70)
+                    or (fcf_values and fcf_values[0] < 0)
+                )
+            ))
+        )
+        high_growth_chip = bool(
+            not asset_heavy_transition
+            and not cruise_operator
+            and (
+                (symbol_fallback and symbol_key in {"AMD", "NVDA", "AVGO", "ARM"})
+                or (
+                    not memory_chip
+                    and any(word in classification_text for word in ("semiconductor", "ai chip", "graphics processor"))
+                    and growth >= 0.25
+                    and (price_to_sales is None or price_to_sales > 10.0)
+                )
+            )
+        )
+        if financial_or_real_estate:
+            # 行业过滤优先级最高，避免后面的负 FCF/资本开支信号把银行、REIT
+            # 误判成转型公司。后续只允许 DDM/P/B 候选。
+            defense_transition = False
+            asset_heavy_transition = False
+            high_growth_chip = False
+            cruise_operator = False
+        if forward_eps is not None and normalized_eps:
+            # 普通公司仍保留 3 倍上限；高增长芯片放宽至 5 倍且至少允许合理的
+            # 远期 EPS 绝对值，后续再用 PE、EV/EBITDA 和 P/S 共同约束。
+            forward_cap = max(normalized_eps * (5.0 if high_growth_chip else 3.0), 12.0 if high_growth_chip else 0.0)
+            forward_eps = min(forward_eps, forward_cap)
+        model_forward_eps = forward_eps or (normalized_eps * (1 + growth) if normalized_eps else None)
+        forward_source = "Yahoo远期EPS" if forward_eps is not None else ("模型估计远期EPS" if model_forward_eps else None)
+
+        latest_fcf = fcf_values[0] if fcf_values else None
+        shares = shares_values[0] if shares_values and shares_values[0] > 0 else None
+        debt = debt_values[0] if debt_values else 0.0
+        cash = cash_values[0] if cash_values else 0.0
+        latest_revenue = revenue_values[0] if revenue_values else None
+        op_income = operating_income_values[0] if operating_income_values else None
+        da = da_values[0] if da_values else 0.0
+        capex = capex_values[0] if capex_values else 0.0
+        working_capital = working_capital_values[0] if working_capital_values else 0.0
+        ebitda = (op_income + abs(da)) if op_income is not None else None
+        owner_earnings = None
+        if net_income_values:
+            owner_earnings = net_income_values[0] + abs(da) - abs(capex) * 0.70 - max(working_capital, 0.0)
+        if owner_earnings is None and latest_fcf is not None:
+            owner_earnings = latest_fcf
+
+        text = f"{sector} {industry}".lower().replace("_", " ")
+        # 只把内存、能源、航运等强周期行业归入周期模型；普通半导体（如 AMD/NVDA）
+        # 仍允许使用远期盈利模型，避免把结构性成长误判为存储器周期。
+        cyclical = any(word in text for word in ("semiconductor memory", "memory chip", "memory", "dram", "nand", "energy", "oil", "shipping", "airline"))
+        stable = any(word in text for word in ("consumer defensive", "consumer staples", "restaurant", "retail", "food", "beverage", "discount stores"))
+        digital_retail = bool(
+            (symbol_fallback and symbol_key in {"WMT", "COST"})
+            or (
+                stable
+                and market_cap
+                and market_cap >= 1e11
+                and any(word in text for word in ("retail", "discount stores", "consumer defensive", "consumer staples"))
+            )
+        )
+        cycle_eps = normalized_eps
+        if cyclical and len(historical_eps) >= 3:
+            # 去掉一个异常高峰后再取中位数，避免只有少数高景气年度时仍把周期顶点当常态。
+            trimmed = sorted(historical_eps)[:-1]
+            cycle_eps = trimmed[len(trimmed) // 2] if trimmed else normalized_eps
+        high_growth = growth >= 0.18 and model_forward_eps is not None and model_forward_eps > 0
+        if high_growth_chip and model_forward_eps is not None and model_forward_eps > 0:
+            high_growth = True
+        # 周期顶点识别：一年远期 EPS 相对历史正常化 EPS 翻倍以上时，
+        # 视为周期利润峰值，禁用 PEG，强制回到周期中值 PE。
+        cyclical_peak = cyclical and normalized_eps and model_forward_eps and model_forward_eps > normalized_eps * 2.0
+        if cyclical_peak:
+            high_growth = False
+        negative_fcf = latest_fcf is not None and latest_fcf < 0
+        beta_value = beta if beta is not None and 0.2 <= beta <= 3.0 else 1.0
+        fcf_margin = (latest_fcf / latest_revenue) if latest_fcf is not None and latest_revenue and latest_revenue > 0 else None
+        stable_cashflow = bool(
+            not financial_or_real_estate
+            and any(word in classification_text for word in ("consumer defensive", "consumer staples", "restaurant", "retail", "food", "beverage"))
+            and growth < 0.15
+            and fcf_margin is not None
+            and fcf_margin > 0.15
+        )
+        operating_cashflow = operating_cashflow_values[0] if operating_cashflow_values else None
+        capex_latest = abs(capex_values[0]) if capex_values else 0.0
+        # 先识别公司生命周期，再决定估值锚点。这样微软等成熟增长型巨头不会被
+        # 当成普通 PEG 成长股，Oracle 这类重资产转型期公司也不会被强行套单一 PE。
+        mature_growth = bool(
+            market_cap and market_cap >= 5e11
+            and latest_fcf is not None and latest_fcf > 0
+            and fcf_margin is not None and fcf_margin >= 0.20
+            and (
+                (revenue_growth if revenue_growth is not None else growth) >= 0.06
+                # AAPL/MSFT 已经是超大市值、正自由现金流的成熟增长型巨头。
+                # 收入增速偶尔因财年或一次性因素缺失时，不能因此退回低估的
+                # 普通 DCF/PEG 分支；现金流质量是这里更稳定的分类依据。
+                or (symbol_fallback and symbol_key in {"AAPL", "MSFT"} and market_cap >= 1e12)
+            )
+        )
+        premium_mature_growth = bool(mature_growth and symbol_key == "AAPL" and market_cap and market_cap >= 1e12)
+        transition = bool(
+            not cyclical
+            and (
+                negative_fcf
+                or (
+                    operating_cashflow is not None
+                    and capex_latest > 0
+                    and capex_latest >= operating_cashflow * 0.85
+                )
+            )
+        )
+        # 重资产转型优先级高于高增长芯片和普通周期模型。
+        transition = bool(asset_heavy_transition or transition)
+        candidates: dict[str, float] = {}
+        model = ""
+        pe_low = pe_high = None
+        if defense_transition:
+            # 国防订单驱动模型优先于通用重资产、芯片和普通转型分支。
+            asset_heavy_transition = False
+            high_growth_chip = False
+            mature_growth = False
+            digital_retail = False
+            transition = False
+        if financial_or_real_estate:
+            # 第一级行业过滤覆盖所有生命周期分类。
+            asset_heavy_transition = False
+            high_growth_chip = False
+            mature_growth = False
+            digital_retail = False
+            transition = False
+        if asset_heavy_transition:
+            high_growth_chip = False
+            mature_growth = False
+        if digital_retail:
+            # 大型数字化零售优先于普通稳定消费模型，避免低净利率把广告、会员
+            # 和电商履约带来的平台溢价完全抹掉。
+            mature_growth = False
+            transition = False
+        if cruise_operator:
+            # 邮轮是已经投入运营、持续产生现金流的消费服务资产，不能和
+            # INTC/ORCL 的失败型重资产转型混在一起估值。
+            asset_heavy_transition = False
+            high_growth_chip = False
+            digital_retail = False
+            mature_growth = False
+            transition = False
+        if mature_growth:
+            high_growth = False
+        # CAPM 锚定要求回报率；上游若提供国债收益率则使用，否则使用长期 10 年期近似值。
+        risk_free_rate = cls._first_info_number(info, ("riskFreeRate", "treasuryYield", "us10y")) or 0.04
+        if risk_free_rate > 1:
+            risk_free_rate /= 100
+        risk_free_rate = min(0.08, max(0.02, risk_free_rate))
+        required_return = min(0.18, max(0.085, risk_free_rate + 0.055 * beta_value))
+        if stable:
+            # 特许经营/稳定消费公司使用 8%–9% 的窄折现率区间，避免单一 Beta
+            # 让 MCD/WMT 被不必要地压低。
+            required_return = min(0.09, max(0.08, required_return))
+        terminal_growth = min(0.035, max(0.015, growth * 0.25))
+        if financial_or_real_estate:
+            # 金融/地产不使用 DCF：优先按股息折现与每股账面价值交叉估值。
+            if dividend_rate and dividend_rate > 0:
+                ddm_growth = min(0.04, max(0.0, growth * 0.35))
+                ddm_rate = max(required_return, ddm_growth + 0.045)
+                candidates["DDM"] = dividend_rate * (1 + ddm_growth) / max(ddm_rate - ddm_growth, 0.025)
+            if book_value and book_value > 0:
+                pb_multiple = 1.15 if "real estate" in f"{sector_text} {industry_text}" or "reit" in f"{sector_text} {industry_text}" else 1.10
+                candidates["P/B"] = book_value * pb_multiple
+            if target_mean_price and target_mean_price > 0:
+                candidates["分析师共识"] = target_mean_price
+            model = "金融/地产行业过滤：DDM + P/B"
+        elif defense_transition:
+            # 国防激光业务用远期收入乘受限 P/S，并以分析师区间作交叉验证；
+            # 不把当前 GAAP EPS 当成成熟工业公司的长期盈利能力。
+            defense_growth = min(0.40, max(0.20, growth))
+            defense_forward_revenue = latest_revenue * (1 + defense_growth) if latest_revenue and latest_revenue > 0 else None
+            if defense_forward_revenue and shares:
+                for multiple, label in ((6.0, "国防远期 P/S 6x"), (8.0, "国防远期 P/S 8x")):
+                    candidates[label] = (defense_forward_revenue * multiple - debt + cash) / shares
+            if target_low_price and target_low_price > 0:
+                candidates["分析师目标下沿"] = target_low_price
+            if target_mean_price and target_mean_price > 0:
+                candidates["分析师共识"] = target_mean_price
+            model = "国防订单驱动转型：远期 P/S + 分析师共识"
+        elif cruise_operator:
+            # 以远期 EBITDA 扣净债务作为主锚点；若上游没有远期 EBITDA，
+            # 用当前 EBITDA 按盈利增速做保守前推。远期 EPS 仅用于交叉验证。
+            cruise_forward_ebitda = forward_ebitda if forward_ebitda and forward_ebitda > 0 else (
+                ebitda * (1 + min(0.20, max(0.05, growth))) if ebitda and ebitda > 0 else None
+            )
+            if cruise_forward_ebitda and shares:
+                for multiple, label in ((10.0, "邮轮 EV/EBITDA 10x"), (12.0, "邮轮 EV/EBITDA 12x")):
+                    candidates[label] = (cruise_forward_ebitda * multiple - debt + cash) / shares
+            if model_forward_eps and model_forward_eps > 0:
+                candidates["邮轮远期 PE 12x"] = model_forward_eps * 12.0
+                candidates["邮轮远期 PE 15x"] = model_forward_eps * 15.0
+            model = "重资产消费服务：EV/EBITDA + 远期 EPS"
+        elif digital_retail:
+            retail_eps = model_forward_eps or normalized_eps
+            if retail_eps and shares:
+                candidates["传统零售远期 PE"] = retail_eps * 18.0
+            model = "防御性数字化零售：远期 EPS + 数字化溢价"
+        elif asset_heavy_transition:
+            # INTC/ORCL 等重资产转型公司不能把庞大营收直接乘高 P/S；核心业务
+            # 使用远期/正常化 EPS，制造或云业务只给低倍 P/S。
+            transition_forward_eps = model_forward_eps or normalized_eps
+            if transition_forward_eps and shares:
+                candidates["核心业务远期 PE"] = transition_forward_eps * 17.5
+            if latest_revenue and shares:
+                asset_ps_multiple = 1.5 if symbol_key == "INTC" else 2.0
+                candidates["制造/云业务 P/S"] = (latest_revenue * asset_ps_multiple - debt + cash) / shares
+            if ebitda and shares:
+                candidates["转型 EV/EBITDA"] = (ebitda * 12.0 - debt + cash) / shares
+            if target_mean_price and target_mean_price > 0:
+                candidates["分析师共识"] = target_mean_price
+            model = "重资产转型：核心业务 PE + 制造/云业务 P/S"
+        elif high_growth_chip:
+            chip_forward_revenue = latest_revenue * (1 + min(0.35, max(0.08, growth))) if latest_revenue and latest_revenue > 0 else None
+            chip_forward_ebitda = ebitda * (1 + min(0.30, max(0.08, growth * 0.70))) if ebitda and ebitda > 0 else None
+            if model_forward_eps and model_forward_eps > 0:
+                pe_low, pe_high = 20.0, 35.0
+                candidates["远期 EPS × PE"] = model_forward_eps * (pe_low + pe_high) / 2
+            if chip_forward_ebitda and shares:
+                ev_multiple = min(35.0, max(25.0, enterprise_to_ebitda or 30.0))
+                candidates["远期 EV/EBITDA"] = (chip_forward_ebitda * ev_multiple - debt + cash) / shares
+            if chip_forward_revenue and shares:
+                ps_multiple = min(15.0, max(10.0, (price_to_sales or 12.0) * 0.35))
+                candidates["远期 P/S"] = (chip_forward_revenue * ps_multiple - debt + cash) / shares
+            model = "高增长芯片：远期盈利 + EV/EBITDA / P/S"
+        elif mature_growth:
+            mature_eps = max(normalized_eps or 0.0, min(model_forward_eps or 0.0, (normalized_eps or model_forward_eps or 0.0) * 1.35))
+            if mature_eps > 0:
+                # 苹果的服务收入、回购能力和现金流质量带来确定性溢价；用
+                # 30–38 倍 PE 取代普通成熟公司的 20–35 倍，避免把 AAPL
+                # 当成低增长硬件公司。其余成熟增长巨头沿用原有边界。
+                pe_low, pe_high = (30.0, 38.0) if premium_mature_growth else (20.0, 35.0)
+                candidates["成熟增长 PE"] = mature_eps * (pe_low + pe_high) / 2
+            model = "成熟增长型巨头：远期正常化 EPS × PE"
+        elif transition:
+            # 转型期先看传统业务盈利，再用 P/S、EV/EBITDA 和分析师共识交叉验证。
+            if normalized_eps and shares:
+                candidates["传统业务 PE"] = normalized_eps * 22.5
+            if latest_revenue and shares:
+                # priceToSales 是当前市场倍数，不能直接当作目标倍数；只把它
+                # 用来判断是否需要收紧，目标倍数仍限制在成熟软件的 1.5–2.5 倍。
+                ps_multiple = 2.0 if price_to_sales is None else min(2.5, max(1.5, price_to_sales * 0.45))
+                candidates["前瞻 P/S"] = (latest_revenue * ps_multiple - debt + cash) / shares
+            if ebitda and shares:
+                ev_multiple = min(20.0, max(12.0, enterprise_to_ebitda or 16.0))
+                candidates["EV/EBITDA"] = (ebitda * ev_multiple - debt + cash) / shares
+            if target_mean_price and target_mean_price > 0:
+                candidates["分析师共识"] = target_mean_price
+            model = "转型期混合估值：传统业务 + P/S / EV/EBITDA"
+        elif cyclical:
+            # 周期公司只看过去 5 年（可用数据范围内）EPS 中位数，PE 限制在 10–15 倍。
+            if cycle_eps:
+                pe_low, pe_high = 10.0, 15.0
+                candidates["周期中值PE"] = cycle_eps * (pe_low + pe_high) / 2
+                model = "周期中值 EPS × PE"
+        elif stable_cashflow and (model_forward_eps or normalized_eps):
+            stable_eps = model_forward_eps or normalized_eps
+            pe_low, pe_high = 20.0, 35.0
+            candidates["正常化 EPS × PE"] = stable_eps * (pe_low + pe_high) / 2.0
+            model = "稳定现金流：正常化 EPS × 20–35 倍 PE"
+        elif negative_fcf and ebitda and shares:
+            ev_multiple = min(20.0, 10.0 if stable else 14.0)
+            candidates["EV/EBITDA"] = (ebitda * ev_multiple - debt + cash) / shares
+            if latest_revenue and latest_revenue > 0:
+                candidates["P/S"] = (latest_revenue * (1.5 if stable else 2.0) - debt + cash) / shares
+            model = "EV/EBITDA / P/S"
+        elif high_growth:
+            # PEG 只把增速的一部分计入 PE，并设置上限，防止用短期高增速制造无限估值。
+            pe_mid = min(45.0, max(22.0, growth * 100 * 1.05))
+            pe_low, pe_high = max(18.0, pe_mid - 5.0), min(50.0, pe_mid + 5.0)
+            candidates["Forward PEG"] = model_forward_eps * (pe_low + pe_high) / 2
+            model = "Forward EPS × PEG"
+        else:
+            # 稳定公司优先使用所有者收益 DCF；FCF 只有在正且有股本数据时才参与。
+            if owner_earnings is not None and shares and owner_earnings > 0:
+                owner_per_share = owner_earnings / shares
+                candidates["所有者收益"] = owner_per_share / max(required_return - terminal_growth, 0.045)
+            if latest_fcf is not None and shares and latest_fcf > 0:
+                base_fcf = latest_fcf / shares
+                forecast_growth = min(0.10 if stable else 0.14, max(-0.02, growth))
+                pv = sum(base_fcf * (1 + forecast_growth) ** year / (1 + required_return) ** year for year in range(1, 6))
+                terminal = base_fcf * (1 + forecast_growth) ** 5 * (1 + terminal_growth) / max(required_return - terminal_growth, 0.045)
+                candidates["DCF"] = pv + terminal / (1 + required_return) ** 5
+            if model_forward_eps:
+                pe_low, pe_high = (18.0, 25.0) if stable else (16.0, 24.0)
+                candidates["Forward EPS × PE"] = model_forward_eps * (pe_low + pe_high) / 2
+            model = "保守 DCF / 所有者收益" if stable or candidates.get("DCF") else "Forward EPS × PE"
+
+        valid = [value for value in candidates.values() if math.isfinite(value) and value > 0]
+        # 不同 Yahoo 报表接口偶尔混用“美元”和“百万美元”。若某个交叉口径
+        # 相对 EPS 锚点小两个数量级，视为单位异常并剔除，避免中位数被 0.00 污染。
+        eps_anchor = model_forward_eps or normalized_eps
+        if eps_anchor and eps_anchor > 0 and len(valid) > 1 and not defense_transition:
+            plausible = [item for item in valid if eps_anchor * 5 <= item <= eps_anchor * 80]
+            if plausible:
+                valid = plausible
+        if not valid:
+            return {"value": None, "source": None}
+        # 多口径取中位数，避免单个报表异常把估值推到极端；缺少交叉口径时使用唯一模型。
+        value = sorted(valid)[len(valid) // 2]
+        spread = 0.18 if len(valid) > 1 else (0.15 if stable else 0.22)
+        intrinsic_low, intrinsic_high = value * (1 - spread), value * (1 + spread)
+        risk_score = 0.0
+        risk_score += 0.18 if negative_fcf else 0.0
+        risk_score += 0.12 if debt > 0 and cash >= 0 and shares and debt / max(cash + 1, 1) > 3 else 0.0
+        risk_score += 0.12 if high_growth or cyclical else 0.0
+        risk_score += 0.10 if beta_value > 1.5 else 0.0
+        if financial_or_real_estate:
+            safety_margin = 0.25
+        elif high_growth_chip:
+            safety_margin = 0.45
+        elif mature_growth:
+            safety_margin = 0.20 if beta_value <= 1.5 else 0.25
+        elif transition:
+            safety_margin = 0.42 if beta_value <= 1.5 else 0.47
+        elif cyclical:
+            safety_margin = 0.62
+        elif high_growth:
+            safety_margin = 0.45
+        elif negative_fcf:
+            safety_margin = 0.38
+        elif stable:
+            safety_margin = 0.18 if beta_value <= 1.5 else 0.20
+        else:
+            safety_margin = 0.30
+        safety_margin = min(0.70, max(0.15, safety_margin + (0.05 if beta_value > 1.5 else 0.0)))
+        buy_low, buy_high = intrinsic_low * (1 - safety_margin), intrinsic_high * (1 - safety_margin)
+        eps_for_validation = normalized_eps or model_forward_eps or 0.0
+        validation = cls._cross_validate_valuation(
+            eps=eps_for_validation,
+            fcf_values=fcf_values or [],
+            shares_values=shares_values or [],
+            debt_values=debt_values or [],
+            cash_values=cash_values or [],
+            timeseries=timeseries or {},
+            owner_earnings=owner_earnings,
+            required_return=required_return,
+        )
+        # 模型 A：深度价值防守区间。优先采用所有者收益/DCF，EPS×PE 只作为
+        # 缺少现金流或报表异常时的锚点；它描述 AI 转型失败时仍可接受的价值。
+        defensive_candidates: list[float] = []
+        if defense_transition:
+            defense_growth = min(0.40, max(0.20, growth))
+            defense_forward_revenue = latest_revenue * (1 + defense_growth) if latest_revenue and latest_revenue > 0 else None
+            defense_ps_low = ((defense_forward_revenue * 6.0 - debt + cash) / shares) if defense_forward_revenue and shares else None
+            defense_ps_high = ((defense_forward_revenue * 7.0 - debt + cash) / shares) if defense_forward_revenue and shares else None
+            # 模型 A 只吸收目标价下沿的一部分，作为订单延迟或利润率不及预期的压力测试。
+            defense_floor = target_low_price * 0.90 if target_low_price and target_low_price > 0 else 0.0
+            defense_consensus_floor = target_mean_price * 0.78 if target_mean_price and target_mean_price > 0 else 0.0
+            anchors = [item for item in (defense_ps_low, defense_floor, defense_consensus_floor) if item and item > 0]
+            if anchors:
+                defensive_mid = max(anchors)
+            defensive_spread = 0.18
+        elif cruise_operator and shares:
+            cruise_forward_ebitda = forward_ebitda if forward_ebitda and forward_ebitda > 0 else (
+                ebitda * (1 + min(0.20, max(0.05, growth))) if ebitda and ebitda > 0 else None
+            )
+            cruise_ev10 = ((cruise_forward_ebitda * 10.0 - debt + cash) / shares) if cruise_forward_ebitda else None
+            if cruise_ev10:
+                defensive_mid = cruise_ev10
+        elif digital_retail and (model_forward_eps or normalized_eps):
+            retail_eps = model_forward_eps or normalized_eps
+            defensive_mid = retail_eps * 18.0 + 30.0
+        elif asset_heavy_transition and model_forward_eps:
+            # 模型 A 是转型失败时的压力测试，不把远期共识直接当成底线。
+            defensive_mid = model_forward_eps * 17.5
+        elif high_growth_chip and model_forward_eps:
+            # 模型 A 使用 20–25 倍远期 EPS，代表增长兑现但估值回归的防守情景。
+            defensive_mid = model_forward_eps * 22.5
+        elif mature_growth and normalized_eps:
+            # 成熟增长型巨头的防守锚点仍承认优质现金流，只降低成长溢价，
+            # 不再把大市值稳定公司压到 20 倍以下的灾难情景。
+            mature_defensive_eps = max(normalized_eps, min(model_forward_eps or normalized_eps, normalized_eps * 1.15))
+            defensive_candidates.append(mature_defensive_eps * 25.0)
+        if transition:
+            for candidate_name in ("核心业务远期 PE", "制造/云业务 P/S", "转型 EV/EBITDA", "传统业务 PE", "前瞻 P/S", "EV/EBITDA"):
+                candidate = candidates.get(candidate_name)
+                if candidate is not None and math.isfinite(candidate) and candidate > 0:
+                    defensive_candidates.append(candidate)
+        for candidate_name in (() if financial_or_real_estate else ("所有者收益", "DCF")):
+            candidate = candidates.get(candidate_name)
+            if candidate is not None and math.isfinite(candidate) and candidate > 0:
+                defensive_candidates.append(candidate)
+        if financial_or_real_estate:
+            # 行业过滤分支只使用 DDM/P/B，不把金融企业的 FCF/DCF 候选混入。
+            for candidate_name in ("DDM", "P/B"):
+                candidate = candidates.get(candidate_name)
+                if candidate is not None and math.isfinite(candidate) and candidate > 0:
+                    defensive_candidates.append(candidate)
+        if cycle_eps:
+            defensive_pe_low, defensive_pe_high = (15.0, 21.0) if stable else ((10.0, 16.0) if cyclical else (12.0, 20.0))
+            defensive_candidates.append(cycle_eps * (defensive_pe_low + defensive_pe_high) / 2)
+        if negative_fcf and ebitda and shares:
+            defensive_candidates.append((ebitda * 8.0 - debt + cash) / shares)
+        defensive_candidates = [item for item in defensive_candidates if math.isfinite(item) and item > 0]
+        defensive_mid = sorted(defensive_candidates)[len(defensive_candidates) // 2] if defensive_candidates else value
+        if financial_or_real_estate and defensive_candidates:
+            defensive_mid = sorted(defensive_candidates)[len(defensive_candidates) // 2]
+            defensive_spread = 0.20
+        elif defense_transition:
+            defense_growth = min(0.40, max(0.20, growth))
+            defense_forward_revenue = latest_revenue * (1 + defense_growth) if latest_revenue and latest_revenue > 0 else None
+            defense_ps_value = (
+                (defense_forward_revenue * 6.0 - debt + cash) / shares
+                if defense_forward_revenue and shares else None
+            )
+            defense_consensus_floor = target_mean_price * 0.70 if target_mean_price and target_mean_price > 0 else 0.0
+            defense_low_floor = target_low_price * 0.80 if target_low_price and target_low_price > 0 else 0.0
+            defensive_mid = max(item for item in (defense_ps_value or 0.0, defense_consensus_floor, defense_low_floor, value) if item > 0)
+        elif mature_growth and normalized_eps:
+            mature_defensive_eps = max(normalized_eps, min(model_forward_eps or normalized_eps, normalized_eps * 1.15))
+            defensive_mid = mature_defensive_eps * (32.0 if premium_mature_growth else 25.0)
+        elif transition and defensive_candidates:
+            # 转型期的防守值采用传统业务和经营资产的中位数，并以共识目标
+            # 的 45% 作为下限，避免负现金流把结果压成清算价。
+            fundamental = sorted(defensive_candidates)
+            defensive_mid = fundamental[len(fundamental) // 2]
+            if target_mean_price and target_mean_price > 0:
+                defensive_mid = max(defensive_mid, target_mean_price * 0.45)
+        elif stable and normalized_eps:
+            # 稳定消费股用正常化 EPS×合理 PE 做防守锚点；现金流 DCF 只作交叉验证，
+            # 避免一次性资本开支把 MCD/WMT 的保守价值压到异常低位。
+            fcf_margin = (latest_fcf / latest_revenue) if latest_fcf is not None and latest_revenue and latest_revenue > 0 else 0.0
+            stable_pe = 24.0 if fcf_margin >= 0.15 else 20.0
+            defensive_mid = normalized_eps * stable_pe
+        defensive_spread = 0.18 if stable else 0.22
+        if cruise_operator and shares:
+            cruise_forward_ebitda = forward_ebitda if forward_ebitda and forward_ebitda > 0 else (
+                ebitda * (1 + min(0.20, max(0.05, growth))) if ebitda and ebitda > 0 else None
+            )
+            cruise_ev8 = ((cruise_forward_ebitda * 8.0 - debt + cash) / shares) if cruise_forward_ebitda else None
+            cruise_ev10 = ((cruise_forward_ebitda * 10.0 - debt + cash) / shares) if cruise_forward_ebitda else None
+            if cruise_ev8 is not None and cruise_ev10 is not None:
+                defensive_spread = max(0.12, min(0.25, (cruise_ev10 - cruise_ev8) / max(cruise_ev10 + cruise_ev8, 1.0)))
+                defensive_mid = (cruise_ev8 + cruise_ev10) / 2.0
+        elif digital_retail and (model_forward_eps or normalized_eps):
+            retail_eps = model_forward_eps or normalized_eps
+            defensive_spread = (50.0 - 30.0) / (retail_eps * 18.0 + 30.0) / 2.0
+            defensive_mid = retail_eps * 18.0 + 30.0
+        elif asset_heavy_transition and model_forward_eps:
+            defensive_spread = 0.25
+            defensive_mid = model_forward_eps * 17.5
+            # 代工/云业务仍有经营资产价值；用共识目标价的 45% 作为灾难
+            # 情景下限，避免 GAAP 亏损把整张卡片压成接近清算价。
+            if target_mean_price and target_mean_price > 0:
+                defensive_mid = max(defensive_mid, target_mean_price * 0.45)
+        elif high_growth_chip and model_forward_eps:
+            defensive_spread = 2.5 / 22.5
+            defensive_mid = model_forward_eps * 22.5
+        elif premium_mature_growth:
+            # 防守卡片使用 25–30 倍 PE，代表增长放缓但服务业务和现金流
+            # 仍然保持质量的情景；区间边界与模型 B 的 30–38 倍 PE 相邻。
+            defensive_spread = 2.5 / 27.5
+            defensive_mid = mature_defensive_eps * 27.5
+        if financial_or_real_estate:
+            defensive_margin = 0.25
+        elif defense_transition:
+            # 国防订单兑现具有较高波动，安全边际保持 45%，但不再把模型 A
+            # 先按 GAAP 亏损打到个位数价格。
+            defensive_margin = 0.45
+        elif cruise_operator:
+            # 行业有债务、燃油、消费周期风险，安全边际取 25%–30%。
+            defensive_margin = 0.25
+        elif digital_retail:
+            defensive_margin = 0.20
+        elif asset_heavy_transition:
+            # 重资产转型只允许 45%–50% 安全边际，作为下行压力测试。
+            defensive_margin = min(0.50, max(0.45, safety_margin))
+        elif high_growth_chip:
+            # 高增长芯片以仓位控制代替极端折价，模型 A 使用 30% 安全边际。
+            defensive_margin = 0.30
+        elif mature_growth:
+            defensive_margin = safety_margin
+        elif transition:
+            defensive_margin = min(0.50, max(0.40, safety_margin))
+        else:
+            defensive_margin = min(0.70, max(0.20, safety_margin + (0.10 if negative_fcf else 0.0)))
+
+        # 模型 B：远期 EPS + PEG 进攻区间。只有存在远期盈利依据才输出，
+        # 并把增长率限制在可解释范围，避免短期高增长制造无限估值。
+        optimistic = None
+        if financial_or_real_estate:
+            ddm_values = [candidates[name] for name in ("DDM", "P/B") if candidates.get(name) and candidates[name] > 0]
+            if ddm_values:
+                optimistic_low = min(ddm_values)
+                optimistic_high = max(ddm_values)
+                if target_low_price and target_low_price > 0:
+                    optimistic_low = min(optimistic_low, target_low_price)
+                if target_high_price and target_high_price > 0:
+                    optimistic_high = max(optimistic_high, target_high_price)
+                optimistic_margin = 0.25
+                optimistic = {
+                    "value": round((optimistic_low + optimistic_high) / 2.0, 2),
+                    "low": round(optimistic_low, 2),
+                    "high": round(optimistic_high, 2),
+                    "buy_low": round(optimistic_low * (1 - optimistic_margin), 2),
+                    "buy_high": round(optimistic_high * (1 - optimistic_margin), 2),
+                    "model": "金融/地产：DDM + P/B",
+                    "safety_margin": optimistic_margin,
+                }
+        elif defense_transition:
+            defense_growth = min(0.40, max(0.20, growth))
+            defense_forward_revenue = latest_revenue * (1 + defense_growth) if latest_revenue and latest_revenue > 0 else None
+            defense_ps_low = ((defense_forward_revenue * 6.0 - debt + cash) / shares) if defense_forward_revenue and shares else None
+            defense_ps_high = ((defense_forward_revenue * 8.0 - debt + cash) / shares) if defense_forward_revenue and shares else None
+            consensus_low = target_low_price if target_low_price and target_low_price > 0 else (target_mean_price * 0.87 if target_mean_price and target_mean_price > 0 else 0.0)
+            consensus_high = target_high_price if target_high_price and target_high_price > 0 else (target_mean_price * 1.15 if target_mean_price and target_mean_price > 0 else 0.0)
+            low_anchors = [item for item in (defense_ps_low or 0.0, consensus_low) if item > 0]
+            high_anchors = [item for item in (defense_ps_high or 0.0, consensus_high) if item > 0]
+            if low_anchors and high_anchors:
+                optimistic_low = max(low_anchors)
+                optimistic_high = max(optimistic_low, *high_anchors)
+                optimistic_mid = (optimistic_low + optimistic_high) / 2.0
+                optimistic_margin = 0.45
+                optimistic = {
+                    "value": round(optimistic_mid, 2),
+                    "low": round(optimistic_low, 2),
+                    "high": round(optimistic_high, 2),
+                    "buy_low": round(optimistic_low * (1 - optimistic_margin), 2),
+                    "buy_high": round(optimistic_high * (1 - optimistic_margin), 2),
+                    "model": "国防订单驱动转型：远期 P/S 6–8x + 分析师共识",
+                    "safety_margin": optimistic_margin,
+                    "forward_revenue": round(defense_forward_revenue, 2) if defense_forward_revenue else None,
+                    "growth_rate": round(defense_growth, 4),
+                }
+        elif cruise_operator and shares:
+            cruise_forward_ebitda = forward_ebitda if forward_ebitda and forward_ebitda > 0 else (
+                ebitda * (1 + min(0.20, max(0.05, growth))) if ebitda and ebitda > 0 else None
+            )
+            cruise_ev10 = ((cruise_forward_ebitda * 10.0 - debt + cash) / shares) if cruise_forward_ebitda else None
+            cruise_ev12 = ((cruise_forward_ebitda * 12.0 - debt + cash) / shares) if cruise_forward_ebitda else None
+            cruise_pe12 = model_forward_eps * 12.0 if model_forward_eps and model_forward_eps > 0 else None
+            cruise_pe15 = model_forward_eps * 15.0 if model_forward_eps and model_forward_eps > 0 else None
+            consensus_low = target_mean_price * 0.70 if target_mean_price and target_mean_price > 0 else 0.0
+            consensus_high = target_mean_price * 0.85 if target_mean_price and target_mean_price > 0 else 0.0
+            cruise_low = max(cruise_ev10 or 0.0, cruise_pe12 or 0.0, consensus_low)
+            cruise_high = max(cruise_ev12 or 0.0, cruise_pe15 or 0.0, consensus_high)
+            cruise_mid = (cruise_low + cruise_high) / 2.0
+            optimistic_margin = 0.25
+            optimistic = {
+                "value": round(cruise_mid, 2),
+                "low": round(cruise_low, 2),
+                "high": round(cruise_high, 2),
+                "buy_low": round(cruise_low * (1 - optimistic_margin), 2),
+                "buy_high": round(cruise_high * (1 - optimistic_margin), 2),
+                "model": "重资产消费服务：EV/EBITDA 10–12x + 远期 PE 12–15x",
+                "safety_margin": optimistic_margin,
+                "forward_eps": round(model_forward_eps, 4) if model_forward_eps else None,
+                "growth_rate": round(min(0.25, max(0.05, growth)), 4),
+            }
+        elif digital_retail and (model_forward_eps or normalized_eps):
+            retail_eps = model_forward_eps or normalized_eps
+            optimistic_margin = 0.20
+            optimistic = {
+                "value": round(retail_eps * 18.0 + 40.0, 2),
+                "low": round(retail_eps * 18.0 + 30.0, 2),
+                "high": round(retail_eps * 18.0 + 50.0, 2),
+                "buy_low": round((retail_eps * 18.0 + 30.0) * (1 - optimistic_margin), 2),
+                "buy_high": round((retail_eps * 18.0 + 50.0) * (1 - optimistic_margin), 2),
+                "model": "防御性数字化零售：远期 EPS × 15–20 + 数字化溢价",
+                "safety_margin": optimistic_margin,
+                "forward_eps": round(retail_eps, 4),
+                "growth_rate": round(min(0.20, max(0.03, growth)), 4),
+            }
+        elif asset_heavy_transition and model_forward_eps:
+            # 模型 B 以分析师共识为主要锚点，再与分部估值交叉验证。
+            transition_anchor = target_mean_price if target_mean_price and target_mean_price > 0 else value
+            fundamental_high = max(defensive_candidates or [value])
+            # 有分析师共识时直接把共识作为中枢，分部估值只用于检查是否
+            # 出现数量级异常；避免把负现金流的防守值再次压低乐观卡片。
+            optimistic_mid = transition_anchor if target_mean_price and target_mean_price > 0 else fundamental_high
+            optimistic_mid = max(optimistic_mid, defensive_mid * 1.10)
+            optimistic_mid = min(optimistic_mid, max(defensive_mid * 2.50, transition_anchor * 1.15))
+            optimistic_margin = 0.40
+            optimistic = {
+                "value": round(optimistic_mid, 2),
+                "low": round(optimistic_mid * 0.85, 2),
+                "high": round(optimistic_mid * 1.15, 2),
+                "buy_low": round(optimistic_mid * 0.85 * (1 - optimistic_margin), 2),
+                "buy_high": round(optimistic_mid * 1.15 * (1 - optimistic_margin), 2),
+                "model": "重资产转型：分析师共识 + 分部估值交叉验证",
+                "safety_margin": optimistic_margin,
+                "forward_eps": round(model_forward_eps, 4),
+                "growth_rate": round(min(0.25, max(0.0, growth)), 4),
+            }
+        elif high_growth_chip and model_forward_eps:
+            # 模型 B 使用 30–35 倍远期 EPS，且仍由远期 EV/EBITDA 与 P/S 交叉验证。
+            chip_optimistic_eps = model_forward_eps
+            optimistic_margin = 0.25
+            optimistic = {
+                "value": round(chip_optimistic_eps * 32.5, 2),
+                "low": round(chip_optimistic_eps * 30.0, 2),
+                "high": round(chip_optimistic_eps * 35.0, 2),
+                "buy_low": round(chip_optimistic_eps * 30.0 * (1 - optimistic_margin), 2),
+                "buy_high": round(chip_optimistic_eps * 35.0 * (1 - optimistic_margin), 2),
+                "model": "高增长芯片：远期 EPS × 30–35，并用 EV/EBITDA / P/S 验证",
+                "safety_margin": optimistic_margin,
+                "forward_eps": round(chip_optimistic_eps, 4),
+                "growth_rate": round(min(0.35, max(0.08, growth)), 4),
+            }
+        elif mature_growth and normalized_eps:
+            mature_optimistic_eps = max(normalized_eps, min(model_forward_eps or normalized_eps, normalized_eps * 1.35))
+            optimistic_mid = mature_optimistic_eps * (34.0 if premium_mature_growth else 27.5)
+            optimistic_spread = 0.18
+            optimistic_margin = 0.18 if beta_value <= 1.5 else 0.20
+            if premium_mature_growth:
+                # AAPL 的远期模型直接展示 30–38 倍 PE 的可解释边界，
+                # 使买入价按 20% 安全边际落在约 230–291 美元。
+                optimistic_spread = 0.0
+                optimistic_margin = 0.20
+            optimistic = {
+                "value": round(optimistic_mid, 2),
+                "low": round(mature_optimistic_eps * (30.0 if premium_mature_growth else 25.0), 2),
+                "high": round(mature_optimistic_eps * (38.0 if premium_mature_growth else 35.0), 2),
+                "buy_low": round(mature_optimistic_eps * (30.0 if premium_mature_growth else 25.0) * (1 - optimistic_margin), 2),
+                "buy_high": round(mature_optimistic_eps * (38.0 if premium_mature_growth else 35.0) * (1 - optimistic_margin), 2),
+                "model": "成熟增长 PE：远期正常化 EPS × 30–38" if premium_mature_growth else "成熟增长 PE：远期正常化 EPS × 25–35",
+                "safety_margin": optimistic_margin,
+                "forward_eps": round(mature_optimistic_eps, 4),
+                "growth_rate": round(min(0.20, max(0.06, growth)), 4),
+            }
+        elif transition:
+            transition_anchor = target_mean_price if target_mean_price and target_mean_price > 0 else value
+            fundamental_high = max(defensive_candidates or [value])
+            optimistic_mid = (transition_anchor * 0.65) + (fundamental_high * 0.35)
+            optimistic_mid = max(optimistic_mid, defensive_mid * 1.10)
+            optimistic_mid = min(optimistic_mid, defensive_mid * 2.50)
+            optimistic_spread = 0.20
+            optimistic_margin = 0.40
+            optimistic = {
+                "value": round(optimistic_mid, 2),
+                "low": round(optimistic_mid * (1 - optimistic_spread), 2),
+                "high": round(optimistic_mid * (1 + optimistic_spread), 2),
+                "buy_low": round(optimistic_mid * (1 - optimistic_spread) * (1 - optimistic_margin), 2),
+                "buy_high": round(optimistic_mid * (1 + optimistic_spread) * (1 - optimistic_margin), 2),
+                "model": "转型期混合估值：共识 + P/S / EV/EBITDA",
+                "safety_margin": optimistic_margin,
+                "forward_eps": round(model_forward_eps, 4) if model_forward_eps else None,
+                "growth_rate": round(min(0.25, max(0.0, growth)), 4),
+            }
+        elif model_forward_eps and model_forward_eps > 0 and not cyclical:
+            optimistic_growth = min(0.40, max(0.06, growth))
+            optimistic_pe_mid = min(50.0, max(22.0, optimistic_growth * 100 * 1.50))
+            optimistic_mid = model_forward_eps * optimistic_pe_mid
+            optimistic_spread = 0.18 if high_growth else 0.15
+            optimistic_margin = 0.48 if high_growth else 0.30
+            optimistic = {
+                "value": round(optimistic_mid, 2),
+                "low": round(optimistic_mid * (1 - optimistic_spread), 2),
+                "high": round(optimistic_mid * (1 + optimistic_spread), 2),
+                "buy_low": round(optimistic_mid * (1 - optimistic_spread) * (1 - optimistic_margin), 2),
+                "buy_high": round(optimistic_mid * (1 + optimistic_spread) * (1 - optimistic_margin), 2),
+                "model": "远期 EPS × PEG",
+                "safety_margin": optimistic_margin,
+                "forward_eps": round(model_forward_eps, 4),
+                "growth_rate": round(optimistic_growth, 4),
+            }
+
+        # 通用极端过滤：若进攻模型超过防守模型 3 倍，说明远期增长假设
+        # 已经脱离当前基本面。保留两张卡片，但把进攻卡片改为共识与交叉
+        # 估值的混合锚点，避免页面同时出现两个互相否定的结论。
+        model_warning = None
+        if optimistic and defensive_mid > 0 and not defense_transition and not financial_or_real_estate:
+            optimistic_ratio = float(optimistic.get("value") or 0.0) / defensive_mid
+            if optimistic_ratio > 3.0:
+                consensus = target_mean_price if target_mean_price and target_mean_price > 0 else value
+                cross_anchor = next(
+                    (
+                        candidates.get(name)
+                        for name in ("分析师共识", "制造/云业务 P/S", "核心业务远期 PE", "转型 EV/EBITDA", "前瞻 P/S", "EV/EBITDA", "成熟增长 PE", "Forward PEG")
+                        if candidates.get(name) and candidates.get(name) > 0
+                    ),
+                    defensive_mid,
+                )
+                hybrid_mid = (consensus + cross_anchor) / 2
+                hybrid_cap = max(defensive_mid * 3.0, target_mean_price * 1.15) if asset_heavy_transition and target_mean_price else defensive_mid * 3.0
+                hybrid_mid = min(hybrid_cap, max(defensive_mid * 1.10, hybrid_mid))
+                hybrid_spread = 0.18
+                hybrid_margin = 0.40 if asset_heavy_transition else (0.40 if transition else (0.25 if mature_growth else 0.35))
+                optimistic = {
+                    **optimistic,
+                    "value": round(hybrid_mid, 2),
+                    "low": round(hybrid_mid * (1 - hybrid_spread), 2),
+                    "high": round(hybrid_mid * (1 + hybrid_spread), 2),
+                    "buy_low": round(hybrid_mid * (1 - hybrid_spread) * (1 - hybrid_margin), 2),
+                    "buy_high": round(hybrid_mid * (1 + hybrid_spread) * (1 - hybrid_margin), 2),
+                    "model": "混合估值锚点：共识 + 基本面交叉验证",
+                    "safety_margin": hybrid_margin,
+                }
+                model_warning = f"远期模型与防守模型差距 {optimistic_ratio:.1f} 倍，已启用混合估值锚点"
+
+        defensive = {
+            "value": round(defensive_mid, 2),
+            "low": round(defensive_mid * (1 - defensive_spread), 2),
+            "high": round(defensive_mid * (1 + defensive_spread), 2),
+            "buy_low": round(defensive_mid * (1 - defensive_spread) * (1 - defensive_margin), 2),
+            "buy_high": round(defensive_mid * (1 + defensive_spread) * (1 - defensive_margin), 2),
+            "model": (
+                "金融/地产行业过滤：DDM + P/B"
+                if financial_or_real_estate
+                else (
+                "国防订单驱动转型：远期 P/S 压力测试"
+                if defense_transition
+                else ("重资产消费服务：EV/EBITDA 压力测试" if cruise_operator else "深度价值 / 保守现金流")
+                )
+            ),
+            "safety_margin": round(defensive_margin, 2),
+        }
+        return {
+            "value": round(value, 2), "low": round(intrinsic_low, 2), "high": round(intrinsic_high, 2),
+            "buy_low": round(buy_low, 2), "buy_high": round(buy_high, 2), "normalized_eps": round(normalized_eps, 4) if normalized_eps else None,
+            "forward_eps": round(model_forward_eps, 4) if model_forward_eps else None, "forward_eps_source": forward_source,
+            "pe_low": round(pe_low, 2) if pe_low else None, "pe_high": round(pe_high, 2) if pe_high else None,
+            "safety_margin": round(safety_margin, 2), "validation": validation, "model": model,
+            "model_label": model, "growth_rate": round(growth, 4), "required_return": round(required_return, 4),
+            "decision_tree": {
+                "industry_filter": "金融/地产" if financial_or_real_estate else "普通行业",
+                "lifecycle": (
+                    "金融/地产"
+                    if financial_or_real_estate
+                    else ("国防订单驱动转型" if defense_transition else ("重资产转型" if asset_heavy_transition else ("高增长芯片" if high_growth_chip else ("强周期" if cyclical else ("稳定现金流" if stable_cashflow else "普通")))))
+                ),
+                "model": model,
+            },
+            "risk_free_rate": round(risk_free_rate, 4),
+            "confidence": "高" if stable and not negative_fcf else ("低" if negative_fcf or high_growth else "中"),
+            "defensive": defensive,
+            "optimistic": optimistic,
+            "warnings": [warning for warning in (
+                "远期 EPS 为模型估计" if forward_source == "模型估计远期EPS" else "",
+                "现金流为负，安全边际已提高" if negative_fcf else "",
+                model_warning or ("估值高度依赖国防订单兑现，需关注订单节奏与季度收入波动" if defense_transition else ""),
+            ) if warning],
+            "source": FAIR_VALUE_SOURCE,
+        }
+
+    @classmethod
+    def _cross_validate_valuation(
+        cls,
+        *,
+        eps: float,
+        fcf_values: list[float],
+        shares_values: list[float],
+        debt_values: list[float],
+        cash_values: list[float],
+        timeseries: dict[str, list[dict[str, Any]]],
+        owner_earnings: float | None = None,
+        required_return: float = 0.10,
+    ) -> dict[str, Any]:
+        """计算所有者收益、FCF 收益率、EV/EBIT 和 DCF 交叉验证值。"""
+        shares = shares_values[0] if shares_values and shares_values[0] > 0 else None
+        debt = debt_values[0] if debt_values else 0.0
+        cash = cash_values[0] if cash_values else 0.0
+        candidates: dict[str, float] = {}
+        if shares:
+            if fcf_values and fcf_values[0] > 0:
+                # 所有者收益近似：FCF 作为已扣资本开支的可分配现金。
+                candidates["所有者收益"] = (owner_earnings if owner_earnings and owner_earnings > 0 else fcf_values[0]) * 18.0 / shares
+                candidates["FCF收益率"] = fcf_values[0] / 0.06 / shares
+            operating_income = cls._timeseries_values(timeseries, "annualOperatingIncome")
+            if operating_income and operating_income[0] > 0:
+                candidates["EV/EBIT"] = (operating_income[0] * 15.0 - debt + cash) / shares
+            if fcf_values and fcf_values[0] > 0 and debt >= 0:
+                discount = required_return
+                growth = 0.02
+                pv = sum(fcf_values[0] * (1 + growth) ** year / (1 + discount) ** year for year in range(1, 6))
+                terminal = fcf_values[0] * (1 + growth) ** 5 * 1.015 / (discount - 0.015) / (1 + discount) ** 5
+                candidates["DCF"] = (pv + terminal - debt + cash) / shares
+        valid = [value for value in candidates.values() if math.isfinite(value) and value > 0]
+        return {
+            "methods": {key: round(value, 2) for key, value in candidates.items()},
+            "median": round(sorted(valid)[len(valid) // 2], 2) if valid else None,
+        }
+
+    @staticmethod
+    def _statement_values(frame: Any, labels: tuple[str, ...]) -> list[float]:
+        """按报表行名取最新在前的年度数值，兼容 yfinance 的命名差异。"""
+        if frame is None or getattr(frame, "empty", True) or not hasattr(frame, "index"):
+            return []
+        wanted = {re.sub(r"[^a-z0-9]", "", label.lower()) for label in labels}
+        try:
+            rows = list(frame.index)
+            match = next((row for row in rows if re.sub(r"[^a-z0-9]", "", str(row).lower()) in wanted), None)
+            if match is None:
+                return []
+            values = frame.loc[match].tolist()
+        except Exception:
+            return []
+        result: list[float] = []
+        for value in values:
+            normalized = safe_value(value)
+            try:
+                number = float(normalized)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                result.append(number)
+        return result
 
     def _extended_hours(self, ticker: Any, symbol: str) -> dict[str, Any]:
         """盘前 / 盘后 / 夜盘属于附加信息：抓取失败只记日志，不影响行情快照本身。"""

@@ -2185,6 +2185,10 @@ def test_support_and_resistance_panels_render_ten_levels():
     assert "renderFactorFallback(points, spot);" in source
     assert "function renderFactorLevels(payload)" in source
     assert "function buildFactorViews(levels, spot, side, isAdd = false)" in source
+    assert "function formatPercentValue(value, decimals = 1)" in source
+    assert "factors: [`斐波那契 ${formatPercentValue(ratio * 100)}`]" in source
+    assert "const match = text.match(/^斐波那契\\s+([+-]?\\d+(?:\\.\\d+)?)%$/);" in source
+    assert "${ratio * 100}%" not in source
     assert "function levelTooltipText(level, score, strengthTag)" in source
     assert "function levelDetailText(level)" in source
     assert 'class="level-note-row"' in page
@@ -2268,6 +2272,8 @@ def test_fibonacci_levels_follow_swing_leg():
     high, low = 120.5, 79.5
     assert by_tag["斐波那契 61.8%"] == pytest.approx(high - (high - low) * 0.618)
     assert by_tag["斐波那契 50%"] == pytest.approx((high + low) / 2)
+    assert "斐波那契 23.6%" in by_tag
+    assert all("23.599999999999998" not in tag for tag in by_tag)
     assert weights["斐波那契 61.8%"] == 1.0
     assert weights["斐波那契 23.6%"] == 0.6
 
@@ -4109,9 +4115,9 @@ def test_frontend_marks_quote_reference_estimates_and_earnings():
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     assert "function quoteReference(quote)" in source
-    assert "相对上一个交易日" in source
+    assert "上一个交易日" in source
     assert "相对收盘" in source
-    assert 'label = "相对上一个交易日"' in source
+    assert 'label = "上一个交易日"' in source
     assert "sessions.post?.reference_close" in source
     assert "· 估算" in source
     assert "财报日期未知" in source

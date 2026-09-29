@@ -11,6 +11,9 @@ const ANALYSIS_REFRESH_BLOCK_MS = 8000;
 const ANALYSIS_REFRESH_COOLDOWN_SECONDS = 600;
 // 批次运行期间最多读取 90 次状态，每次间隔 3 秒；批次完成后再启动下一批。
 const ANALYSIS_POLL_LIMIT = 90;
+// 估值计算独立于现货/期权快照，首次进入新标的时只轮询轻量 quote 接口，不重复抓整份期权链。
+const FAIR_VALUE_POLL_INTERVAL_MS = 700;
+const FAIR_VALUE_POLL_LIMIT = 20;
 
 const TREND_SIGNAL_TITLE = "规则估算，不是下单指令，也不包含财报跳空";
 const state = {
@@ -25,6 +28,10 @@ const state = {
   refreshing: false,
   loading: false,
   refreshInFlight: null,
+  fairValuePollTimer: null,
+  fairValuePollKey: "",
+  fairValuePollAttempts: 0,
+  fairValuePollInFlight: false,
   analysisRefreshSymbol: null,
   analysisRefreshTimer: null,
   analysisBlockUntil: 0,
@@ -69,8 +76,17 @@ const state = {
     quoteChangeColor: "var(--muted)",
     quoteCurrency: "USD",
     quoteMarket: "--",
-    quoteReference: "相对上一个交易日 --",
+    quoteReference: "上一个交易日 --",
     quoteReferenceTitle: "涨跌幅以上一个交易日的收盘价为基准",
+    fairValue: "--",
+    fairValueSource: "保守模型 -- · 乐观模型 --",
+    fairValueTitle: "保守估值按公开财务数据估算；区间比单点更能反映模型不确定性",
+    fairDefensive: "--",
+    fairDefensiveSource: "等待估值计算",
+    fairDefensiveTitle: "模型 A：深度价值 / 保守现金流",
+    fairOptimistic: "--",
+    fairOptimisticSource: "等待远期盈利数据",
+    fairOptimisticTitle: "模型 B：远期 EPS × PEG",
     earnings: {
       status: "unknown",
       label: "财报日期未知",
@@ -101,7 +117,7 @@ const state = {
         unknownVolume: "--",
         buyPremium: "权利金 --",
         sellPremium: "权利金 --",
-        netVolume: "净量 --",
+        netVolume: "--",
         focusTitle: "集中执行价 --",
         focusSummary: "等待相邻快照",
         concentration: [],
@@ -114,7 +130,7 @@ const state = {
         unknownVolume: "--",
         buyPremium: "权利金 --",
         sellPremium: "权利金 --",
-        netVolume: "净量 --",
+        netVolume: "--",
         focusTitle: "集中执行价 --",
         focusSummary: "等待相邻快照",
         concentration: [],
@@ -327,31 +343,48 @@ function initChartGroup() {
   });
 }
 
-// 期权流向默认展开，展开状态仅在当前标签页内记忆。
-const OPTION_FLOW_KEY = "option-scope-option-flow";
+// 期权流向与买方结构共用一个折叠组，内部按钮只切换视图，不折叠外层面板。
+const OPTION_ANALYSIS_KEY = "option-scope-option-analysis";
 
-function initOptionFlowGroup() {
+function initOptionAnalysisGroup() {
   bindFoldGroup({
-    headerId: "option-flow-header",
-    toggleId: "option-flow-toggle",
-    bodyId: "option-flow-fold",
-    actionId: "option-flow-action",
-    storageKey: OPTION_FLOW_KEY,
+    headerId: "option-analysis-header",
+    toggleId: "option-analysis-toggle",
+    bodyId: "option-analysis-fold",
+    actionId: "option-analysis-action",
+    storageKey: OPTION_ANALYSIS_KEY,
     defaultExpanded: true,
+    // 面板折叠时隐藏视图切换按钮，避免折叠标题栏仍显示内部操作控件。
+    onChange: (expanded) => {
+      const tabs = byId("option-analysis-tabs");
+      if (tabs) tabs.hidden = !expanded;
+    },
+    shouldIgnore: (event) => {
+      const tab = closestElement(event.target, "[data-option-view]");
+      if (tab) {
+        setOptionAnalysisView(tab.dataset.optionView);
+        return true;
+      }
+      return Boolean(closestElement(event.target, "#option-analysis-tabs"));
+    },
   });
+  document.querySelectorAll("[data-option-view]").forEach((tab) => {
+    tab.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setOptionAnalysisView(tab.dataset.optionView);
+    });
+  });
+  setOptionAnalysisView("flow");
 }
 
-// 买方结构默认折叠，展开状态仅在当前标签页内记忆，避免首屏占用过多空间。
-const BUYER_STRUCTURE_KEY = "option-scope-buyer-structure";
-
-function initBuyerStructureGroup() {
-  bindFoldGroup({
-    headerId: "buyer-structure-header",
-    toggleId: "buyer-structure-toggle",
-    bodyId: "buyer-structure-fold",
-    actionId: "buyer-structure-action",
-    storageKey: BUYER_STRUCTURE_KEY,
-    defaultExpanded: false,
+function setOptionAnalysisView(view) {
+  const next = view === "buyer" ? "buyer" : "flow";
+  document.querySelectorAll("[data-option-view-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.optionViewPanel !== next;
+  });
+  document.querySelectorAll("[data-option-view]").forEach((tab) => {
+    tab.setAttribute("aria-pressed", tab.dataset.optionView === next ? "true" : "false");
   });
 }
 
@@ -638,6 +671,16 @@ function formatCount(value, digits = 2) {
   if (absolute >= 10000) return `${sign}${formatNumber(absolute / 10000, digits)}万`;
   return `${sign}${formatNumber(absolute, 0)}`;
 }
+// 期权流向成交量带上方向：主动买入为正号，主动卖出为负号，中性成交不添加符号。
+// 这里仅改变展示值，后端的买入/卖出/中性原始数量与净量计算保持不变。
+function formatFlowVolume(value, direction) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  const text = formatCount(Math.abs(number));
+  if (direction === "buy") return `+${text}`;
+  if (direction === "sell") return `-${text}`;
+  return text;
+}
 function formatUsd(value) {
   if (value == null || !Number.isFinite(Number(value))) return "--";
   return `$${Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -903,7 +946,12 @@ function levelScore(level) {
 }
 
 function levelFactors(level) {
-  return Array.isArray(level?.factors) ? level.factors.map((factor) => String(factor)) : [];
+  if (!Array.isArray(level?.factors)) return [];
+  return level.factors.map((factor) => {
+    const text = String(factor);
+    const match = text.match(/^斐波那契\s+([+-]?\d+(?:\.\d+)?)%$/);
+    return match ? `斐波那契 ${formatPercentValue(Number(match[1]))}` : text;
+  });
 }
 
 function hasStrongLevelEvidence(factors) {
@@ -1142,7 +1190,7 @@ function clientTechnicalCandidates(bars, spot) {
   if (high > low) {
     [[0.236, 0.6], [0.382, 0.9], [0.5, 1], [0.618, 1], [0.786, 0.6]].forEach(([ratio, score]) => {
       const price = lowIndex < highIndex ? high - (high - low) * ratio : low + (high - low) * ratio;
-      result.push({ price, score, factors: [`斐波那契 ${ratio * 100}%`] });
+      result.push({ price, score, factors: [`斐波那契 ${formatPercentValue(ratio * 100)}`] });
     });
   }
   const weighted = window.filter((bar) => bar.volume > 0).reduce((sum, bar) => sum + bar.close * bar.volume, 0);
@@ -1558,6 +1606,13 @@ function loadFactorLevels(points, spot) {
 
 // 渲染多因子结果：价位 / 距现价 / 综合依据（组成该价位的因子标签）。
 // 触及概率：0~1 的概率值转百分比，极小/极大用不等号，缺数据用占位符。
+// 普通百分比统一保留指定小数位，并去掉尾随的 0，避免浮点计算结果直接暴露给用户。
+function formatPercentValue(value, decimals = 1) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return `${number.toFixed(decimals).replace(/\.?(0+)$/, "")}%`;
+}
+
 function formatProbability(value) {
   if (value == null || !Number.isFinite(Number(value))) return "--";
   const percent = Number(value) * 100;
@@ -2375,11 +2430,11 @@ function quoteReference(quote) {
   const marketState = quote?.market_state;
   const sessions = quote?.sessions || {};
   const previous = finitePrice(quote?.previous_close);
-  let label = "相对上一个交易日";
+  let label = "上一个交易日";
   let price = previous;
   let title = "涨跌幅以最近一个已完成交易日的收盘价为基准";
   if (marketState === "PRE") {
-    label = "相对上一个交易日";
+    label = "上一个交易日";
     price = finitePrice(sessions.pre?.reference_close) ?? previous;
     title = "盘前涨跌以盘前开始前最近一次盘中收盘为基准；没有该基准时回退昨收";
   } else if (marketState === "POST" || (marketState === "OVERNIGHT"
@@ -2390,7 +2445,7 @@ function quoteReference(quote) {
     title = "盘后涨跌以最近一次正式盘中收盘为基准，不用昨收代替";
   } else if (marketState === "OVERNIGHT") {
     // 夜盘没有当前盘中报价时，涨跌基准是上一个交易日的收盘价。
-    label = "相对上一个交易日";
+    label = "上一个交易日";
     price = previous;
     title = "夜盘涨跌以上一个交易日的收盘价为基准";
   }
@@ -2457,6 +2512,91 @@ function renderQuote(quote) {
   const reference = quoteReference(quote);
   state.view.quoteReference = reference.text;
   state.view.quoteReferenceTitle = reference.title;
+  const hasConservativeValue = quote?.fair_value_source === "valuation_v14"
+    && quote?.fair_value != null;
+  const low = Number(quote?.fair_value_low);
+  const high = Number(quote?.fair_value_high);
+  const buyLow = Number(quote?.fair_value_buy_low);
+  const buyHigh = Number(quote?.fair_value_buy_high);
+  const defensive = quote?.fair_value_defensive;
+  const optimistic = quote?.fair_value_optimistic;
+  const defensiveModel = defensive?.model || "深度价值 / 保守现金流";
+  const optimisticModel = optimistic?.model || "远期 EPS × PEG";
+  const formatRange = (item) => item && Number.isFinite(Number(item.low)) && Number.isFinite(Number(item.high))
+    ? `${formatMoney(item.low)}-${formatMoney(item.high)}` : "--";
+  state.view.fairValue = hasConservativeValue
+    ? `保守 ${formatRange(defensive || { low, high })} · 乐观 ${formatRange(optimistic)}`
+    : "--";
+  const defensiveBuy = defensive ? formatRange({ low: defensive.buy_low, high: defensive.buy_high }) : "--";
+  const optimisticBuy = optimistic ? formatRange({ low: optimistic.buy_low, high: optimistic.buy_high }) : "--";
+  state.view.fairValueSource = !hasConservativeValue
+    ? "暂无可靠估算"
+    : `保守买入 ${defensiveBuy} · 乐观买入 ${optimisticBuy}`;
+  state.view.fairValueTitle = hasConservativeValue
+    ? `模型 A：${defensiveModel}，防守区间 ${formatRange(defensive)}；模型 B：${optimisticModel}，进攻区间 ${formatRange(optimistic)}。远期 EPS 来源：${quote?.fair_value_forward_eps_source || "暂无"}`
+    : "公开财务数据不足，暂不输出保守估值";
+  state.view.fairDefensive = hasConservativeValue ? formatRange(defensive || { low, high }) : "--";
+  state.view.fairDefensiveSource = hasConservativeValue && defensive
+    ? `买入 ${defensiveBuy} · 安全边际 ${(Number(defensive.safety_margin || 0) * 100).toFixed(0)}%`
+    : (hasConservativeValue ? "模型 A 数据不足" : "等待估值计算");
+  state.view.fairDefensiveTitle = hasConservativeValue
+    ? `模型 A：${defensiveModel}。估值 ${state.view.fairDefensive}，${state.view.fairDefensiveSource}`
+    : "模型 A：深度价值 / 保守现金流，等待计算完成";
+  state.view.fairOptimistic = optimistic ? formatRange(optimistic) : "--";
+  state.view.fairOptimisticSource = optimistic
+    ? `买入 ${optimisticBuy} · 安全边际 ${(Number(optimistic.safety_margin || 0) * 100).toFixed(0)}%`
+    : (hasConservativeValue ? "暂无可靠远期盈利依据" : "等待估值计算");
+  state.view.fairOptimisticTitle = optimistic
+    ? `模型 B：${optimisticModel}。远期 EPS ${optimistic.forward_eps ?? "--"}，增长率 ${optimistic.growth_rate != null ? `${(Number(optimistic.growth_rate) * 100).toFixed(1)}%` : "--"}。${state.view.fairOptimisticSource}`
+    : "模型 B：远期 EPS × PEG，当前没有可靠远期盈利依据";
+  scheduleFairValuePoll(quote);
+}
+
+function clearFairValuePoll() {
+  if (state.fairValuePollTimer) clearTimeout(state.fairValuePollTimer);
+  state.fairValuePollTimer = null;
+  state.fairValuePollKey = "";
+  state.fairValuePollAttempts = 0;
+  state.fairValuePollInFlight = false;
+}
+
+function scheduleFairValuePoll(quote) {
+  const ready = quote?.fair_value_source === "valuation_v14" && quote?.fair_value != null;
+  if (ready) {
+    clearFairValuePoll();
+    return;
+  }
+  if (!state.symbol || state.loading || state.refreshing) return;
+  const key = `${state.loadId}|${state.symbol}`;
+  if (state.fairValuePollKey !== key) {
+    if (state.fairValuePollTimer) clearTimeout(state.fairValuePollTimer);
+    state.fairValuePollKey = key;
+    state.fairValuePollAttempts = 0;
+  }
+  if (state.fairValuePollTimer || state.fairValuePollInFlight || state.fairValuePollAttempts >= FAIR_VALUE_POLL_LIMIT) return;
+  state.fairValuePollTimer = setTimeout(() => pollFairValue(key), FAIR_VALUE_POLL_INTERVAL_MS);
+}
+
+async function pollFairValue(key) {
+  state.fairValuePollTimer = null;
+  if (key !== `${state.loadId}|${state.symbol}` || state.fairValuePollInFlight) return;
+  state.fairValuePollInFlight = true;
+  state.fairValuePollAttempts += 1;
+  let resolved = false;
+  try {
+    const quote = await request(`/api/quote/${encodeURIComponent(state.symbol)}`).catch(() => null);
+    if (key !== `${state.loadId}|${state.symbol}`) return;
+    if (quote?.fair_value_source === "valuation_v14" && quote?.fair_value != null) {
+      resolved = true;
+      renderQuote(quote);
+      return;
+    }
+  } finally {
+    state.fairValuePollInFlight = false;
+    if (!resolved && key === `${state.loadId}|${state.symbol}` && state.fairValuePollAttempts < FAIR_VALUE_POLL_LIMIT) {
+      scheduleFairValuePoll(null);
+    }
+  }
 }
 
 function emptyFlowSide(type) {
@@ -2466,7 +2606,7 @@ function emptyFlowSide(type) {
     unknownVolume: "--",
     buyPremium: "权利金 --",
     sellPremium: "权利金 --",
-    netVolume: "净量 --",
+    netVolume: "--",
     focusTitle: "集中执行价 --",
     focusSummary: "等待相邻快照",
     concentration: [],
@@ -2494,7 +2634,7 @@ function renderFlowSide(side, type) {
   const concentration = rawConcentration.slice(0, 5).map((item, index) => ({
     key: `${type}-${item.strike}-${index}`,
     label: `${formatFlowStrike(item.strike)} ${typeLabel}`,
-    detail: `${directionLabel(item.dominant_direction)} ${formatCount(item.volume)}`,
+    detail: `${directionLabel(item.dominant_direction)} ${formatFlowVolume(item.volume, item.dominant_direction)}`,
     className: item.dominant_direction === "buy" ? "buy" : item.dominant_direction === "sell" ? "sell" : "unknown",
   }));
   const rows = rawConcentration.slice(0, 5).map((item, index) => {
@@ -2505,7 +2645,7 @@ function renderFlowSide(side, type) {
       label: `${formatFlowStrike(item.strike)} ${typeLabel}`,
       direction: directionLabel(dominantDirection),
       className: dominantDirection === "buy" ? "buy" : dominantDirection === "sell" ? "sell" : "unknown",
-      volume: formatCount(item.volume),
+      volume: formatFlowVolume(item.volume, dominantDirection),
       share: totalVolume > 0 ? `${Math.round(volume / totalVolume * 100)}%` : "--",
       premium: `权利金 ${formatUsd(item.premium)}`,
     };
@@ -2514,14 +2654,14 @@ function renderFlowSide(side, type) {
   const top = rawConcentration[0] || null;
   const focusPercent = top && totalVolume > 0 ? ` · 占 ${Math.round(Number(top.volume) / totalVolume * 100)}%` : "";
   return {
-    buyVolume: formatCount(source.buy_volume),
-    sellVolume: formatCount(source.sell_volume),
+    buyVolume: formatFlowVolume(source.buy_volume, "buy"),
+    sellVolume: formatFlowVolume(source.sell_volume, "sell"),
     unknownVolume: `中性 ${formatCount(source.unknown_volume)}`,
     buyPremium: `权利金 ${formatUsd(source.buy_premium)}`,
     sellPremium: `权利金 ${formatUsd(source.sell_premium)}`,
-    netVolume: Number.isFinite(netVolume) ? `净量 ${netVolume >= 0 ? "+" : ""}${formatCount(netVolume)}` : "净量 --",
+    netVolume: Number.isFinite(netVolume) ? `${netVolume >= 0 ? "+" : ""}${formatCount(netVolume)}` : "--",
     focusTitle: top ? `${formatFlowStrike(top.strike)} ${typeLabel}` : "集中执行价 --",
-    focusSummary: top ? `${directionLabel(top.dominant_direction)} ${formatCount(top.volume)}${focusPercent}` : "等待相邻快照",
+    focusSummary: top ? `${directionLabel(top.dominant_direction)} ${formatFlowVolume(top.volume, top.dominant_direction)}${focusPercent}` : "等待相邻快照",
     concentration,
     rows,
     rowspan: rows.length,
@@ -2571,8 +2711,8 @@ function renderOptionFlow(payload) {
     warning: payload.warning || "",
     summary: {
       totalVolume: formatCount(sumVolume("buy_volume") + sumVolume("sell_volume") + sumVolume("unknown_volume")),
-      buyVolume: formatCount(sumVolume("buy_volume")),
-      sellVolume: formatCount(sumVolume("sell_volume")),
+      buyVolume: formatFlowVolume(sumVolume("buy_volume"), "buy"),
+      sellVolume: formatFlowVolume(sumVolume("sell_volume"), "sell"),
       neutralVolume: formatCount(sumVolume("unknown_volume")),
     },
     call: renderFlowSide(payload.call, "call"),
@@ -2823,8 +2963,16 @@ function showChartSkeletons() {
 }
 
 function showPending(message) {
+  clearFairValuePoll();
   resetEarningsChip();
   resetOptionFlow(message || "需要两份相邻期权链快照才能估算流向");
+  state.view.fairValue = "--";
+  state.view.fairValueSource = "保守模型 -- · 乐观模型 --";
+  state.view.fairValueTitle = "公开财务数据不足，暂不输出保守估值";
+  state.view.fairDefensive = "--";
+  state.view.fairDefensiveSource = "等待估值计算";
+  state.view.fairOptimistic = "--";
+  state.view.fairOptimisticSource = "等待远期盈利数据";
   state.view.chainTitle = `${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
   state.view.dataSource = "后台刷新中";
   state.view.fetchedAt = "快照时间 --";
@@ -2882,6 +3030,13 @@ function applyCachedQuote(quote) {
     const reference = quoteReference(null);
     state.view.quoteReference = reference.text;
     state.view.quoteReferenceTitle = reference.title;
+    state.view.fairValue = "--";
+    state.view.fairValueSource = "保守模型 -- · 乐观模型 --";
+    state.view.fairValueTitle = "公开财务数据不足，暂不输出保守估值";
+    state.view.fairDefensive = "--";
+    state.view.fairDefensiveSource = "等待估值计算";
+    state.view.fairOptimistic = "--";
+    state.view.fairOptimisticSource = "等待远期盈利数据";
     return;
   }
   renderQuote(quote);
@@ -3205,9 +3360,13 @@ async function refreshInBackground(loadId, force = false) {
         }
       }
       syncRefreshAnchorToServerAge(refreshResult);
-      state.view.lastStatus = refreshResult.deferred
-        ? "内存保护：本轮刷新已让路，继续使用本地快照"
-        : `本地快照 ${formatTime(refreshResult.fetched_at)} 已是最新（${Math.round(Number(refreshResult.age_seconds) || 0)} 秒前）`;
+      if (refreshResult.deferred) {
+        state.view.lastStatus = /内存保护/.test(String(refreshResult.warning || ""))
+          ? "内存保护：本轮刷新已让路，继续使用本地快照"
+          : "已有刷新进行中，本轮沿用本地快照";
+      } else {
+        state.view.lastStatus = `本地快照 ${formatTime(refreshResult.fetched_at)} 已是最新（${Math.round(Number(refreshResult.age_seconds) || 0)} 秒前）`;
+      }
       return;
     }
     const currentExpiration = state.expiration || refreshResult?.expiration;
@@ -3404,6 +3563,7 @@ async function loadSymbol() {
   state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
+  clearFairValuePoll();
   state.expiration = parsePageQuery(location.search).expiration || null;
   // 切换标的时取消旧页面的 Gamma 状态轮询；服务端任务可继续，但旧响应不能再驱动新页面。
   if (state.analysisRefreshTimer) clearTimeout(state.analysisRefreshTimer);
@@ -3428,6 +3588,9 @@ async function loadSymbol() {
     setError(error.message);
   } finally {
     state.loading = false;
+    // 首次进入新标的时行情/期权链可能先完成，估值仍在后端线程计算；
+    // 在 loading 解除后启动独立轻量轮询，避免必须手动刷新整页才能看到估值。
+    if (state.lastQuote) scheduleFairValuePoll(state.lastQuote);
     scheduleAutoRefresh();
   }
 }
@@ -3553,8 +3716,7 @@ window.optionScopeApp = optionScopeApp;
 initDetailGroup();
 initChainGroup();
 initChartGroup();
-initOptionFlowGroup();
-initBuyerStructureGroup();
+initOptionAnalysisGroup();
 // 时钟是独立的高频显示，不进入 Vue 响应式树，避免每秒遍历整张期权链的虚拟 DOM。
 function updateClock() {
   const clock = byId("clock");

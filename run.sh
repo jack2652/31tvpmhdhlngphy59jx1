@@ -36,12 +36,14 @@ WATCHDOG_LOG="$LOG_DIR/watchdog.log"
 APP_PID_FILE="$RUN_DIR/app.pid"
 WATCHDOG_PID_FILE="$RUN_DIR/watchdog.pid"
 DEPS_STAMP="$RUN_DIR/deps.stamp"
+SYSTEMD_UNIT_NAME="option-scope.service"
+SYSTEMD_UNIT_FILE="/etc/systemd/system/$SYSTEMD_UNIT_NAME"
 
 # Python 版本下限，与 pyproject.toml 的 requires-python 保持一致
 PYTHON_MIN_MAJOR=3
 PYTHON_MIN_MINOR=11
-WATCHDOG_INTERVAL=60          # 看门狗检查间隔（秒），可理解成「每分钟检查一次」
-WATCHDOG_FAIL_LIMIT=3         # 连续多少次健康检查失败才重启，避免偶发抖动引发重启风暴
+WATCHDOG_INTERVAL=15          # 无 systemd 环境的降级看门狗检查间隔（秒）
+WATCHDOG_FAIL_LIMIT=2         # 连续失败两次即重启，缩短源站不可用窗口
 START_TIMEOUT=60              # 启动后等待健康检查的最长秒数
 STOP_TIMEOUT=10               # 优雅退出等待秒数，超时强制结束
 LOG_MAX_KB=$((5 * 1024))      # 单个日志上限，超过就轮转，避免 512M 容器被日志写满
@@ -752,6 +754,138 @@ spawn_detached() {
   return 0
 }
 
+# ---------- systemd 服务托管 ----------
+# 生产环境优先使用 systemd：它能在服务器开机、进程崩溃和 OOM 后重新拉起应用。
+# 没有 systemd 的容器继续使用下方的 shell 看门狗，不强行安装服务文件。
+systemd_available() {
+  has_cmd systemctl && [ -d /run/systemd/system ]
+}
+
+systemd_unit_installed() {
+  [ -f "$SYSTEMD_UNIT_FILE" ]
+}
+
+systemd_service_active() {
+  systemd_available && systemd_unit_installed && systemctl is-active --quiet "$SYSTEMD_UNIT_NAME"
+}
+
+systemd_service_account() {
+  local owner group
+  if has_cmd stat; then
+    owner="$(stat -c '%U' "$PROJECT_DIR" 2>/dev/null || true)"
+    group="$(stat -c '%G' "$PROJECT_DIR" 2>/dev/null || true)"
+  fi
+  [ -n "$owner" ] || owner="${SUDO_USER:-$(id -un)}"
+  [ -n "$group" ] || group="$(id -gn "$owner" 2>/dev/null || id -gn)"
+  printf '%s\t%s' "$owner" "$group"
+}
+
+systemd_start_service() {
+  local waited=0
+  run_root systemctl start "$SYSTEMD_UNIT_NAME" || return 1
+  # systemctl start 只代表进程被拉起，仍需确认 HTTP 端口已经接受请求。
+  while [ "$waited" -lt 45 ]; do
+    if health_ok; then
+      ok "systemd 服务已启动，健康检查通过（耗时 ${waited}s）"
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  fail "systemd 服务启动后 45s 内未通过健康检查"
+  run_root systemctl status "$SYSTEMD_UNIT_NAME" --no-pager 2>&1 | tail -n 30 || true
+  return 1
+}
+
+systemd_stop_service() {
+  if systemd_service_active; then
+    info "停止 systemd 服务（$SYSTEMD_UNIT_NAME）"
+    run_root systemctl stop "$SYSTEMD_UNIT_NAME" || return 1
+  fi
+  return 0
+}
+
+install_systemd_service() {
+  local tmp="" service_user="" service_group=""
+  section "安装 systemd 服务"
+  if ! systemd_available; then
+    fail "当前系统未运行 systemd，无法安装 $SYSTEMD_UNIT_NAME；将继续使用 shell 看门狗"
+    return 1
+  fi
+  ensure_runtime || return 1
+  IFS=$'\t' read -r service_user service_group <<<"$(systemd_service_account)"
+  if [ -z "$service_user" ] || [ "$service_user" = "root" ]; then
+    service_user="root"
+    service_group="root"
+    warn "项目目录属于 root，将以 root 运行 systemd 服务；如需最小权限，请先把项目目录交给普通用户"
+  fi
+  tmp="$(mktemp "${TMPDIR:-/tmp}/option-scope.service.XXXXXX")" || return 1
+  cat >"$tmp" <<UNIT
+[Unit]
+Description=Option Scope stock and options dashboard
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory="$PROJECT_DIR"
+ExecStart=/bin/bash "$SCRIPT_PATH" foreground
+User=$service_user
+Group=$service_group
+Restart=always
+RestartSec=3
+TimeoutStartSec=120
+TimeoutStopSec=30
+KillSignal=SIGINT
+KillMode=mixed
+LimitNOFILE=8192
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=option-scope
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  # 先停旧的后台实例，避免 systemd 与 shell 看门狗同时抢端口。
+  stop_app || {
+    rm -f "$tmp"
+    return 1
+  }
+  if ! run_root install -m 0644 "$tmp" "$SYSTEMD_UNIT_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  run_root systemctl daemon-reload || return 1
+  run_root systemctl enable "$SYSTEMD_UNIT_NAME" || return 1
+  systemd_start_service || return 1
+  ok "systemd 服务已安装并设置为开机自动启动"
+  printf '  查看状态：systemctl status %s\n' "$SYSTEMD_UNIT_NAME"
+  printf '  查看日志：journalctl -u %s -f\n' "$SYSTEMD_UNIT_NAME"
+  return 0
+}
+
+remove_systemd_service() {
+  section "移除 systemd 服务"
+  if ! systemd_available; then
+    warn "当前系统未运行 systemd"
+    return 0
+  fi
+  if ! systemd_unit_installed; then
+    info "未找到 $SYSTEMD_UNIT_FILE"
+    return 0
+  fi
+  # 先停掉当前实例，避免移除服务文件后留下一个旧的前台进程占用端口。
+  stop_app || return 1
+  run_root systemctl disable --now "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1 || true
+  run_root rm -f "$SYSTEMD_UNIT_FILE" || return 1
+  run_root systemctl daemon-reload || return 1
+  ok "systemd 服务已移除"
+  return 0
+}
+
 # 启动应用必须用虚拟环境里的解释器，避免污染系统 Python
 app_python() {
   if [ -x "$VENV_PY" ]; then
@@ -760,6 +894,17 @@ app_python() {
   fi
   fail "虚拟环境不可用：$VENV_PY（请先执行菜单第 1 项完成环境安装）"
   return 1
+}
+
+# systemd 使用的前台入口：不 fork、不启动 shell 看门狗，让 systemd 直接监管 Python 进程。
+foreground_app() {
+  local py
+  ensure_env_file || return 1
+  py="$(app_python)" || return 1
+  mkdir -p "$RUN_DIR" "$LOG_DIR"
+  cd "$PROJECT_DIR" || return 1
+  apply_low_memory_allocator || return 1
+  exec "$py" -m app
 }
 
 # 启动应用进程本体（不含看门狗）：已在运行直接返回，端口被占用则打印占用者
@@ -893,6 +1038,11 @@ stop_app_process() {
 start_app() {
   section "启动应用"
   ensure_runtime || return 1
+  if systemd_unit_installed && systemd_available; then
+    systemd_start_service || return 1
+    show_access_url
+    return 0
+  fi
   start_app_internal || return 1
   start_watchdog || warn "应用已启动，但看门狗没起来（不影响使用，可稍后重试）"
   show_access_url
@@ -903,6 +1053,9 @@ stop_app() {
   section "停止应用"
   # 先停看门狗，否则它会把刚停掉的应用又拉起来
   stop_watchdog
+  if systemd_unit_installed && systemd_available; then
+    systemd_stop_service || return 1
+  fi
   stop_app_process
   sleep 1
   if app_running; then
@@ -917,7 +1070,7 @@ restart_app() {
   start_app
 }
 
-# 看门狗主循环：日志轮转 → 进程存活 → 健康检查 → 必要时拉起（每分钟一轮）
+# 看门狗主循环：日志轮转 → 进程存活 → 健康检查 → 必要时拉起（无 systemd 时使用）
 watchdog_loop() {
   local fails=0 pid="" other=""
   mkdir -p "$RUN_DIR" "$LOG_DIR"
@@ -970,7 +1123,7 @@ watchdog_loop() {
 
 # ---------- 状态展示与各菜单动作 ----------
 show_status() {
-  local port pid db_path size limit
+  local port pid db_path size limit systemd_state systemd_enabled
   section "运行状态"
   printf '  系统：%s（架构 %s，包管理器 %s）\n' "$OS_NAME" "$ARCH" "${PKG_MANAGER:-未知}"
   printf '  项目目录：%s\n' "$PROJECT_DIR"
@@ -980,6 +1133,17 @@ show_status() {
     printf '  虚拟环境：%s（未安装）\n' "$VENV_DIR"
   fi
   port="$(app_port)"
+  if systemd_unit_installed; then
+    if systemd_available; then
+      systemd_state="$(systemctl is-active "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+      systemd_enabled="$(systemctl is-enabled "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+      printf '  systemd：%s（状态 %s，开机启动 %s）\n' "$SYSTEMD_UNIT_NAME" "${systemd_state:-未知}" "${systemd_enabled:-未知}"
+    else
+      printf '  systemd：已安装服务文件，但当前环境未运行 systemd\n'
+    fi
+  else
+    printf '  systemd：未安装（使用 shell 看门狗）\n'
+  fi
   pid="$(app_pid 2>/dev/null || true)"
   if [ -n "$pid" ]; then
     if health_ok; then
@@ -1277,6 +1441,8 @@ action_service() {
   printf '  1) 重启应用\n'
   printf '  2) 更新依赖并重启（改过 pyproject.toml 时用）\n'
   printf '  3) 卸载运行环境（停止服务并删除 .venv/.run/logs）\n'
+  printf '  4) 安装/启用 systemd 服务（生产环境推荐）\n'
+  printf '  5) 移除 systemd 服务（恢复 shell 看门狗）\n'
   printf '  0) 返回\n'
   printf '请选择：'
   read -r choice || return 0
@@ -1284,6 +1450,8 @@ action_service() {
     1) restart_app ;;
     2) update_deps_and_restart ;;
     3) uninstall_runtime ;;
+    4) install_systemd_service ;;
+    5) remove_systemd_service ;;
     0 | "") return 0 ;;
     *) warn "无效选择：$choice" ;;
   esac
@@ -1418,6 +1586,9 @@ Option Scope 运维脚本用法：
   ./run.sh                    打开交互菜单
   ./run.sh 2                  直接执行第 2 项（适合脚本、计划任务调用）
   ./run.sh start|stop|restart|status|doctor|install|config|db
+  ./run.sh install-service     安装并启用 systemd 常驻服务（生产环境推荐）
+  ./run.sh remove-service      移除 systemd 服务，恢复 shell 看门狗
+  ./run.sh foreground          前台运行应用（供 systemd 使用）
   ./run.sh update             更新应用：停止 → 拉取最新源码 → 依赖检查 → 重启（菜单第 3 项）
   ./run.sh help               显示本帮助
 从零安装（当前目录下没有源码时先自动拉取，再继续执行）：
@@ -1431,7 +1602,7 @@ show_menu() {
   printf '  1) 检测环境并安装依赖（已安装的步骤自动跳过）\n'
   printf '  2) 启动应用（后台运行 + 看门狗守护）\n'
   printf '  3) 更新应用（停止 → 拉取最新源码 → 依赖检查 → 重启）\n'
-  printf '  4) 服务管理（重启 / 更新依赖 / 卸载运行环境）\n'
+  printf '  4) 服务管理（重启 / systemd / 更新依赖 / 卸载运行环境）\n'
   printf '  5) 修改配置（.env 交互式编辑）\n'
   printf '  6) 停止应用（含看门狗）\n'
   printf '  7) 查看状态与日志\n'
@@ -1742,6 +1913,9 @@ main() {
     8 | db | database) action_database ;;
     9 | doctor | check) action_doctor ;;
     restart) restart_app ;;
+    install-service | service-install) install_systemd_service ;;
+    remove-service | service-remove) remove_systemd_service ;;
+    foreground | serve) foreground_app ;;
     log | logs) tail_log "$APP_LOG" "${2:-50}" ;;
     -h | --help | help) usage ;;
     *)

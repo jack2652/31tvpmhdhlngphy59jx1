@@ -241,11 +241,16 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 database.finish_analysis_job(job_key, "failed", None, str(exc), started_at)
                 return
             if result.get("deferred"):
+                default_warning = (
+                    "内存保护：Gamma 窗口已让路"
+                    if settings.low_memory
+                    else "Gamma 窗口正在等待首屏刷新完成"
+                )
                 database.finish_analysis_job(
                     job_key,
                     "failed",
                     result,
-                    result.get("warning") or "内存保护：Gamma 窗口已让路",
+                    result.get("warning") or default_warning,
                     started_at,
                 )
             else:
@@ -262,12 +267,45 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
     def quote_response(row: dict[str, Any], source: str) -> dict[str, Any]:
         """统一行情响应结构：把 SQLite 里的 sessions_json 解析成前端的 sessions 对象。"""
         payload = dict(row)
+        # 估值在行情快照之后异步完成；没有结果时由前端做轻量轮询，而不是重复抓整份期权链。
+        payload.setdefault("fair_value_pending", payload.get("fair_value_source") != "valuation_v14")
+        # 估值在后台线程完成后先写入共享分析缓存；这里合并到旧行情快照，
+        # 让多 worker 和首次估值都能在下一次轻量报价请求中显示，不必等待期权链刷新。
+        symbol_name = str(payload.get("symbol") or "").upper()
+        if symbol_name and payload.get("fair_value_source") != "valuation_v14":
+            shared = database.get_analysis_cache(f"fair-value:v14:{symbol_name}")
+            if isinstance(shared, dict) and shared.get("source") == "valuation_v14" and shared.get("value") is not None:
+                for key in ("value", "low", "high", "buy_low", "buy_high", "source", "model", "forward_eps", "forward_eps_source", "safety_margin", "confidence", "defensive", "optimistic"):
+                    payload_key = {
+                        "value": "fair_value",
+                        "low": "fair_value_low",
+                        "high": "fair_value_high",
+                        "buy_low": "fair_value_buy_low",
+                        "buy_high": "fair_value_buy_high",
+                        "source": "fair_value_source",
+                        "model": "fair_value_model",
+                        "forward_eps": "fair_value_forward_eps",
+                        "forward_eps_source": "fair_value_forward_eps_source",
+                        "safety_margin": "fair_value_safety_margin",
+                        "confidence": "fair_value_confidence",
+                        "defensive": "fair_value_defensive",
+                        "optimistic": "fair_value_optimistic",
+                    }[key]
+                    payload[payload_key] = shared.get(key)
         stored = payload.pop("sessions_json", None)
+        for field, column in (("fair_value_defensive", "fair_value_defensive_json"), ("fair_value_optimistic", "fair_value_optimistic_json")):
+            raw = payload.pop(column, None)
+            if field not in payload or payload.get(field) is None:
+                try:
+                    payload[field] = json.loads(raw) if raw else None
+                except (TypeError, ValueError):
+                    payload[field] = None
         sessions = payload.get("sessions") or parse_sessions(stored)
         # 最新快照没有时段数据时（数据源限流或旧进程写入）回退最近 24 小时内的有效值。
         if not sessions and payload.get("symbol"):
             sessions = database.latest_sessions(payload["symbol"])
         payload["sessions"] = sessions
+        payload["fair_value_pending"] = payload.get("fair_value_source") != "valuation_v14"
         payload["source"] = source
         return payload
 
@@ -276,6 +314,13 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         return {
             "symbol": symbol_name, "price": None, "change_percent": None, "currency": "USD",
             "market_state": None, "sessions": {}, "provider": "upstream", "source": "pending",
+            "fair_value": None, "fair_value_low": None, "fair_value_high": None,
+            "fair_value_buy_low": None, "fair_value_buy_high": None, "fair_value_source": None,
+            "fair_value_model": None, "fair_value_forward_eps": None,
+            "fair_value_forward_eps_source": None, "fair_value_safety_margin": None,
+            "fair_value_confidence": None,
+            "fair_value_defensive": None, "fair_value_optimistic": None,
+            "fair_value_pending": True,
         }
 
     @router.get("/quote/{stock_symbol}")

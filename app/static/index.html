@@ -35,10 +35,12 @@
     </section>
 
     <section class="headline-grid">
-      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">相对上一个交易日 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">财报日期未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
+      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">上一个交易日 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">财报日期未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
       <article class="metric panel"><div class="eyebrow">合约总数</div><strong id="total-count" v-text="view.totalCount">--</strong><span>当前到期日</span></article>
       <article class="metric call-metric panel"><div class="eyebrow">看涨成交量</div><strong id="call-volume" v-text="view.callVolume">--</strong><span id="call-interest" v-text="view.callInterest">未平仓 --</span></article>
       <article class="metric put-metric panel"><div class="eyebrow">看跌成交量</div><strong id="put-volume" v-text="view.putVolume">--</strong><span id="put-interest" v-text="view.putInterest">未平仓 --</span></article>
+      <article class="metric fair-value-metric fair-defensive-metric panel" :title="view.fairDefensiveTitle"><div class="eyebrow">保守估值 (DCF/正常化PE)</div><strong id="fair-defensive" v-text="view.fairDefensive">--</strong><span id="fair-defensive-source" v-text="view.fairDefensiveSource">等待估值计算</span></article>
+      <article class="metric fair-value-metric fair-optimistic-metric panel" :title="view.fairOptimisticTitle"><div class="eyebrow">乐观估值 (远期PEG/高成长)</div><strong id="fair-optimistic" v-text="view.fairOptimistic">--</strong><span id="fair-optimistic-source" v-text="view.fairOptimisticSource">等待远期盈利数据</span></article>
     </section>
 
     <section class="detail-group panel" id="analysis-detail">
@@ -48,7 +50,6 @@
           <span class="detail-text"><span class="eyebrow">ANALYSIS DETAIL</span><span class="detail-title">趋势通道 · 加仓价位 · 压力位/支撑位</span></span>
         </button>
         <div class="detail-modes" id="detail-modes" hidden>
-          <span class="detail-modes-label">基准价</span>
           <div class="detail-segmented" role="group" aria-label="压力位/支撑位的计算基准">
             <button class="detail-seg" id="basis-live" type="button" data-basis="live" aria-pressed="true" title="按当前时段的实时价（盘中为最新成交价）重算压力位与支撑位">实时价</button>
             <button class="detail-seg" id="basis-close" type="button" data-basis="close" aria-pressed="false" title="按盘后价重算（沿用原口径，盘后数据缺失时回退盘前价）">盘后价</button>
@@ -148,15 +149,22 @@
       </div>
     </section>
 
-    <section class="detail-group panel option-flow-group" id="option-flow-group">
-      <div class="detail-header" id="option-flow-header">
-        <button class="detail-toggle" id="option-flow-toggle" type="button" aria-expanded="true" aria-controls="option-flow-fold">
+    <section class="detail-group panel option-analysis-group" id="option-analysis-group">
+      <div class="detail-header" id="option-analysis-header">
+        <button class="detail-toggle" id="option-analysis-toggle" type="button" aria-expanded="true" aria-controls="option-analysis-fold">
           <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">OPTION FLOW</span><span class="detail-title">期权成交方向与流向分析</span></span>
+          <span class="detail-text"><span class="eyebrow">OPTION ANALYSIS</span><span class="detail-title">期权流向与买方结构分析</span></span>
         </button>
-        <span class="detail-action" id="option-flow-action">收起</span>
+        <div class="detail-modes option-analysis-tabs" id="option-analysis-tabs" role="group" aria-label="期权分析视图">
+          <div class="detail-segmented">
+            <button class="detail-seg" type="button" data-option-view="flow" aria-pressed="true">期权成交方向与流向分析</button>
+            <button class="detail-seg" type="button" data-option-view="buyer" aria-pressed="false">期权买方结构分析</button>
+          </div>
+        </div>
+        <span class="detail-action" id="option-analysis-action">收起</span>
       </div>
-      <div class="option-flow-fold" id="option-flow-fold">
+      <div class="detail-body option-analysis-fold" id="option-analysis-fold">
+    <div class="option-flow-fold" id="option-flow-fold" data-option-view-panel="flow">
         <div class="option-flow-panel">
           <div class="flow-overview"><div><span class="flow-kicker">相邻快照</span><p>用成交量增量和买卖价位置判断主动买卖</p></div><div class="flow-signal" :class="`flow-signal-${view.flow.signalClass}`"><strong v-text="view.flow.signalLabel">等待相邻快照</strong><span v-text="view.flow.signalDetail">需要两份相邻期权链快照才能估算流向</span></div></div>
           <div class="flow-window"><span v-text="view.flow.windowLabel">快照窗口 --</span><span v-text="view.flow.methodLabel">成交量增量 · 买卖价方向估算 · 中性单列</span></div>
@@ -169,30 +177,21 @@
           <div class="flow-directions">
             <section class="flow-direction-card flow-direction-call">
               <header><div><strong>CALL</strong><span>看涨方向</span></div><b>净量 <em v-text="view.flow.call.netVolume">--</em></b></header>
-              <div class="flow-direction-metrics"><div><span>买入</span><strong v-text="view.flow.call.buyVolume">--</strong><small v-text="view.flow.call.buyPremium">权利金 --</small></div><div><span>卖出</span><strong v-text="view.flow.call.sellVolume">--</strong><small v-text="view.flow.call.sellPremium">权利金 --</small></div><div><span>中性</span><strong v-text="view.flow.call.unknownVolume">--</strong></div></div>
-              <div class="flow-strikes"><div class="flow-strikes-title">集中执行价 <span>成交量 / 占比</span></div><div v-if="!view.flow.call.rows.length" class="flow-strikes-empty">等待数据</div><div v-for="row in view.flow.call.rows" :key="row.key" class="flow-strike-row"><div><strong v-text="row.label">--</strong><small v-text="row.premium">权利金 --</small></div><span class="flow-direction-value" :class="`flow-direction-${row.className}`" v-text="row.direction">中性</span><b v-text="row.volume">--</b><i v-text="row.share">--</i></div></div>
+              <div class="flow-direction-metrics"><div><span>买入成交量</span><strong v-text="view.flow.call.buyVolume">--</strong><small v-text="view.flow.call.buyPremium">权利金 --</small></div><div><span>卖出成交量</span><strong v-text="view.flow.call.sellVolume">--</strong><small v-text="view.flow.call.sellPremium">权利金 --</small></div><div><span>中性成交量</span><strong v-text="view.flow.call.unknownVolume">--</strong><small>中间价 / 缺报价</small></div></div>
+              <div class="flow-strikes"><div class="flow-strikes-title">集中执行价 <span>按成交量排序</span></div><div class="flow-strike-head" aria-hidden="true"><span>执行价 / 权利金</span><span>成交方向</span><span>成交量</span><span>占比</span></div><div v-if="!view.flow.call.rows.length" class="flow-strikes-empty">等待数据</div><div v-for="row in view.flow.call.rows" :key="row.key" class="flow-strike-row"><div><strong v-text="row.label">--</strong><small v-text="row.premium">权利金 --</small></div><span class="flow-direction-value" :class="`flow-direction-${row.className}`" v-text="row.direction">中性</span><b :class="`flow-volume-${row.className}`" v-text="row.volume">--</b><i v-text="row.share">--</i></div></div>
             </section>
             <section class="flow-direction-card flow-direction-put">
               <header><div><strong>PUT</strong><span>看跌方向</span></div><b>净量 <em v-text="view.flow.put.netVolume">--</em></b></header>
-              <div class="flow-direction-metrics"><div><span>买入</span><strong v-text="view.flow.put.buyVolume">--</strong><small v-text="view.flow.put.buyPremium">权利金 --</small></div><div><span>卖出</span><strong v-text="view.flow.put.sellVolume">--</strong><small v-text="view.flow.put.sellPremium">权利金 --</small></div><div><span>中性</span><strong v-text="view.flow.put.unknownVolume">--</strong></div></div>
-              <div class="flow-strikes"><div class="flow-strikes-title">集中执行价 <span>成交量 / 占比</span></div><div v-if="!view.flow.put.rows.length" class="flow-strikes-empty">等待数据</div><div v-for="row in view.flow.put.rows" :key="row.key" class="flow-strike-row"><div><strong v-text="row.label">--</strong><small v-text="row.premium">权利金 --</small></div><span class="flow-direction-value" :class="`flow-direction-${row.className}`" v-text="row.direction">中性</span><b v-text="row.volume">--</b><i v-text="row.share">--</i></div></div>
+              <div class="flow-direction-metrics"><div><span>买入成交量</span><strong v-text="view.flow.put.buyVolume">--</strong><small v-text="view.flow.put.buyPremium">权利金 --</small></div><div><span>卖出成交量</span><strong v-text="view.flow.put.sellVolume">--</strong><small v-text="view.flow.put.sellPremium">权利金 --</small></div><div><span>中性成交量</span><strong v-text="view.flow.put.unknownVolume">--</strong><small>中间价 / 缺报价</small></div></div>
+              <div class="flow-strikes"><div class="flow-strikes-title">集中执行价 <span>按成交量排序</span></div><div class="flow-strike-head" aria-hidden="true"><span>执行价 / 权利金</span><span>成交方向</span><span>成交量</span><span>占比</span></div><div v-if="!view.flow.put.rows.length" class="flow-strikes-empty">等待数据</div><div v-for="row in view.flow.put.rows" :key="row.key" class="flow-strike-row"><div><strong v-text="row.label">--</strong><small v-text="row.premium">权利金 --</small></div><span class="flow-direction-value" :class="`flow-direction-${row.className}`" v-text="row.direction">中性</span><b :class="`flow-volume-${row.className}`" v-text="row.volume">--</b><i v-text="row.share">--</i></div></div>
             </section>
           </div>
           <div class="flow-method-note">中性：成交价位于买卖价中间，或该合约缺少有效买卖报价；这部分不会被强行归入买入或卖出。</div>
           <div class="flow-warning" v-if="view.flow.warning" v-text="view.flow.warning"></div>
         </div>
       </div>
-    </section>
 
-    <section class="detail-group panel buyer-structure-panel" id="buyer-structure-group">
-      <div class="detail-header" id="buyer-structure-header">
-        <button class="detail-toggle" id="buyer-structure-toggle" type="button" aria-expanded="false" aria-controls="buyer-structure-fold">
-          <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">OPTIONS BUYER STRUCTURE</span><span class="detail-title">期权买方结构分析</span></span>
-        </button>
-        <span class="detail-action" id="buyer-structure-action">展开</span>
-      </div>
-      <div class="buyer-structure-fold" id="buyer-structure-fold" hidden>
+    <div class="buyer-structure-fold" id="buyer-structure-fold" data-option-view-panel="buyer" hidden>
         <div class="buyer-structure-heading">
           <p>按当前方向、报价流动性和分析窗口筛选两侧各最多 5 条结构；排序按触及目标的概率加权，预计盈亏按到达目标价估算</p>
           <div class="buyer-structure-meta">
@@ -222,6 +221,7 @@
           </div>
         </div>
         <div v-if="view.buyer.available" class="buyer-structure-note">{{ view.buyer.note }}</div>
+      </div>
       </div>
     </section>
 
