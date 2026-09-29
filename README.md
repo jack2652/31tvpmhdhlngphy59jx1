@@ -98,7 +98,7 @@ URL 中的密钥会进入浏览器历史记录，
 请避免在公开截图或聊天中直接分享完整地址。
 
 应用会自动读取项目根目录下的 `.env`；也可以直接在启动命令前导出环境变量。
-交互菜单第 6 项会以数字菜单逐项修改配置，包含 `ACCESS_KEY`：可手动设置、自动生成或清空（清空表示关闭访问保护），修改后应用运行中会询问是否立即重启。
+交互菜单第 5 项会以数字菜单逐项修改配置，包含 `ACCESS_KEY` 和 Alpaca 夜盘凭据：`ALPACA_API_KEY`、`ALPACA_API_SECRET` 输入时不会回显，摘要只显示掩码；输入 `clear` 可清空凭据。修改后应用运行中会询问是否立即重启。
 
 也可以直接使用 `.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000`。可通过 `HOST` 和 `PORT` 环境变量覆盖 `python -m app` 的默认值。
 
@@ -138,6 +138,8 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 | `PORT` | `8000` | `python -m app` 的监听端口 |
 | `ACCESS_KEY` | 空 | 页面与 API 访问密钥；`run.sh` 首次启动自动生成 16 位小写字母 + 数字 |
 | `MARKET_PROXY` | 空 | 主行情接口和 Cboe 盘外期权接口使用的代理地址，例如 `http://127.0.0.1:7890` |
+| `ALPACA_API_KEY` | 空 | Alpaca Basic API Key；配置后仅在美东夜盘补充股票现货行情，未配置时沿用原行情源 |
+| `ALPACA_API_SECRET` | 空 | Alpaca Basic API Secret；`run.sh config` 菜单中隐藏输入，摘要不会显示原文 |
 | `DEFAULT_SYMBOLS` | `QQQ` | 后台定时刷新的逗号分隔标的；也是页面未带 `?symbol=` 时的默认标的 |
 | `REFRESH_INTERVAL_SECONDS` | `60` | 后台定时刷新间隔 |
 | `AUTO_REFRESH_SECONDS` | `60` | 页面倒计时和自动刷新间隔；同时作为自动刷新复用 SQLite 快照的新鲜期 |

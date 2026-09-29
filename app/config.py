@@ -70,6 +70,9 @@ class Settings:
     low_memory: bool = False
     # SQLite 共享分析缓存条数。低内存时少留几份，避免大 JSON 反复进出内存
     analysis_cache_entries: int = 128
+    # Alpaca Basic 夜盘现货凭据；只用于股票夜盘，不接入期权 indicative feed
+    alpaca_api_key: str = ""
+    alpaca_api_secret: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -99,4 +102,6 @@ class Settings:
             auto_refresh_seconds=_positive_int("AUTO_REFRESH_SECONDS", 60),
             low_memory=low_memory,
             analysis_cache_entries=8 if low_memory else 128,
+            alpaca_api_key=os.getenv("ALPACA_API_KEY", "").strip(),
+            alpaca_api_secret=os.getenv("ALPACA_API_SECRET", "").strip(),
         )

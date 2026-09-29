@@ -35,7 +35,7 @@
     </section>
 
     <section class="headline-grid">
-      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">相对昨收 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">财报日期未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
+      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">相对上一个交易日 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">财报日期未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
       <article class="metric panel"><div class="eyebrow">合约总数</div><strong id="total-count" v-text="view.totalCount">--</strong><span>当前到期日</span></article>
       <article class="metric call-metric panel"><div class="eyebrow">看涨成交量</div><strong id="call-volume" v-text="view.callVolume">--</strong><span id="call-interest" v-text="view.callInterest">未平仓 --</span></article>
       <article class="metric put-metric panel"><div class="eyebrow">看跌成交量</div><strong id="put-volume" v-text="view.putVolume">--</strong><span id="put-interest" v-text="view.putInterest">未平仓 --</span></article>
@@ -45,7 +45,7 @@
       <div class="detail-header" id="detail-header">
         <button class="detail-toggle" id="detail-toggle" type="button" aria-expanded="false" aria-controls="detail-body">
           <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">ANALYSIS DETAIL</span><span class="detail-title">趋势通道 · 加仓价位 · 压力位/支撑位</span><span class="detail-hint" id="detail-hint">默认折叠，点击展开这四张面板的明细表</span></span>
+          <span class="detail-text"><span class="eyebrow">ANALYSIS DETAIL</span><span class="detail-title">趋势通道 · 加仓价位 · 压力位/支撑位</span></span>
         </button>
         <div class="detail-modes" id="detail-modes" hidden>
           <span class="detail-modes-label">基准价</span>
@@ -117,7 +117,7 @@
       <div class="detail-header" id="chart-header">
         <button class="detail-toggle" id="chart-toggle" type="button" aria-expanded="true" aria-controls="chart-fold">
           <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">CHARTS</span><span class="detail-title">Gamma 敞口 · 压力位/支撑位 · 成交量分布 · 持仓量分布</span><span class="detail-hint">默认展开，点击收起这四张图表</span></span>
+          <span class="detail-text"><span class="eyebrow">CHARTS</span><span class="detail-title">Gamma 敞口 · 压力位/支撑位 · 成交量分布 · 持仓量分布</span></span>
         </button>
         <span class="detail-action" id="chart-action">收起</span>
       </div>
@@ -148,11 +148,47 @@
       </div>
     </section>
 
+    <section class="detail-group panel option-flow-group" id="option-flow-group">
+      <div class="detail-header" id="option-flow-header">
+        <button class="detail-toggle" id="option-flow-toggle" type="button" aria-expanded="true" aria-controls="option-flow-fold">
+          <span class="detail-caret" aria-hidden="true"></span>
+          <span class="detail-text"><span class="eyebrow">OPTION FLOW</span><span class="detail-title">期权成交方向与流向分析</span></span>
+        </button>
+        <span class="detail-action" id="option-flow-action">收起</span>
+      </div>
+      <div class="option-flow-fold" id="option-flow-fold">
+        <div class="option-flow-panel">
+          <div class="flow-overview"><div><span class="flow-kicker">相邻快照</span><p>用成交量增量和买卖价位置判断主动买卖</p></div><div class="flow-signal" :class="`flow-signal-${view.flow.signalClass}`"><strong v-text="view.flow.signalLabel">等待相邻快照</strong><span v-text="view.flow.signalDetail">需要两份相邻期权链快照才能估算流向</span></div></div>
+          <div class="flow-window"><span v-text="view.flow.windowLabel">快照窗口 --</span><span v-text="view.flow.methodLabel">成交量增量 · 买卖价方向估算 · 中性单列</span></div>
+          <div class="flow-kpi-strip" aria-label="期权流向汇总">
+            <div><span>新增成交量</span><strong v-text="view.flow.summary.totalVolume">--</strong><small>看涨 + 看跌</small></div>
+            <div><span>主动买入</span><strong class="flow-positive" v-text="view.flow.summary.buyVolume">--</strong><small>接近卖价</small></div>
+            <div><span>主动卖出</span><strong class="flow-negative" v-text="view.flow.summary.sellVolume">--</strong><small>接近买价</small></div>
+            <div><span>中性成交</span><strong class="flow-neutral" v-text="view.flow.summary.neutralVolume">--</strong><small>中间价 / 缺报价</small></div>
+          </div>
+          <div class="flow-directions">
+            <section class="flow-direction-card flow-direction-call">
+              <header><div><strong>CALL</strong><span>看涨方向</span></div><b>净量 <em v-text="view.flow.call.netVolume">--</em></b></header>
+              <div class="flow-direction-metrics"><div><span>买入</span><strong v-text="view.flow.call.buyVolume">--</strong><small v-text="view.flow.call.buyPremium">权利金 --</small></div><div><span>卖出</span><strong v-text="view.flow.call.sellVolume">--</strong><small v-text="view.flow.call.sellPremium">权利金 --</small></div><div><span>中性</span><strong v-text="view.flow.call.unknownVolume">--</strong></div></div>
+              <div class="flow-strikes"><div class="flow-strikes-title">集中执行价 <span>成交量 / 占比</span></div><div v-if="!view.flow.call.rows.length" class="flow-strikes-empty">等待数据</div><div v-for="row in view.flow.call.rows" :key="row.key" class="flow-strike-row"><div><strong v-text="row.label">--</strong><small v-text="row.premium">权利金 --</small></div><span class="flow-direction-value" :class="`flow-direction-${row.className}`" v-text="row.direction">中性</span><b v-text="row.volume">--</b><i v-text="row.share">--</i></div></div>
+            </section>
+            <section class="flow-direction-card flow-direction-put">
+              <header><div><strong>PUT</strong><span>看跌方向</span></div><b>净量 <em v-text="view.flow.put.netVolume">--</em></b></header>
+              <div class="flow-direction-metrics"><div><span>买入</span><strong v-text="view.flow.put.buyVolume">--</strong><small v-text="view.flow.put.buyPremium">权利金 --</small></div><div><span>卖出</span><strong v-text="view.flow.put.sellVolume">--</strong><small v-text="view.flow.put.sellPremium">权利金 --</small></div><div><span>中性</span><strong v-text="view.flow.put.unknownVolume">--</strong></div></div>
+              <div class="flow-strikes"><div class="flow-strikes-title">集中执行价 <span>成交量 / 占比</span></div><div v-if="!view.flow.put.rows.length" class="flow-strikes-empty">等待数据</div><div v-for="row in view.flow.put.rows" :key="row.key" class="flow-strike-row"><div><strong v-text="row.label">--</strong><small v-text="row.premium">权利金 --</small></div><span class="flow-direction-value" :class="`flow-direction-${row.className}`" v-text="row.direction">中性</span><b v-text="row.volume">--</b><i v-text="row.share">--</i></div></div>
+            </section>
+          </div>
+          <div class="flow-method-note">中性：成交价位于买卖价中间，或该合约缺少有效买卖报价；这部分不会被强行归入买入或卖出。</div>
+          <div class="flow-warning" v-if="view.flow.warning" v-text="view.flow.warning"></div>
+        </div>
+      </div>
+    </section>
+
     <section class="detail-group panel buyer-structure-panel" id="buyer-structure-group">
       <div class="detail-header" id="buyer-structure-header">
         <button class="detail-toggle" id="buyer-structure-toggle" type="button" aria-expanded="false" aria-controls="buyer-structure-fold">
           <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">OPTIONS BUYER STRUCTURE</span><span class="detail-title">期权买方结构分析</span><span class="detail-hint">默认折叠，展开查看候选结构</span></span>
+          <span class="detail-text"><span class="eyebrow">OPTIONS BUYER STRUCTURE</span><span class="detail-title">期权买方结构分析</span></span>
         </button>
         <span class="detail-action" id="buyer-structure-action">展开</span>
       </div>

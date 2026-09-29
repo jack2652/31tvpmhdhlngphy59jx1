@@ -69,8 +69,8 @@ const state = {
     quoteChangeColor: "var(--muted)",
     quoteCurrency: "USD",
     quoteMarket: "--",
-    quoteReference: "相对昨收 --",
-    quoteReferenceTitle: "涨跌幅以最近一个已完成交易日的收盘价为基准",
+    quoteReference: "相对上一个交易日 --",
+    quoteReferenceTitle: "涨跌幅以上一个交易日的收盘价为基准",
     earnings: {
       status: "unknown",
       label: "财报日期未知",
@@ -81,6 +81,47 @@ const state = {
     putVolume: "--",
     callInterest: "未平仓 --",
     putInterest: "未平仓 --",
+    flow: {
+      available: false,
+      signalLabel: "等待相邻快照",
+      signalClass: "waiting",
+      signalDetail: "需要两份相邻期权链快照才能估算流向",
+      windowLabel: "快照窗口 --",
+      methodLabel: "成交量增量 · 买卖价方向估算 · 中性单列",
+      warning: "",
+      summary: {
+        totalVolume: "--",
+        buyVolume: "--",
+        sellVolume: "--",
+        neutralVolume: "--",
+      },
+      call: {
+        buyVolume: "--",
+        sellVolume: "--",
+        unknownVolume: "--",
+        buyPremium: "权利金 --",
+        sellPremium: "权利金 --",
+        netVolume: "净量 --",
+        focusTitle: "集中执行价 --",
+        focusSummary: "等待相邻快照",
+        concentration: [],
+        rows: [{ key: "call-empty", label: "--", direction: "等待数据", className: "unknown", volume: "--", share: "--", premium: "权利金 --" }],
+        rowspan: 1,
+      },
+      put: {
+        buyVolume: "--",
+        sellVolume: "--",
+        unknownVolume: "--",
+        buyPremium: "权利金 --",
+        sellPremium: "权利金 --",
+        netVolume: "净量 --",
+        focusTitle: "集中执行价 --",
+        focusSummary: "等待相邻快照",
+        concentration: [],
+        rows: [{ key: "put-empty", label: "--", direction: "等待数据", className: "unknown", volume: "--", share: "--", premium: "权利金 --" }],
+        rowspan: 1,
+      },
+    },
     chainTitle: "选择到期日查看期权链",
     dataSource: "尚未加载",
     fetchedAt: "快照时间 --",
@@ -283,6 +324,20 @@ function initChartGroup() {
     defaultExpanded: true,
     // 图表按容器实际尺寸绘制：折叠期间若被后台刷新重绘过（隐藏时只有最小尺寸），展开后必须补一次重绘。
     onChange: (expanded) => { if (expanded) requestAnimationFrame(() => redrawChartsIfResized()); },
+  });
+}
+
+// 期权流向默认展开，展开状态仅在当前标签页内记忆。
+const OPTION_FLOW_KEY = "option-scope-option-flow";
+
+function initOptionFlowGroup() {
+  bindFoldGroup({
+    headerId: "option-flow-header",
+    toggleId: "option-flow-toggle",
+    bodyId: "option-flow-fold",
+    actionId: "option-flow-action",
+    storageKey: OPTION_FLOW_KEY,
+    defaultExpanded: true,
   });
 }
 
@@ -545,6 +600,18 @@ function scheduleAutoRefresh() {
 function formatNumber(value, digits = 0) { if (value === null || value === undefined || value === "") return "--"; return Number(value).toLocaleString("en-US", { maximumFractionDigits: digits }); }
 function formatMoney(value) { return value == null ? "--" : Number(value).toFixed(2); }
 function formatTime(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false }); }
+function formatFlowInterval(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "相邻快照";
+  if (seconds >= 3600) return `相隔 ${Math.floor(seconds / 3600)} 小时`;
+  if (seconds >= 60) return `相隔 ${Math.floor(seconds / 60)} 分钟`;
+  return `相隔 ${Math.max(1, Math.round(seconds))} 秒`;
+}
+function formatFlowStrike(value) {
+  const strike = Number(value);
+  if (!Number.isFinite(strike)) return "--";
+  return Number.isInteger(strike) ? String(strike) : strike.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
 // 回溯的未平仓量只展示到日期，避免角标里塞入完整时间。
 function formatDay(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? "--" : date.toLocaleDateString("zh-CN"); }
 // GEX 数值内部按「百万美元」存储，展示时换算成中文单位：≥1 亿用「亿」，其余用「万」，不足万元的显示原值。
@@ -780,10 +847,13 @@ const BASIS_MODES = { live: "实时价", close: "盘后价" };
 // 夜盘没有可用的 Yahoo 夜盘价时改用最近一次正常交易日收盘价，避免把常规价误标成夜盘实时价。
 function activeBasis(quote) {
   if (state.levelBasisMode === "close") return levelBasis(quote, quote?.price);
-  // 夜盘没有 Yahoo 的实时标的价时，实时价口径改用最近一次正常交易日收盘价。
+  // Alpaca 夜盘价是当前有效的夜盘参考；没有 Alpaca 时才回退最近一次正式收盘。
   if (quote?.market_state === "OVERNIGHT") {
     const close = overnightCloseQuote(quote);
-    if (close) return { price: close.price, label: "收盘" };
+    if (close) {
+      const label = quote?.sessions?.overnight?.provider === "alpaca-overnight" ? "夜盘价" : "收盘";
+      return { price: close.price, label };
+    }
   }
   const price = Number(activeSessionQuote(quote)?.price);
   return Number.isFinite(price) && price > 0 ? { price, label: "实时" } : levelBasis(quote, quote?.price);
@@ -1703,9 +1773,11 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const fallbackPrice = Number(spot);
   const displayedPrice = Number.isFinite(basisPrice) && basisPrice > 0 ? basisPrice : fallbackPrice;
   const validPrice = Number.isFinite(displayedPrice) && displayedPrice > 0;
-  const priceLabel = state.levelBasisMode === "live" && selectedBasis?.label === "收盘"
-    ? "收盘价"
-    : (BASIS_MODES[state.levelBasisMode] || BASIS_MODES.live);
+  const priceLabel = selectedBasis?.label === "夜盘价"
+    ? "夜盘价"
+    : (state.levelBasisMode === "live" && selectedBasis?.label === "收盘"
+      ? "收盘价"
+      : (BASIS_MODES[state.levelBasisMode] || BASIS_MODES.live));
   const priceTitle = validPrice
     ? `${priceLabel} ${formatMoney(displayedPrice)} · 数据来源：${selectedBasis?.label || "常规"}`
     : `${priceLabel}暂无数据`;
@@ -2247,21 +2319,37 @@ async function request(path, options = {}) {
   });
 }
 
-// 夜盘正式收盘价优先取盘后摘要里的 reference_close；它代表最近一次正常盘收盘，
-// 不能误用 sessions.post.price（那是盘后最新价）。没有扩展时段摘要时再回退行情源的 previous_close。
+// 夜盘优先展示 Alpaca 夜盘价；未配置或失效时沿用主行情适配器返回的价格。
 function overnightCloseQuote(quote) {
   const sessions = quote?.sessions || {};
+  const alpacaOvernight = sessions.overnight?.provider === "alpaca-overnight";
+  // 未配置 Alpaca 时，主行情的 price/change_percent 才是原有行为。
+  // 不能再用盘后 reference_close 覆盖它，否则 132.60 会被替换成 132.63，
+  // 页面就会把昨收和当前价显示成同一个数，涨跌固定为 0.00%。
+  if (!alpacaOvernight) {
+    const price = finitePrice(quote?.price);
+    return price == null ? null : { ...quote, price };
+  }
+  // Alpaca 夜盘快照提供参考价时优先展示它；没有夜盘价时才回退正式收盘。
+  const overnightPrice = alpacaOvernight ? finitePrice(sessions.overnight?.price) : null;
   const reference = Number(sessions.post?.reference_close ?? sessions.overnight?.reference_close);
   const previous = Number(quote?.previous_close);
-  const price = Number.isFinite(reference) && reference > 0
+  const price = overnightPrice ?? (Number.isFinite(reference) && reference > 0
     ? reference
-    : (Number.isFinite(previous) && previous > 0 ? previous : null);
+    : (Number.isFinite(previous) && previous > 0 ? previous : null));
   if (price == null) return null;
-  const change = Number.isFinite(previous) && previous > 0 ? (price - previous) / previous * 100 : null;
+  // `Number(null)` 会得到 0；夜盘快照未提供涨跌时必须继续按夜盘价和昨收计算，不能误显示 +0.00%。
+  const rawReportedChange = sessions.overnight?.change_percent;
+  const reportedChange = rawReportedChange == null || rawReportedChange === ""
+    ? null
+    : Number(rawReportedChange);
+  const change = Number.isFinite(reportedChange)
+    ? reportedChange
+    : (Number.isFinite(previous) && previous > 0 ? (price - previous) / previous * 100 : null);
   return { ...quote, price, change_percent: change };
 }
 
-// 现价按时段动态取值：盘前显示盘前价，盘后显示盘后价，夜盘显示最近正常盘收盘价，
+// 现价按时段动态取值：盘前显示盘前价，盘后显示盘后价，夜盘优先显示 Alpaca 夜盘价，
 // 盘中与休市显示常规价。对应时段没有数据时回退常规价，避免整块行情空掉。
 function activeSessionQuote(quote) {
   const sessions = quote?.sessions || {};
@@ -2269,8 +2357,9 @@ function activeSessionQuote(quote) {
   if (marketState === "PRE" && sessions.pre?.price != null) return sessions.pre;
   if (marketState === "POST" && sessions.post?.price != null) return sessions.post;
   if (marketState === "OVERNIGHT") {
-    // 盘后价基准明确要求显示盘后最新价；实时价基准仍显示正式收盘价。
-    if (state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;
+    // 配置 Alpaca 后，夜盘价优先级高于分析面板的盘后价基准开关；未配置时保留旧口径。
+    if (sessions.overnight?.provider !== "alpaca-overnight"
+      && state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;
     return overnightCloseQuote(quote) || quote;
   }
   return quote;
@@ -2286,21 +2375,24 @@ function quoteReference(quote) {
   const marketState = quote?.market_state;
   const sessions = quote?.sessions || {};
   const previous = finitePrice(quote?.previous_close);
-  let label = "相对昨收";
+  let label = "相对上一个交易日";
   let price = previous;
   let title = "涨跌幅以最近一个已完成交易日的收盘价为基准";
   if (marketState === "PRE") {
-    label = "相对昨收";
+    label = "相对上一个交易日";
     price = finitePrice(sessions.pre?.reference_close) ?? previous;
     title = "盘前涨跌以盘前开始前最近一次盘中收盘为基准；没有该基准时回退昨收";
-  } else if (marketState === "POST" || (marketState === "OVERNIGHT" && state.levelBasisMode === "close")) {
+  } else if (marketState === "POST" || (marketState === "OVERNIGHT"
+    && state.levelBasisMode === "close"
+    && sessions.overnight?.provider !== "alpaca-overnight")) {
     label = "相对收盘";
     price = finitePrice(sessions.post?.reference_close);
     title = "盘后涨跌以最近一次正式盘中收盘为基准，不用昨收代替";
   } else if (marketState === "OVERNIGHT") {
-    label = "相对前收";
+    // 夜盘没有当前盘中报价时，涨跌基准是上一个交易日的收盘价。
+    label = "相对上一个交易日";
     price = previous;
-    title = "夜盘卡片显示最近一次正式收盘价，涨跌幅相对前一交易日收盘";
+    title = "夜盘涨跌以上一个交易日的收盘价为基准";
   }
   return {
     text: `${label} ${price == null ? "--" : formatMoney(price)}`,
@@ -2367,15 +2459,137 @@ function renderQuote(quote) {
   state.view.quoteReferenceTitle = reference.title;
 }
 
+function emptyFlowSide(type) {
+  return {
+    buyVolume: "--",
+    sellVolume: "--",
+    unknownVolume: "--",
+    buyPremium: "权利金 --",
+    sellPremium: "权利金 --",
+    netVolume: "净量 --",
+    focusTitle: "集中执行价 --",
+    focusSummary: "等待相邻快照",
+    concentration: [],
+    rows: [{ key: `${type}-empty`, label: "--", direction: "等待数据", className: "unknown", volume: "--", share: "--", premium: "权利金 --" }],
+    rowspan: 1,
+  };
+}
+
+function renderFlowSide(side, type) {
+  const source = side || {};
+  const netVolume = Number(source.net_volume);
+  const rawConcentration = Array.isArray(source.concentration) && source.concentration.length
+    ? source.concentration
+    : (Array.isArray(source.top_strikes) ? source.top_strikes : []).map((item) => ({
+      strike: item.strike,
+      volume: item.volume,
+      dominant_direction: item.direction,
+      buy_volume: item.direction === "buy" ? item.volume : 0,
+      sell_volume: item.direction === "sell" ? item.volume : 0,
+      unknown_volume: item.direction === "unknown" ? item.volume : 0,
+    }));
+  const directionLabel = (value) => value === "buy" ? "买入" : value === "sell" ? "卖出" : "中性";
+  const typeLabel = type === "call" ? "CALL" : "PUT";
+  const totalVolume = [source.buy_volume, source.sell_volume, source.unknown_volume].reduce((sum, value) => sum + (Number(value) || 0), 0);
+  const concentration = rawConcentration.slice(0, 5).map((item, index) => ({
+    key: `${type}-${item.strike}-${index}`,
+    label: `${formatFlowStrike(item.strike)} ${typeLabel}`,
+    detail: `${directionLabel(item.dominant_direction)} ${formatCount(item.volume)}`,
+    className: item.dominant_direction === "buy" ? "buy" : item.dominant_direction === "sell" ? "sell" : "unknown",
+  }));
+  const rows = rawConcentration.slice(0, 5).map((item, index) => {
+    const volume = Number(item.volume) || 0;
+    const dominantDirection = item.dominant_direction;
+    return {
+      key: `${type}-row-${item.strike}-${index}`,
+      label: `${formatFlowStrike(item.strike)} ${typeLabel}`,
+      direction: directionLabel(dominantDirection),
+      className: dominantDirection === "buy" ? "buy" : dominantDirection === "sell" ? "sell" : "unknown",
+      volume: formatCount(item.volume),
+      share: totalVolume > 0 ? `${Math.round(volume / totalVolume * 100)}%` : "--",
+      premium: `权利金 ${formatUsd(item.premium)}`,
+    };
+  });
+  if (!rows.length) rows.push({ key: `${type}-empty`, label: "--", direction: "等待数据", className: "unknown", volume: "--", share: "--", premium: "权利金 --" });
+  const top = rawConcentration[0] || null;
+  const focusPercent = top && totalVolume > 0 ? ` · 占 ${Math.round(Number(top.volume) / totalVolume * 100)}%` : "";
+  return {
+    buyVolume: formatCount(source.buy_volume),
+    sellVolume: formatCount(source.sell_volume),
+    unknownVolume: `中性 ${formatCount(source.unknown_volume)}`,
+    buyPremium: `权利金 ${formatUsd(source.buy_premium)}`,
+    sellPremium: `权利金 ${formatUsd(source.sell_premium)}`,
+    netVolume: Number.isFinite(netVolume) ? `净量 ${netVolume >= 0 ? "+" : ""}${formatCount(netVolume)}` : "净量 --",
+    focusTitle: top ? `${formatFlowStrike(top.strike)} ${typeLabel}` : "集中执行价 --",
+    focusSummary: top ? `${directionLabel(top.dominant_direction)} ${formatCount(top.volume)}${focusPercent}` : "等待相邻快照",
+    concentration,
+    rows,
+    rowspan: rows.length,
+  };
+}
+
+function resetOptionFlow(reason = "需要两份相邻期权链快照才能估算流向") {
+  state.view.flow = {
+    available: false,
+    signalLabel: "等待相邻快照",
+    signalClass: "waiting",
+    signalDetail: reason,
+    windowLabel: "快照窗口 --",
+    methodLabel: "成交量增量 · 买卖价方向估算 · 中性单列",
+    warning: "",
+    summary: {
+      totalVolume: "--",
+      buyVolume: "--",
+      sellVolume: "--",
+      neutralVolume: "--",
+    },
+    call: emptyFlowSide("call"),
+    put: emptyFlowSide("put"),
+  };
+}
+
+function renderOptionFlow(payload) {
+  if (!payload || payload.expiration && state.expiration && payload.expiration !== state.expiration) {
+    resetOptionFlow();
+    return;
+  }
+  const signal = payload.signal || {};
+  const hasWindow = Boolean(payload.current_fetched_at && payload.previous_fetched_at);
+  const windowLabel = hasWindow
+    ? `${formatTime(payload.previous_fetched_at)} → ${formatTime(payload.current_fetched_at)} · ${formatFlowInterval(payload.interval_seconds)}`
+    : payload.current_fetched_at ? `当前快照 ${formatTime(payload.current_fetched_at)} · 等待下一份` : "快照窗口 --";
+  const call = payload.call || {};
+  const put = payload.put || {};
+  const sumVolume = (key) => (Number(call[key]) || 0) + (Number(put[key]) || 0);
+  state.view.flow = {
+    available: Boolean(payload.available),
+    signalLabel: payload.available ? (signal.label || "暂无新增流向") : "等待相邻快照",
+    signalClass: payload.available ? (signal.class_name || "neutral") : "waiting",
+    signalDetail: payload.available ? (signal.detail || payload.reason || "暂无方向判断") : (payload.reason || "需要两份相邻期权链快照才能估算流向"),
+    windowLabel,
+    methodLabel: "成交量增量 · 买卖价方向估算 · 中性单列",
+    warning: payload.warning || "",
+    summary: {
+      totalVolume: formatCount(sumVolume("buy_volume") + sumVolume("sell_volume") + sumVolume("unknown_volume")),
+      buyVolume: formatCount(sumVolume("buy_volume")),
+      sellVolume: formatCount(sumVolume("sell_volume")),
+      neutralVolume: formatCount(sumVolume("unknown_volume")),
+    },
+    call: renderFlowSide(payload.call, "call"),
+    put: renderFlowSide(payload.put, "put"),
+  };
+}
+
 // 时段标签：数据源若返回未知取值就原样展示，避免换口径时把信息吞掉。
 function marketStateLabel(value, fallback = "快照") {
   if (!value) return fallback;
   return MARKET_STATE_LABELS[value] || value;
 }
 
-// 夜盘没有实时价：现货卡片的标签跟随分析基准，避免把收盘价继续标成「夜盘」。
+// Alpaca 夜盘价可用时明确标注；没有夜盘价时沿用旧的收盘价回退标签。
 function quoteMarketLabel(quote) {
   if (quote?.market_state !== "OVERNIGHT") return marketStateLabel(quote?.market_state);
+  if (quote?.sessions?.overnight?.provider === "alpaca-overnight") return "夜盘价";
   return state.levelBasisMode === "close" ? "盘后" : "收盘";
 }
 
@@ -2521,18 +2735,18 @@ function renderChain(payload, quote, analysisPayload) {
   // 基准价开关切换时要用最近一次快照重算，这里留一份引用。
   state.lastQuote = quote || null;
   state.view.chainTitle = `${payload.symbol} · ${payload.expiration}`;
-  // 期权链始终从 SQLite 读取，这里按快照新鲜度标注来源，避免刚抓完还显示“缓存”造成误解。
+  // 期权链始终从本地缓存读取，这里按快照新鲜度标注来源，避免刚抓完还显示“缓存”造成误解。
   const snapshotAge = payload.fetched_at ? (Date.now() - new Date(payload.fetched_at).getTime()) / 1000 : null;
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
   const oiFallback = payload.oi_fallback || {};
-  state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < AUTO_REFRESH_SECONDS ? "上游新快照" : "SQLite 缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
+  state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < AUTO_REFRESH_SECONDS ? "上游新快照" : "本地缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
   state.view.fetchedAt = `快照时间 ${formatTime(payload.fetched_at)}`;
   state.view.totalCount = formatNumber(rows.length);
   const calls = rows.filter((row) => row.contract_type === "call"); const puts = rows.filter((row) => row.contract_type === "put");
-  state.view.callVolume = formatNumber(calls.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
-  state.view.putVolume = formatNumber(puts.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
-  state.view.callInterest = `未平仓 ${formatNumber(calls.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
-  state.view.putInterest = `未平仓 ${formatNumber(puts.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
+  state.view.callVolume = formatCount(calls.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
+  state.view.putVolume = formatCount(puts.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
+  state.view.callInterest = `未平仓 ${formatCount(calls.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
+  state.view.putInterest = `未平仓 ${formatCount(puts.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
   const analysisRows = analysisPayload?.data?.length ? analysisPayload.data : rows;
   // 记录本次快照时间：压力位/支撑位的合成接口按「标的 + 到期日 + 快照时间」去重请求。
   state.chainFetchedAt = payload.fetched_at || null;
@@ -2610,6 +2824,7 @@ function showChartSkeletons() {
 
 function showPending(message) {
   resetEarningsChip();
+  resetOptionFlow(message || "需要两份相邻期权链快照才能估算流向");
   state.view.chainTitle = `${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
   state.view.dataSource = "后台刷新中";
   state.view.fetchedAt = "快照时间 --";
@@ -2704,11 +2919,13 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
   snapshotReadInFlight += 1;
   let quote;
   let payload;
+  let flow;
   let analysis = null;
   try {
-    [quote, payload] = await Promise.all([
+    [quote, payload, flow] = await Promise.all([
       request(`/api/quote/${encodedSymbol}`).catch(() => null),
       expiration ? request(`/api/chain/${encodedSymbol}?expiration=${encodedExpiration}`).catch(() => null) : Promise.resolve(null),
+      expiration ? request(`/api/flow/${encodedSymbol}?expiration=${encodedExpiration}`).catch(() => null) : Promise.resolve(null),
     ]);
     if (isCurrentLoad(loadId, expiration)) {
       const chainAge = snapshotAgeSeconds(payload?.fetched_at);
@@ -2727,9 +2944,13 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
   if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null, discarded: true };
   const resolvedQuote = quoteIsReady(quote) ? quote : fallbackQuote;
   applyCachedQuote(resolvedQuote);
-  if (!payload?.data?.length) return { shown: false, source: payload?.source || resolvedQuote?.source || null, fetchedAt: payload?.fetched_at || null, quote: resolvedQuote };
+  if (!payload?.data?.length) {
+    resetOptionFlow("当前期限暂无可用期权快照");
+    return { shown: false, source: payload?.source || resolvedQuote?.source || null, fetchedAt: payload?.fetched_at || null, quote: resolvedQuote };
+  }
   state.analysisReady = gammaProfileReady(analysis) || state.analysisReady;
   renderChain(payload, resolvedQuote, analysis);
+  renderOptionFlow(flow);
   state.view.lastStatus = payload.source === "sqlite"
     ? `本地缓存 ${formatTime(payload.fetched_at)}`
     : `最近更新 ${formatTime(payload.fetched_at)}`;
@@ -3003,10 +3224,11 @@ async function refreshInBackground(loadId, force = false) {
     const quoteRequest = quoteIsReady(refreshResult?.quote)
       ? Promise.resolve(refreshResult.quote)
       : request(`/api/quote/${encodedSymbol}`);
-    const [payload, quote, expirations] = await Promise.all([
+    const [payload, quote, expirations, flow] = await Promise.all([
       request(`/api/chain/${encodedSymbol}?expiration=${encodedExpiration}`),
       quoteRequest,
       expirationRequest,
+      request(`/api/flow/${encodedSymbol}?expiration=${encodeURIComponent(currentExpiration)}`).catch(() => null),
     ]);
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
     // 响应期间用户切了到期日：这批结果属于旧期限，整体作废并按新选择重来——
@@ -3034,6 +3256,7 @@ async function refreshInBackground(loadId, force = false) {
     renderQuote(resolvedQuote);
     // Gamma 窗口继续后台刷新；选中期限的综合价位已在这里与窗口任务并行请求。
     renderChain(payload, resolvedQuote, state.lastAnalysis?.analysisPayload || null);
+    renderOptionFlow(flow);
     // 新数据已经显示出来，下一轮倒计时从现在起算完整间隔。
     armRefreshAnchor(payload.fetched_at);
     state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
@@ -3191,6 +3414,7 @@ async function loadSymbol() {
   const loadId = ++state.loadId;
   setError("");
   applyCachedQuote(null);
+  resetOptionFlow("正在读取当前标的的相邻快照…");
   resetEarningsChip();
   state.view.lastStatus = "正在读取本地缓存…";
   syncPageQuery();
@@ -3219,6 +3443,7 @@ const EXPIRATION_SWITCH_TIMEOUT_MS = 20000;
 async function switchExpiration(expiration) {
   const token = ++expirationSwitchToken;
   state.expiration = expiration;
+  resetOptionFlow("正在读取当前期限的相邻快照…");
   setError("");
   setBusy(true);
   // 兜底：请求万一一直不落地（例如上游卡住），20 秒后强制放开下拉框，避免控件被永久禁用。
@@ -3328,6 +3553,7 @@ window.optionScopeApp = optionScopeApp;
 initDetailGroup();
 initChainGroup();
 initChartGroup();
+initOptionFlowGroup();
 initBuyerStructureGroup();
 // 时钟是独立的高频显示，不进入 Vue 响应式树，避免每秒遍历整张期权链的虚拟 DOM。
 function updateClock() {

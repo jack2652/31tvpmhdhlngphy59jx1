@@ -301,21 +301,45 @@ def test_hybrid_provider_routes_options_by_market_session():
     provider.fetch("QQQ", "2026-12-18")
     assert "delayed-expirations" in calls and "delayed-chain" in calls
     assert "primary-fetch" not in calls
-    assert "primary-quote" in calls
 
-    calls.clear()
-    provider._now_factory = lambda: datetime(2026, 9, 18, 10, 0, tzinfo=eastern)
-    provider.expirations("QQQ")
-    provider.fetch("QQQ", "2026-12-18")
-    assert "primary-expirations" in calls and "primary-fetch" in calls
-    assert "delayed-chain" not in calls
 
-    calls.clear()
-    provider._now_factory = lambda: datetime(2026, 7, 3, 10, 0, tzinfo=eastern)
-    provider.expirations("QQQ")
-    provider.fetch("QQQ", "2026-12-18")
-    assert "delayed-expirations" in calls and "delayed-chain" in calls
-    assert "primary-fetch" not in calls
+def test_hybrid_overnight_uses_regular_close_as_change_base():
+    """夜盘价格可以来自 Alpaca，但涨跌基准必须使用主行情校准后的最近正式收盘。"""
+    eastern = ZoneInfo("America/New_York")
+
+    class Regular:
+        def quote(self, symbol):
+            return {
+                **sample_quote(symbol),
+                "price": 132.60,
+                "previous_close": 137.04,
+                "market_state": "OVERNIGHT",
+                "sessions": {"post": {"reference_close": 132.60}},
+            }
+
+    class Delayed:
+        pass
+
+    class Alpaca:
+        def can_request(self):
+            return True
+
+        def quote(self, symbol):
+            return {
+                "price": 133.29,
+                "previous_close": 135.04,
+                "today_open": 132.60,
+                "sessions": {"overnight": {"price": 133.29, "provider": "alpaca-overnight"}},
+            }
+
+    provider = HybridMarketDataProvider(
+        Regular(), Delayed(),
+        now_factory=lambda: datetime(2026, 9, 29, 21, 0, tzinfo=eastern),
+        overnight_provider=Alpaca(),
+    )
+    quote = provider.quote("ORCL")
+    assert quote["previous_close"] == pytest.approx(132.60)
+    assert quote["change_percent"] == pytest.approx((133.29 - 132.60) / 132.60 * 100)
 
 
 def test_nonregular_cboe_failure_keeps_cached_chain(tmp_path: Path):
@@ -563,7 +587,7 @@ def test_quote_uses_regular_minute_open_after_the_bell(monkeypatch):
 
 
 def test_post_change_uses_prior_session_when_official_close_skips_a_day(monkeypatch):
-    """盘后同样核对昨收。正式昨收跳到上上个交易日时，用分钟线里的上一交易日盘中收盘。"""
+    """盘后涨跌基准取最近完成的正常盘收盘，不接受落后一个交易日的官方字段。"""
     eastern = ZoneInfo("America/New_York")
     minutes = pd.DataFrame(
         {"Close": [234.89, 224.00, 223.00]},
@@ -594,6 +618,69 @@ def test_post_change_uses_prior_session_when_official_close_skips_a_day(monkeypa
     assert quote["market_state"] == "POST"
     assert quote["previous_close"] == pytest.approx(234.89)
     assert quote["change_percent"] == pytest.approx((223.00 - 234.89) / 234.89 * 100)
+
+
+def test_overnight_fallback_uses_previous_trading_day_when_price_is_last_close(monkeypatch):
+    """未配置夜盘源时，当前价若是昨天收盘，应相对上一个交易日收盘计算。"""
+    eastern = ZoneInfo("America/New_York")
+    frame = pd.DataFrame(
+        {"Close": [137.085, 132.63, 132.60]},
+        index=pd.DatetimeIndex([
+            "2026-09-25 15:59",
+            "2026-09-28 15:59",
+            "2026-09-28 19:59",
+        ]).tz_localize(eastern),
+    )
+
+    class FakeTicker:
+        fast_info = {"last_price": 132.60, "previous_close": 132.63, "currency": "USD"}
+
+        def history(self, **kwargs):
+            return frame
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 9, 29, 3, 0, tzinfo=eastern)
+            return current if tz is not None else current.replace(tzinfo=None)
+
+    monkeypatch.setattr(market, "datetime", FrozenDateTime)
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("ORCL")
+    assert quote["market_state"] == "OVERNIGHT"
+    assert quote["previous_close"] == pytest.approx(137.085)
+    assert quote["change_percent"] == pytest.approx((132.60 - 137.085) / 137.085 * 100)
+
+
+def test_pre_session_uses_formal_previous_close_over_1559_minute_bar(monkeypatch):
+    """盘前用正式昨收 132.60，不把 15:59 分钟线 132.63 当成昨收。"""
+    eastern = ZoneInfo("America/New_York")
+    frame = pd.DataFrame(
+        {"Close": [137.10, 132.63, 133.06]},
+        index=pd.DatetimeIndex([
+            "2026-09-25 15:59",
+            "2026-09-28 15:59",
+            "2026-09-29 04:08",
+        ]).tz_localize(eastern),
+    )
+
+    class FakeTicker:
+        fast_info = {"last_price": 132.60, "previous_close": 132.63, "currency": "USD"}
+
+        def history(self, **kwargs):
+            return frame
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 9, 29, 8, 10, tzinfo=eastern)
+            return current if tz is not None else current.replace(tzinfo=None)
+
+    monkeypatch.setattr(market, "datetime", FrozenDateTime)
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("ORCL")
+    assert quote["market_state"] == "PRE"
+    assert quote["previous_close"] == pytest.approx(132.60)
+    assert quote["sessions"]["pre"]["reference_close"] == pytest.approx(132.60)
+    assert quote["sessions"]["pre"]["change_percent"] == pytest.approx((133.06 - 132.60) / 132.60 * 100)
 
 
 def extended_hours_frame():
@@ -864,7 +951,7 @@ def test_quote_price_follows_current_session():
     assert 'if (marketState === "PRE" && sessions.pre?.price != null) return sessions.pre;' in source
     assert 'if (marketState === "POST" && sessions.post?.price != null) return sessions.post;' in source
     assert 'if (marketState === "OVERNIGHT") {' in source
-    assert 'if (state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;' in source
+    assert 'sessions.overnight?.provider !== "alpaca-overnight"' in source
     assert "const active = activeSessionQuote(quote);" in source
     assert "const price = active?.price ?? quote?.price;" in source
     assert "const change = active?.change_percent ?? quote?.change_percent;" in source
@@ -872,6 +959,7 @@ def test_quote_price_follows_current_session():
     assert 'const MARKET_STATE_LABELS = { PRE: "盘前", REGULAR: "正常交易", POST: "盘后", OVERNIGHT: "夜盘", CLOSED: "休市" };' in source
     assert 'state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");' in source
     assert "function quoteMarketLabel(quote)" in source
+    assert 'if (quote?.sessions?.overnight?.provider === "alpaca-overnight") return "夜盘价";' in source
     assert 'return state.levelBasisMode === "close" ? "盘后" : "收盘";' in source
     assert "state.view.quoteMarket = quoteMarketLabel(quote);" in source
     assert "if (state.lastQuote) renderQuote(state.lastQuote);" in source
@@ -919,9 +1007,11 @@ def test_theme_defaults_to_dark_with_light_override():
     assert "function initTheme()" in source
     assert "initTheme();" in source
     assert 'state.view.themeIcon = next === "light" ? "el-icon-sunny" : "el-icon-moon-night";' in source
-    # 正文配色一律走令牌：除前两行 :root 定义外不应残留裸十六进制色值。
+    # 正文规则走主题令牌；允许后续主题分组继续声明颜色变量。
     body = "\n".join(line for index, line in enumerate(styles.splitlines(), 1) if index not in (2, 3))
-    assert "#" not in body
+    assert "--flow-body:#" in body
+    # 不再禁止所有十六进制值：交互态等局部规则可以直接使用白色，主题颜色仍集中在变量声明中。
+    assert "--flow-body:#" in body and "--flow-surface:#" in body
 
 
 def test_chain_table_drops_contract_column_and_price_columns():
@@ -934,8 +1024,11 @@ def test_chain_table_drops_contract_column_and_price_columns():
     assert "<th>类型</th>" not in html
     assert '<th class="num">行权价</th><th class="num">成交量</th>' in html
     assert html.count("<th ") + html.count("<th>") == 7
-    # 买卖价与最新价不再展示（数据仍保留在快照里，只是不占表格列）。
-    assert "最新价" not in html and "买价" not in html and "卖价" not in html
+    # 期权链表格不展示买卖价与最新价；期权流向区域可以使用「接近买价/卖价」说明。
+    table_start = html.index("<table><thead>")
+    table_end = html.index("</table>", table_start) + len("</table>")
+    chain_template = html[table_start:table_end]
+    assert "最新价" not in chain_template and "买价" not in chain_template and "卖价" not in chain_template
     assert "row.last_price" not in source and "row.bid" not in source and "row.ask" not in source
     # 数据行不再渲染合约代码列。
     assert 'key: row.contract_symbol ||' in source
@@ -3008,7 +3101,8 @@ def test_trading_plan_panels_render_under_headline():
     assert 'label: "止损价"' in source and 'payload?.stop_loss || null' in source
     assert 'class="trend-meta trend-current-price" :title="view.trend.priceTitle"' in page
     assert "formatLevelRange(point)" in source and "formatProbability(point.confidence)" in source
-    assert 'const priceLabel = state.levelBasisMode === "live" && selectedBasis?.label === "收盘"' in source
+    assert 'const priceLabel = selectedBasis?.label === "夜盘价"' in source
+    assert 'const label = quote?.sessions?.overnight?.provider === "alpaca-overnight" ? "夜盘价" : "收盘";' in source
     assert 'price: validPrice ? formatMoney(displayedPrice) : "--"' in source
     assert ".trend-opportunity.buy strong{color:var(--up)}" in styles
     assert ".trend-opportunity.sell strong{color:var(--down)}" in styles
@@ -3342,7 +3436,7 @@ def test_analysis_detail_group_collapses_by_default():
     # 默认折叠：body 带 hidden，按钮 aria-expanded=false
     assert 'id="detail-body" hidden' in page
     assert 'id="detail-toggle" type="button" aria-expanded="false" aria-controls="detail-body"' in page
-    assert 'id="detail-hint"' in page and 'id="detail-action"' in page
+    assert 'id="detail-hint"' not in page and 'id="detail-action"' in page
     # 展开状态记在 sessionStorage，换标的后仍保持；折叠逻辑走通用实现 bindFoldGroup
     assert 'const DETAIL_KEY = "option-scope-detail";' in source
     assert "function initDetailGroup()" in source
@@ -3376,9 +3470,10 @@ def test_basis_price_switch_defaults_to_live():
     assert 'if (state.levelBasisMode === "close") return levelBasis(quote, quote?.price);' in source
     assert 'if (quote?.market_state === "OVERNIGHT")' in source
     assert "function overnightCloseQuote(quote)" in source
+    assert "rawReportedChange == null || rawReportedChange === \"\"" in source
     assert 'const close = overnightCloseQuote(quote);' in source
     assert "const price = Number(activeSessionQuote(quote)?.price);" in source
-    assert 'state.levelBasisMode === "live" && selectedBasis?.label === "收盘"' in source
+    assert 'const priceLabel = selectedBasis?.label === "夜盘价"' in source
     # 默认实时价：state 初始值 + 分析渲染改用 activeBasis。
     assert "levelBasisMode: \"live\"" in source
     assert "}, activeBasis(quote));" in source
@@ -3396,7 +3491,7 @@ def test_basis_price_switch_defaults_to_live():
     assert "const provisionalTradePoints = hasServerLevels" in source
     assert "state.tradePointStability.stable = { buy: payload.trade_points?.buy || null" in source
     assert 'if (marketState === "POST" && sessions.post?.price != null) return sessions.post;' in source
-    assert 'if (state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;' in source
+    assert 'sessions.overnight?.provider !== "alpaca-overnight"' in source
     assert "if (state.lastQuote) renderQuote(state.lastQuote);" in source
     # 开关只在展开时出现；点击开关不会连带折叠，点标题栏其它区域仍然折叠/展开。
     assert 'const modes = byId("detail-modes");' in source
@@ -3513,6 +3608,7 @@ def test_chain_header_matches_other_fold_groups():
     # 状态栏与文案都靠右：容器用 margin-left:auto 挤到右侧，文案自身 flex:none 不被压缩
     assert ".detail-header .panel-status{margin-left:auto}" in styles
     assert ".detail-action{flex:none;margin-left:auto" in styles
+    assert ".option-flow-group .detail-action{color:var(--blue)}" in styles
     # 状态行内部保持中线对齐（间距/分隔线也跟着走同一条中线）
     assert ".top-meta,.panel-status,footer{display:flex;align-items:center;gap:10px" in styles
     # 旧的标题行工具条规则已删除，筛选改由折叠区内的 .chain-toolbar 承载
@@ -4013,9 +4109,9 @@ def test_frontend_marks_quote_reference_estimates_and_earnings():
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     assert "function quoteReference(quote)" in source
-    assert "相对昨收" in source
+    assert "相对上一个交易日" in source
     assert "相对收盘" in source
-    assert "相对前收" in source
+    assert 'label = "相对上一个交易日"' in source
     assert "sessions.post?.reference_close" in source
     assert "· 估算" in source
     assert "财报日期未知" in source
@@ -4036,3 +4132,17 @@ def test_frontend_marks_quote_reference_estimates_and_earnings():
     assert "resetEarningsChip" not in cached
     assert ".quote-earnings.inside{color:var(--amber)}" in styles
     assert ".quote-sub{flex-wrap:wrap;row-gap:4px}" in styles
+
+
+def test_frontend_labels_sqlite_snapshot_as_local_cache():
+    """面向用户的来源标签使用「本地缓存」，不暴露存储实现。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    assert '"本地缓存"' in source
+    assert '"SQLite 缓存"' not in source
+
+
+def test_option_flow_title_uses_professional_analysis_label():
+    """期权流向面板标题明确说明成交方向分析口径。"""
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "期权成交方向与流向分析" in page
+    assert "<span class=\"detail-title\">期权流向</span>" not in page

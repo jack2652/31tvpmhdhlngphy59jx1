@@ -19,6 +19,7 @@ from app.db import Database
 from app.http import ETagMiddleware
 from app.providers.market import HybridMarketDataProvider, MarketDataProvider
 from app.providers.cboe import CboeOptionsProvider
+from app.providers.alpaca import AlpacaOvernightProvider
 from app.runtime import memory_limit_mb, release_memory
 from app.services.scheduler import Scheduler
 from app.services.concurrency import UpstreamGate
@@ -30,7 +31,17 @@ database = Database(settings.database_path)
 upstream_gate = UpstreamGate(settings.upstream_concurrency, settings.upstream_wait_seconds)
 regular_provider = MarketDataProvider(proxy=settings.proxy_url, upstream_gate=upstream_gate)
 delayed_provider = CboeOptionsProvider(proxy=settings.proxy_url, upstream_gate=upstream_gate)
-provider = HybridMarketDataProvider(regular_provider, delayed_provider)
+overnight_provider = AlpacaOvernightProvider(
+    settings.alpaca_api_key,
+    settings.alpaca_api_secret,
+    proxy=settings.proxy_url,
+    upstream_gate=upstream_gate,
+)
+provider = HybridMarketDataProvider(
+    regular_provider,
+    delayed_provider,
+    overnight_provider=overnight_provider,
+)
 snapshots = SnapshotService(database, provider)
 scheduler = Scheduler(settings, snapshots, database)
 
@@ -45,6 +56,18 @@ if not app_logger.handlers:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Alpaca 只作为可选的夜盘现货补充：未配置或凭据失效都不能阻止主行情服务启动。
+    alpaca_status = overnight_provider.validate_credentials()
+    if alpaca_status == "disabled":
+        app_logger.info("Alpaca 夜盘现货未配置，沿用原行情源")
+    elif alpaca_status == "invalid_config":
+        app_logger.warning("Alpaca 夜盘现货配置不完整，沿用原行情源")
+    elif alpaca_status == "invalid_credentials":
+        app_logger.warning("Alpaca 夜盘现货凭据无效，沿用原行情源；冷却后自动重试")
+    elif alpaca_status == "unavailable":
+        app_logger.warning("Alpaca 夜盘现货启动校验暂不可用，运行时按需重试")
+    else:
+        app_logger.info("Alpaca 夜盘现货凭据校验通过")
     if settings.low_memory:
         # 更早回收临时对象，避免期权链和日线在两次刷新之间叠在一起。
         gc.set_threshold(400, 5, 5)

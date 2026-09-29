@@ -117,6 +117,9 @@ def summarize_extended_hours(frame: Any, now: datetime | None = None) -> dict[st
 
 # 正式昨收和分钟线昨收的相对偏差不超过该比例时，视为同一交易日，优先正式收盘。
 PREVIOUS_CLOSE_AGREEMENT = 0.01
+# 盘前主行情通常把上一交易日的正式收盘价放在 last_price，分钟线最后一根
+# 可能只是 15:59 的成交价。两者在这个范围内视为同一收盘，优先正式收盘。
+PREVIOUS_CLOSE_AUCTION_AGREEMENT = 0.001
 
 
 def _positive_price(value: Any) -> float | None:
@@ -241,6 +244,22 @@ def choose_previous_close(official: Any, minute_close: Any) -> Any:
     if abs(official_number - minute_number) / minute_number <= PREVIOUS_CLOSE_AGREEMENT:
         return official_number
     return minute_number
+
+
+def choose_pre_session_close(price: Any, minute_close: Any, fallback: Any) -> Any:
+    """盘前校准上一交易日收盘，优先主行情的正式收盘价。
+
+    盘前没有当日正常盘成交，``fast_info.last_price`` 通常仍是上一交易日
+    的正式收盘；扩展分钟线的最后一笔常停在 15:59，可能出现几分钱差异。
+    只有两者足够接近时才采用主行情价，避免把真正的旧价误当成昨收。
+    """
+    price_number = _positive_price(price)
+    minute_number = _positive_price(minute_close)
+    if price_number is not None and minute_number is not None:
+        difference = abs(price_number - minute_number) / minute_number
+        if difference <= PREVIOUS_CLOSE_AUCTION_AGREEMENT:
+            return price_number
+    return fallback
 
 
 class ProviderError(RuntimeError):
@@ -465,9 +484,48 @@ class MarketDataProvider:
             regular_open = extended.get("regular_open")
             if market_state in {"REGULAR", "POST", "OVERNIGHT"} and regular_open is not None:
                 today_open = regular_open
-            # 正式昨收含收盘竞价。它和分钟线上一交易日收盘接近时以它为准；
-            # 日线空掉一根时两者会差出一整段行情，这时改用分钟线，避免涨跌幅被放大。
-            previous = choose_previous_close(previous, extended.get("prior_session_regular_close"))
+            # 没有 Alpaca 夜盘价时，主行情的 price 可能只是最近一个已完成交易日的收盘，
+            # 所以涨跌基准要再往前取一个交易日：例如当前显示周一收盘 132.60，
+            # “相对上一个交易日”应使用上周五收盘约 137.10，而不是把周一收盘 132.63
+            # 同时当成当前价和基准。盘前摘要的 reference_close 正好记录了这个上一个交易日；
+            # 缺失时再回退分钟线识别出的上一交易日收盘和官方 previous_close。
+            regular_close = None
+            if market_state == "OVERNIGHT":
+                regular_close = (extended.get("sessions", {}).get("pre") or {}).get("reference_close")
+            if regular_close is None:
+                regular_close = extended.get("prior_session_regular_close")
+            if regular_close is None:
+                regular_close = extended.get("previous_regular_close")
+            # 夜盘没有独立现货源时，`pre.reference_close` 是分钟线明确识别出的
+            # 上一个交易日收盘；不要再用 fast_info 的近似值（例如 137.04）覆盖它。
+            if market_state == "PRE" and regular_close is not None:
+                # 盘前没有当日正常盘成交；主行情 price 若与 15:59 分钟线收盘
+                # 只差收盘竞价级别的几分钱，优先它作为上一交易日正式收盘。
+                previous = choose_pre_session_close(
+                    price,
+                    regular_close,
+                    choose_previous_close(previous, regular_close),
+                )
+            elif market_state == "OVERNIGHT" and regular_close is not None:
+                previous = regular_close
+            else:
+                previous = choose_previous_close(previous, regular_close)
+            # 让前端盘前基准与后端 quote.previous_close 使用同一口径，
+            # 不再把分钟线的 132.63 单独传给 quoteReference。
+            pre_summary = (extended.get("sessions") or {}).get("pre")
+            if market_state == "PRE" and isinstance(pre_summary, dict) and previous not in (None, 0):
+                pre_summary["reference_close"] = previous
+                pre_price = _positive_price(pre_summary.get("price"))
+                if pre_price is not None:
+                    pre_summary["change_percent"] = safe_value((pre_price - previous) / previous * 100)
+                # 同一份分钟线里的盘后摘要也引用这次正式收盘，避免后续趋势面板
+                # 或切换时段时重新暴露 15:59 的 132.63。
+                post_summary = (extended.get("sessions") or {}).get("post")
+                if isinstance(post_summary, dict):
+                    post_summary["reference_close"] = previous
+                    post_price = _positive_price(post_summary.get("price"))
+                    if post_price is not None:
+                        post_summary["change_percent"] = safe_value((post_price - previous) / previous * 100)
             change = None
             if price is not None and previous not in (None, 0):
                 change = (price - previous) / previous * 100
@@ -666,7 +724,7 @@ class MarketDataProvider:
 
 
 class HybridMarketDataProvider:
-    """按交易时段路由期权链，现货与历史行情仍由主行情适配器提供。"""
+    """按交易时段路由期权链，并在夜盘用 Alpaca 补充股票现货参考价。"""
 
     name = "hybrid"
 
@@ -675,9 +733,11 @@ class HybridMarketDataProvider:
         regular_provider: Any,
         delayed_provider: Any,
         now_factory: Callable[[], datetime] | None = None,
+        overnight_provider: Any | None = None,
     ):
         self.regular_provider = regular_provider
         self.delayed_provider = delayed_provider
+        self.overnight_provider = overnight_provider
         self._now_factory = now_factory or (lambda: datetime.now(MARKET_TIMEZONE))
 
     @staticmethod
@@ -691,12 +751,63 @@ class HybridMarketDataProvider:
         moment = moment.astimezone(MARKET_TIMEZONE)
         return not is_regular_session(moment)
 
+    def uses_overnight_quote(self) -> bool:
+        """只在美东 20:00–04:00 请求 Alpaca 夜盘股票快照。"""
+        moment = self._now_factory()
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=MARKET_TIMEZONE)
+        moment = moment.astimezone(MARKET_TIMEZONE)
+        return session_of(moment) == "overnight" and is_session_trading_day(moment)
+
     def expirations(self, symbol: str) -> list[str]:
         provider = self.delayed_provider if self.uses_delayed_options() else self.regular_provider
         return provider.expirations(symbol)
 
     def quote(self, symbol: str) -> dict[str, Any]:
-        return self.regular_provider.quote(symbol)
+        base: dict[str, Any] | None = None
+        try:
+            base = self.regular_provider.quote(symbol)
+        except Exception:
+            if not self.uses_overnight_quote() or self.overnight_provider is None:
+                raise
+        if (
+            not self.uses_overnight_quote()
+            or self.overnight_provider is None
+            or not getattr(self.overnight_provider, "can_request", lambda: True)()
+        ):
+            return base or self.regular_provider.quote(symbol)
+        try:
+            overnight = self.overnight_provider.quote(symbol)
+        except ProviderError as exc:
+            # Alpaca 凭据失效后由适配器进入冷却期；这里统一回退原行情，避免夜盘把整页打成 502。
+            logger.warning("Alpaca 夜盘现货不可用，沿用主行情：%s", exc)
+            return base or self.regular_provider.quote(symbol)
+        if base is None:
+            return overnight
+        sessions = dict(base.get("sessions") or {})
+        sessions.update(overnight.get("sessions") or {})
+        # Alpaca 的 prevDailyBar 在夜盘可能指向更早的数据日。盘后摘要里的
+        # reference_close 才是最近一次已经完成的正常盘收盘（例如昨收 132.60），
+        # 因此优先使用它，再回退主行情 previous_close，最后才使用 Alpaca 的值。
+        base_sessions = base.get("sessions") or {}
+        post_reference = (base_sessions.get("post") or {}).get("reference_close")
+        overnight_reference = (base_sessions.get("overnight") or {}).get("reference_close")
+        previous = post_reference or overnight_reference or base.get("previous_close") or overnight.get("previous_close")
+        price = overnight.get("price") or base.get("price")
+        change = None
+        if price is not None and previous not in (None, 0):
+            change = (float(price) - float(previous)) / float(previous) * 100
+        return {
+            **base,
+            "price": price,
+            "change_percent": safe_value(change),
+            "today_open": overnight.get("today_open") or base.get("today_open"),
+            "previous_close": previous,
+            "market_state": "OVERNIGHT",
+            "sessions": sessions,
+            "provider": self.name,
+            "raw": {**(base.get("raw") or {}), "overnight_provider": overnight.get("raw") or {}},
+        }
 
     def history(self, symbol: str, period: str = "6mo") -> list[dict[str, Any]]:
         return self.regular_provider.history(symbol, period)
@@ -732,7 +843,7 @@ class HybridMarketDataProvider:
         quote = quote_override
         if quote is None:
             try:
-                quote = self.regular_provider.quote(symbol)
+                quote = self.quote(symbol)
             except ProviderError as exc:
                 logger.warning("非盘中主行情请求失败，改用 Cboe 标的延迟价：%s", exc)
                 quote = self.delayed_provider.quote(symbol)

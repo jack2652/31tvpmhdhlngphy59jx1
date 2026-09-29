@@ -146,7 +146,12 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
     # 扩展时段摘要中的 reference_close 是同一批分钟线对应的最近正常盘收盘价，
     # 优先使用它，避免日线缓存或上游 previous_close 落后时显示上周五数据。
     sessions = quote.get("sessions") or {}
-    regular_summary = sessions.get("post") or sessions.get("overnight") or {}
+    # 盘前的基准来自上一交易日正式收盘；盘后/夜盘才使用盘后摘要。
+    # 不能固定先取 post：它可能保留 15:59 的 132.63，而 quote 已校准为正式收盘 132.60。
+    if market_state == "PRE":
+        regular_summary = sessions.get("pre") or {}
+    else:
+        regular_summary = sessions.get("post") or sessions.get("overnight") or {}
     try:
         reference_close = float(regular_summary.get("reference_close"))
     except (TypeError, ValueError):
@@ -356,6 +361,12 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
                 "source": "sqlite",
             }
         return {"symbol": normalized, "expiration": expiration, "fetched_at": None, "data": [], "source": "pending"}
+
+    @router.get("/flow/{stock_symbol}")
+    def option_flow(stock_symbol: str, expiration: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$")) -> dict[str, Any]:
+        """比较同一期限最近两次快照，返回估算的 Call/Put 买卖流向。"""
+        normalized = symbol(stock_symbol)
+        return database.option_flow(normalized, expiration)
 
     @router.get("/gamma/{stock_symbol}")
     def gamma_profile(

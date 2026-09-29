@@ -1038,6 +1038,30 @@ ask_env_value() {
   return 0
 }
 
+# 机密配置项使用隐藏输入，避免 API Key / Secret 出现在终端回显或日志中。
+ask_secret_env_value() {
+  local key="$1" desc="$2" current="" input=""
+  current="$(read_env_value "$key" "")"
+  printf '\n  %s\n' "$desc"
+  printf '  当前值：%s\n' "$(mask_access_key "$current")"
+  printf '  新值（直接回车保持不变，输入 clear 清空）：'
+  if [ -t 0 ] && [ -t 1 ] && [ -r /dev/tty ]; then
+    IFS= read -r -s input < /dev/tty || input=""
+    printf '\n'
+  else
+    # 非交互测试/脚本输入没有终端时，保持可管道化行为。
+    read -r input || input=""
+  fi
+  if [ -z "$input" ]; then
+    info "$key 保持不变"
+  elif [ "$input" = "clear" ]; then
+    write_env_value "$key" "" && ok "$key 已清空"
+  else
+    write_env_value "$key" "$input" && ok "$key 已更新（值已隐藏）"
+  fi
+  return 0
+}
+
 mask_access_key() {
   local value="$1"
   if [ -z "$value" ]; then
@@ -1092,8 +1116,10 @@ ask_access_key() {
 }
 
 show_config_summary() {
-  local access_key
+  local access_key alpaca_key alpaca_secret
   access_key="$(read_env_value ACCESS_KEY "")"
+  alpaca_key="$(read_env_value ALPACA_API_KEY "")"
+  alpaca_secret="$(read_env_value ALPACA_API_SECRET "")"
   printf '  配置文件：%s\n' "$ENV_FILE"
   printf '  1) DATABASE_PATH=%s\n' "$(read_env_value DATABASE_PATH data/options.db)"
   printf '  2) HOST=%s\n' "$(read_env_value HOST 0.0.0.0)"
@@ -1113,6 +1139,8 @@ show_config_summary() {
   printf ' 16) WEB_WORKERS=%s\n' "$(read_env_value WEB_WORKERS 1)"
   printf ' 17) AUTO_REFRESH_SECONDS=%s\n' "$(read_env_value AUTO_REFRESH_SECONDS 30)"
   printf ' 18) LOW_MEMORY=%s\n' "$(read_env_value LOW_MEMORY auto)"
+  printf ' 19) ALPACA_API_KEY=%s\n' "$(mask_access_key "$alpaca_key")"
+  printf ' 20) ALPACA_API_SECRET=%s\n' "$(mask_access_key "$alpaca_secret")"
 }
 
 validate_config_values() {
@@ -1181,6 +1209,8 @@ action_config() {
       16) ask_env_value WEB_WORKERS "Web worker 数量（小内存机器保持 1）" ;;
       17) ask_env_value AUTO_REFRESH_SECONDS "页面自动刷新间隔（秒）" ;;
       18) ask_env_value LOW_MEMORY "低内存保护（auto/true/false，512MB 及以下自动开启）" ;;
+      19) ask_secret_env_value ALPACA_API_KEY "Alpaca API Key（夜盘股票行情）" ;;
+      20) ask_secret_env_value ALPACA_API_SECRET "Alpaca API Secret（夜盘股票行情）" ;;
       0 | "") break ;;
       *) warn "无效选择：$choice" ;;
     esac
