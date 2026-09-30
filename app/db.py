@@ -128,8 +128,21 @@ class Database:
                     fair_value_forward_eps_source TEXT,
                     fair_value_safety_margin REAL,
                     fair_value_confidence TEXT
+                    ,fair_value_confidence_score REAL
+                    ,fair_value_interest_coverage REAL
+                    ,fair_value_regime TEXT
+                    ,fair_value_regime_signals_json TEXT
+                    ,fair_value_model_under_regime TEXT
                     ,fair_value_defensive_json TEXT
                     ,fair_value_optimistic_json TEXT
+                    ,fair_value_normalized_eps_source TEXT
+                    ,fair_value_quarterly_momentum_json TEXT
+                    ,fair_value_historical_valuation_percentiles_json TEXT
+                    ,fair_value_shareholder_total_return_yield REAL
+                    ,fair_value_market_cap_data_quality TEXT
+                    ,fair_value_data_quality_score REAL
+                    ,fair_value_owner_earnings_maintenance_ratio REAL
+                    ,fair_value_owner_earnings_ratio_source TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_quote_symbol_time
                     ON quote_snapshots(symbol, fetched_at DESC);
@@ -280,10 +293,36 @@ class Database:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_safety_margin REAL")
             if "fair_value_confidence" not in quote_columns:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_confidence TEXT")
+            if "fair_value_confidence_score" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_confidence_score REAL")
+            if "fair_value_interest_coverage" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_interest_coverage REAL")
+            if "fair_value_regime" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_regime TEXT")
+            if "fair_value_regime_signals_json" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_regime_signals_json TEXT")
+            if "fair_value_model_under_regime" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_model_under_regime TEXT")
             if "fair_value_defensive_json" not in quote_columns:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_defensive_json TEXT")
             if "fair_value_optimistic_json" not in quote_columns:
                 connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_optimistic_json TEXT")
+            if "fair_value_normalized_eps_source" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_normalized_eps_source TEXT")
+            if "fair_value_quarterly_momentum_json" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_quarterly_momentum_json TEXT")
+            if "fair_value_historical_valuation_percentiles_json" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_historical_valuation_percentiles_json TEXT")
+            if "fair_value_shareholder_total_return_yield" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_shareholder_total_return_yield REAL")
+            if "fair_value_market_cap_data_quality" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_market_cap_data_quality TEXT")
+            if "fair_value_data_quality_score" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_data_quality_score REAL")
+            if "fair_value_owner_earnings_maintenance_ratio" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_owner_earnings_maintenance_ratio REAL")
+            if "fair_value_owner_earnings_ratio_source" not in quote_columns:
+                connection.execute("ALTER TABLE quote_snapshots ADD COLUMN fair_value_owner_earnings_ratio_source TEXT")
             # 旧库首次升级时建立每个到期日的最新批次索引，后续写入由 write_snapshot 增量维护。
             if connection.execute("SELECT COUNT(*) FROM option_latest_batches").fetchone()[0] == 0:
                 connection.execute(
@@ -495,17 +534,18 @@ class Database:
     def write_snapshot(self, quote: dict[str, Any], options: Iterable[dict[str, Any]], fetched_at: str) -> int:
         # raw_json 目前没有任何读取方，为避免小磁盘环境被冗余 JSON 撑爆，写入时不再保存原始报文。
         option_rows = list(options)
+        self._preserve_cached_fair_value(quote)
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO quote_snapshots
-                (symbol, fetched_at, price, change_percent, currency, market_state, provider, sessions_json, today_open, previous_close, fair_value, fair_value_low, fair_value_high, fair_value_buy_low, fair_value_buy_high, fair_value_source, fair_value_model, fair_value_forward_eps, fair_value_forward_eps_source, fair_value_safety_margin, fair_value_confidence, fair_value_defensive_json, fair_value_optimistic_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol, fetched_at, price, change_percent, currency, market_state, provider, sessions_json, today_open, previous_close, fair_value, fair_value_low, fair_value_high, fair_value_buy_low, fair_value_buy_high, fair_value_source, fair_value_model, fair_value_forward_eps, fair_value_forward_eps_source, fair_value_safety_margin, fair_value_confidence, fair_value_confidence_score, fair_value_interest_coverage, fair_value_regime, fair_value_regime_signals_json, fair_value_model_under_regime, fair_value_defensive_json, fair_value_optimistic_json, fair_value_normalized_eps_source, fair_value_quarterly_momentum_json, fair_value_historical_valuation_percentiles_json, fair_value_shareholder_total_return_yield, fair_value_market_cap_data_quality, fair_value_data_quality_score, fair_value_owner_earnings_maintenance_ratio, fair_value_owner_earnings_ratio_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     quote["symbol"], fetched_at, quote.get("price"), quote.get("change_percent"),
                     quote.get("currency"), quote.get("market_state"), quote.get("provider", "upstream"),
                     json.dumps(quote.get("sessions") or {}, ensure_ascii=True),
                     quote.get("today_open"), quote.get("previous_close"),
-                    quote.get("fair_value"), quote.get("fair_value_low"), quote.get("fair_value_high"), quote.get("fair_value_buy_low"), quote.get("fair_value_buy_high"), quote.get("fair_value_source"), quote.get("fair_value_model"), quote.get("fair_value_forward_eps"), quote.get("fair_value_forward_eps_source"), quote.get("fair_value_safety_margin"), quote.get("fair_value_confidence"), json.dumps(quote.get("fair_value_defensive") or {}, ensure_ascii=False), json.dumps(quote.get("fair_value_optimistic") or {}, ensure_ascii=False),
+                    quote.get("fair_value"), quote.get("fair_value_low"), quote.get("fair_value_high"), quote.get("fair_value_buy_low"), quote.get("fair_value_buy_high"), quote.get("fair_value_source"), quote.get("fair_value_model"), quote.get("fair_value_forward_eps"), quote.get("fair_value_forward_eps_source"), quote.get("fair_value_safety_margin"), quote.get("fair_value_confidence"), quote.get("fair_value_confidence_score"), quote.get("fair_value_interest_coverage"), quote.get("fair_value_regime"), json.dumps(quote.get("fair_value_regime_signals") or {}, ensure_ascii=False), quote.get("fair_value_model_under_regime"), json.dumps(quote.get("fair_value_defensive") or {}, ensure_ascii=False), json.dumps(quote.get("fair_value_optimistic") or {}, ensure_ascii=False), quote.get("fair_value_normalized_eps_source"), json.dumps(quote.get("fair_value_quarterly_momentum") or {}, ensure_ascii=False), json.dumps(quote.get("fair_value_historical_valuation_percentiles") or {}, ensure_ascii=False), quote.get("fair_value_shareholder_total_return_yield"), quote.get("fair_value_market_cap_data_quality"), quote.get("fair_value_data_quality_score"), quote.get("fair_value_owner_earnings_maintenance_ratio"), quote.get("fair_value_owner_earnings_ratio_source"),
                 ),
             )
             connection.executemany(
@@ -533,6 +573,47 @@ class Database:
         if self.low_memory:
             self._passive_checkpoint()
         return len(option_rows)
+
+    def _preserve_cached_fair_value(self, quote: dict[str, Any]) -> None:
+        """行情刷新缺少估值时沿用上一份有效结果，避免后台计算窗口覆盖估值卡片。"""
+        symbol = str(quote.get("symbol") or "").upper()
+        if not symbol:
+            return
+        cached = self.latest_quote(symbol)
+        if not cached or cached.get("fair_value") is None:
+            return
+        scalar_fields = (
+            "fair_value", "fair_value_low", "fair_value_high", "fair_value_buy_low",
+            "fair_value_buy_high", "fair_value_source", "fair_value_model",
+            "fair_value_forward_eps", "fair_value_forward_eps_source", "fair_value_safety_margin",
+            "fair_value_confidence", "fair_value_confidence_score", "fair_value_interest_coverage",
+            "fair_value_regime", "fair_value_model_under_regime",
+            "fair_value_normalized_eps_source", "fair_value_market_cap_data_quality", "fair_value_data_quality_score",
+            "fair_value_owner_earnings_maintenance_ratio", "fair_value_owner_earnings_ratio_source",
+            "fair_value_shareholder_total_return_yield",
+        )
+        for field in scalar_fields:
+            if quote.get(field) is None and cached.get(field) is not None:
+                quote[field] = cached[field]
+        for field, column in (
+            ("fair_value_regime_signals", "fair_value_regime_signals_json"),
+            ("fair_value_defensive", "fair_value_defensive_json"),
+            ("fair_value_optimistic", "fair_value_optimistic_json"),
+            ("fair_value_quarterly_momentum", "fair_value_quarterly_momentum_json"),
+            ("fair_value_historical_valuation_percentiles", "fair_value_historical_valuation_percentiles_json"),
+        ):
+            current = quote.get(field)
+            if current not in (None, {}, ""):
+                continue
+            raw = cached.get(column)
+            if not raw:
+                continue
+            try:
+                value = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if value not in (None, {}, ""):
+                quote[field] = value
 
     def latest_quote(self, symbol: str) -> dict[str, Any] | None:
         with self.connect() as connection:

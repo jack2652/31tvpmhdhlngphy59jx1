@@ -332,16 +332,8 @@ class HistoryService:
             cached = None
         if cached and self._is_fresh(cached.get("fetched_at"), self.earnings_max_age_seconds):
             return self._earnings_result(normalized, cached, "sqlite", None)
-        # 财报日期只影响提示标签，不参与价位计算。低内存实例上该 SDK 调用没有可靠的
-        # timeout 参数，网络异常可能把整个 /api/levels 请求挂住；没有旧缓存时直接降级，
-        # 后续页面刷新再尝试补齐，避免为一个可选字段拖垮首屏。
-        if low_memory_enabled() and not cached:
-            return self._earnings_result(
-                normalized,
-                None,
-                "none",
-                "低内存保护：暂跳过财报日期读取",
-            )
+        # 财报日期是现货卡片的关键提示，不应因低内存模式被永久跳过。
+        # 请求仍受上游闸门、租约和新鲜期保护；失败时沿用旧缓存并返回 warning。
         loader = getattr(self.provider, "earnings_dates", None)
         if not callable(loader):
             return self._earnings_result(

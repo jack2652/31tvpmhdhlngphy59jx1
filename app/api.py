@@ -9,7 +9,7 @@ import secrets
 import threading
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +19,12 @@ from app.config import Settings
 from app.db import Database, expiration_dates, iso, parse_sessions
 from app.gamma import annotate_model_greeks, find_zero_gamma
 from app.levels import build_levels
-from app.providers.market import ProviderError, MarketDataProvider
+from app.providers.market import FAIR_VALUE_SOURCE, ProviderError, MarketDataProvider
 from app.runtime import release_memory
 from app.services.concurrency import SingleFlightCache, get_heavy_gate
 from app.services.earnings import summarize_earnings
 from app.services.history import HistoryService
-from app.services.snapshots import SnapshotService, active_expirations, market_today
+from app.services.snapshots import SnapshotService, active_expirations, market_today, snapshot_age_seconds
 
 
 # 后台 Gamma 窗口超过这个时间还没写回，只把这一轮标记失败。晚到的线程靠 started_at 避免覆盖新任务。
@@ -183,6 +183,41 @@ def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict
     }
 
 
+def _align_quote_with_history(
+    quote: dict[str, Any],
+    history_payload: dict[str, Any] | None,
+    max_age_seconds: int,
+) -> dict[str, Any]:
+    """用新鲜日线校准缓存行情，避免首屏 quote 与趋势通道使用不同昨收。"""
+    if not quote or not isinstance(history_payload, dict):
+        return quote
+    age = snapshot_age_seconds(history_payload.get("fetched_at"))
+    if age is None or age > max_age_seconds:
+        return quote
+    bars = history_payload.get("bars")
+    if not isinstance(bars, list) or not bars:
+        return quote
+    recent_dates = sorted(str(item.get("date"))[:10] for item in bars if isinstance(item, dict) and item.get("date"))
+    try:
+        latest_day = date.fromisoformat(recent_dates[-1])
+    except (IndexError, ValueError):
+        return quote
+    # 防止上游刚返回一份“抓取时间新、实际交易日很旧”的降级历史覆盖可靠 quote。
+    # 正常周末/节假日最多相隔几天，超过一周说明它不能作为首屏昨收依据。
+    if (market_today() - latest_day).days > 7:
+        return quote
+    market = trend_market_data(bars, quote)
+    previous_close = _positive_price(market.get("previous_close"))
+    if previous_close is None:
+        return quote
+    aligned = dict(quote)
+    aligned["previous_close"] = previous_close
+    price = _positive_price(aligned.get("price"))
+    if price is not None:
+        aligned["change_percent"] = (price - previous_close) / previous_close * 100
+    return aligned
+
+
 def create_router(database: Database, snapshots: SnapshotService, provider: MarketDataProvider, settings: Settings) -> APIRouter:
     router = APIRouter(prefix="/api")
     history = HistoryService(
@@ -211,6 +246,20 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         if not bulky:
             database.put_analysis_cache(shared_key, value, settings.analysis_cache_entries)
         return value
+
+    def quote_history(symbol_name: str) -> dict[str, Any] | None:
+        """为现货响应准备与趋势通道相同的新鲜日线。"""
+        cached = database.latest_history(symbol_name)
+        cached_age = snapshot_age_seconds((cached or {}).get("fetched_at"))
+        if cached and cached_age is not None and cached_age <= settings.history_max_age_seconds:
+            return cached
+        # 新标的首屏通常先请求 quote，日线则由 levels 随后才触发；这里提前补齐一次，
+        # 让现货卡片不会先显示旧快照的昨收，再被趋势通道的正确值覆盖。
+        try:
+            refreshed = history.bars(symbol_name)
+        except Exception:
+            refreshed = None
+        return refreshed if refreshed and refreshed.get("bars") else cached
 
     def run_gamma_refresh(
         job_key: str,
@@ -264,36 +313,52 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    def merge_fair_value_payload(payload: dict[str, Any], result: dict[str, Any]) -> None:
+        """把内存/SQLite 估值结果覆盖到行情行，避免等待下一次完整快照。"""
+        mapping = {
+            "value": "fair_value", "low": "fair_value_low", "high": "fair_value_high",
+            "buy_low": "fair_value_buy_low", "buy_high": "fair_value_buy_high",
+            "source": "fair_value_source", "model": "fair_value_model",
+            "forward_eps": "fair_value_forward_eps", "forward_eps_source": "fair_value_forward_eps_source",
+            "safety_margin": "fair_value_safety_margin", "confidence": "fair_value_confidence",
+            "confidence_score": "fair_value_confidence_score", "interest_coverage": "fair_value_interest_coverage",
+            "regime": "fair_value_regime", "regime_signals": "fair_value_regime_signals",
+            "model_under_regime": "fair_value_model_under_regime", "defensive": "fair_value_defensive",
+            "optimistic": "fair_value_optimistic", "status": "fair_value_status", "warning": "fair_value_warning",
+            "normalized_eps_source": "fair_value_normalized_eps_source",
+            "quarterly_momentum": "fair_value_quarterly_momentum",
+            "historical_valuation_percentiles": "fair_value_historical_valuation_percentiles",
+            "shareholder_total_return_yield": "fair_value_shareholder_total_return_yield",
+            "market_cap_data_quality": "fair_value_market_cap_data_quality",
+            "data_quality_score": "fair_value_data_quality_score",
+            "owner_earnings_maintenance_ratio": "fair_value_owner_earnings_maintenance_ratio",
+            "owner_earnings_ratio_source": "fair_value_owner_earnings_ratio_source",
+        }
+        for key, payload_key in mapping.items():
+            if key in result:
+                payload[payload_key] = result.get(key)
+
     def quote_response(row: dict[str, Any], source: str) -> dict[str, Any]:
         """统一行情响应结构：把 SQLite 里的 sessions_json 解析成前端的 sessions 对象。"""
         payload = dict(row)
+        # 估值任务是异步的；旧快照可能只有行情而没有估值，状态字段不能继续
+        # 让前端把「没有候选」误显示成「仍在等待」。
+        payload.setdefault(
+            "fair_value_status",
+            "ready" if payload.get("fair_value_source") == FAIR_VALUE_SOURCE and payload.get("fair_value") is not None else "pending",
+        )
+        payload.setdefault("fair_value_warning", None)
         # 估值在行情快照之后异步完成；没有结果时由前端做轻量轮询，而不是重复抓整份期权链。
-        payload.setdefault("fair_value_pending", payload.get("fair_value_source") != "valuation_v14")
+        payload.setdefault("fair_value_pending", payload.get("fair_value_source") != FAIR_VALUE_SOURCE)
         # 估值在后台线程完成后先写入共享分析缓存；这里合并到旧行情快照，
         # 让多 worker 和首次估值都能在下一次轻量报价请求中显示，不必等待期权链刷新。
         symbol_name = str(payload.get("symbol") or "").upper()
-        if symbol_name and payload.get("fair_value_source") != "valuation_v14":
-            shared = database.get_analysis_cache(f"fair-value:v14:{symbol_name}")
-            if isinstance(shared, dict) and shared.get("source") == "valuation_v14" and shared.get("value") is not None:
-                for key in ("value", "low", "high", "buy_low", "buy_high", "source", "model", "forward_eps", "forward_eps_source", "safety_margin", "confidence", "defensive", "optimistic"):
-                    payload_key = {
-                        "value": "fair_value",
-                        "low": "fair_value_low",
-                        "high": "fair_value_high",
-                        "buy_low": "fair_value_buy_low",
-                        "buy_high": "fair_value_buy_high",
-                        "source": "fair_value_source",
-                        "model": "fair_value_model",
-                        "forward_eps": "fair_value_forward_eps",
-                        "forward_eps_source": "fair_value_forward_eps_source",
-                        "safety_margin": "fair_value_safety_margin",
-                        "confidence": "fair_value_confidence",
-                        "defensive": "fair_value_defensive",
-                        "optimistic": "fair_value_optimistic",
-                    }[key]
-                    payload[payload_key] = shared.get(key)
+        if symbol_name and payload.get("fair_value_source") != FAIR_VALUE_SOURCE:
+            shared = database.get_analysis_cache(f"fair-value:{FAIR_VALUE_SOURCE.removeprefix('valuation_')}:{symbol_name}")
+            if isinstance(shared, dict) and shared.get("source") == FAIR_VALUE_SOURCE and shared.get("value") is not None:
+                merge_fair_value_payload(payload, shared)
         stored = payload.pop("sessions_json", None)
-        for field, column in (("fair_value_defensive", "fair_value_defensive_json"), ("fair_value_optimistic", "fair_value_optimistic_json")):
+        for field, column in (("fair_value_defensive", "fair_value_defensive_json"), ("fair_value_optimistic", "fair_value_optimistic_json"), ("fair_value_regime_signals", "fair_value_regime_signals_json"), ("fair_value_quarterly_momentum", "fair_value_quarterly_momentum_json")):
             raw = payload.pop(column, None)
             if field not in payload or payload.get(field) is None:
                 try:
@@ -305,7 +370,28 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         if not sessions and payload.get("symbol"):
             sessions = database.latest_sessions(payload["symbol"])
         payload["sessions"] = sessions
-        payload["fair_value_pending"] = payload.get("fair_value_source") != "valuation_v14"
+        # 首次进入标的时 quote 可能先读到旧 SQLite 行，而 levels 已经拿到较新的日线。
+        # 先在响应层按同一趋势口径校准，避免现货卡片短暂显示错误昨收，随后又被覆盖。
+        if symbol_name:
+            payload = _align_quote_with_history(payload, quote_history(symbol_name), settings.history_max_age_seconds)
+        # 财报提示是现货卡片的一部分，不能依赖稍后才触发的 levels 请求；统一走
+        # HistoryService，缓存缺失或过期时会补读上游，盘后发布当天也能立即显示。
+        earnings_payload: dict[str, Any]
+        try:
+            earnings_payload = history.earnings(symbol_name) if symbol_name else {"dates": [], "source": "none"}
+        except Exception as exc:
+            earnings_payload = {"dates": [], "source": "none", "warning": str(exc)}
+        earnings_dates = earnings_payload.get("dates")
+        payload["earnings"] = summarize_earnings(
+            earnings_dates if isinstance(earnings_dates, list) else None,
+            market_today(),
+        )
+        payload["earnings"]["fetched_at"] = earnings_payload.get("fetched_at")
+        payload["earnings"]["source"] = earnings_payload.get("source")
+        payload["earnings"]["warning"] = earnings_payload.get("warning")
+        if payload.get("fair_value_source") == FAIR_VALUE_SOURCE and payload.get("fair_value") is not None:
+            payload["fair_value_status"] = "ready"
+        payload["fair_value_pending"] = payload.get("fair_value_source") != FAIR_VALUE_SOURCE and payload.get("fair_value_status") in {"pending", "retry"}
         payload["source"] = source
         return payload
 
@@ -319,7 +405,15 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             "fair_value_model": None, "fair_value_forward_eps": None,
             "fair_value_forward_eps_source": None, "fair_value_safety_margin": None,
             "fair_value_confidence": None,
+            "fair_value_confidence_score": None, "fair_value_interest_coverage": None,
+            "fair_value_regime": None, "fair_value_regime_signals": None, "fair_value_model_under_regime": None,
             "fair_value_defensive": None, "fair_value_optimistic": None,
+            "fair_value_normalized_eps_source": None, "fair_value_quarterly_momentum": None,
+            "fair_value_historical_valuation_percentiles": None, "fair_value_shareholder_total_return_yield": None,
+            "fair_value_market_cap_data_quality": None, "fair_value_data_quality_score": None,
+            "fair_value_owner_earnings_maintenance_ratio": None, "fair_value_owner_earnings_ratio_source": None,
+            "fair_value_status": "pending", "fair_value_warning": None,
+            "earnings": summarize_earnings(None, market_today()),
             "fair_value_pending": True,
         }
 
@@ -328,8 +422,36 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         normalized = symbol(stock_symbol)
         cached = database.latest_quote(normalized)
         if cached and cached.get("price") is not None and not refresh:
-            return quote_response(cached, "sqlite")
+            payload = quote_response(cached, "sqlite")
+            # 本地行情快照存在但估值缺失时，轻量请求也要触发估值任务；不能
+            # 让前端的轮询永远只读同一份没有估值的 SQLite 行。
+            if payload.get("fair_value_source") != FAIR_VALUE_SOURCE:
+                try:
+                    pending = provider.ensure_fair_value(normalized)
+                    if pending.get("status") == "ready" and pending.get("value") is not None:
+                        merge_fair_value_payload(payload, pending)
+                        payload["fair_value_pending"] = False
+                    elif pending.get("status") in {"retry", "unavailable", "failed"}:
+                        merge_fair_value_payload(payload, pending)
+                        payload["fair_value_pending"] = pending.get("status") == "retry"
+                except Exception:
+                    # 估值是可选字段，触发失败不能影响现货快照响应。
+                    pass
+            return payload
         if not refresh:
+            try:
+                pending = provider.ensure_fair_value(normalized)
+                response = pending_quote(normalized)
+                if pending.get("status") == "ready" and pending.get("value") is not None:
+                    merge_fair_value_payload(response, pending)
+                    response["fair_value_pending"] = False
+                    return response
+                if pending.get("status") in {"retry", "unavailable", "failed"}:
+                    merge_fair_value_payload(response, pending)
+                    response["fair_value_pending"] = pending.get("status") == "retry"
+                    return response
+            except Exception:
+                pass
             return pending_quote(normalized)
         try:
             fresh = provider.quote(normalized)
@@ -576,6 +698,8 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
         """
         normalized = symbol(stock_symbol)
         quote = database.latest_quote(normalized) or {}
+        cached_history = database.latest_history(normalized) or {}
+        quote = _align_quote_with_history(quote, cached_history, settings.history_max_age_seconds)
         # 价位接口使用跨期限链；选中的远期期限若不在 45 天窗口内，额外并入，避免切换期限后期权因子消失。
         profile = database.latest_chains(normalized, horizon_days=45)
         option_rows = list(profile.get("data") or [])
@@ -610,7 +734,6 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             # raw 模式严格只读 SQLite；极值、趋势和基础价位交给浏览器计算。
             # 这里不触发日线、Beta、财报回源，也不执行 build_levels，避免切换新
             # 标的时和 Gamma/期权刷新叠加成一次重量级请求。
-            cached_history = database.latest_history(normalized) or {}
             cached_extremes = database.latest_extremes(normalized) or {}
             cached_beta = database.latest_beta(normalized) or {}
             cached_earnings = database.latest_earnings(normalized) or {}
@@ -693,6 +816,16 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
             }
 
         history_payload = history.bars(normalized)
+        # 非 raw 模式的日线可能是本次请求刚回源得到的；前面计算 candidate_spot 时
+        # 还只有 SQLite quote，必须在这里重新按同一日线口径校准，否则 levels 的
+        # trend_market 是正确昨收，但 candidate_spot 仍会保留旧行情快照的昨收。
+        quote = _align_quote_with_history(quote, history_payload, settings.history_max_age_seconds)
+        candidate_spot = quote.get("previous_close")
+        try:
+            if candidate_spot is None or float(candidate_spot) <= 0:
+                candidate_spot = quote.get("price") or resolved_spot
+        except (TypeError, ValueError):
+            candidate_spot = resolved_spot
         # 极值和 Beta 使用不同缓存/锁；并行读取可以缩短首次加载等待。Beta 复用已经取回的两年日线，
         # 避免同一请求再次向行情源请求同一份标的数据。财报日期同样并行，失败不能拖垮价位接口。
         earnings_payload: dict[str, Any] = {

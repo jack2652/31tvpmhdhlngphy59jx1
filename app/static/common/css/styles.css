@@ -185,7 +185,7 @@
 .detail-seg[aria-pressed="false"]:hover{color:var(--blue)}
 .detail-seg[aria-pressed="true"]{background:var(--blue);color:var(--on-blue)}
 .detail-seg:focus-visible{outline:1px solid var(--blue);outline-offset:-3px}
-/* 期权链折叠面板：表格与图例放进 .chain-fold，默认展开；类型筛选属于表格，一起放进折叠区（收起时隐藏）。
+/* 期权链折叠面板：表格与图例放进 .chain-fold，默认折叠；类型筛选属于表格，一起放进折叠区（收起时隐藏）。
    分隔线放在内容体上（与其它折叠组一致），折叠时面板底部不会出现双层边框。 */
 .detail-header .panel-status{margin-left:auto}
 /* 状态栏后面紧跟着「展开/收起」时取消文案自身的 auto 外边距：两个 auto 会平分整行留白，

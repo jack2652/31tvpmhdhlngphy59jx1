@@ -35,7 +35,7 @@
     </section>
 
     <section class="headline-grid">
-      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">上一个交易日 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">财报日期未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
+      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">昨收 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">财报日期未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
       <article class="metric panel"><div class="eyebrow">合约总数</div><strong id="total-count" v-text="view.totalCount">--</strong><span>当前到期日</span></article>
       <article class="metric call-metric panel"><div class="eyebrow">看涨成交量</div><strong id="call-volume" v-text="view.callVolume">--</strong><span id="call-interest" v-text="view.callInterest">未平仓 --</span></article>
       <article class="metric put-metric panel"><div class="eyebrow">看跌成交量</div><strong id="put-volume" v-text="view.putVolume">--</strong><span id="put-interest" v-text="view.putInterest">未平仓 --</span></article>
@@ -227,15 +227,15 @@
 
     <section class="data-panel panel">
       <div class="detail-header" id="chain-header">
-        <button class="detail-toggle" id="chain-toggle" type="button" aria-expanded="true" aria-controls="chain-fold" aria-label="期权链明细"><span class="detail-caret" aria-hidden="true"></span></button>
+        <button class="detail-toggle" id="chain-toggle" type="button" aria-expanded="false" aria-controls="chain-fold" aria-label="期权链明细"><span class="detail-caret" aria-hidden="true"></span></button>
         <div class="detail-text"><span class="eyebrow">期权链</span><h1 id="chain-title" v-text="view.chainTitle">选择到期日查看期权链</h1></div>
         <div class="panel-status"><span id="data-source" v-text="view.dataSource">尚未加载</span><span class="divider"></span><span id="fetched-at" v-text="view.fetchedAt">快照时间 --</span></div>
-        <span class="detail-action" id="chain-action">收起</span>
+        <span class="detail-action" id="chain-action">展开</span>
       </div>
       <div id="error-box" class="error-box" role="alert" v-show="view.error" v-text="view.error"></div>
-      <div class="chain-fold" id="chain-fold">
+      <div class="chain-fold" id="chain-fold" hidden>
         <div class="chain-toolbar"><div class="chain-filter"><span class="chain-filter-label">类型</span><el-select id="chain-type-filter" v-model="chainFilter" size="small" @change="filterChanged" aria-label="按类型筛选期权链"><el-option value="all" label="全部"></el-option><el-option value="call" label="看涨"></el-option><el-option value="put" label="看跌"></el-option></el-select></div></div>
-        <div class="table-wrap"><table><thead><tr><th class="num">行权价</th><th class="num">成交量</th><th class="num">未平仓</th><th class="num">Gamma</th><th class="num" title="Gamma × 未平仓 × 100 × 现价² × 0.01，即现价每变动 1% 的美元敞口；看涨为正、看跌为负">GEX</th><th class="num" title="按该到期日近 ATM 合约价格反解得到的估计值，用于 Gamma 敞口估算">IV（估）</th><th>价内</th></tr></thead><tbody id="chain-body" is="chain-table-body" :rows="view.chainRows" :empty="view.chainEmpty"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th class="num">行权价</th><th class="num">成交量</th><th class="num">未平仓</th><th class="num">买价</th><th class="num">卖价</th><th class="num">Gamma</th><th class="num" title="Gamma × 未平仓 × 100 × 现价² × 0.01，即现价每变动 1% 的美元敞口；看涨为正、看跌为负">GEX</th><th class="num" title="按该到期日近 ATM 合约价格反解得到的估计值，用于 Gamma 敞口估算">IV（估）</th><th>价内</th></tr></thead><tbody id="chain-body" is="chain-table-body" :rows="view.chainRows" :empty="view.chainEmpty"></tbody></table></div>
         <div class="chain-legend"><span id="chain-heat-note" v-text="view.chainHeatNote">行权价绿=看涨、红=看跌 · 底色：按该列本屏最强值归一</span></div>
       </div>
     </section>

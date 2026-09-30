@@ -23,6 +23,7 @@ from app.levels import absorption_levels, annotate_level_history, average_true_r
 from app.providers import market
 from app.providers import cboe
 from app.providers.market import (
+    MarketRegime,
     ProviderError,
     HybridMarketDataProvider,
     MarketDataProvider,
@@ -128,12 +129,748 @@ def test_safe_value_and_symbol_validation():
 
     assert safe_value(np.float64("nan")) is None
     assert safe_value(np.int64(4)) == 4
+
+
+def test_market_regime_extreme_signal_enters_winter_without_second_hit():
+    """VIX 或指数断崖单独达到极端阈值时，不能等待第二个普通信号。"""
+    regime, signals = MarketRegime.detect({"vix": 80.0, "us10y": 0.006})
+    assert regime == MarketRegime.WINTER
+    assert signals["extreme_hits"] == ["vix_extreme"]
+
+
+def test_winter_valuation_uses_default_ai_share_and_floor_eps():
+    """AI 营收拆分缺失时使用行业默认值，寒冬盈利取最低三年均值。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 5.0},
+        symbol="NVDA",
+        eps_values=[5.0],
+        annual_eps_values=[3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+        forward_eps=30.0,
+        current_price=100.0,
+        growth_hint=0.50,
+        beta=1.5,
+        sector="Technology",
+        industry="Semiconductors",
+        revenue_values=[100.0, 80.0],
+        operating_income_values=[30.0],
+        net_income_values=[20.0],
+        da_values=[5.0],
+        capex_values=[5.0],
+        working_capital_values=[0.0],
+        operating_cashflow_values=[25.0],
+        market_cap=1_000_000_000.0,
+        price_to_sales=12.0,
+        regime=MarketRegime.WINTER,
+        regime_signals={"extreme_hits": ["vix_extreme"]},
+    )
+    # 3,4,5,6,7 去掉高端后取最低三年平均 4，再乘 10 倍 PE 和 40% AI 折扣。
+    assert result["value"] == pytest.approx(16.0)
+    assert result["regime"] == MarketRegime.WINTER
+    assert any("AI 寒冬" in warning for warning in result["warnings"])
+
+
+def test_storage_forward_eps_is_capped_by_consensus_anchor():
+    """存储股异常远期 EPS 必须受分析师目标价反推的 35 倍 PE 上限约束。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 100.0},
+        symbol="SNDK",
+        eps_values=[100.0],
+        annual_eps_values=[100.0, 90.0, 80.0, 70.0, 60.0],
+        forward_eps=527.0,
+        current_price=1719.11,
+        growth_hint=0.50,
+        beta=1.2,
+        sector="Technology",
+        industry="Computer Hardware Storage",
+        revenue_values=[1000.0, 800.0],
+        operating_income_values=[300.0],
+        net_income_values=[200.0],
+        da_values=[50.0],
+        capex_values=[50.0],
+        working_capital_values=[0.0],
+        operating_cashflow_values=[250.0],
+        market_cap=10_000_000_000.0,
+        price_to_sales=12.0,
+        target_mean_price=2137.0,
+        regime="NORMAL",
+        regime_signals={},
+    )
+    assert result["forward_eps"] == pytest.approx(2137.0 / 35.0, rel=1e-4)
+    assert result["value"] == pytest.approx((2137.0 / 35.0) * 0.70 * 25.0)
+
+
+@pytest.mark.parametrize("industry", ["Computer Hardware Storage", "Semiconductor Memory"])
+def test_memory_storage_uses_cyclical_model_even_with_strong_fcf_and_growth(industry):
+    """NAND/DRAM 等内存制造商不能因景气期 FCF 和增速高而套结构性成长 PE。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 100.0},
+        symbol="SNDK",
+        eps_values=[100.0],
+        annual_eps_values=[100.0, 90.0, 80.0, 70.0, 60.0],
+        forward_eps=527.0,
+        current_price=1726.18,
+        growth_hint=0.50,
+        beta=1.2,
+        sector="Technology",
+        industry=industry,
+        revenue_values=[1000.0, 800.0],
+        fcf_values=[250.0],
+        operating_income_values=[300.0],
+        net_income_values=[200.0],
+        da_values=[50.0],
+        capex_values=[50.0],
+        working_capital_values=[0.0],
+        operating_cashflow_values=[250.0],
+        market_cap=10_000_000_000.0,
+        price_to_sales=12.0,
+        target_mean_price=2137.0,
+        regime="NORMAL",
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] == "AI存储/硬件周期"
+    assert result["value"] == pytest.approx((2137.0 / 35.0) * 0.70 * 25.0)
+    assert result["defensive"]["high"] < 1500.0
+    assert result["optimistic"]["low"] == pytest.approx(round(2137.0 / 35.0 * 20.0, 2))
+    assert result["optimistic"]["high"] == pytest.approx(round(2137.0 / 35.0 * 30.0, 2))
+    assert result["optimistic"]["value"] == pytest.approx(round(2137.0 / 35.0 * 25.0, 2))
+
+
+def test_software_storage_terms_do_not_trigger_storage_hardware_model():
+    """cloud/data storage 等软件服务术语不能把 ORCL 误判成存储硬件公司。"""
+    result = MarketDataProvider._conservative_earnings(
+        {
+            "trailingEps": 6.38,
+            "longBusinessSummary": (
+                "Oracle provides cloud storage, data storage, storage infrastructure and "
+                "autonomous database software for enterprise customers."
+            ),
+        },
+        symbol="ORCL",
+        eps_values=[6.38],
+        annual_eps_values=[6.38, 5.80, 5.20],
+        forward_eps=6.80,
+        current_price=137.34,
+        growth_hint=0.50,
+        beta=1.1,
+        sector="Technology",
+        industry="Software - Infrastructure",
+        revenue_values=[67.36, 57.40, 52.96, 49.95],
+        fcf_values=[10000.0],
+        shares_values=[2.88],
+        debt_values=[10000.0],
+        cash_values=[11000.0],
+        operating_income_values=[15000.0],
+        net_income_values=[13000.0],
+        da_values=[3000.0],
+        capex_values=[8000.0],
+        operating_cashflow_values=[18000.0],
+        market_cap=417.7e9,
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] != "AI存储/硬件周期"
+    assert "AI 存储/硬件周期" not in result["model"]
+
+
+def test_asset_heavy_transition_defensive_label_matches_branch():
+    """重资产转型分支的防守卡片应显示对应模型标签。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 6.38, "longBusinessSummary": "Oracle enterprise cloud software and infrastructure."},
+        symbol="ORCL",
+        eps_values=[6.38],
+        annual_eps_values=[6.38, 5.80, 5.20],
+        forward_eps=6.80,
+        current_price=137.34,
+        growth_hint=0.20,
+        beta=1.1,
+        sector="Technology",
+        industry="Software - Infrastructure",
+        revenue_values=[67.36, 57.40],
+        fcf_values=[-100.0],
+        shares_values=[2.88],
+        debt_values=[10000.0],
+        cash_values=[11000.0],
+        operating_income_values=[15000.0],
+        net_income_values=[13000.0],
+        da_values=[3000.0],
+        capex_values=[20000.0],
+        operating_cashflow_values=[10000.0],
+        market_cap=417.7e9,
+        target_mean_price=180.0,
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] == "重资产转型"
+    assert result["defensive"]["model"] == "重资产转型：核心业务 PE + 制造/云业务 P/S 压力测试"
+
+
+def test_defense_tag_enters_order_driven_model_without_forward_eps():
+    """国防/航空航天/激光标签配合负 FCF 时，不得掉入普通亏损转型模型。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 0.10},
+        symbol="LASR",
+        eps_values=[0.10],
+        annual_eps_values=[0.10, 0.08, 0.05],
+        forward_eps=None,
+        current_price=38.11,
+        growth_hint=0.0,
+        beta=1.5,
+        sector="Industrials",
+        industry="Aerospace & Defense Laser",
+        revenue_values=[1000.0, 900.0],
+        fcf_values=[-50.0],
+        shares_values=[100.0],
+        operating_income_values=[10.0],
+        net_income_values=[-5.0],
+        da_values=[20.0],
+        capex_values=[60.0],
+        working_capital_values=[0.0],
+        target_low_price=75.75,
+        target_mean_price=86.70,
+        target_high_price=105.0,
+        regime="NORMAL",
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] == "国防订单驱动转型"
+    assert result["defensive"]["model"] == "国防订单驱动转型：远期 P/S + 分析师共识 压力测试"
+    assert result["optimistic"] is not None
+    assert result["optimistic"]["low"] >= 75.75
+    assert result["optimistic"]["high"] >= 105.0
+    assert result["value"] > 20.0
+
+
+def test_business_summary_overrides_generic_semiconductor_label_for_laser_defense():
+    """业务摘要命中激光/国防时，即使 Yahoo 行业为 Semiconductors 也走国防模型。"""
+    result = MarketDataProvider._conservative_earnings(
+        {
+            "trailingEps": 0.10,
+            "longBusinessSummary": (
+                "nLIGHT designs semiconductor and fiber lasers for aerospace and defense "
+                "and high-energy laser systems in directed energy applications."
+            ),
+        },
+        symbol="LASR",
+        eps_values=[0.10],
+        annual_eps_values=[0.10, 0.08, 0.05],
+        forward_eps=None,
+        current_price=40.15,
+        growth_hint=0.0,
+        beta=1.5,
+        sector="Technology",
+        industry="Semiconductors",
+        revenue_values=[1000.0, 900.0],
+        fcf_values=[-50.0],
+        shares_values=[100.0],
+        operating_income_values=[10.0],
+        net_income_values=[-5.0],
+        da_values=[20.0],
+        capex_values=[60.0],
+        working_capital_values=[0.0],
+        target_low_price=75.75,
+        target_mean_price=86.70,
+        target_high_price=105.0,
+        regime="NORMAL",
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] == "国防订单驱动转型"
+    assert result["optimistic"] is not None
+    assert result["value"] > 20.0
+
+
+def test_extreme_model_value_emits_data_source_warning():
+    """模型结果超过现价五倍时，输出数据源失真警告并回退到现价锚点。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 100.0},
+        symbol="SNDK",
+        eps_values=[100.0],
+        annual_eps_values=[100.0, 90.0, 80.0],
+        forward_eps=527.0,
+        current_price=100.0,
+        growth_hint=0.50,
+        beta=1.2,
+        sector="Technology",
+        industry="Computer Hardware Storage",
+        revenue_values=[1000.0, 800.0],
+        operating_income_values=[300.0],
+        net_income_values=[200.0],
+        da_values=[50.0],
+        capex_values=[50.0],
+        operating_cashflow_values=[250.0],
+        market_cap=10_000_000_000.0,
+        price_to_sales=12.0,
+        target_mean_price=2137.0,
+        regime="NORMAL",
+        regime_signals={},
+    )
+    assert result["value"] == pytest.approx(150.0)
+    assert any("Yahoo 财务数据口径异常" in warning for warning in result["warnings"])
+    assert any("已降级到现价锚定" in warning for warning in result["warnings"])
+
+
+def test_mobility_technology_growth_keeps_auto_bottom_and_adds_upside_case():
+    """超大市值自动驾驶/机器人公司保留汽车底线，同时输出独立成长情景。"""
+    result = MarketDataProvider._conservative_earnings(
+        {
+            "trailingEps": 1.20,
+            "longBusinessSummary": (
+                "Tesla develops electric vehicles, autonomous self driving robotaxi, "
+                "robotics, humanoid Optimus, artificial intelligence and energy storage "
+                "for residential, commercial and industrial customers and utilities. "
+                "It also provides automotive insurance services."
+            ),
+        },
+        symbol="TSLA",
+        eps_values=[1.20],
+        annual_eps_values=[1.00, 1.10, 1.20],
+        forward_eps=1.26,
+        current_price=354.54,
+        growth_hint=0.12,
+        beta=2.0,
+        sector="Consumer Cyclical",
+        industry="Auto Manufacturers",
+        revenue_values=[100000.0, 85000.0],
+        fcf_values=[8000.0],
+        shares_values=[3200.0],
+        debt_values=[5000.0],
+        cash_values=[25000.0],
+        operating_income_values=[12000.0],
+        net_income_values=[9000.0],
+        da_values=[3000.0],
+        capex_values=[5000.0],
+        working_capital_values=[0.0],
+        operating_cashflow_values=[13000.0],
+        market_cap=1.13e12,
+        target_mean_price=400.0,
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] == "移动科技成长"
+    assert result["defensive"]["value"] < 100.0
+    assert result["optimistic"] is not None
+    assert result["optimistic"]["low"] > result["defensive"]["high"]
+    assert "移动科技成长" in result["optimistic"]["model"]
+    assert any("保守估值仍按汽车制造底线" in warning for warning in result["warnings"])
+
+
+def test_enterprise_software_terms_do_not_trigger_mobility_model():
+    """Oracle 的 autonomous database/robotic automation 不能误触发移动科技估值。"""
+    result = MarketDataProvider._conservative_earnings(
+        {
+            "trailingEps": 6.38,
+            "longBusinessSummary": (
+                "Oracle offers autonomous database products and robotic process automation "
+                "for enterprise software customers."
+            ),
+        },
+        symbol="ORCL",
+        eps_values=[6.38],
+        annual_eps_values=[6.38, 5.80, 5.20],
+        forward_eps=10.99719,
+        current_price=137.34,
+        growth_hint=0.50,
+        beta=1.1,
+        sector="Technology",
+        industry="Software - Infrastructure",
+        revenue_values=[67.36, 57.40, 52.96, 49.95],
+        fcf_values=[10000.0],
+        shares_values=[2.88],
+        debt_values=[10000.0],
+        cash_values=[11000.0],
+        operating_income_values=[15000.0],
+        net_income_values=[13000.0],
+        da_values=[3000.0],
+        capex_values=[8000.0],
+        operating_cashflow_values=[18000.0],
+        market_cap=417.7e9,
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] != "移动科技成长"
+    assert "移动科技成长" not in (result["optimistic"] or {}).get("model", "")
+
+
+def test_mobility_growth_is_disabled_in_ai_winter():
+    """寒冬状态关闭移动科技成长估值，回退到压力测试模型。"""
+    result = MarketDataProvider._conservative_earnings(
+        {
+            "trailingEps": 1.20,
+            "longBusinessSummary": "autonomous robotaxi robotics artificial intelligence energy storage",
+        },
+        symbol="TSLA",
+        eps_values=[1.20],
+        annual_eps_values=[0.80, 1.00, 1.20, 1.40, 1.60],
+        forward_eps=1.26,
+        current_price=354.54,
+        growth_hint=0.12,
+        beta=2.0,
+        sector="Consumer Cyclical",
+        industry="Auto Manufacturers",
+        revenue_values=[100000.0, 85000.0],
+        fcf_values=[8000.0],
+        shares_values=[3200.0],
+        debt_values=[5000.0],
+        cash_values=[25000.0],
+        operating_income_values=[12000.0],
+        net_income_values=[9000.0],
+        da_values=[3000.0],
+        capex_values=[5000.0],
+        operating_cashflow_values=[13000.0],
+        market_cap=1.13e12,
+        regime=MarketRegime.WINTER,
+        regime_signals={"extreme_hits": ["vix_extreme"]},
+    )
+    assert result["regime"] == MarketRegime.WINTER
+    assert result["decision_tree"]["lifecycle"] != "移动科技成长"
+    assert "AI寒冬" in result["optimistic"]["model"]
+
+
+def test_large_ai_mobility_company_keeps_upside_when_growth_data_is_weak():
+    """TSLA 类超大市值 AI 移动公司不因短期负增长或负 FCF 丢失成长情景。"""
+    result = MarketDataProvider._conservative_earnings(
+        {
+            "trailingEps": 1.20,
+            "longBusinessSummary": (
+                "Tesla develops electric vehicles, self-driving development and artificial intelligence software."
+            ),
+        },
+        symbol="TSLA",
+        eps_values=[1.20],
+        annual_eps_values=[1.00, 1.10, 1.20],
+        forward_eps=1.26,
+        current_price=353.53,
+        growth_hint=-0.08,
+        beta=2.0,
+        sector="Consumer Cyclical",
+        industry="Auto Manufacturers",
+        revenue_values=[100000.0, 105000.0],
+        fcf_values=[-1000.0],
+        shares_values=[3200.0],
+        debt_values=[5000.0],
+        cash_values=[25000.0],
+        operating_income_values=[12000.0],
+        net_income_values=[9000.0],
+        da_values=[3000.0],
+        capex_values=[14000.0],
+        working_capital_values=[0.0],
+        operating_cashflow_values=[13000.0],
+        market_cap=1.13e12,
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] == "移动科技成长"
+    assert result["optimistic"] is not None
+    assert "移动科技成长" in result["optimistic"]["model"]
+
+
+def test_real_utility_company_still_uses_utility_model():
+    """真正的公用事业公司仍应命中公用事业行业过滤。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 3.0, "longBusinessSummary": "Operates regulated electric utilities and water utilities."},
+        symbol="UTIL",
+        eps_values=[3.0],
+        annual_eps_values=[2.8, 2.9, 3.0],
+        forward_eps=3.2,
+        current_price=60.0,
+        growth_hint=0.04,
+        beta=0.7,
+        sector="Utilities",
+        industry="Utilities - Regulated Electric",
+        revenue_values=[10000.0, 9500.0],
+        fcf_values=[1500.0],
+        shares_values=[1000.0],
+        debt_values=[8000.0],
+        cash_values=[500.0],
+        operating_income_values=[2500.0],
+        net_income_values=[1800.0],
+        da_values=[1200.0],
+        capex_values=[1800.0],
+        operating_cashflow_values=[3300.0],
+        market_cap=60_000.0,
+        dividend_rate=2.0,
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["decision_tree"]["industry_filter"] == "utility"
+    assert result["decision_tree"]["lifecycle"] == "utility"
+
+
+def test_ai_internet_platform_has_separate_premium_upside_without_inversion():
+    """超大市值 AI 广告平台保留基础 P/S 防守值，并单独输出 AI 溢价上沿。"""
+    result = MarketDataProvider._conservative_earnings(
+        {
+            "trailingEps": 25.0,
+            "longBusinessSummary": (
+                "Meta operates social media and internet content platforms with "
+                "artificial intelligence, machine learning, generative AI and recommendation engines."
+            ),
+        },
+        symbol="META",
+        eps_values=[25.0],
+        annual_eps_values=[20.0, 22.0, 25.0],
+        forward_eps=30.0,
+        current_price=735.84,
+        growth_hint=0.15,
+        beta=1.2,
+        sector="Communication Services",
+        industry="Internet Content & Information",
+        revenue_values=[180000.0, 155000.0],
+        fcf_values=[60000.0],
+        shares_values=[2530.0],
+        debt_values=[50000.0],
+        cash_values=[65000.0],
+        operating_income_values=[70000.0],
+        net_income_values=[55000.0],
+        da_values=[10000.0],
+        capex_values=[30000.0],
+        working_capital_values=[0.0],
+        operating_cashflow_values=[90000.0],
+        market_cap=1.85e12,
+        target_mean_price=800.0,
+        churn_rate=0.05,
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["decision_tree"]["industry_filter"] == "internet_platform"
+    assert result["optimistic"] is not None
+    assert "AI 互联网平台" in result["optimistic"]["model"]
+    assert result["optimistic"]["high"] > result["defensive"]["high"]
+    assert result["optimistic"]["low"] >= result["defensive"]["low"]
+
+
+def test_regime_benchmark_history_is_cached_for_fifteen_minutes():
+    """同一行情提供器内，基准指数在 15 分钟内只读取一次。"""
+    provider = MarketDataProvider(ticker_factory=lambda symbol: SimpleNamespace(info={}))
+    calls = []
+    bars = sample_bars(60)
+    provider.benchmark_history = lambda symbol, period="6mo": calls.append((symbol, period)) or bars
+    ticker = SimpleNamespace(info={"vix": 15.0})
+
+    provider._detect_regime(ticker)
+    provider._detect_regime(ticker)
+
+    assert calls == [("^GSPC", "6mo")]
     assert safe_value(pd.NA) is None
     assert safe_value(pd.NaT) is None
     assert MarketDataProvider.normalize_symbol(" brk.b ") == "BRK.B"
     assert MarketDataProvider.normalize_symbol("BF-B") == "BF-B"
     with pytest.raises(ValueError):
         MarketDataProvider.normalize_symbol("AAPL/")
+
+
+def test_timeseries_values_preserves_fetch_sorted_newest_first_arrays():
+    """时序提取器不再二次反转，直接保留 fetch 层按 timestamp 排好的顺序。"""
+    newest_first = {
+        "annualTotalRevenue": [
+            {"reportedValue": {"raw": 125.0}},
+            {"reportedValue": {"raw": 100.0}},
+            {"reportedValue": {"raw": 80.0}},
+        ]
+    }
+    assert MarketDataProvider._timeseries_values(newest_first, "annualTotalRevenue") == [125.0, 100.0, 80.0]
+
+
+def test_valuation_quality_metrics_are_exposed_and_eps_units_are_guarded():
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 10.0},
+        symbol="QUALITY",
+        eps_values=[10.0],
+        annual_eps_values=[10.0, 9.0, 8.0],
+        net_income_values=[1_000_000.0, 900_000.0],
+        shares_values=[100.0],
+        current_price=100.0,
+        revenue_values=[1_000_000.0, 900_000.0],
+        dividend_rate=1.0,
+        buyback_values=[-500.0],
+        operating_income_values=[200_000.0, 180_000.0],
+        da_values=[20_000.0, 18_000.0],
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert "量纲异常回退" in result["normalized_eps_source"]
+    assert result["shareholder_total_return_yield"] == pytest.approx(0.06)
+
+
+def test_market_cap_reconciliation_preserves_yahoo_value_for_non_statement_shares():
+    """info/fast_info 股数推导出更低市值时，避免未经报表确认就向下校正。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 1.0},
+        symbol="ONDS",
+        eps_values=[1.0],
+        annual_eps_values=[0.9, 1.0],
+        shares_values=[80_000_000.0],
+        shares_source="info",
+        current_price=35.0,
+        market_cap=4.4e9,
+        revenue_values=[500e6, 400e6],
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["market_cap_data_quality"] == "market_cap_preferred"
+    assert any("保留 Yahoo market_cap" in warning for warning in result["warnings"])
+
+
+def test_market_cap_reconciliation_allows_balance_sheet_shares_to_correct_value():
+    """资产负债表股本是较强证据，市值偏差超过阈值时允许校正。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 1.0},
+        symbol="BALANCE",
+        eps_values=[1.0],
+        annual_eps_values=[0.9, 1.0],
+        shares_values=[80_000_000.0],
+        shares_source="balance_sheet",
+        current_price=35.0,
+        market_cap=4.4e9,
+        revenue_values=[500e6, 400e6],
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["market_cap_data_quality"] == "reconciled"
+    assert any("校正市值" in warning for warning in result["warnings"])
+
+
+def test_market_cap_reconciliation_is_symmetric_for_untrusted_high_implied_value():
+    """低 Yahoo 市值不能被滞后/未知股本推导出的高市值反向抬升。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"trailingEps": 1.0},
+        symbol="STALE_SHARES",
+        eps_values=[1.0],
+        annual_eps_values=[0.9, 1.0],
+        shares_values=[80_000_000.0],
+        shares_source="fundamentals_timeseries",
+        current_price=35.0,
+        market_cap=1.0e9,
+        revenue_values=[500e6, 400e6],
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["market_cap_data_quality"] == "market_cap_preferred"
+    assert any("保留 Yahoo market_cap" in warning for warning in result["warnings"])
+
+
+def test_industry_key_category_is_typed_without_injecting_free_text_keywords():
+    """computer-hardware 映射本身不应制造 storage 关键词命中。"""
+    result = MarketDataProvider._conservative_earnings(
+        {
+            "trailingEps": 2.0,
+            "longBusinessSummary": "Designs industrial controllers and automation software.",
+        },
+        symbol="CTRL",
+        eps_values=[2.0],
+        annual_eps_values=[1.8, 2.0],
+        forward_eps=2.2,
+        current_price=40.0,
+        growth_hint=0.08,
+        sector="Technology",
+        industry="Electronic Components",
+        industry_key="computer-hardware",
+        revenue_values=[1000.0, 950.0],
+        fcf_values=[100.0],
+        shares_values=[10.0],
+        market_cap=400.0,
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["decision_tree"]["lifecycle"] != "AI存储/硬件周期"
+
+
+def test_valuation_diagnostic_log_records_input_series(caplog):
+    """估值诊断日志应暴露输入营收序列和关键锚点，便于定位数据源问题。"""
+    previous_debug = market.VALUATION_CONFIG["debug"]
+    market.VALUATION_CONFIG["debug"] = True
+    try:
+        with caplog.at_level("INFO", logger="app.providers.market"):
+            MarketDataProvider._conservative_earnings(
+                {"trailingEps": 2.16},
+                symbol="TSLA",
+                eps_values=[2.16],
+                annual_eps_values=[2.0, 2.1, 2.16],
+                forward_eps=1.8,
+                growth_hint=0.05,
+                sector="Consumer Cyclical",
+                industry="Auto Manufacturers",
+                revenue_values=[97.7e9, 96.8e9, 81.5e9],
+                shares_values=[3.52e9],
+                market_cap=1.23e12,
+                regime=MarketRegime.NORMAL,
+                regime_signals={},
+                )
+    finally:
+        market.VALUATION_CONFIG["debug"] = previous_debug
+    assert any("估值诊断 symbol=TSLA" in record.message for record in caplog.records)
+    message = next(record.message for record in caplog.records if "估值诊断 symbol=TSLA" in record.message)
+    assert "rev_series(前5)=[97.7, 96.8, 81.5]" in message
+    assert "shares=3.520B" in message
+    assert "fwd_eps=1.8" in message
+
+
+def test_fetch_yahoo_timeseries_sorts_each_metric_by_outer_timestamp(monkeypatch):
+    """Yahoo timestamp 位于结果外层时，fetch 层应把每项数据排成最新在前。"""
+    payload = {
+        "timeseries": {
+            "result": [
+                {
+                    "meta": {"type": ["annualTotalRevenue"]},
+                    "timestamp": [1262304000, 1735603200],
+                    "annualTotalRevenue": [
+                        {"reportedValue": {"raw": 80.0}},
+                        {"reportedValue": {"raw": 125.0}},
+                    ],
+                }
+            ]
+        }
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            import json
+            return json.dumps(payload).encode()
+
+    class Opener:
+        def open(self, request, timeout):
+            return Response()
+
+    monkeypatch.setattr(market, "build_opener", lambda proxy: Opener())
+    provider = MarketDataProvider(ticker_factory=lambda symbol: SimpleNamespace(info={}))
+    result = provider._fetch_yahoo_timeseries("TSLA")
+    assert MarketDataProvider._timeseries_values(result, "annualTotalRevenue") == [125.0, 80.0]
+
+
+def test_fetch_yahoo_timeseries_marks_rate_limit_for_retry(monkeypatch):
+    """Yahoo 429 不应被当成永久没有财务数据。"""
+    from urllib.error import HTTPError
+
+    class Opener:
+        def open(self, request, timeout):
+            raise HTTPError(request.full_url, 429, "Too Many Requests", {}, None)
+
+    monkeypatch.setattr(market, "build_opener", lambda proxy: Opener())
+    provider = MarketDataProvider(ticker_factory=lambda symbol: SimpleNamespace(info={}))
+    result = provider._fetch_yahoo_timeseries("ONDS")
+    assert result.get("__status__") == "retry"
+
+
+def test_low_confidence_info_revenue_fallback_produces_value_when_timeseries_is_rate_limited():
+    """小盘股时序被限流时，仍用 info 的营收和股数生成可见的低置信度估值。"""
+    result = MarketDataProvider._conservative_earnings(
+        {"totalRevenue": 1000.0, "priceToSalesTrailing12Months": 3.0},
+        symbol="ONDS",
+        shares_values=[100.0],
+        current_price=10.0,
+        revenue_values=[1000.0],
+        price_to_sales=3.0,
+        upstream_errors=["fundamentals_timeseries_rate_limited"],
+        regime=MarketRegime.NORMAL,
+        regime_signals={},
+    )
+    assert result["value"] is not None
+    assert result["data_quality"] == "partial_upstream"
+    assert any("Yahoo 财务接口" in warning for warning in result["warnings"])
 
 
 def test_single_flight_runs_same_key_once():
@@ -475,8 +1212,8 @@ def test_regular_change_uses_previous_session_when_daily_bar_is_missing(monkeypa
     assert quote["change_percent"] == pytest.approx((224.27 - 234.89) / 234.89 * 100)
 
 
-def test_regular_change_prefers_official_close_when_minute_bar_agrees(monkeypatch):
-    """正式昨收和分钟线昨收接近时，保留含竞价的正式收盘，不用 15:59 那一笔盖掉它。"""
+def test_regular_change_uses_minute_close_when_official_previous_close_differs(monkeypatch):
+    """现货卡片与趋势通道统一使用已识别的正常盘收盘，不保留滞后的上游昨收。"""
     eastern = ZoneInfo("America/New_York")
     minutes = pd.DataFrame(
         {"Close": [234.83, 224.27]},
@@ -504,8 +1241,8 @@ def test_regular_change_prefers_official_close_when_minute_bar_agrees(monkeypatc
     monkeypatch.setattr(market, "datetime", FrozenDateTime)
     quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("RCL")
     assert quote["market_state"] == "REGULAR"
-    assert quote["previous_close"] == pytest.approx(234.89)
-    assert quote["change_percent"] == pytest.approx((224.27 - 234.89) / 234.89 * 100)
+    assert quote["previous_close"] == pytest.approx(234.83)
+    assert quote["change_percent"] == pytest.approx((224.27 - 234.83) / 234.83 * 100)
     # 分钟线只有收盘价时，不能用收盘价冒充今开。
     assert quote["today_open"] is None
 
@@ -618,6 +1355,42 @@ def test_post_change_uses_prior_session_when_official_close_skips_a_day(monkeypa
     assert quote["market_state"] == "POST"
     assert quote["previous_close"] == pytest.approx(234.89)
     assert quote["change_percent"] == pytest.approx((223.00 - 234.89) / 234.89 * 100)
+
+
+def test_regular_quote_keeps_latest_completed_close_when_minute_data_lags(monkeypatch):
+    """当前盘中分钟线暂缺时，不能把盘后/旧 previous_close 当成昨收。"""
+    eastern = ZoneInfo("America/New_York")
+    minutes = pd.DataFrame(
+        {"Close": [140.00, 137.79, 138.91]},
+        index=pd.DatetimeIndex([
+            "2026-09-29 15:59",
+            "2026-09-30 15:59",
+            "2026-09-30 18:00",
+        ]).tz_localize(eastern),
+    )
+
+    class FakeTicker:
+        # 上游 previous_close 错把盘后价返回为 138.91。
+        fast_info = {"last_price": 137.53, "previous_close": 138.91, "currency": "USD"}
+
+        def history(self, **kwargs):
+            assert kwargs.get("interval") == "1m"
+            return minutes
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 10, 1, 10, 0, tzinfo=eastern)
+            if tz is None:
+                return current.replace(tzinfo=None)
+            return current.astimezone(tz)
+
+    monkeypatch.setattr(market, "datetime", FrozenDateTime)
+    quote = MarketDataProvider(ticker_factory=lambda symbol: FakeTicker()).quote("ORCL")
+    assert quote["market_state"] == "REGULAR"
+    assert quote["previous_close"] == pytest.approx(137.79)
+    assert quote["change_percent"] == pytest.approx((137.53 - 137.79) / 137.79 * 100)
+    assert quote["sessions"]["post"]["reference_close"] == pytest.approx(137.79)
 
 
 def test_overnight_fallback_uses_previous_trading_day_when_price_is_last_close(monkeypatch):
@@ -796,6 +1569,26 @@ def test_database_snapshot_lookup_and_cleanup(tmp_path: Path):
     assert database.latest_expirations("AAPL") == []
 
 
+def test_new_quote_snapshot_preserves_previous_fair_value(tmp_path: Path):
+    """行情快照缺少后台估值时，不得覆盖上一份有效估值。"""
+    database = Database(tmp_path / "options.db")
+    first = sample_quote("AAPL") | {
+        "fair_value": 210.0,
+        "fair_value_low": 180.0,
+        "fair_value_high": 240.0,
+        "fair_value_source": "valuation_v26",
+        "fair_value_defensive": {"low": 180.0, "high": 220.0},
+        "fair_value_optimistic": {"low": 200.0, "high": 240.0},
+    }
+    database.write_snapshot(first, sample_rows(), iso(utc_now() - timedelta(minutes=2)))
+    database.write_snapshot(sample_quote("AAPL"), sample_rows(), iso())
+    latest = database.latest_quote("AAPL")
+    assert latest["fair_value"] == 210.0
+    assert latest["fair_value_source"] == "valuation_v26"
+    assert latest["fair_value_defensive_json"]
+    assert latest["fair_value_optimistic_json"]
+
+
 def test_latest_option_batch_index_keeps_newest_snapshot(tmp_path: Path):
     """最新批次索引只加速定位，不改变按 fetched_at 取最新链的口径。"""
     database = Database(tmp_path / "options.db")
@@ -828,6 +1621,95 @@ def test_existing_database_gets_sessions_column(tmp_path: Path):
     assert parse_sessions(None) == {}
     assert parse_sessions("{坏数据") == {}
     assert parse_sessions("[1, 2]") == {}
+
+
+def test_quote_and_levels_align_cached_previous_close_with_fresh_history(tmp_path: Path, monkeypatch):
+    """首屏旧行情快照与新日线并存时，quote 和 levels 必须使用同一昨收。"""
+    database = Database(tmp_path / "options.db")
+    monkeypatch.setattr(api_module, "market_today", lambda: date(2026, 9, 30))
+    quote_fetched_at = iso(utc_now() - timedelta(minutes=2))
+    history_fetched_at = iso(utc_now() - timedelta(minutes=1))
+    database.write_snapshot(
+        {
+            **sample_quote("ORCL"),
+            "price": 137.30,
+            "previous_close": 137.90,
+            "change_percent": (137.30 - 137.90) / 137.90 * 100,
+        },
+        sample_rows("ORCL", "2026-10-02"),
+        quote_fetched_at,
+    )
+    database.write_history(
+        "ORCL",
+        [
+            {"date": "2026-09-29", "open": 132.79, "high": 139.0, "low": 132.0, "close": 137.79, "volume": 1000},
+            {"date": "2026-09-30", "open": 136.54, "high": 138.0, "low": 136.0, "close": 137.30, "volume": 1100},
+        ],
+        history_fetched_at,
+    )
+    settings = Settings(
+        database_path=tmp_path / "options.db",
+        proxy_url=None,
+        default_symbols=("ORCL",),
+        refresh_interval_seconds=60,
+        raw_retention_days=30,
+        cleanup_interval_seconds=86400,
+        scheduler_enabled=False,
+    )
+    provider = FakeProvider()
+    test_app = FastAPI()
+    test_app.include_router(create_router(database, SnapshotService(database, provider), provider, settings))
+    with TestClient(test_app) as client:
+        quote = client.get("/api/quote/ORCL").json()
+        levels = client.get(
+            "/api/levels/ORCL",
+            params={"expiration": "2026-10-02", "spot": 137.30, "raw": "true"},
+        ).json()
+    assert quote["previous_close"] == pytest.approx(137.79)
+    assert quote["change_percent"] == pytest.approx((137.30 - 137.79) / 137.79 * 100)
+    assert levels["candidate_spot"] == pytest.approx(137.79)
+    assert levels["trend_market"]["previous_close"] == pytest.approx(137.79)
+
+
+def test_quote_fetches_missing_history_before_returning_cached_previous_close(tmp_path: Path, monkeypatch):
+    """新标的首屏没有日线缓存时，quote 先补齐历史再返回趋势口径的昨收。"""
+    database = Database(tmp_path / "options.db")
+    monkeypatch.setattr(api_module, "market_today", lambda: date(2026, 9, 30))
+    database.write_snapshot(
+        {
+            **sample_quote("ORCL"),
+            "price": 137.30,
+            "previous_close": 137.90,
+            "change_percent": (137.30 - 137.90) / 137.90 * 100,
+        },
+        sample_rows("ORCL", "2026-10-02"),
+        iso(utc_now() - timedelta(minutes=1)),
+    )
+
+    class HistoryProvider(FakeProvider):
+        def history(self, symbol: str, period: str = "6mo") -> list[dict]:
+            return [
+                {"date": "2026-09-29", "open": 132.79, "high": 139.0, "low": 132.0, "close": 137.79, "volume": 1000},
+                {"date": "2026-09-30", "open": 136.54, "high": 138.0, "low": 136.0, "close": 137.30, "volume": 1100},
+            ]
+
+    settings = Settings(
+        database_path=tmp_path / "options.db",
+        proxy_url=None,
+        default_symbols=("ORCL",),
+        refresh_interval_seconds=60,
+        raw_retention_days=30,
+        cleanup_interval_seconds=86400,
+        scheduler_enabled=False,
+    )
+    provider = HistoryProvider()
+    test_app = FastAPI()
+    test_app.include_router(create_router(database, SnapshotService(database, provider), provider, settings))
+    with TestClient(test_app) as client:
+        quote = client.get("/api/quote/ORCL").json()
+    assert quote["previous_close"] == pytest.approx(137.79)
+    assert quote["change_percent"] == pytest.approx((137.30 - 137.79) / 137.79 * 100)
+    assert database.latest_history("ORCL")["bars"][-1]["close"] == pytest.approx(137.30)
 
 
 def test_snapshot_stores_extended_hours_and_api_exposes_them(tmp_path: Path):
@@ -887,6 +1769,89 @@ def test_snapshot_service_refresh_and_api(tmp_path: Path):
         gamma = client.get("/api/gamma/AAPL", params={"horizon_days": 365})
         assert gamma.status_code == 200
         assert gamma.json()["expirations"] == ["2026-12-18"]
+
+
+def test_quote_triggers_missing_fair_value_without_refreshing_snapshot(tmp_path: Path):
+    """已有行情快照但估值为空时，轻量 quote 请求必须启动估值任务并合并结果。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote("ONDS"), sample_rows("ONDS"), iso())
+
+    class FairValueProvider(FakeProvider):
+        def __init__(self):
+            self.ensure_calls = 0
+
+        def ensure_fair_value(self, symbol: str) -> dict:
+            self.ensure_calls += 1
+            return {
+                "value": 12.0,
+                "low": 10.0,
+                "high": 14.0,
+                "source": "valuation_v26",
+                "status": "ready",
+                "defensive": {"low": 10.0, "high": 12.0},
+                "optimistic": {"low": 12.0, "high": 14.0},
+            }
+
+    provider = FairValueProvider()
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    test_app = FastAPI()
+    test_app.include_router(create_router(database, SnapshotService(database, provider), provider, settings))
+    with TestClient(test_app) as client:
+        payload = client.get("/api/quote/ONDS").json()
+    assert provider.ensure_calls == 1
+    assert payload["fair_value"] == 12.0
+    assert payload["fair_value_status"] == "ready"
+    assert payload["fair_value_pending"] is False
+
+
+def test_quote_reports_unavailable_fair_value_instead_of_waiting_forever(tmp_path: Path):
+    """没有有效估值候选时，API 应返回终态状态，前端不再无限显示等待。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote("ONDS"), sample_rows("ONDS"), iso())
+
+    class UnavailableProvider(FakeProvider):
+        def ensure_fair_value(self, symbol: str) -> dict:
+            return {"value": None, "source": None, "status": "unavailable", "warning": "公开财务数据不足"}
+
+    provider = UnavailableProvider()
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    test_app = FastAPI()
+    test_app.include_router(create_router(database, SnapshotService(database, provider), provider, settings))
+    with TestClient(test_app) as client:
+        payload = client.get("/api/quote/ONDS").json()
+    assert payload["fair_value_status"] == "unavailable"
+    assert payload["fair_value_warning"] == "公开财务数据不足"
+    assert payload["fair_value_pending"] is False
+
+
+def test_quote_keeps_rate_limited_fair_value_pending(tmp_path: Path):
+    """临时限流状态要继续让前端轮询，而不是被 API 标成终态。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote("ONDS"), sample_rows("ONDS"), iso())
+
+    class RetryProvider(FakeProvider):
+        def ensure_fair_value(self, symbol: str) -> dict:
+            return {"value": None, "source": None, "status": "retry", "warning": "Yahoo 数据源暂时限流"}
+
+    provider = RetryProvider()
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    test_app = FastAPI()
+    test_app.include_router(create_router(database, SnapshotService(database, provider), provider, settings))
+    with TestClient(test_app) as client:
+        payload = client.get("/api/quote/ONDS").json()
+    assert payload["fair_value_status"] == "retry"
+    assert payload["fair_value_pending"] is True
+
+
+def test_fair_value_process_cache_uses_versioned_shared_key():
+    """进程内估值缓存必须和 SQLite 共享缓存使用同一个版本化键。"""
+    provider = MarketDataProvider(ticker_factory=lambda symbol: SimpleNamespace(info={}))
+    key = f"fair-value:{market.VALUATION_CONFIG['cache_version']}:TSLA"
+    provider._fair_value_cache[key] = (time.monotonic(), {"value": 123.0, "source": market.FAIR_VALUE_SOURCE})
+    result = provider._fair_value("TSLA", SimpleNamespace(info={}))
+    assert result["value"] == 123.0
+    assert "TSLA" not in provider._fair_value_cache
+
 
 def test_page_query_helpers_are_exported_in_frontend():
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
@@ -1014,28 +1979,30 @@ def test_theme_defaults_to_dark_with_light_override():
     assert "--flow-body:#" in body and "--flow-surface:#" in body
 
 
-def test_chain_table_drops_contract_column_and_price_columns():
-    """期权链表格：去掉合约列与最新价/买价/卖价，类型并入行权价后共 7 列，数据单元格统一居中。"""
+def test_chain_table_shows_bid_ask_without_contract_column():
+    """期权链表格：类型并入行权价，并展示当前买价与卖价。"""
     html = Path("app/static/index.html").read_text(encoding="utf-8")
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
-    # 表头去掉「合约」与「类型」（类型改由行权价文字颜色表达），共 7 列（<thead> 不计入）。
+    # 表头去掉「合约」与「类型」（类型改由行权价文字颜色表达），并加入买价/卖价，共 9 列。
     assert "<th>合约</th>" not in html
     assert "<th>类型</th>" not in html
-    assert '<th class="num">行权价</th><th class="num">成交量</th>' in html
-    assert html.count("<th ") + html.count("<th>") == 7
-    # 期权链表格不展示买卖价与最新价；期权流向区域可以使用「接近买价/卖价」说明。
+    assert '<th class="num">行权价</th><th class="num">成交量</th><th class="num">未平仓</th><th class="num">买价</th><th class="num">卖价</th>' in html
+    assert html.count("<th ") + html.count("<th>") == 9
+    # 期权链表格展示买卖价，不额外展示最新价；期权流向区域可以使用「接近买价/卖价」说明。
     table_start = html.index("<table><thead>")
     table_end = html.index("</table>", table_start) + len("</table>")
     chain_template = html[table_start:table_end]
-    assert "最新价" not in chain_template and "买价" not in chain_template and "卖价" not in chain_template
-    assert "row.last_price" not in source and "row.bid" not in source and "row.ask" not in source
+    assert "最新价" not in chain_template and "买价" in chain_template and "卖价" in chain_template
+    assert "bid: formatOptionQuote(row.bid)" in source and "ask: formatOptionQuote(row.ask)" in source
+    assert "{{ row.bid }}" in source and "{{ row.ask }}" in source
+    assert 'function formatOptionQuote(value)' in source
     # 数据行不再渲染合约代码列。
     assert 'key: row.contract_symbol ||' in source
-    # 空态 colspan 跟期权链组件模板走，表头仍留在页面里，列数保持 7。
-    assert 'colspan="7"' not in html
-    assert 'colspan="7"' in source
-    assert source.count('colspan="7"') == 1
+    # 空态 colspan 跟期权链组件模板走，表头仍留在页面里，列数保持 9。
+    assert 'colspan="9"' not in html
+    assert 'colspan="9"' in source
+    assert source.count('colspan="9"') == 1
     # 期权链单元格统一居中（覆盖默认左对齐与 .num 的右对齐）。
     assert ".data-panel table th,.data-panel table td{text-align:center}" in styles
 
@@ -1113,28 +2080,28 @@ def test_chain_type_filter_select():
     assert '<label class="chain-filter">' not in html
 
 
-def test_chain_panel_expands_by_default():
-    """期权链面板：表格与图例默认展开；标题行（标的 · 到期日）与右侧状态栏始终可见。"""
+def test_chain_panel_collapses_by_default():
+    """期权链面板：表格与图例默认折叠；标题行（标的 · 到期日）与右侧状态栏始终可见。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 折叠按钮挂在标题行左侧（caret + 展开/收起），受控内容是包住工具栏、表格与图例的 chain-fold
-    assert 'id="chain-toggle" type="button" aria-expanded="true" aria-controls="chain-fold"' in page
+    assert 'id="chain-toggle" type="button" aria-expanded="false" aria-controls="chain-fold"' in page
     assert 'id="chain-action"' in page
-    assert 'id="chain-fold" hidden' not in page
+    assert 'id="chain-fold" hidden' in page
     fold = page[page.index('id="chain-fold"') : page.index('</section>', page.index('id="chain-fold"'))]
     assert 'class="chain-toolbar"' in fold and 'class="table-wrap"' in fold and 'id="chain-heat-note"' in fold
     # 报错提示不跟着折叠：出错时即使面板收起也要看得见
     assert page.index('id="error-box"') < page.index('id="chain-fold"')
-    # 默认展开 + 状态记 sessionStorage（同一标签页换标的、跳 URL 不必重复展开）
+    # 默认折叠 + 状态记 sessionStorage（同一标签页换标的、跳 URL 不必重复折叠）
     assert 'const CHAIN_KEY = "option-scope-chain";' in source
     # 折叠逻辑走通用实现：与「分析详情」「图表」共用同一份 bindFoldGroup
     assert "function bindFoldGroup({ headerId, toggleId, bodyId, actionId, storageKey, defaultExpanded, onChange, shouldIgnore })" in source
     assert 'bodyId: "chain-fold",' in source
     assert 'storageKey: CHAIN_KEY,' in source
-    # 期权链组默认展开（注意：图表组也是 true，这里靠 bodyId 定位到本组）
+    # 期权链组默认折叠（注意：图表组仍是 true，这里靠 bodyId 定位到本组）
     chain_group = source[source.index("function initChainGroup()") : source.index("function initChartGroup()")]
-    assert "defaultExpanded: true," in chain_group
+    assert "defaultExpanded: false," in chain_group
     assert "function initChainGroup()" in source
     assert "initChainGroup();" in source
     # 通用实现按 storageKey 读写本次会话的偏好
@@ -3979,6 +4946,16 @@ def test_parse_earnings_dates_uses_new_york_calendar_day():
     assert parse_earnings_dates(frame.drop(columns=["Reported EPS"])) == []
 
 
+def test_parse_earnings_dates_keeps_today_after_eps_is_reported():
+    """财报当天盘后上游可能已填 EPS，仍必须保留当天日期供页面提示。"""
+    today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    frame = pd.DataFrame(
+        {"Reported EPS": [2.34]},
+        index=pd.to_datetime([f"{today} 21:00:00-04:00"]),
+    )
+    assert parse_earnings_dates(frame) == [today]
+
+
 def test_hybrid_provider_delegates_earnings_dates():
     """混合行情源不继承主行情类，财报日期必须转给常规适配器。"""
     class Regular(FakeProvider):
@@ -4077,6 +5054,30 @@ def test_levels_endpoint_reports_earnings_inside_window(tmp_path: Path, monkeypa
         assert provider.calls == 1
 
 
+def test_quote_endpoint_includes_earnings_summary(tmp_path: Path, monkeypatch):
+    """现货接口直接携带财报摘要，前端无需等待 levels 请求。"""
+    database = Database(tmp_path / "options.db")
+    database.write_snapshot(sample_quote("MU"), [], iso())
+    today = {"value": date(2026, 9, 25)}
+    monkeypatch.setattr(api_module, "market_today", lambda: today["value"])
+
+    class EarningsProvider(FakeProvider):
+        def earnings_dates(self, symbol: str) -> list[str]:
+            return ["2026-09-30"]
+
+    provider = EarningsProvider()
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("MU",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    router = create_router(database, SnapshotService(database, provider), provider, settings)
+    test_app = FastAPI()
+    test_app.include_router(router)
+    with TestClient(test_app) as client:
+        response = client.get("/api/quote/MU")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["earnings"]["status"] == "inside"
+    assert payload["earnings"]["date"] == "2026-09-30"
+
+
 def test_cleanup_keeps_earnings_snapshots(tmp_path: Path):
     """保留天数清理不删除财报日期缓存。"""
     database = Database(tmp_path / "options.db")
@@ -4115,9 +5116,12 @@ def test_frontend_marks_quote_reference_estimates_and_earnings():
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     assert "function quoteReference(quote)" in source
-    assert "上一个交易日" in source
+    assert "function mergeFairValueSnapshot(quote)" in source
+    assert "const keepFairValue = state.lastQuote" in source
+    assert "applyEarnings(quote?.earnings)" in source
+    assert "昨收" in source
     assert "相对收盘" in source
-    assert 'label = "上一个交易日"' in source
+    assert 'label = "昨收"' in source
     assert "sessions.post?.reference_close" in source
     assert "· 估算" in source
     assert "财报日期未知" in source
