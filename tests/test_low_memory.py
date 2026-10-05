@@ -26,9 +26,7 @@ def _settings(path: Path, **overrides) -> Settings:
         database_path=path,
         proxy_url=None,
         default_symbols=("AAPL",),
-        refresh_interval_seconds=60,
         raw_retention_days=30,
-        cleanup_interval_seconds=86400,
         scheduler_enabled=False,
     )
     values.update(overrides)
@@ -209,17 +207,12 @@ def test_low_memory_settings_cap_upstream(monkeypatch: pytest.MonkeyPatch):
 def test_frontend_holds_refresh_until_heavy_work_finishes():
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     assert "function refreshWorkPending()" in source
-    assert "if (refreshWorkPending())" in source
-    assert "if (silent && refreshWorkPending())" in source
-    assert "分析计算中，刷新稍后开始" in source
+    assert "if (!expirationMenuOpen && !refreshWorkPending())" in source
+    assert "刷新稍后开始" not in source
     assert "内存保护：本轮刷新已让路，继续使用本地快照" in source
     assert "Array.isArray(refreshResult?.expirations)" in source
     assert "state.loading = true;" in source
     assert "state.loading = false;" in source
-    # 这些字符串是原有倒计时测试的锚点，低内存改动不能把它们改掉。
-    assert "if (state.refreshing) return;" in source
-    assert "function armRefreshAnchor(fetchedAt)" in source
-    assert "armRefreshAnchor(payload.fetched_at);" in source
-    assert "Math.min(anchoredAge, snapshotAge)" in source
-    assert "setTimeout(() => { refresh(true); }, delaySeconds * 1000);" in source
-    assert "return `${seconds} 秒后自动更新`;" in source
+    # Snapshot updates are applied from the active SSE subscription.
+    assert "state.pendingSnapshotRefresh = true;" in source
+    assert 'source.addEventListener("update", onUpdate);' in source

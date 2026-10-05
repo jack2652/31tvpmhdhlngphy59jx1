@@ -5,9 +5,9 @@ const GAMMA_ESTIMATE_TITLE = "Black-Scholes 估算：看涨为正、看跌为负
 const LEVEL_COUNT = 10;
 // 交易计划（买入 / 加仓 / 卖出）各自最多展示的条数。
 const PLAN_COUNT = 10;
-// Gamma 轮询和快照倒计时分开：只在开始后的几秒挡住自动刷新，避免任务卡住时整页停住。
+// Gamma 轮询不阻塞实时快照推送，但页面已有计算任务时延后应用推送以避免重复分析。
 const ANALYSIS_REFRESH_BLOCK_MS = 8000;
-// Gamma 窗口远慢于单期限快照，不跟着每次 60 秒行情刷新重复下载；十分钟内复用上一份窗口。
+// Gamma 窗口远慢于单期限快照，不跟随每次行情更新重复下载；十分钟内复用上一份窗口。
 const ANALYSIS_REFRESH_COOLDOWN_SECONDS = 600;
 // 批次运行期间最多读取 90 次状态，每次间隔 3 秒；批次完成后再启动下一批。
 const ANALYSIS_POLL_LIMIT = 90;
@@ -24,16 +24,21 @@ const state = {
   expiration: null,
   expirationOptions: [],
   expirationPlaceholder: "先载入标的",
-  timer: null,
   analysisReady: false,
   loadId: 0,
-  refreshing: false,
   loading: false,
   refreshInFlight: null,
   fairValuePollTimer: null,
   fairValuePollKey: "",
   fairValuePollAttempts: 0,
   fairValuePollInFlight: false,
+  pushSource: null,
+  pushSymbol: "",
+  pushReconnectTimer: null,
+  pushRefreshTimer: null,
+  pushVisibilityHandler: null,
+  pendingGammaRefresh: null,
+  pendingSnapshotRefresh: false,
   analysisRefreshSymbol: null,
   analysisRefreshTimer: null,
   analysisBlockUntil: 0,
@@ -42,7 +47,7 @@ const state = {
   chainFetchedExpiration: "",
   levelsKey: "",
   levelsPayload: null,
-  // 最近一次服务端综合结果；倒计时刷新优先改用客户端 raw 计算时保留复杂字段。
+  // 最近一次服务端综合结果；服务端快照更新优先改用客户端 raw 计算时保留复杂字段。
   serverLevelsPayload: null,
   serverLevelsContext: "",
   serverLevelsRequestKey: "",
@@ -66,6 +71,8 @@ const state = {
   chainSpot: null,
   levelBasisMode: "live",
   lastQuote: null,
+  trendMarket: null,
+  trendMarketSymbol: "",
   accessKey: "",
   storageAvailable: false,
   view: {
@@ -188,31 +195,13 @@ let scopeChartToken = 0;
 const analysisWindowLastStartedAt = new Map();
 // 最近一次已应用到页面的 Gamma 窗口时间；冷却期内只读任务状态，完成后立即更新图表。
 const analysisWindowLastAppliedAt = new Map();
-// 页面自动刷新间隔来自服务端 AUTO_REFRESH_SECONDS；非法或缺失时回到 60 秒。
-function readAutoRefreshSeconds() {
-  const meta = document.querySelector('meta[name="option-scope-auto-refresh-seconds"]');
-  const value = Number.parseInt(meta?.content || "", 10);
-  return Number.isInteger(value) && value >= 1 ? value : 60;
-}
-// 自动刷新间隔（秒）：页面倒计时与定时器共用同一个值。
-const AUTO_REFRESH_SECONDS = readAutoRefreshSeconds();
-// 倒计时终点。只驱动刷新提示文字，不放进 Vue 状态，避免每秒重绘整页。
-let refreshDeadline = 0;
-// 到期日菜单打开时暂停自动刷新。倒计时文字停在打开时的秒数，避免走到 0 后假装正在刷新。
+// SSE 生命周期驱动服务端市场时段调度；浏览器只接收变化通知，不运行轮询器。
+const SNAPSHOT_FRESH_SECONDS = 15;
 let expirationMenuOpen = false;
-let expirationMenuSeconds = 0;
 // 已经在飞的快照读取数。切换到期日叠上自动刷新时，后到的读取不再并行打 Gamma。
 let snapshotReadInFlight = 0;
 // 同一轮、同一到期日的快照读取共用一个 Promise，避免刷新和切换叠在一起时把 quote/chain/gamma 各打两遍。
 let snapshotReadCache = null;
-// 新快照落到页面上的时刻。上游 fetched_at 在请求开始时就写了，慢请求不能拿它倒扣倒计时。
-let refreshAnchorAt = 0;
-let refreshAnchorFetchedAt = "";
-// 快照已过期但上一轮没写成新数据时的重试间隔，避免再空等一个完整周期。
-// 间隔短于 15 秒时，重试不再慢于自动刷新本身。
-const AUTO_REFRESH_RETRY_SECONDS = Math.min(15, AUTO_REFRESH_SECONDS);
-// 本地快照新鲜期与页面自动刷新间隔对齐，避免间隔改短后仍被当成新鲜快照跳过。
-const SNAPSHOT_FRESH_SECONDS = AUTO_REFRESH_SECONDS;
 // 强化色只显示后端同时通过模型强度、独立证据和历史回踩验证的价位。
 const STRONG_LEVEL_SCORE = 0.7;
 // 新候选连续两次快照确认后才替换，避免期权链短暂波动造成最佳点闪烁。
@@ -472,9 +461,6 @@ function initializeAccessKey() {
 }
 
 function showAccessDenied() {
-  clearAutoRefresh();
-  refreshDeadline = 0;
-  paintRefreshNote();
   document.body.classList.add("access-denied-page");
   const view = byId("access-denied-view");
   if (view) view.hidden = false;
@@ -502,135 +488,133 @@ function snapshotAgeSeconds(fetchedAt) {
   return Number.isNaN(time) ? null : Math.max((syncedNow() - time) / 1000, 0);
 }
 
-// 定时器句柄放在 Vue 状态外面。只清 state.timer 时，响应式赋值可能丢掉还在走的那一个。
-let refreshTimer = null;
-
-function clearAutoRefresh() {
-  if (refreshTimer) clearTimeout(refreshTimer);
-  if (state.timer && state.timer !== refreshTimer) clearTimeout(state.timer);
-  refreshTimer = null;
-  state.timer = null;
-}
-
-// 刚抓到的新快照从页面落地时刻重新计时；只读到旧缓存时仍按快照年龄补剩余时间。
-// 过期却没更新成功时短间隔重试。
-function armRefreshAnchor(fetchedAt) {
-  if (!fetchedAt) return;
-  refreshAnchorAt = Date.now();
-  refreshAnchorFetchedAt = fetchedAt;
-}
-
-// 服务端判定仍新鲜时，按它给出的年龄回拨锚点。下一轮只补剩余新鲜期，避免立刻再刷一次。
-function syncRefreshAnchorToServerAge(result) {
-  const fetchedAt = result?.fetched_at;
-  const age = Number(result?.age_seconds);
-  if (!fetchedAt || !Number.isFinite(age)) return;
-  const fetchedMs = new Date(fetchedAt).getTime();
-  if (!Number.isNaN(fetchedMs) && window.OptionScopeRequest && typeof OptionScopeRequest.noteServerNow === "function") {
-    OptionScopeRequest.noteServerNow(fetchedMs + Math.max(age, 0) * 1000);
-  }
-  refreshAnchorFetchedAt = state.chainFetchedAt || fetchedAt;
-  refreshAnchorAt = Date.now() - Math.max(age, 0) * 1000;
-}
-
-function refreshCountdownSeconds(deadline, now) {
-  const ms = deadline - now;
-  if (!Number.isFinite(ms) || ms <= 0) return 0;
-  // 满一个周期先显示 N-1，之后每秒减 1；最后一段保持 1，到点才开始刷新。
-  return Math.max(Math.ceil(ms / 1000) - 1, 1);
-}
-
 function analysisRefreshBlocking(now = Date.now()) {
   return state.analysisBlockUntil > now;
 }
 
 function refreshWorkPending() {
-  return Boolean(state.loading || state.refreshing || state.refreshInFlight || analysisRefreshBlocking());
+  return Boolean(state.loading || state.refreshInFlight || analysisRefreshBlocking());
 }
 
-function refreshNoteText(now = Date.now()) {
-  if (state.refreshing || state.loading || state.refreshInFlight) return "正在刷新…";
-  if (analysisRefreshBlocking(now)) return "分析计算中，刷新稍后开始";
-  // 菜单开着时停在打开那一秒，不跟着时钟走到「正在刷新…」。
-  if (expirationMenuOpen && expirationMenuSeconds > 0) return `${expirationMenuSeconds} 秒后自动更新`;
-  if (!refreshDeadline) return `每 ${AUTO_REFRESH_SECONDS} 秒自动更新`;
-  const seconds = refreshCountdownSeconds(refreshDeadline, now);
-  if (seconds <= 0) return "正在刷新…";
-  return `${seconds} 秒后自动更新`;
-}
-
-// 到期日下拉框打开时拆掉定时器，关掉后再排程。Element UI 先同步发出 change，再异步发出 visible-change(false)，
-// 所以选中新日期时 switchExpiration 已经把 loading 置上，这里看到有工作在飞就不会立刻再开一轮刷新。
 function setExpirationMenuOpen(open) {
-  if (open) {
-    if (refreshDeadline) {
-      const seconds = refreshCountdownSeconds(refreshDeadline, Date.now());
-      expirationMenuSeconds = seconds > 0 ? seconds : 1;
-    } else {
-      expirationMenuSeconds = 0;
-    }
-    expirationMenuOpen = true;
-    clearAutoRefresh();
-    paintRefreshNote();
-    return;
+  expirationMenuOpen = Boolean(open);
+  if (!open) {
+    if (state.pendingSnapshotRefresh) setTimeout(applyPendingSnapshotRefresh, 0);
+    if (state.pendingGammaRefresh) setTimeout(applyPushedGammaUpdate, 0);
   }
-  const due = Boolean(refreshDeadline) && refreshDeadline <= Date.now();
-  expirationMenuOpen = false;
-  expirationMenuSeconds = 0;
-  // 只是关掉菜单、倒计时已经到点：马上补上被暂停的那一轮。选中了新日期时 loading 已置上，交给切换流程。
-  if (due && !refreshWorkPending() && !document.body.classList.contains("access-denied-page")) {
-    refresh(true);
-    return;
-  }
-  scheduleAutoRefresh();
 }
 
-function paintRefreshNote() {
-  const note = byId("refresh-note");
-  if (!note) return;
-  const text = refreshNoteText();
-  if (note.textContent !== text) note.textContent = text;
+function applyPendingSnapshotRefresh() {
+  if (!state.pendingSnapshotRefresh || document.hidden || refreshWorkPending()) return;
+  state.pendingSnapshotRefresh = false;
+  state.chainFetchedAt = null;
+  state.chainFetchedSymbol = "";
+  loadChain({ loadId: state.loadId, refresh: false });
+}
+
+async function applyPushedGammaUpdate() {
+  const pending = state.pendingGammaRefresh;
+  if (!pending || pending.symbol !== state.symbol || pending.loadId !== state.loadId || refreshWorkPending()) return;
+  state.pendingGammaRefresh = null;
+  const symbol = pending.symbol;
+  const encodedSymbol = encodeURIComponent(symbol);
+  const [analysis, chain] = await Promise.all([
+    request(`/api/gamma/${encodedSymbol}?horizon_days=45&include_rows=false`).catch(() => null),
+    state.expiration ? request(`/api/chain/${encodedSymbol}?expiration=${encodeURIComponent(state.expiration)}`).catch(() => null) : Promise.resolve(null),
+  ]);
+  if (symbol !== state.symbol || pending.loadId !== state.loadId) return;
+  const payload = chain?.data?.length ? chain : state.lastAnalysis?.payload;
+  if (payload?.data?.length) renderChain(payload, state.lastQuote, gammaProfileReady(analysis) ? analysis : null);
+}
+
+function closePushStream() {
+  if (state.pushReconnectTimer) clearTimeout(state.pushReconnectTimer);
+  if (state.pushRefreshTimer) clearTimeout(state.pushRefreshTimer);
+  state.pushReconnectTimer = null;
+  state.pushRefreshTimer = null;
+  if (state.pushVisibilityHandler) document.removeEventListener("visibilitychange", state.pushVisibilityHandler);
+  state.pushVisibilityHandler = null;
+  if (state.pushSource) state.pushSource.close();
+  state.pushSource = null;
+  state.pushSymbol = "";
+}
+
+function connectPushStream(symbol = state.symbol) {
+  if (!window.EventSource || !symbol || accessKeyRequired() && !currentAccessKey()) return;
+  const subscriptionKey = `${symbol}|${state.expiration || ""}`;
+  if (state.pushSource && state.pushSymbol === subscriptionKey) return;
+  closePushStream();
+  const params = new URLSearchParams();
+  if (state.expiration) params.set("expiration", state.expiration);
+  const eventPath = `/api/events/${encodeURIComponent(symbol)}${params.size ? `?${params}` : ""}`;
+  const path = withAccessKey(eventPath, currentAccessKey());
+  const source = new EventSource(path);
+  state.pushSource = source;
+  state.pushSymbol = subscriptionKey;
+  const onUpdate = (event) => {
+    let message = {};
+    try { message = JSON.parse(event.data || "{}"); } catch (error) { return; }
+    if (message.symbol !== state.symbol || symbol !== state.symbol) return;
+    if (message.kind === "fair_value" || message.kind === "quote") {
+      const loadId = state.loadId;
+      request(`/api/quote/${encodeURIComponent(symbol)}`).then((quote) => {
+        if (symbol === state.symbol && loadId === state.loadId && quote?.symbol === symbol) renderQuote(quote);
+      }).catch(() => {});
+      return;
+    }
+    if (message.kind === "gamma") {
+      state.pendingGammaRefresh = { symbol, loadId: state.loadId };
+      if (!state.analysisRefreshSymbol && !refreshWorkPending()) applyPushedGammaUpdate();
+      return;
+    }
+    if (message.kind !== "snapshot") return;
+    state.pendingSnapshotRefresh = true;
+    if (state.pushRefreshTimer) clearTimeout(state.pushRefreshTimer);
+    // The worker that owns the refresh already wrote SQLite; read its result without another upstream fetch.
+    state.pushRefreshTimer = setTimeout(() => {
+      state.pushRefreshTimer = null;
+      if (symbol !== state.symbol) return;
+      applyPendingSnapshotRefresh();
+    }, 250);
+  };
+  source.addEventListener("update", onUpdate);
+  source.addEventListener("ready", () => {
+    if (symbol === state.symbol && !document.hidden && !state.loading && !state.refreshInFlight) {
+      state.chainFetchedAt = null;
+      state.chainFetchedSymbol = "";
+      loadChain({ loadId: state.loadId });
+    }
+  });
+  state.pushVisibilityHandler = () => {
+    if (!document.hidden && symbol === state.symbol && state.pushSource === source) {
+      state.chainFetchedAt = null;
+      state.chainFetchedSymbol = "";
+      loadChain({ loadId: state.loadId, refresh: false });
+    }
+  };
+  document.addEventListener("visibilitychange", state.pushVisibilityHandler);
+  source.addEventListener("error", () => {
+    if (state.pushSource !== source) return;
+    // EventSource performs native reconnect; fallback REST refresh only while disconnected for extended periods.
+    if (!state.pushReconnectTimer) state.pushReconnectTimer = setTimeout(() => {
+      state.pushReconnectTimer = null;
+      if (symbol === state.symbol && source.readyState === EventSource.CLOSED) {
+        closePushStream();
+        connectPushStream(symbol);
+        if (!state.loading && !state.refreshInFlight) loadChain({ loadId: state.loadId });
+      }
+    }, 30000);
+  });
 }
 
 function scheduleAutoRefresh() {
-  clearAutoRefresh();
-  if (document.body.classList.contains("access-denied-page")) {
-    refreshDeadline = 0;
-    paintRefreshNote();
-    return;
+  if (document.body.classList.contains("access-denied-page")) return;
+  connectPushStream(state.symbol);
+  // Automatic snapshot refresh is server-side and active only while this SSE subscription exists.
+  if (!expirationMenuOpen && !refreshWorkPending()) {
+    if (state.pendingSnapshotRefresh) setTimeout(applyPendingSnapshotRefresh, 0);
+    if (state.pendingGammaRefresh) setTimeout(applyPushedGammaUpdate, 0);
   }
-  // 到期日菜单开着时不排下一轮，避免倒计时归零和切换叠在一起。
-  if (expirationMenuOpen) {
-    paintRefreshNote();
-    return;
-  }
-  // 首屏或快照请求还没结束时不要把倒计时走到 0。Gamma 只占用刚开始的几秒。
-  if (refreshWorkPending()) {
-    refreshDeadline = 0;
-    state.timer = setTimeout(() => { scheduleAutoRefresh(); }, 1000);
-    refreshTimer = state.timer;
-    paintRefreshNote();
-    return;
-  }
-  const snapshotAge = snapshotAgeSeconds(state.chainFetchedAt);
-  const anchoredAge = refreshAnchorAt && refreshAnchorFetchedAt === state.chainFetchedAt
-    ? Math.max((Date.now() - refreshAnchorAt) / 1000, 0)
-    : null;
-  // 取更晚的那个时刻：慢请求已经花掉的时间不再从下一轮倒计时里扣。
-  const age = anchoredAge == null || snapshotAge == null ? (anchoredAge ?? snapshotAge) : Math.min(anchoredAge, snapshotAge);
-  // 卡在新鲜期边界上会先被服务端跳过，倒计时再走几秒后又回源一次。晚 1 秒，这一轮就直接回源。
-  const settledAge = age == null ? null : Math.max(age - 1, 0);
-  // 新标的或新期限尚未落地快照时，完整周期会让失败后的页面再等 60 秒；
-  // 没有可展示快照就用短重试，已有快照仍按其年龄计算，避免正常刷新形成请求风暴。
-  const hasDisplayedSnapshot = displayedSnapshotMatches();
-  const remaining = !hasDisplayedSnapshot
-    ? AUTO_REFRESH_RETRY_SECONDS
-    : (settledAge == null ? AUTO_REFRESH_SECONDS : AUTO_REFRESH_SECONDS - settledAge);
-  const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);
-  refreshDeadline = Date.now() + delaySeconds * 1000;
-  state.timer = setTimeout(() => { refresh(true); }, delaySeconds * 1000);
-  refreshTimer = state.timer;
-  paintRefreshNote();
 }
 function formatNumber(value, digits = 0) { if (value === null || value === undefined || value === "") return "--"; return Number(value).toLocaleString("en-US", { maximumFractionDigits: digits }); }
 function formatMoney(value) { return value == null ? "--" : Number(value).toFixed(2); }
@@ -695,12 +679,7 @@ function formatUsd(value) {
 }
 // 图表数值统一入口：GEX 走中文金额单位，成交量/持仓量走中文计数单位。
 function formatChartValue(value, digits, unit) { return unit === "M" ? formatGex(value, digits) : formatCount(value, digits); }
-// 刷新按钮只由「是否正在刷新」决定，避免多条并发路径各自改写 disabled 后被误启用；
-// 没有到期日（标的没有挂牌期权）时同样允许手动刷新现货快照。
-function syncRefreshButton() {
-  paintRefreshNote();
-}
-function setBusy(busy) { state.loading = busy; syncRefreshButton(); }
+function setBusy(busy) { state.loading = busy; }
 
 function aggregateByStrike(rows, spot) {
   const grouped = new Map();
@@ -1386,6 +1365,7 @@ function renderClientRaw(payload, points, spot) {
     hasServerLevels ? (serverPayload?.support || []) : displayedSupport,
   );
   renderPlan({ add: addLevels }, spot);
+  refreshQuoteWithTrendClose();
 }
 
 // 综合接口还在计算时，先用已经拿到的当前期限期权分布填充基础价位和图表，避免首屏整块留空。
@@ -1813,6 +1793,11 @@ function placeholderTrend(status = "正在加载") {
 
 // 趋势通道：展示方向、上下轨、日均斜率、RSI 超买超卖、今开或昨开/昨收、Beta，以及 52 周 / 历史最高最低价。
 function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, tradePoints = null, tradePointsHorizon = null, trendMarket = null, beta = null, serverStopLoss = null, stopLossSupports = []) {
+  const trendClose = finitePrice(trendMarket?.previous_close);
+  if (trendClose != null) {
+    state.trendMarket = trendMarket;
+    state.trendMarketSymbol = state.symbol;
+  }
   const extremeRows = trendExtremeRows(extremes, spot);
   const hasExtremes = extremeRows.some((row) => row.valid);
   if (!trend && !hasExtremes && !tradePoints?.buy && !tradePoints?.sell) {
@@ -2121,6 +2106,7 @@ function renderFactorLevels(payload) {
   const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);
   renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null, payload?.stop_loss || null, payload?.support || []);
   renderPlan(payload?.plan, spot);
+  refreshQuoteWithTrendClose();
 }
 
 function formatStructureDelta(value) {
@@ -2437,14 +2423,16 @@ function finitePrice(value) {
 function quoteReference(quote) {
   const marketState = quote?.market_state;
   const sessions = quote?.sessions || {};
-  const previous = finitePrice(quote?.previous_close);
+  const previous = alignedPreviousClose(quote);
   let label = "昨收";
   let price = previous;
   let title = "涨跌幅以最近一个已完成交易日的收盘价为基准";
   if (marketState === "PRE") {
+    // 盘前现货卡片的昨收必须直接沿用趋势通道显示的历史日线收盘；
+    // quote.previous_close 和 sessions.pre.reference_close 都可能与当前趋势结果不同步。
     label = "昨收";
-    price = finitePrice(sessions.pre?.reference_close) ?? previous;
-    title = "盘前涨跌以盘前开始前最近一次盘中收盘为基准；没有该基准时回退昨收";
+    price = previous;
+    title = "昨收与趋势通道一致，按最近一个已完成交易日的收盘价显示";
   } else if (marketState === "POST" || (marketState === "OVERNIGHT"
     && state.levelBasisMode === "close"
     && sessions.overnight?.provider !== "alpaca-overnight")) {
@@ -2460,7 +2448,21 @@ function quoteReference(quote) {
   return {
     text: `${label} ${price == null ? "--" : formatMoney(price)}`,
     title,
+    price,
   };
+}
+
+function alignedPreviousClose(quote) {
+  const trendPrevious = state.trendMarketSymbol === quote?.symbol
+    ? finitePrice(state.trendMarket?.previous_close)
+    : null;
+  return trendPrevious ?? finitePrice(quote?.previous_close);
+}
+
+function refreshQuoteWithTrendClose() {
+  if (state.lastQuote?.symbol === state.symbol && state.trendMarketSymbol === state.symbol) {
+    renderQuote(state.lastQuote);
+  }
 }
 
 function earningsMonthDay(value) {
@@ -2545,7 +2547,11 @@ function renderQuote(quote) {
   // 财报日期随轻量 quote 返回，先于 levels/raw 请求更新现货卡片，避免首屏长期显示“未知”。
   applyEarnings(quote?.earnings);
   const price = active?.price ?? quote?.price;
-  const change = active?.change_percent ?? quote?.change_percent;
+  const reference = quoteReference(quote);
+  const referencePrice = finitePrice(reference.price);
+  const change = referencePrice != null && finitePrice(price) != null
+    ? (Number(price) - referencePrice) / referencePrice * 100
+    : (active?.change_percent ?? quote?.change_percent);
   state.view.quoteSymbol = quote?.symbol || state.symbol;
   state.view.quotePrice = formatMoney(price);
   state.view.quoteChange = change == null ? "涨跌 --" : `涨跌 ${change >= 0 ? "+" : ""}${Number(change).toFixed(2)}%`;
@@ -2555,7 +2561,6 @@ function renderQuote(quote) {
   state.view.quoteMarket = quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
-  const reference = quoteReference(quote);
   state.view.quoteReference = reference.text;
   state.view.quoteReferenceTitle = reference.title;
   const hasConservativeValue = quote?.fair_value_source?.startsWith("valuation_")
@@ -2613,20 +2618,8 @@ function clearFairValuePoll() {
 function scheduleFairValuePoll(quote) {
   const ready = quote?.fair_value_source?.startsWith("valuation_") && quote?.fair_value != null;
   const terminal = ["unavailable", "failed"].includes(String(quote?.fair_value_status || ""));
-  if (ready || terminal) {
-    clearFairValuePoll();
-    return;
-  }
-  if (!state.symbol || state.loading || state.refreshing) return;
-  const key = `${state.loadId}|${state.symbol}`;
-  if (state.fairValuePollKey !== key) {
-    if (state.fairValuePollTimer) clearTimeout(state.fairValuePollTimer);
-    state.fairValuePollKey = key;
-    state.fairValuePollAttempts = 0;
-  }
-  if (state.fairValuePollTimer || state.fairValuePollInFlight || state.fairValuePollAttempts >= FAIR_VALUE_POLL_LIMIT) return;
-  const retrying = String(quote?.fair_value_status || "") === "retry";
-  state.fairValuePollTimer = setTimeout(() => pollFairValue(key), retrying ? FAIR_VALUE_RETRY_INTERVAL_MS : FAIR_VALUE_POLL_INTERVAL_MS);
+  if (ready || terminal) clearFairValuePoll();
+  // Valuation completion and retry notifications arrive through the symbol SSE stream.
 }
 
 async function pollFairValue(key) {
@@ -2944,7 +2937,7 @@ function renderChain(payload, quote, analysisPayload) {
   const snapshotAge = payload.fetched_at ? (Date.now() - new Date(payload.fetched_at).getTime()) / 1000 : null;
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
   const oiFallback = payload.oi_fallback || {};
-  state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < AUTO_REFRESH_SECONDS ? "上游新快照" : "本地缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
+  state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < SNAPSHOT_FRESH_SECONDS ? "上游新快照" : "本地缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
   state.view.fetchedAt = `快照时间 ${formatTime(payload.fetched_at)}`;
   state.view.totalCount = formatNumber(rows.length);
   const calls = rows.filter((row) => row.contract_type === "call"); const puts = rows.filter((row) => row.contract_type === "put");
@@ -2969,12 +2962,10 @@ function applyExpirations(dates, preferred, emptyLabel = "正在获取到期日�
   state.expirationOptions = unique;
   state.expirationPlaceholder = emptyLabel;
   if (!unique.length) {
-    syncRefreshButton();
     return false;
   }
   const requested = preferred || parsePageQuery(location.search).expiration || state.expiration;
   state.expiration = unique.includes(requested) ? requested : unique[0];
-  syncRefreshButton();
   return true;
 }
 
@@ -3268,9 +3259,7 @@ function releaseAnalysisRefresh(symbol) {
   if (state.analysisRefreshTimer || state.analysisRefreshSymbol !== symbol) return;
   state.analysisRefreshSymbol = null;
   state.analysisBlockUntil = 0;
-  // 倒计时已经在走就不要清掉重排，否则会把还剩几秒的定时器换成一轮新的请求。
-  if (state.refreshing || state.refreshInFlight || state.loading || expirationMenuOpen) return;
-  if (refreshDeadline > Date.now() + 1000) return;
+  if (state.refreshInFlight || state.loading || expirationMenuOpen) return;
   scheduleAutoRefresh();
 }
 
@@ -3295,8 +3284,8 @@ async function applyGammaPollResult(loadId, payload, quote, symbol, pendingText)
 
 function scheduleNextGammaBatch(loadId, payload, quote, symbol) {
   if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
-  // 批次间隔期间仍保留互斥标记，防止倒计时或手动刷新同时领取同一游标的下一批。
-  // 复用首次启动设置的刷新闸门，不因继续加载而重置倒计时。
+  // 批次间隔期间仍保留互斥标记，防止快照刷新同时领取同一游标的下一批。
+  // 继续加载时保留首次启动的刷新闸门。
   if (state.analysisRefreshTimer) clearTimeout(state.analysisRefreshTimer);
   // 批次之间让出事件循环和重任务闸门，避免连续到期日请求重新形成突发。
   state.analysisRefreshTimer = setTimeout(() => {
@@ -3373,7 +3362,7 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
       }
     });
   // jQuery 的 Deferred 没有 Promise.finally。直接链式调用会抛 TypeError，
-  // 被快照刷新的 catch 接住后会再去回源到期日，倒计时就一直停在「正在刷新」。
+  // 被快照更新的 catch 接住后会再去回源到期日，页面状态就会一直停在「正在刷新」。
   Promise.resolve(task).then(() => {
     if (!continuePolling) releaseAnalysisRefresh(symbol);
   }, () => {
@@ -3381,27 +3370,27 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
   });
 }
 
-async function refreshInBackground(loadId, force = false) {
+async function refreshInBackground(loadId) {
   const symbol = state.symbol;
   const expiration = state.expiration;
   const encodedSymbol = encodeURIComponent(symbol);
   // 回源后的补读必须看到新快照，不能复用回源前那一次读取。
   snapshotReadCache = null;
   if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
-  // 同一标的只允许一条网络刷新链路：页面加载、手动点击、定时刷新共用这份互斥，避免叠加出多组请求。
+  // 同一标的只允许一条网络刷新链路：页面加载与服务端通知后的读取共用这份互斥，避免叠加请求。
   if (state.refreshInFlight === symbol) return;
   state.refreshInFlight = symbol;
   // 到期日在 await 期间被换掉时，旧结果不能拿去渲染或拉新期限。先释放互斥再重入，第二轮请求等这一轮结束才发。
   async function restartIfExpirationChanged(captured) {
     if (state.expiration === captured || !isCurrentLoad(loadId) || state.symbol !== symbol) return false;
     state.refreshInFlight = null;
-    await refreshInBackground(loadId, force);
+    await refreshInBackground(loadId);
     return true;
   }
   try {
     state.view.lastStatus = "正在请求上游快照…";
-    // 手动刷新必须强制回源；自动刷新仍复用 60 秒新鲜期，避免定时器重复请求上游。
-    const params = new URLSearchParams({ max_age: String(force ? 0 : SNAPSHOT_FRESH_SECONDS) });
+    // 页面读取使用短缓存新鲜期，由服务端按交易时段调度活跃 SSE 标的的回源。
+    const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });
     if (expiration) params.set("expiration", expiration);
     const refreshResult = await request(`/api/refresh/${encodedSymbol}?${params}`, { method: "POST" });
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
@@ -3409,7 +3398,7 @@ async function refreshInBackground(loadId, force = false) {
     if (await restartIfExpirationChanged(expiration)) return;
     // 后端在标的没有挂牌期权时只写现货快照：走现货渲染分支，避免页面一直停在“后台刷新中”。
     if (refreshResult?.quote_only) {
-      const restarted = await loadQuoteOnly(loadId, force);
+      const restarted = await loadQuoteOnly(loadId);
       if (!restarted && await restartIfExpirationChanged(expiration)) return;
       return;
     }
@@ -3431,7 +3420,6 @@ async function refreshInBackground(loadId, force = false) {
           refreshAnalysisWindow(loadId, snapshot.payload, snapshot.quote);
         }
       }
-      syncRefreshAnchorToServerAge(refreshResult);
       if (refreshResult.deferred) {
         state.view.lastStatus = /内存保护/.test(String(refreshResult.warning || ""))
           ? "内存保护：本轮刷新已让路，继续使用本地快照"
@@ -3443,7 +3431,7 @@ async function refreshInBackground(loadId, force = false) {
     }
     const currentExpiration = state.expiration || refreshResult?.expiration;
     if (!currentExpiration) {
-      const restarted = await loadQuoteOnly(loadId, force);
+      const restarted = await loadQuoteOnly(loadId);
       if (!restarted && await restartIfExpirationChanged(expiration)) return;
       return;
     }
@@ -3467,14 +3455,14 @@ async function refreshInBackground(loadId, force = false) {
     // 本次调用还占着互斥标记，直接重入会被互斥挡住，先释放再重入。
     if (state.expiration !== currentExpiration) {
       state.refreshInFlight = null;
-      await refreshInBackground(loadId, force);
+      await refreshInBackground(loadId);
       return;
     }
     if (expirations?.expirations?.length) applyExpirations(expirations.expirations, currentExpiration);
     // 选中的到期日已下架（例如当天盘后过期）时，切到最新到期日并重新加载；同样先释放互斥标记再重入。
     if (state.expiration && state.expiration !== currentExpiration) {
       state.refreshInFlight = null;
-      await refreshInBackground(loadId, force);
+      await refreshInBackground(loadId);
       return;
     }
     let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;
@@ -3488,8 +3476,6 @@ async function refreshInBackground(loadId, force = false) {
     // Gamma 窗口继续后台刷新；选中期限的综合价位已在这里与窗口任务并行请求。
     renderChain(payload, resolvedQuote, state.lastAnalysis?.analysisPayload || null);
     renderOptionFlow(flow);
-    // 新数据已经显示出来，下一轮倒计时从现在起算完整间隔。
-    armRefreshAnchor(payload.fetched_at);
     state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
     syncPageQuery();
     // Gamma 轮询自己收尾。这里再抛错会被下面的 catch 当成快照失败，转去回源全部到期日。
@@ -3506,7 +3492,7 @@ async function refreshInBackground(loadId, force = false) {
     state.view.lastStatus = `后台刷新失败，仍显示本地缓存（${error.message}）`;
     if (!state.view.chainRows.length) setError(error.message);
     // 失败后不追加读请求：超时的服务端线程可能仍在抓取期权链，恢复读取
-    // quote/chain 只会再占一轮连接。保留当前画面并交给短重试倒计时。
+    // quote/chain 只会再占一轮连接。保留当前画面，等待 SSE 服务端调度下一轮重试。
     state.refreshInFlight = null;
   } finally {
     if (state.refreshInFlight === symbol) state.refreshInFlight = null;
@@ -3515,7 +3501,7 @@ async function refreshInBackground(loadId, force = false) {
 
 // 标的没有挂牌期权（或可用期限已全部到期）时只渲染现货：现货与盘前盘后照常刷新，
 // 期权相关面板统一提示没有期权数据，避免整页停在 “--”。
-async function loadQuoteOnly(loadId, force = false) {
+async function loadQuoteOnly(loadId) {
   const symbol = state.symbol;
   const expiration = state.expiration;
   const encodedSymbol = encodeURIComponent(symbol);
@@ -3532,7 +3518,7 @@ async function loadQuoteOnly(loadId, force = false) {
   if (dates.length) {
     applyExpirations(dates, null);
     state.refreshInFlight = null;
-    await refreshInBackground(loadId, force);
+    await refreshInBackground(loadId);
     return true;
   }
   applyCachedQuote(quote);
@@ -3583,12 +3569,11 @@ function displayedSnapshotIsCurrent(fetchedAt) {
 async function loadChain(options = {}) {
   try {
     const loadId = options.loadId || state.loadId;
-    const force = options.force === true;
     if (!isCurrentLoad(loadId)) return;
-    // 页面上已经是当前标的和到期日：没过期就直接复用，过期或手动刷新直接回源。
-    // 这样定时刷新不会先把 quote、chain、gamma 读一遍，回源后再读一遍。
+    // 页面上已经是当前标的和到期日：新鲜时复用，过期后才请求上游。
+    // 这样 SSE 触发的快照检查不会先把 quote、chain、gamma 读一遍，回源后再读一遍。
     if (displayedSnapshotMatches()) {
-      if (!force && displayedSnapshotIsFresh()) {
+      if (displayedSnapshotIsFresh()) {
         showFreshStatus({ fetchedAt: state.chainFetchedAt });
         if (!state.analysisReady && state.lastQuote) {
           refreshAnalysisWindow(loadId, {
@@ -3600,7 +3585,7 @@ async function loadChain(options = {}) {
         }
         return;
       }
-      await refreshInBackground(loadId, force);
+      await refreshInBackground(loadId);
       return;
     }
     // 即使本地还没有到期日也要往下走：首次加载某个标的时后端需要回源才能拿到期限列表，
@@ -3611,7 +3596,7 @@ async function loadChain(options = {}) {
     if (!snapshot.shown) showPending("正在后台获取上游快照…");
     if (options.refresh === false) return;
     // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求上游接口。
-    if (!force && isSnapshotFresh(snapshot)) {
+    if (isSnapshotFresh(snapshot)) {
       showFreshStatus(snapshot);
       // 首次访问可能只有选中期限的缓存，跨期限 Gamma 尚未生成；只补后台分析，不阻塞首屏。
       if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
@@ -3619,9 +3604,10 @@ async function loadChain(options = {}) {
       }
       return;
     }
-    await refreshInBackground(loadId, force);
+    await refreshInBackground(loadId);
   } finally {
     scheduleAutoRefresh();
+    if (state.pendingSnapshotRefresh) setTimeout(applyPendingSnapshotRefresh, 0);
   }
 }
 
@@ -3635,6 +3621,9 @@ async function loadSymbol() {
   state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
+  state.trendMarket = null;
+  state.trendMarketSymbol = "";
+  closePushStream();
   clearFairValuePoll();
   state.expiration = parsePageQuery(location.search).expiration || null;
   // 切换标的时取消旧页面的 Gamma 状态轮询；服务端任务可继续，但旧响应不能再驱动新页面。
@@ -3678,6 +3667,7 @@ const EXPIRATION_SWITCH_TIMEOUT_MS = 20000;
 async function switchExpiration(expiration) {
   const token = ++expirationSwitchToken;
   state.expiration = expiration;
+  connectPushStream(state.symbol);
   resetOptionFlow("正在读取当前期限的相邻快照…");
   setError("");
   setBusy(true);
@@ -3710,47 +3700,6 @@ function navigateToSymbol() {
   else location.assign(target);
 }
 
-// 手动点击强制刷新上游快照；60 秒定时刷新仍优先复用 SQLite 新鲜缓存，整段流程互斥。
-async function refresh(silent = false) {
-  if (state.refreshing) return;
-  // 菜单还开着时，到点的静默刷新先让路；关掉菜单后会补排或立刻刷新。
-  if (silent && expirationMenuOpen) {
-    scheduleAutoRefresh();
-    return;
-  }
-  if (silent && refreshWorkPending()) {
-    scheduleAutoRefresh();
-    return;
-  }
-  // 右上角倒计时还没到点。这通常是上一轮没清掉的定时器，提前打会把同一轮快照请求两遍。
-  // 不能直接 return：那个定时器已经消耗掉了，倒计时会走到 0 却不再请求。
-  if (silent && refreshDeadline - Date.now() > 1500) {
-    const delay = refreshDeadline - Date.now();
-    clearAutoRefresh();
-    state.timer = setTimeout(() => { refresh(true); }, delay);
-    refreshTimer = state.timer;
-    paintRefreshNote();
-    return;
-  }
-  // 进入标的或后台刷新还在飞时，按钮已经禁用；这里再挡住手动点击，避免叠出第二轮上游请求。
-  if (!silent && (state.loading || state.refreshInFlight)) return;
-  state.refreshing = true;
-  clearAutoRefresh();
-  syncRefreshButton();
-  paintRefreshNote();
-  const loadId = state.loadId;
-  try {
-    if (!silent) setError("");
-    await loadChain({ loadId, force: !silent });
-  } catch (error) {
-    if (isCurrentLoad(loadId)) setError(error.message);
-  } finally {
-    state.refreshing = false;
-    syncRefreshButton();
-    scheduleAutoRefresh();
-  }
-}
-
 initTheme();
 // Element UI 2.x 基于 Vue 2，必须在根实例创建前注册；静态库已经由 index.html 按依赖顺序加载。
 if (window.Vue && window.ELEMENT) Vue.use(ELEMENT);
@@ -3768,11 +3717,10 @@ const optionScopeApp = new Vue({
   el: "#app",
   data: state,
   computed: {
-    busy() { return this.loading || this.refreshing; },
+    busy() { return this.loading; },
   },
   methods: {
     navigateToSymbol() { return navigateToSymbol(); },
-    refreshNow() { return refresh(false); },
     expirationChanged() { return switchExpiration(this.expiration); },
     expirationMenuChanged(open) { return setExpirationMenuOpen(open); },
     filterChanged() { return renderChainTable(); },
@@ -3793,8 +3741,7 @@ initOptionAnalysisGroup();
 function updateClock() {
   const clock = byId("clock");
   if (clock) clock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-  // 倒计时跟时钟同一拍改文字，不写 Vue 数据。
-  paintRefreshNote();
+  // 状态跟随时钟更新，不写 Vue 数据。
 }
 updateClock();
 setInterval(updateClock, 1000);
@@ -3832,7 +3779,7 @@ if (accessKeyRequired() && !initialAccessKey) {
   showAccessDenied();
 } else {
   // 没有到期日（仅现货标的）也要走刷新链路：后端会返回 quote_only，只更新现货卡片。
-  // 首屏和 Gamma 窗口结束前不计倒计时，避免刚加载完就立刻再刷一轮。
+  // 首屏加载完成后由活跃 SSE 订阅启动服务端更新调度。
   state.loading = true;
   scheduleAutoRefresh();
   showChartSkeletons();

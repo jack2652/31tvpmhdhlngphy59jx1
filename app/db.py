@@ -13,22 +13,20 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from app.runtime import low_memory_enabled
+from app.db_constants import (ANALYSIS_JOB_STALE_SECONDS, NO_FLOOR, ORPHANED_ANALYSIS_MESSAGE, SIZE_CLEANUP_PROTECT_HOURS, SIZE_CLEANUP_TARGET_RATIO, SIZE_CLEANUP_TIME_BUDGET_SECONDS)
+from app.db_cleanup import DatabaseCleanupMixin
+from app.db_options import DatabaseOptionsMixin
 
 
 logger = logging.getLogger(__name__)
 
 # 体积清理时保留的历史批次时长：未平仓量回退（_open_interest_fallback）只依赖这段时间内的旧批次。
-SIZE_CLEANUP_PROTECT_HOURS = 24
 # 体积清理目标水位相对上限的比例，留出余量，避免每次写入都触发一轮清理。
-SIZE_CLEANUP_TARGET_RATIO = 0.8
 # 体积清理的时间上限（秒）：跑在后台线程里，避免长时间占住数据库连接。
-SIZE_CLEANUP_TIME_BUDGET_SECONDS = 120
 # 表示「不设保护期」的哨兵时间戳，比任何写入时间都新，可复用同一套 SQL。
-NO_FLOOR = "9999-12-31T23:59:59+00:00"
 # 后台分析停在 running 超过这个时间，下一轮可以重新领取。进程还活着时由接口侧的看门狗先标记失败。
-ANALYSIS_JOB_STALE_SECONDS = 180
-ORPHANED_ANALYSIS_MESSAGE = "进程重启，后台分析已中断"
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
+MAX_PUSH_REFRESH_BACKOFF_SECONDS = 300
 
 
 
@@ -67,7 +65,7 @@ def parse_sessions(raw: str | None) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-class Database:
+class Database(DatabaseOptionsMixin, DatabaseCleanupMixin):
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,10 +255,40 @@ class Database:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS push_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    expiration TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_push_events_id ON push_events(id);
+                CREATE TABLE IF NOT EXISTS push_refresh_state (
+                    symbol TEXT NOT NULL,
+                    expiration TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL,
+                    retry_after TEXT,
+                    retry_delay_seconds INTEGER NOT NULL DEFAULT 0,
+                    last_interval_seconds INTEGER NOT NULL DEFAULT 0,
+                    lease_until TEXT,
+                    PRIMARY KEY(symbol, expiration)
+                );
                 CREATE INDEX IF NOT EXISTS idx_api_analysis_cache_time
                     ON api_analysis_cache(created_at ASC);
                 """
             )
+            push_event_columns = {row[1] for row in connection.execute("PRAGMA table_info(push_events)")}
+            if "expiration" not in push_event_columns:
+                connection.execute("ALTER TABLE push_events ADD COLUMN expiration TEXT")
+            push_refresh_columns = {row[1] for row in connection.execute("PRAGMA table_info(push_refresh_state)")}
+            if "retry_after" not in push_refresh_columns:
+                connection.execute("ALTER TABLE push_refresh_state ADD COLUMN retry_after TEXT")
+            if "retry_delay_seconds" not in push_refresh_columns:
+                connection.execute("ALTER TABLE push_refresh_state ADD COLUMN retry_delay_seconds INTEGER NOT NULL DEFAULT 0")
+            if "last_interval_seconds" not in push_refresh_columns:
+                connection.execute("ALTER TABLE push_refresh_state ADD COLUMN last_interval_seconds INTEGER NOT NULL DEFAULT 0")
+            if "lease_until" not in push_refresh_columns:
+                connection.execute("ALTER TABLE push_refresh_state ADD COLUMN lease_until TEXT")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(option_snapshots)")}
             if "gamma" not in columns:
                 connection.execute("ALTER TABLE option_snapshots ADD COLUMN gamma REAL")
@@ -440,7 +468,17 @@ class Database:
                     started_at,
                 ),
             )
-            return cursor.rowcount > 0
+            finished = cursor.rowcount > 0
+            if finished and status in {"completed", "failed"}:
+                symbol = str(job_id).rsplit(":", 1)[0].upper()
+                connection.execute(
+                    "INSERT INTO push_events(symbol, kind, expiration, created_at) VALUES (?, 'gamma', NULL, ?)",
+                    (symbol, iso()),
+                )
+                connection.execute(
+                    "DELETE FROM push_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - 20000 FROM push_events)"
+                )
+            return finished
 
     def fail_orphaned_analysis_jobs(self, error_message: str = ORPHANED_ANALYSIS_MESSAGE) -> int:
         """进程重启后，上一轮还停在 running 的分析不会再有线程写回结果。"""
@@ -530,6 +568,164 @@ class Database:
                     )""",
                 (max(1, max_entries),),
             )
+
+    def publish_push_event(self, symbol: str, kind: str = "snapshot", expiration: str | None = None) -> int:
+        """Append a small cross-worker notification; payloads remain in the normal snapshot tables."""
+        normalized = str(symbol).strip().upper()
+        if not normalized:
+            return 0
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO push_events(symbol, kind, expiration, created_at) VALUES (?, ?, ?, ?)",
+                (normalized, kind, expiration, iso()),
+            )
+            # Bounded event log supports brief disconnect/reconnect without unbounded growth.
+            connection.execute("DELETE FROM push_events WHERE id <= (SELECT COALESCE(MAX(id), 0) - 20000 FROM push_events)")
+            return int(cursor.lastrowid or 0)
+
+    def push_events_since(self, event_id: int, symbol: str | None = None, kind: str | None = None, expiration: str | None = None) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            clauses = ["id > ?"]
+            params: list[Any] = [max(0, int(event_id))]
+            if symbol is not None:
+                clauses.append("symbol = ?")
+                params.append(str(symbol).strip().upper())
+            if kind is not None:
+                clauses.append("kind = ?")
+                params.append(kind)
+            if expiration is not None:
+                clauses.append("(expiration = ? OR expiration IS NULL)")
+                params.append(expiration)
+            rows = connection.execute(
+                f"SELECT id, symbol, kind, expiration, created_at FROM push_events WHERE {' AND '.join(clauses)} ORDER BY id LIMIT 100",
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_push_refresh(self, symbol: str, expiration: str | None, interval_seconds: int) -> bool:
+        """Atomically reserve one refresh per symbol/expiry across workers, honoring cadence/backoff and an in-flight lease."""
+        normalized = str(symbol).strip().upper()
+        expiry = str(expiration or "")
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT started_at, retry_after, retry_delay_seconds, last_interval_seconds, lease_until FROM push_refresh_state WHERE symbol=? AND expiration=?",
+                (normalized, expiry),
+            ).fetchone()
+            if row:
+                try:
+                    lease_until = row["lease_until"]
+                    if lease_until:
+                        lease_at = datetime.fromisoformat(str(lease_until))
+                        if lease_at.tzinfo is None:
+                            lease_at = lease_at.replace(tzinfo=timezone.utc)
+                        if now < lease_at.astimezone(timezone.utc):
+                            return False
+                    retry_after = row["retry_after"]
+                    if retry_after:
+                        retry_at = datetime.fromisoformat(str(retry_after))
+                        if retry_at.tzinfo is None:
+                            retry_at = retry_at.replace(tzinfo=timezone.utc)
+                        if now < retry_at.astimezone(timezone.utc):
+                            return False
+                    previous = datetime.fromisoformat(str(row["started_at"]))
+                    if previous.tzinfo is None:
+                        previous = previous.replace(tzinfo=timezone.utc)
+                    # A cadence regime change may legitimately shorten the previous interval (e.g. market opens).
+                    previous_interval = int(row["last_interval_seconds"] or 0)
+                    if previous_interval == max(1, int(interval_seconds)) and (now - previous.astimezone(timezone.utc)).total_seconds() < max(1, interval_seconds - 1):
+                        return False
+                except ValueError:
+                    pass
+            connection.execute(
+                """INSERT INTO push_refresh_state(symbol, expiration, started_at, retry_after, retry_delay_seconds, last_interval_seconds, lease_until)
+                   VALUES (?, ?, ?, NULL, 0, ?, ?)
+                   ON CONFLICT(symbol, expiration) DO UPDATE SET started_at=excluded.started_at,
+                     retry_after=NULL, last_interval_seconds=excluded.last_interval_seconds, lease_until=excluded.lease_until""",
+                (normalized, expiry, now.isoformat(), max(1, int(interval_seconds)), (now + timedelta(seconds=180)).isoformat()),
+            )
+        return True
+
+    def push_refresh_wait_seconds(self, symbol: str, expiration: str | None, interval_seconds: int) -> float:
+        """Return the shared lease/cadence/cooldown delay after another worker's claim succeeds."""
+        normalized = str(symbol).strip().upper()
+        expiry = str(expiration or "")
+        now = utc_now()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT started_at, retry_after, retry_delay_seconds, lease_until FROM push_refresh_state WHERE symbol=? AND expiration=?",
+                (normalized, expiry),
+            ).fetchone()
+        if not row:
+            return 0.1
+        retry_after = row["retry_after"]
+        if retry_after:
+            try:
+                retry_at = datetime.fromisoformat(str(retry_after))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                retry_wait = (retry_at.astimezone(timezone.utc) - now).total_seconds()
+                if retry_wait > 0:
+                    return retry_wait
+            except ValueError:
+                pass
+        lease_until = row["lease_until"]
+        if lease_until:
+            try:
+                lease_at = datetime.fromisoformat(str(lease_until))
+                if lease_at.tzinfo is None:
+                    lease_at = lease_at.replace(tzinfo=timezone.utc)
+                lease_wait = (lease_at.astimezone(timezone.utc) - now).total_seconds()
+                if lease_wait > 0:
+                    # Let the owning worker clear its lease promptly without hammering SQLite.
+                    return min(lease_wait, 5.0)
+            except ValueError:
+                pass
+        if int(row["last_interval_seconds"] or 0) != max(1, int(interval_seconds)):
+            return 0.1
+        try:
+            started = datetime.fromisoformat(str(row["started_at"]))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            elapsed = (now - started.astimezone(timezone.utc)).total_seconds()
+            return max(0.1, max(1, int(interval_seconds) - 1) - elapsed)
+        except ValueError:
+            return 0.1
+
+    def finish_push_refresh(self, symbol: str, expiration: str | None) -> None:
+        normalized = str(symbol).strip().upper()
+        expiry = str(expiration or "")
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE push_refresh_state SET lease_until=NULL, retry_delay_seconds=0 WHERE symbol=? AND expiration=?",
+                (normalized, expiry),
+            )
+
+    def defer_push_refresh(self, symbol: str, expiration: str | None, delay_seconds: int) -> int:
+        """Persist shared retry backoff after an upstream failure so workers don't synchronize retries."""
+        normalized = str(symbol).strip().upper()
+        expiry = str(expiration or "")
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT retry_delay_seconds FROM push_refresh_state WHERE symbol=? AND expiration=?",
+                (normalized, expiry),
+            ).fetchone()
+            previous = int(row["retry_delay_seconds"] or 0) if row else 0
+            delay = min(MAX_PUSH_REFRESH_BACKOFF_SECONDS, max(int(delay_seconds), previous * 2 or int(delay_seconds), 1))
+            retry_after = (now + timedelta(seconds=delay)).isoformat()
+            connection.execute(
+                "UPDATE push_refresh_state SET retry_after=?, retry_delay_seconds=?, lease_until=NULL WHERE symbol=? AND expiration=?",
+                (retry_after, delay, normalized, expiry),
+            )
+        return delay
+
+    def latest_push_event_id(self) -> int:
+        with self.connect() as connection:
+            row = connection.execute("SELECT COALESCE(MAX(id), 0) AS id FROM push_events").fetchone()
+        return int(row["id"] or 0)
 
     def write_snapshot(self, quote: dict[str, Any], options: Iterable[dict[str, Any]], fetched_at: str) -> int:
         # raw_json 目前没有任何读取方，为避免小磁盘环境被冗余 JSON 撑爆，写入时不再保存原始报文。
@@ -802,544 +998,18 @@ class Database:
         data = [{**dict(row), "expiration": expiration} for row in rows]
         return {"fetched_at": fetched_at, "data": data, "oi_fallback": self._apply_open_interest_fallback(data, fallback)}
 
-    def option_flow(self, symbol: str, expiration: str) -> dict[str, Any]:
-        """比较同一期限最近两次快照，估算 Call/Put 的新增买卖流向。"""
-        def empty_side() -> dict[str, Any]:
-            return {
-                "buy_volume": 0,
-                "sell_volume": 0,
-                "unknown_volume": 0,
-                "buy_premium": 0.0,
-                "sell_premium": 0.0,
-                "unknown_premium": 0.0,
-                "buy_contracts": 0,
-                "sell_contracts": 0,
-                "unknown_contracts": 0,
-                "net_volume": 0,
-                "net_premium": 0.0,
-                "top_strikes": [],
-                "concentration": [],
-            }
 
-        def empty_result(reason: str, current_fetched_at: str | None = None) -> dict[str, Any]:
-            return {
-                "symbol": symbol,
-                "expiration": expiration,
-                "available": False,
-                "source": "sqlite",
-                "reason": reason,
-                "current_fetched_at": current_fetched_at,
-                "previous_fetched_at": None,
-                "interval_seconds": None,
-                "reset_count": 0,
-                "call": empty_side(),
-                "put": empty_side(),
-                "signal": {"label": "等待下一快照", "class_name": "waiting", "detail": reason},
-            }
 
-        with self.connect() as connection:
-            batches = connection.execute(
-                """SELECT fetched_at
-                     FROM option_snapshots
-                    WHERE symbol=? AND expiration=?
-                    GROUP BY fetched_at
-                    ORDER BY fetched_at DESC
-                    LIMIT 2""",
-                (symbol, expiration),
-            ).fetchall()
-            if not batches:
-                return empty_result("暂无该期限的期权快照")
-            current_fetched_at = str(batches[0][0])
-            if len(batches) < 2:
-                return empty_result("等待下一份相邻快照", current_fetched_at)
-            previous_fetched_at = str(batches[1][0])
-            columns = "contract_symbol, contract_type, strike, last_price, bid, ask, volume"
-            current_rows = connection.execute(
-                f"SELECT {columns} FROM option_snapshots WHERE symbol=? AND expiration=? AND fetched_at=?",
-                (symbol, expiration, current_fetched_at),
-            ).fetchall()
-            previous_rows = connection.execute(
-                f"SELECT {columns} FROM option_snapshots WHERE symbol=? AND expiration=? AND fetched_at=?",
-                (symbol, expiration, previous_fetched_at),
-            ).fetchall()
 
-        def number(value: Any) -> float | None:
-            try:
-                parsed = float(value)
-            except (TypeError, ValueError):
-                return None
-            return parsed if parsed == parsed else None
 
-        def volume(value: Any) -> int:
-            parsed = number(value)
-            return max(0, int(parsed or 0))
 
-        def classify(row: dict[str, Any]) -> str:
-            last = number(row.get("last_price"))
-            bid = number(row.get("bid"))
-            ask = number(row.get("ask"))
-            if last is None or bid is None or ask is None or bid <= 0 or ask < bid or last <= 0:
-                return "unknown"
-            spread = ask - bid
-            if spread <= 0:
-                return "unknown"
-            edge = spread * 0.25
-            if last >= ask - edge:
-                return "buy"
-            if last <= bid + edge:
-                return "sell"
-            return "unknown"
 
-        current_by_contract = {str(row[0]): dict(row) for row in current_rows if row[0]}
-        previous_by_contract = {str(row[0]): dict(row) for row in previous_rows if row[0]}
-        sides = {"call": empty_side(), "put": empty_side()}
-        strike_totals: dict[str, dict[tuple[float, str], dict[str, Any]]] = {"call": {}, "put": {}}
-        strike_concentration: dict[str, dict[float, dict[str, Any]]] = {"call": {}, "put": {}}
-        reset_count = 0
-        for contract_symbol, row in current_by_contract.items():
-            contract_type = str(row.get("contract_type") or "").lower()
-            if contract_type not in sides:
-                continue
-            current_volume = volume(row.get("volume"))
-            previous_volume = volume(previous_by_contract.get(contract_symbol, {}).get("volume"))
-            delta = current_volume - previous_volume
-            if delta < 0:
-                reset_count += 1
-                delta = current_volume
-            if delta <= 0:
-                continue
-            direction = classify(row)
-            premium = delta * max(number(row.get("last_price")) or 0.0, 0.0) * 100
-            side = sides[contract_type]
-            side[f"{direction}_volume"] += delta
-            side[f"{direction}_premium"] += premium
-            side[f"{direction}_contracts"] += 1
-            strike = number(row.get("strike"))
-            if strike is not None:
-                key = (strike, direction)
-                grouped = strike_totals[contract_type].setdefault(key, {"volume": 0, "premium": 0.0})
-                grouped["volume"] += delta
-                grouped["premium"] += premium
-                concentrated = strike_concentration[contract_type].setdefault(
-                    strike,
-                    {"volume": 0, "buy_volume": 0, "sell_volume": 0, "unknown_volume": 0, "premium": 0.0},
-                )
-                concentrated["volume"] += delta
-                concentrated[f"{direction}_volume"] += delta
-                concentrated["premium"] += premium
 
-        for contract_type, side in sides.items():
-            side["net_volume"] = side["buy_volume"] - side["sell_volume"]
-            side["net_premium"] = round(side["buy_premium"] - side["sell_premium"], 2)
-            side["buy_premium"] = round(side["buy_premium"], 2)
-            side["sell_premium"] = round(side["sell_premium"], 2)
-            side["unknown_premium"] = round(side["unknown_premium"], 2)
-            side["top_strikes"] = [
-                {"strike": strike, "direction": direction, "volume": values["volume"], "premium": round(values["premium"], 2)}
-                for (strike, direction), values in sorted(
-                    strike_totals[contract_type].items(), key=lambda item: item[1]["volume"], reverse=True
-                )[:5]
-            ]
-            side["concentration"] = []
-            for strike, values in sorted(
-                strike_concentration[contract_type].items(), key=lambda item: item[1]["volume"], reverse=True
-            )[:5]:
-                if values["buy_volume"] > values["sell_volume"]:
-                    dominant_direction = "buy"
-                elif values["sell_volume"] > values["buy_volume"]:
-                    dominant_direction = "sell"
-                else:
-                    dominant_direction = "unknown"
-                side["concentration"].append(
-                    {
-                        "strike": strike,
-                        "volume": values["volume"],
-                        "buy_volume": values["buy_volume"],
-                        "sell_volume": values["sell_volume"],
-                        "unknown_volume": values["unknown_volume"],
-                        "premium": round(values["premium"], 2),
-                        "dominant_direction": dominant_direction,
-                    }
-                )
 
-        try:
-            current_time = datetime.fromisoformat(current_fetched_at.replace("Z", "+00:00"))
-            previous_time = datetime.fromisoformat(previous_fetched_at.replace("Z", "+00:00"))
-            interval_seconds = max(0, round((current_time - previous_time).total_seconds()))
-        except ValueError:
-            interval_seconds = None
-        bullish_premium = sides["call"]["buy_premium"] + sides["put"]["sell_premium"]
-        bearish_premium = sides["call"]["sell_premium"] + sides["put"]["buy_premium"]
-        if bullish_premium <= 0 and bearish_premium <= 0:
-            bullish_score = sides["call"]["buy_volume"] + sides["put"]["sell_volume"]
-            bearish_score = sides["call"]["sell_volume"] + sides["put"]["buy_volume"]
-        else:
-            bullish_score = bullish_premium
-            bearish_score = bearish_premium
-        if bullish_score <= 0 and bearish_score <= 0:
-            signal = {"label": "暂无新增流向", "class_name": "neutral", "detail": "相邻快照没有新增成交量"}
-        elif bullish_score >= bearish_score * 1.15:
-            signal = {"label": "偏多流向", "class_name": "bullish", "detail": "Call 买入与 Put 卖出占优"}
-        elif bearish_score >= bullish_score * 1.15:
-            signal = {"label": "偏空流向", "class_name": "bearish", "detail": "Call 卖出与 Put 买入占优"}
-        else:
-            signal = {"label": "多空分歧", "class_name": "neutral", "detail": "Call/Put 新增流向接近"}
-        result = {
-            "symbol": symbol,
-            "expiration": expiration,
-            "available": True,
-            "source": "sqlite",
-            "reason": "相邻快照成交量增量，买卖方向按成交价接近 Bid/Ask 估算",
-            "current_fetched_at": current_fetched_at,
-            "previous_fetched_at": previous_fetched_at,
-            "interval_seconds": interval_seconds,
-            "reset_count": reset_count,
-            "call": sides["call"],
-            "put": sides["put"],
-            "signal": signal,
-        }
-        if reset_count:
-            result["warning"] = f"{reset_count} 个合约成交量出现回落，按当前量作为重置后增量估算"
-        return result
 
-    @staticmethod
-    def _open_interest_fallback(connection: sqlite3.Connection, symbol: str, start: str, end: str) -> dict[tuple[str, str], tuple[int, str]]:
-        """读取每个合约最近一次非零的未平仓量，供盘前空值兜底使用。"""
-        rows = connection.execute(
-            """SELECT expiration, contract_symbol, open_interest, MAX(fetched_at) AS fetched_at
-                 FROM option_snapshots
-                WHERE symbol=? AND expiration BETWEEN ? AND ? AND open_interest > 0
-                GROUP BY expiration, contract_symbol""",
-            (symbol, start, end),
-        ).fetchall()
-        # SQLite 在 GROUP BY 中搭配 MAX() 时，裸列取自最大值所在的那一行，因此这里拿到的是最近一次有效的未平仓量。
-        return {(str(row["expiration"]), str(row["contract_symbol"])): (int(row["open_interest"]), str(row["fetched_at"])) for row in rows}
 
-    @staticmethod
-    def _apply_open_interest_fallback(rows: list[dict[str, Any]], fallback: dict[tuple[str, str], tuple[int, str]]) -> dict[str, Any]:
-        """把为 0 的未平仓量替换成同一合约最近一次有效值，并返回回溯统计。"""
-        restored = 0
-        as_of: str | None = None
-        for row in rows:
-            if row.get("open_interest"):
-                continue
-            entry = fallback.get((str(row.get("expiration")), str(row.get("contract_symbol"))))
-            if entry is None:
-                continue
-            row["open_interest"] = entry[0]
-            restored += 1
-            if as_of is None or entry[1] > as_of:
-                as_of = entry[1]
-        return {"restored": restored, "as_of": as_of}
 
-    def latest_chains(self, symbol: str, horizon_days: int = 45) -> dict[str, Any]:
-        """返回近期期限的最新期权链，用于跨到期日 Gamma 分析。"""
-        # 到期日是美东日历日；服务在 UTC 晚间运行时，不能提前跳过仍在交易中的美东当天合约。
-        market_date = datetime.now(MARKET_TIMEZONE).date()
-        start = market_date.isoformat()
-        end = (market_date + timedelta(days=horizon_days)).isoformat()
-        with self.connect() as connection:
-            rows = connection.execute(
-                """SELECT current.contract_symbol, current.expiration, current.contract_type,
-                          current.strike, current.last_price, current.bid, current.ask,
-                          current.volume, current.open_interest, current.implied_volatility,
-                          current.gamma, current.in_the_money, current.change_percent,
-                          current.fetched_at
-                     FROM option_latest_batches AS latest
-                     JOIN option_snapshots AS current
-                       ON current.symbol=latest.symbol
-                      AND current.expiration=latest.expiration
-                      AND latest.fetched_at=current.fetched_at
-                    WHERE latest.symbol=? AND latest.expiration BETWEEN ? AND ?
-                   ORDER BY current.expiration, current.strike, current.contract_type""",
-                (symbol, start, end),
-            ).fetchall()
-            fallback = self._open_interest_fallback(connection, symbol, start, end)
-        data = [dict(row) for row in rows]
-        expirations = sorted({str(row["expiration"]) for row in data})
-        fetched_values = [row["fetched_at"] for row in data if row.get("fetched_at")]
-        oi_fallback = self._apply_open_interest_fallback(data, fallback)
-        for row in data:
-            row.pop("fetched_at", None)
-        return {
-            "fetched_at": max(fetched_values) if fetched_values else None,
-            "data": data,
-            "expirations": expirations,
-            "horizon_days": horizon_days,
-            "oi_fallback": oi_fallback,
-        }
 
-    def cleanup(self, retention_days: int, batch_size: int = 5000) -> dict[str, int]:
-        cutoff = iso(utc_now() - timedelta(days=retention_days))
-        deleted = {"quotes": 0, "options": 0, "runs": 0, "history": 0, "extremes": 0}
-        with self.connect() as connection:
-            for table, key in (
-                ("quote_snapshots", "quotes"),
-                ("option_snapshots", "options"),
-                ("price_history", "history"),
-                ("price_extremes", "extremes"),
-            ):
-                while True:
-                    cursor = connection.execute(
-                        # price_history / price_extremes 没有自增 id 列，统一按 rowid 分批删除。
-                        f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE fetched_at < ? LIMIT ?)",
-                        (cutoff, batch_size),
-                    )
-                    deleted[key] += cursor.rowcount
-                    if cursor.rowcount < batch_size:
-                        break
-            while True:
-                cursor = connection.execute(
-                    "DELETE FROM refresh_runs WHERE id IN "
-                    "(SELECT id FROM refresh_runs WHERE started_at < ? LIMIT ?)",
-                    (cutoff, batch_size),
-                )
-                deleted["runs"] += cursor.rowcount
-                if cursor.rowcount < batch_size:
-                    break
-            # 清理掉已没有对应快照的索引行，避免过期到期日继续出现在选择框中。
-            connection.execute(
-                """DELETE FROM option_latest_batches AS latest
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM option_snapshots AS current
-                         WHERE current.symbol=latest.symbol
-                           AND current.expiration=latest.expiration
-                           AND current.fetched_at=latest.fetched_at
-                    )"""
-            )
-        return deleted
-
-    def database_size_bytes(self) -> int:
-        """返回 SQLite 实际占用的磁盘字节数，包含 WAL/SHM 附属文件。"""
-        total = 0
-        for suffix in ("", "-wal", "-shm"):
-            candidate = Path(f"{self.path}{suffix}")
-            if candidate.exists():
-                total += candidate.stat().st_size
-        return total
-
-    def live_size_bytes(self) -> int:
-        """返回有效数据量（去掉空洞后的页数 × 页大小），等价于 VACUUM 之后的文件大小。
-
-        删除行不会立刻缩小 SQLite 文件，清理阶梯必须按有效数据量判断是否已降到目标水位，
-        否则会误判为「还没降下来」而继续删更深一层的数据。
-        """
-        with self.connect() as connection:
-            page_count = connection.execute("PRAGMA page_count").fetchone()[0]
-            free_pages = connection.execute("PRAGMA freelist_count").fetchone()[0]
-            page_size = connection.execute("PRAGMA page_size").fetchone()[0]
-        return (page_count - free_pages) * page_size
-
-    def prune_legacy_raw_json(self, batch_size: int = 5000, time_budget_seconds: int = SIZE_CLEANUP_TIME_BUDGET_SECONDS) -> int:
-        """清空旧版本写入的冗余报文列并回收文件体积，返回清空的行数。
-
-        新版本已不再写入 raw_json，也没有任何读取方，因此启动时清一次即可（全表扫描只做一次）。
-        """
-        cleared = self._clear_raw_json(batch_size, time.monotonic() + time_budget_seconds)
-        if cleared:
-            self._vacuum_if_possible()
-        return cleared
-
-    def cleanup_by_size(
-        self,
-        max_bytes: int,
-        batch_size: int = 5000,
-        time_budget_seconds: int = SIZE_CLEANUP_TIME_BUDGET_SECONDS,
-    ) -> dict[str, Any]:
-        """按数据库体积上限清理历史数据，返回本次清理的统计。
-
-        max_bytes <= 0 表示不限制体积，直接返回。清理按阶梯执行，每一步都先看有效数据量是否
-        已经降到上限的 SIZE_CLEANUP_TARGET_RATIO，够用就停下：
-        1. 清空 raw_json 冗余报文（该列只写不读，纯占空间）并删除过期刷新记录；
-        2. 保护期之外的旧批次按「天」保留一批；
-        3. 仍未达标时保护期内按「小时」保留一批；
-        4. 继续超限才退到每个分组只保留最新一批；
-        5. 磁盘空间允许时执行 VACUUM 回收文件体积，空间不足则跳过并告警。
-        """
-        before = self.database_size_bytes()
-        result: dict[str, Any] = {
-            "limit_bytes": max_bytes,
-            "before_bytes": before,
-            "after_bytes": before,
-            "live_bytes": before,
-            "raw_json_cleared": 0,
-            "superseded_options": 0,
-            "superseded_quotes": 0,
-            "stale_runs": 0,
-            "vacuumed": False,
-        }
-        if max_bytes <= 0 or before <= max_bytes:
-            return result
-
-        target = int(max_bytes * SIZE_CLEANUP_TARGET_RATIO)
-        deadline = time.monotonic() + time_budget_seconds
-        protect_after = iso(utc_now() - timedelta(hours=SIZE_CLEANUP_PROTECT_HOURS))
-
-        # 有效数据量已经达标时说明只是文件还没回收（上一轮 VACUUM 可能因磁盘空间不足被跳过），
-        # 此时不再删除业务数据，只等回收文件体积。
-        if self.live_size_bytes() > target:
-            # 冗余报文列只写不读，超限时直接清空，能省下大头且不丢任何被读取的数据。
-            result["raw_json_cleared"] += self._clear_raw_json(batch_size, deadline)
-            result["stale_runs"] += self._delete_stale_runs(protect_after, batch_size, deadline)
-            # 三步阶梯，每步都比上一步删得狠，只有上一步没降到目标水位才继续：
-            # 1. 保护期之外的旧批次按「天」保留一批（保留跨日的未平仓量样本）；
-            # 2. 保护期之内按「小时」保留一批（盘前回退只需要近期有效样本）；
-            # 3. 每个分组只保留最新一批。
-            for floor, bucket_chars in ((protect_after, 10), (protect_after, 13), (NO_FLOOR, None)):
-                if self.live_size_bytes() <= target or time.monotonic() >= deadline:
-                    break
-                result["superseded_options"] += self._thin_superseded(
-                    "option_snapshots", ("symbol", "expiration"), floor, bucket_chars, batch_size, deadline
-                )
-                result["superseded_quotes"] += self._thin_superseded(
-                    "quote_snapshots", ("symbol",), floor, bucket_chars, batch_size, deadline
-                )
-
-        changed = (
-            result["raw_json_cleared"]
-            + result["superseded_options"]
-            + result["superseded_quotes"]
-            + result["stale_runs"]
-        )
-        # 文件体积超限但有效数据已达标时也要回收，否则文件会一直挂在上限之上。
-        if changed or before > max_bytes:
-            result["vacuumed"] = self._vacuum_if_possible()
-        result["after_bytes"] = self.database_size_bytes()
-        result["live_bytes"] = self.live_size_bytes()
-
-        if result["after_bytes"] > max_bytes:
-            logger.warning(
-                "数据库体积仍超过上限：%.1f MB / %.1f MB，已删除冗余快照 %s 行",
-                result["after_bytes"] / 1048576,
-                max_bytes / 1048576,
-                result["superseded_options"] + result["superseded_quotes"],
-            )
-        else:
-            logger.info(
-                "数据库体积清理完成：%.1f MB → %.1f MB（上限 %.1f MB，VACUUM=%s）",
-                before / 1048576,
-                result["after_bytes"] / 1048576,
-                max_bytes / 1048576,
-                result["vacuumed"],
-            )
-        return result
-
-    def _clear_raw_json(self, batch_size: int, deadline: float) -> int:
-        """清空 raw_json 冗余报文，不删除任何业务字段（该列当前没有任何读取方）。"""
-        cleared = 0
-        with self.connect() as connection:
-            for table in ("option_snapshots", "quote_snapshots"):
-                while time.monotonic() < deadline:
-                    cursor = connection.execute(
-                        f"UPDATE {table} SET raw_json=NULL WHERE rowid IN "
-                        f"(SELECT rowid FROM {table} WHERE raw_json IS NOT NULL LIMIT ?)",
-                        (batch_size,),
-                    )
-                    cleared += cursor.rowcount
-                    # 分批提交，避免一次性事务把 WAL 撑大（小磁盘环境尤其关键）。
-                    connection.commit()
-                    if cursor.rowcount < batch_size:
-                        break
-        return cleared
-
-    def _thin_superseded(
-        self,
-        table: str,
-        keys: tuple[str, ...],
-        floor: str,
-        bucket_chars: int | None,
-        batch_size: int,
-        deadline: float,
-    ) -> int:
-        """删除已被新批次覆盖的历史行，只保留每个分组的最新一批。
-
-        bucket_chars 非空时额外保留「时间桶代表行」：按 fetched_at 的前 N 个字符分桶
-        （10 表示按天、13 表示按小时），每个桶保留该分组的最新一行，用来支撑未平仓量回退；
-        桶表只收录 floor 之后的记录，因此 floor 取 NO_FLOOR 时退化为每组只留最新一批。
-        """
-        keys_sql = ", ".join(keys)
-        join_sql = " AND ".join(f"k.{key}=o.{key}" for key in keys)
-        deleted = 0
-        with self.connect() as connection:
-            connection.execute("DROP TABLE IF EXISTS temp.keep_group")
-            connection.execute(
-                f"CREATE TEMP TABLE keep_group AS "
-                f"SELECT {keys_sql}, MAX(fetched_at) AS newest FROM {table} GROUP BY {keys_sql}"
-            )
-            extra = ""
-            if bucket_chars:
-                bucket_join = " AND ".join(f"b.{key}=o.{key}" for key in keys)
-                connection.execute("DROP TABLE IF EXISTS temp.keep_bucket")
-                connection.execute(
-                    f"CREATE TEMP TABLE keep_bucket AS "
-                    f"SELECT {keys_sql}, substr(fetched_at, 1, {bucket_chars}) AS bucket, MAX(fetched_at) AS newest "
-                    f"FROM {table} WHERE fetched_at >= ? GROUP BY {keys_sql}, bucket",
-                    (floor,),
-                )
-                extra = (
-                    f" AND NOT EXISTS (SELECT 1 FROM keep_bucket b WHERE {bucket_join} "
-                    f"AND b.bucket=substr(o.fetched_at, 1, {bucket_chars}) AND b.newest=o.fetched_at)"
-                )
-            while time.monotonic() < deadline:
-                cursor = connection.execute(
-                    f"DELETE FROM {table} WHERE rowid IN ("
-                    f"SELECT o.rowid FROM {table} o JOIN keep_group k ON {join_sql} "
-                    f"WHERE o.fetched_at < k.newest AND o.fetched_at < ?{extra} "
-                    f"ORDER BY o.fetched_at ASC, o.rowid ASC LIMIT ?)",
-                    (floor, batch_size),
-                )
-                deleted += cursor.rowcount
-                connection.commit()
-                if cursor.rowcount < batch_size:
-                    break
-        return deleted
-
-    def _delete_stale_runs(self, floor: str, batch_size: int, deadline: float) -> int:
-        """删除过期的刷新记录，页面只读取每个标的最新一条。"""
-        deleted = 0
-        with self.connect() as connection:
-            while time.monotonic() < deadline:
-                cursor = connection.execute(
-                    "DELETE FROM refresh_runs WHERE id IN "
-                    "(SELECT id FROM refresh_runs WHERE started_at < ? LIMIT ?)",
-                    (floor, batch_size),
-                )
-                deleted += cursor.rowcount
-                connection.commit()
-                if cursor.rowcount < batch_size:
-                    break
-        return deleted
-
-    def _vacuum_if_possible(self) -> bool:
-        """回收磁盘文件。VACUUM 需要与库体积相当的临时空间，空间不足时跳过并记录告警。
-
-        WAL 模式下删除只会在 WAL 里留下可用页，主库文件要等 checkpoint 才会真正缩小，
-        因此这里先做一次 checkpoint，VACUUM 之后再 checkpoint 一次把体积落盘。
-        低内存机器通常也是小磁盘，VACUUM 的整库复制可能直接把容器写满或打爆内存。
-        """
-        if self.low_memory:
-            self._passive_checkpoint()
-            logger.info("低内存保护：跳过 VACUUM，仅做 PASSIVE checkpoint")
-            return False
-        size = self.path.stat().st_size if self.path.exists() else 0
-        free = shutil.disk_usage(self.path.parent).free
-        if free < size * 1.2:
-            logger.warning(
-                "跳过 VACUUM：磁盘剩余空间不足（需要约 %.1f MB，剩余 %.1f MB）",
-                size * 1.2 / 1048576,
-                free / 1048576,
-            )
-            return False
-        # VACUUM 不能跑在事务里，因此单独建立自动提交连接。
-        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        try:
-            connection.execute("PRAGMA busy_timeout=30000")
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            connection.execute("VACUUM")
-            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        finally:
-            connection.close()
-        return True
 
     def latest_status(self, symbol: str) -> dict[str, Any] | None:
         with self.connect() as connection:

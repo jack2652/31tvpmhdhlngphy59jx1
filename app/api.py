@@ -7,7 +7,9 @@ import json
 import math
 import secrets
 import threading
+import asyncio
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
@@ -24,13 +26,25 @@ from app.runtime import release_memory
 from app.services.concurrency import SingleFlightCache, get_heavy_gate
 from app.services.earnings import summarize_earnings
 from app.services.history import HistoryService
+from app.services.push_events import PushEventHub
 from app.services.snapshots import SnapshotService, active_expirations, market_today, snapshot_age_seconds
+
+from app.api_helpers import (
+    _align_quote_with_history as _align_quote_with_history_impl,
+    _open_copied_from_previous, _positive_price,
+    snapshot_signature, spot_cache_bucket, trend_market_data as _trend_market_data_impl,
+)
+
+def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict[str, Any]:
+    return _trend_market_data_impl(bars, quote, today=market_today)
+
+def _align_quote_with_history(quote, history_payload, max_age_seconds):
+    return _align_quote_with_history_impl(quote, history_payload, max_age_seconds, today=market_today)
 
 
 # 后台 Gamma 窗口超过这个时间还没写回，只把这一轮标记失败。晚到的线程靠 started_at 避免覆盖新任务。
 GAMMA_JOB_TIMEOUT_SECONDS = 180
 GAMMA_JOB_TIMEOUT_MESSAGE = "分析超时，已停止本轮计算"
-
 
 _FORBIDDEN_PAGE = """<!doctype html>
 <html lang="en">
@@ -42,31 +56,6 @@ _FORBIDDEN_PAGE = """<!doctype html>
 </body>
 </html>
 """
-
-
-def snapshot_signature(value: Any) -> str:
-    """为缓存键生成稳定的输入摘要，避免仅依赖时间戳漏掉同批次数据变化。"""
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    return hashlib.blake2b(encoded, digest_size=16).hexdigest()
-
-
-def spot_cache_bucket(value: Any) -> float | None:
-    """把现价收成稳定格子，供价位缓存复用。
-
-    格子宽度大约是价格数量级的 1/500：200 元附近约 0.2 元。
-    半入规则与前端 Math.round 一致。未命中时仍用本次精确现价重算。
-    """
-    try:
-        price = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(price) or price <= 0:
-        return None
-    magnitude = 10 ** math.floor(math.log10(price))
-    step = magnitude / 500
-    units = math.floor(price / step + 0.5)
-    return round(units * step, 6)
-
 
 def install_access_guard(app: FastAPI, settings: Settings) -> None:
     """为页面和 API 安装统一访问密钥校验；空密钥保持旧部署兼容。"""
@@ -88,138 +77,9 @@ def install_access_guard(app: FastAPI, settings: Settings) -> None:
             return HTMLResponse(_FORBIDDEN_PAGE, status_code=403)
         return await call_next(request)
 
-
-def _positive_price(value: Any) -> float | None:
-    """把行情数值收成正的有限价格；缺失或无效时返回 None。"""
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(number) or number <= 0:
-        return None
-    return number
-
-
-def _open_copied_from_previous(current: Any, previous: Any) -> bool:
-    """今开和前一根日线开盘价几乎相同，视为未完成日线把昨开抄了进来。"""
-    current_number = _positive_price(current)
-    previous_number = _positive_price(previous)
-    if current_number is None or previous_number is None:
-        return False
-    tolerance = max(0.01, abs(previous_number) * 1e-4)
-    return abs(current_number - previous_number) <= tolerance
-
-
-def trend_market_data(bars: list[dict[str, Any]], quote: dict[str, Any]) -> dict[str, Any]:
-    """整理趋势面板的今开/昨收；非交易时段缺少当日 K 线时回退最近交易日。"""
-    valid = []
-    for bar in bars:
-        try:
-            day = str(bar.get("date"))[:10]
-            opening = float(bar.get("open")) if bar.get("open") is not None else None
-            close = float(bar.get("close")) if bar.get("close") is not None else None
-        except (TypeError, ValueError):
-            continue
-        valid.append({"date": day, "open": opening, "close": close})
-    valid.sort(key=lambda item: item["date"])
-    latest = valid[-1] if valid else {}
-    previous = valid[-2] if len(valid) > 1 else {}
-    # 只有盘中当日日线仍可能继续变化；盘后、夜盘和休市时，最新日线已经是最近一个完整交易日。
-    # 原先只比较日期，导致周一收盘后的夜盘仍把周一当成「今日」，错误返回周五收盘。
-    market_state = str(quote.get("market_state") or "").upper()
-    latest_is_today = (
-        latest.get("date") == market_today().isoformat()
-        and market_state == "REGULAR"
-    )
-    today_open = latest.get("open")
-    today_open_date = latest.get("date")
-    calendar_today = market_today().isoformat()
-    # “昨开”始终指最近一个已完成交易日的常规时段开盘价。
-    previous_open_row = previous if latest_is_today else latest
-    previous_open = previous_open_row.get("open")
-    previous_open_date = previous_open_row.get("date")
-    previous_close = previous.get("close") if latest_is_today else latest.get("close")
-    previous_close_date = previous.get("date") if latest_is_today else latest.get("date")
-    # Yahoo 在盘后/夜盘的 fast_info.previous_close 可能仍停留在前一个交易日。
-    # 扩展时段摘要中的 reference_close 是同一批分钟线对应的最近正常盘收盘价，
-    # 优先使用它，避免日线缓存或上游 previous_close 落后时显示上周五数据。
-    sessions = quote.get("sessions") or {}
-    # 盘前的基准来自上一交易日正式收盘；盘后/夜盘才使用盘后摘要。
-    # 不能固定先取 post：它可能保留 15:59 的 132.63，而 quote 已校准为正式收盘 132.60。
-    if market_state == "PRE":
-        regular_summary = sessions.get("pre") or {}
-    else:
-        regular_summary = sessions.get("post") or sessions.get("overnight") or {}
-    try:
-        reference_close = float(regular_summary.get("reference_close"))
-    except (TypeError, ValueError):
-        reference_close = None
-    as_of = str(regular_summary.get("as_of") or "")[:10]
-    history_is_behind_session = bool(as_of and (not latest.get("date") or latest.get("date") < as_of))
-    if market_state != "REGULAR" and history_is_behind_session and reference_close is not None and reference_close > 0:
-        previous_close = reference_close
-        previous_close_date = as_of
-    quote_open = _positive_price(quote.get("today_open"))
-    # 日线还没滚到今天，或今天的开盘价和前一根日线开盘价相同，都说明今开还不可信。
-    daily_missing_today = latest.get("date") != calendar_today
-    daily_open_copied = (not daily_missing_today) and _open_copied_from_previous(today_open, previous.get("open"))
-    if market_state in {"REGULAR", "POST", "OVERNIGHT"} and quote_open is not None and (daily_missing_today or daily_open_copied):
-        today_open = quote_open
-        today_open_date = calendar_today
-    elif today_open is None:
-        today_open = quote.get("today_open")
-    if previous_close is None:
-        previous_close = quote.get("previous_close")
-    return {
-        "today_open": today_open,
-        "previous_open": previous_open,
-        "previous_close": previous_close,
-        "today_open_date": today_open_date,
-        "previous_open_date": previous_open_date,
-        "previous_close_date": previous_close_date,
-        "market_state": quote.get("market_state"),
-    }
-
-
-def _align_quote_with_history(
-    quote: dict[str, Any],
-    history_payload: dict[str, Any] | None,
-    max_age_seconds: int,
-) -> dict[str, Any]:
-    """用新鲜日线校准缓存行情，避免首屏 quote 与趋势通道使用不同昨收。"""
-    if not quote or not isinstance(history_payload, dict):
-        return quote
-    age = snapshot_age_seconds(history_payload.get("fetched_at"))
-    if age is None or age > max_age_seconds:
-        return quote
-    bars = history_payload.get("bars")
-    if not isinstance(bars, list) or not bars:
-        return quote
-    recent_dates = sorted(str(item.get("date"))[:10] for item in bars if isinstance(item, dict) and item.get("date"))
-    try:
-        latest_day = date.fromisoformat(recent_dates[-1])
-    except (IndexError, ValueError):
-        return quote
-    # 防止上游刚返回一份“抓取时间新、实际交易日很旧”的降级历史覆盖可靠 quote。
-    # 正常周末/节假日最多相隔几天，超过一周说明它不能作为首屏昨收依据。
-    if (market_today() - latest_day).days > 7:
-        return quote
-    market = trend_market_data(bars, quote)
-    previous_close = _positive_price(market.get("previous_close"))
-    if previous_close is None:
-        return quote
-    aligned = dict(quote)
-    aligned["previous_close"] = previous_close
-    price = _positive_price(aligned.get("price"))
-    if price is not None:
-        aligned["change_percent"] = (price - previous_close) / previous_close * 100
-    return aligned
-
-
 def create_router(database: Database, snapshots: SnapshotService, provider: MarketDataProvider, settings: Settings) -> APIRouter:
     router = APIRouter(prefix="/api")
+    push_hub = PushEventHub(database, snapshots.refresh)
     history = HistoryService(
         database, provider, settings.history_max_age_seconds, settings.extremes_max_age_seconds
     )
@@ -228,6 +88,33 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
     levels_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=2 if settings.low_memory else 32)
     gamma_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=2 if settings.low_memory else 16)
     chain_cache: SingleFlightCache[tuple[Any, ...], dict[str, Any]] = SingleFlightCache(maxsize=2 if settings.low_memory else 32)
+
+    @router.get("/events/{stock_symbol}")
+    async def events(stock_symbol: str, request: Request, expiration: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"), last_event_id: int | None = Query(default=None, ge=0)):
+        """SSE update feed. Initial data stays on REST; frames only invalidate changed symbol snapshots."""
+        normalized = symbol(stock_symbol)
+        header_id = request.headers.get("last-event-id")
+        cursor = last_event_id if last_event_id is not None else 0
+        if header_id and header_id.isdigit():
+            cursor = max(cursor, int(header_id))
+
+        async def stream():
+            async for queue in push_hub.subscribe(normalized, expiration, cursor):
+                if cursor <= 0:
+                    ready = json.dumps({"symbol": normalized, "kind": "ready"})
+                    yield f"event: ready\ndata: {ready}\n\n"
+                while not await request.is_disconnected():
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15)
+                        yield push_hub.format_event(event)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        })
 
     def shared_cached(
         namespace: str,
@@ -654,7 +541,7 @@ def create_router(database: Database, snapshots: SnapshotService, provider: Mark
 
     @router.post("/refresh/{stock_symbol}")
     def refresh(stock_symbol: str, expiration: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"), max_age: int = Query(default=60, ge=0, le=3600)) -> dict[str, Any]:
-        """刷新一次快照；本地快照在 max_age 秒内时直接复用（skipped=True），不再请求上游接口。"""
+        """刷新一次快照；调用方可指定缓存新鲜期，SSE 自动调度由订阅服务独立控制。"""
         normalized = symbol(stock_symbol)
         try:
             result = snapshots.refresh(normalized, expiration, max_age_seconds=max_age)

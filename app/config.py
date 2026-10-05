@@ -48,9 +48,7 @@ class Settings:
     database_path: Path
     proxy_url: str | None
     default_symbols: tuple[str, ...]
-    refresh_interval_seconds: int
     raw_retention_days: int
-    cleanup_interval_seconds: int
     scheduler_enabled: bool
     # 日线历史（斐波那契/筹码分布/承接位）的回源间隔，默认 1 小时
     history_max_age_seconds: int = 3600
@@ -64,8 +62,6 @@ class Settings:
     upstream_concurrency: int = 6
     # 等待上游请求槽位的最长时间，超时后优先回退本地旧数据
     upstream_wait_seconds: int = 20
-    # 页面倒计时和自动刷新新鲜期，单位秒；与后台定时刷新间隔分开配置
-    auto_refresh_seconds: int = 60
     # 256MB 级别的机器自动开启；强制串行重任务、缩小缓存，并收紧上游并发
     low_memory: bool = False
     # SQLite 共享分析缓存条数。低内存时少留几份，避免大 JSON 反复进出内存
@@ -77,9 +73,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         raw_symbols = os.getenv("DEFAULT_SYMBOLS", "QQQ")
-        symbols = tuple(dict.fromkeys(s.strip().upper() for s in raw_symbols.split(",") if s.strip()))
-        if not symbols:
-            raise ValueError("DEFAULT_SYMBOLS 至少需要一个标的")
+        symbols = tuple(dict.fromkeys(s.strip().upper() for s in raw_symbols.split(",") if s.strip())) or ("QQQ",)
         low_memory = low_memory_enabled()
         upstream_concurrency = 1 if low_memory else _positive_int("UPSTREAM_CONCURRENCY", 6)
         upstream_wait = _positive_int("UPSTREAM_WAIT_SECONDS", 20)
@@ -89,9 +83,7 @@ class Settings:
             database_path=Path(os.getenv("DATABASE_PATH", "data/options.db")),
             proxy_url=os.getenv("MARKET_PROXY", "").strip() or None,
             default_symbols=symbols,
-            refresh_interval_seconds=_positive_int("REFRESH_INTERVAL_SECONDS", 60),
             raw_retention_days=_positive_int("RAW_RETENTION_DAYS", 30),
-            cleanup_interval_seconds=_positive_int("CLEANUP_INTERVAL_SECONDS", 86400),
             scheduler_enabled=_bool("SCHEDULER_ENABLED", True),
             history_max_age_seconds=_positive_int("HISTORY_MAX_AGE_SECONDS", 3600),
             extremes_max_age_seconds=_positive_int("EXTREMES_MAX_AGE_SECONDS", 86400),
@@ -99,7 +91,6 @@ class Settings:
             access_key=os.getenv("ACCESS_KEY", "").strip(),
             upstream_concurrency=upstream_concurrency,
             upstream_wait_seconds=upstream_wait,
-            auto_refresh_seconds=_positive_int("AUTO_REFRESH_SECONDS", 60),
             low_memory=low_memory,
             analysis_cache_entries=8 if low_memory else 128,
             alpaca_api_key=os.getenv("ALPACA_API_KEY", "").strip(),

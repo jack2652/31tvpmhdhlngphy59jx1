@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 # 跨期限 Gamma 窗口的单到期日新鲜期（秒）：窗口刷新很慢，短期内的重复请求直接跳过。
-# 与页面自动刷新同一口径。120 秒会让 Gamma 窗口比现价多停一轮。
+# 选中期限行情的刷新由活跃 SSE 订阅负责；Gamma 窗口仍使用自己的较慢缓存周期。
 WINDOW_FRESH_SECONDS = 60
 # 页面请求有明确超时；锁竞争应更早回退，避免请求线程堆积到一分钟以上。
 REFRESH_LOCK_TIMEOUT_SECONDS = 10
@@ -429,6 +429,8 @@ class SnapshotService:
                 fetched_at = iso()
                 self.database.write_snapshot(quote, [], fetched_at)
                 self.database.finish_run(run_id, "success", 0)
+                self.database.publish_push_event(normalized, "quote")
+                self.database.publish_push_event(normalized, "snapshot", None)
                 logger.info("%s 没有可用的期权到期日，本次只记录现货快照", normalized)
                 return {"symbol": normalized, "expiration": None, "fetched_at": fetched_at, "rows": 0, "quote_only": True}
             selected = expiration or available[0]
@@ -452,6 +454,8 @@ class SnapshotService:
                     quote, rows, fetched_at = self.provider.fetch(normalized, selected)
             written = self.database.write_snapshot(self._with_cached_sessions(normalized, quote), rows, fetched_at)
             self.database.finish_run(run_id, "success", written)
+            self.database.publish_push_event(normalized, "quote")
+            self.database.publish_push_event(normalized, "snapshot", selected)
             return {
                 "symbol": normalized,
                 "expiration": selected,
@@ -471,16 +475,6 @@ class SnapshotService:
             cached_quote = self.database.latest_quote(normalized) or {}
             quote["sessions"] = parse_sessions(cached_quote.get("sessions_json"))
         return quote
-
-    def refresh_default(self, symbols: tuple[str, ...]) -> list[dict[str, Any]]:
-        results = []
-        for symbol in symbols:
-            try:
-                results.append(self.refresh(symbol))
-            except Exception as exc:
-                logger.warning("定时刷新 %s 失败: %s", symbol, exc)
-                continue
-        return results
 
     def refresh_window(
         self,

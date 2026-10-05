@@ -47,7 +47,7 @@ provider = HybridMarketDataProvider(
     overnight_provider=overnight_provider,
 )
 snapshots = SnapshotService(database, provider)
-scheduler = Scheduler(settings, snapshots, database)
+scheduler = Scheduler(settings, database)
 
 # uvicorn 默认只放行 WARNING 及以上，后台刷新与体积清理的进度日志需要显式配置才可见。
 app_logger = logging.getLogger("app")
@@ -108,7 +108,6 @@ def index():
     page = (static_dir / "index.html").read_text(encoding="utf-8")
     page = page.replace("__DEFAULT_SYMBOL__", settings.default_symbols[0])
     page = page.replace("__ACCESS_KEY_REQUIRED__", "true" if settings.access_key else "false")
-    page = page.replace("__AUTO_REFRESH_SECONDS__", str(settings.auto_refresh_seconds))
     # 每次源码更新后自动生成新的静态资源版本号，避免浏览器继续使用旧版 app.js。
     # 时间戳只用于缓存键，不参与业务数据计算；使用纳秒可覆盖同一秒内的快速更新。
     asset_paths = (

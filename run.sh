@@ -357,14 +357,28 @@ ensure_env_file() {
   ok "已生成访问密钥 ACCESS_KEY=$access_key"
 }
 
-# 读取 .env 中的配置项（取最后一次出现的值），不存在时返回默认值
+# 读取 .env 中的配置项（取最后一次出现的值），不存在或留空时返回默认值。
+# 用一次 awk 代替 grep/tail/cut/tr/sed 多段管道，减少每次调用启动的子进程数。
 read_env_value() {
-  local key="$1" default_value="$2" value=""
+  local key="$1" default_value="$2"
   if [ -f "$ENV_FILE" ]; then
-    value="$(grep -E "^[[:space:]]*${key}=" "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '\r')"
+    awk -v key="$key" -v fallback="$default_value" '
+      {
+        line = $0
+        sub(/^[[:space:]]*/, "", line)
+        prefix = key "="
+        if (index(line, prefix) == 1) {
+          value = substr(line, length(prefix) + 1)
+          gsub(/\r/, "", value)
+          sub(/^[[:space:]]*/, "", value)
+          sub(/[[:space:]]*$/, "", value)
+        }
+      }
+      END { print value != "" ? value : fallback }
+    ' "$ENV_FILE"
+  else
+    printf '%s' "$default_value"
   fi
-  value="$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-  if [ -n "$value" ]; then printf '%s' "$value"; else printf '%s' "$default_value"; fi
 }
 
 # 写入配置项：已存在则就地替换（并清掉重复项），不存在则追加
@@ -372,13 +386,16 @@ write_env_value() {
   local key="$1" value="$2" tmp
   [ -f "$ENV_FILE" ] || ensure_env_file || return 1
   tmp="$(mktemp "${TMPDIR:-/tmp}/runsh.XXXXXX")" || return 1
-  awk -v k="$key" -v v="$value" '
+  if awk -v k="$key" -v v="$value" '
     BEGIN { written = 0 }
     $0 ~ "^[[:space:]]*" k "=" { if (!written) { print k "=" v; written = 1 } ; next }
     { print }
     END { if (!written) print k "=" v }
-  ' "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"
+  ' "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"; then
+    return 0
+  fi
   rm -f "$tmp" 2>/dev/null
+  return 1
 }
 
 # 一次性把「Python / 虚拟环境 / 依赖 / .env」准备好，已就绪的部分自动跳过
@@ -765,8 +782,12 @@ systemd_unit_installed() {
   [ -f "$SYSTEMD_UNIT_FILE" ]
 }
 
+systemd_managed() {
+  systemd_available && systemd_unit_installed
+}
+
 systemd_service_active() {
-  systemd_available && systemd_unit_installed && systemctl is-active --quiet "$SYSTEMD_UNIT_NAME"
+  systemd_managed && systemctl is-active --quiet "$SYSTEMD_UNIT_NAME"
 }
 
 systemd_service_account() {
@@ -780,18 +801,38 @@ systemd_service_account() {
   printf '%s\t%s' "$owner" "$group"
 }
 
+# 轮询 HTTP 健康检查，供 systemd 和后台启动共用；可选监视 PID 以快速发现启动即崩。
+wait_for_health() {
+  local timeout="$1" stop_if_app_dies="${2:-false}" elapsed=0 missing=0 pid=""
+  while [ "$elapsed" -lt "$timeout" ]; do
+    if health_ok; then
+      printf '%s' "$elapsed"
+      return 0
+    fi
+    if [ "$stop_if_app_dies" = true ]; then
+      pid="$(app_pid 2>/dev/null || true)"
+      if [ -z "$pid" ]; then
+        missing=$((missing + 1))
+        # 连续 5 秒没有应用进程，视为启动即崩，不必等满超时。
+        [ "$missing" -lt 5 ] || return 2
+      else
+        missing=0
+      fi
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  return 1
+}
+
 systemd_start_service() {
   local waited=0
   run_root systemctl start "$SYSTEMD_UNIT_NAME" || return 1
   # systemctl start 只代表进程被拉起，仍需确认 HTTP 端口已经接受请求。
-  while [ "$waited" -lt 45 ]; do
-    if health_ok; then
-      ok "systemd 服务已启动，健康检查通过（耗时 ${waited}s）"
-      return 0
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
+  if waited="$(wait_for_health 45)"; then
+    ok "systemd 服务已启动，健康检查通过（耗时 ${waited}s）"
+    return 0
+  fi
   fail "systemd 服务启动后 45s 内未通过健康检查"
   run_root systemctl status "$SYSTEMD_UNIT_NAME" --no-pager 2>&1 | tail -n 30 || true
   return 1
@@ -909,7 +950,7 @@ foreground_app() {
 
 # 启动应用进程本体（不含看门狗）：已在运行直接返回，端口被占用则打印占用者
 start_app_internal() {
-  local port existing py waited=0 dead=0 pid=""
+  local port existing py waited=0 pid="" wait_status=0
   port="$(app_port)"
   existing="$(app_pid 2>/dev/null || true)"
   if [ -n "$existing" ]; then
@@ -928,25 +969,18 @@ start_app_internal() {
   # 工作目录必须是项目根目录：python -m app 与进程识别（/proc/<pid>/cwd）都依赖它。
   # 分配器环境变量只传给应用进程。
   ( cd "$PROJECT_DIR" && apply_low_memory_allocator && spawn_detached "$APP_LOG" "$py" -m app )
-  while [ "$waited" -lt "$START_TIMEOUT" ]; do
-    sleep 1
-    waited=$((waited + 1))
-    if health_ok; then
-      pid="$(app_pid 2>/dev/null || true)"
-      ok "应用已启动（PID ${pid:-未知}，端口 $port），健康检查通过，耗时 ${waited}s"
-      return 0
-    fi
-    if [ -z "$(app_pid 2>/dev/null || true)" ]; then
-      dead=$((dead + 1))
-      # 连续 5 秒都看不到进程，说明是启动即崩，不必等满超时
-      if [ "$dead" -ge 5 ]; then
-        break
-      fi
-    else
-      dead=0
-    fi
-  done
-  fail "启动失败：${START_TIMEOUT}s 内未通过健康检查"
+  wait_status=0
+  waited="$(wait_for_health "$START_TIMEOUT" true)" || wait_status=$?
+  if [ "$wait_status" -eq 0 ]; then
+    pid="$(app_pid 2>/dev/null || true)"
+    ok "应用已启动（PID ${pid:-未知}，端口 $port），健康检查通过，耗时 ${waited}s"
+    return 0
+  fi
+  if [ "$wait_status" -eq 2 ]; then
+    fail "应用进程快速退出，未能启动（端口 $port）"
+  else
+    fail "启动失败：${START_TIMEOUT}s 内未通过健康检查"
+  fi
   tail_log "$APP_LOG" 20
   return 1
 }
@@ -975,98 +1009,92 @@ start_watchdog() {
   return 1
 }
 
+# 通用 PID 优雅停止：先发 TERM，限时等待，超时后 KILL。
+stop_pid() {
+  local pid="$1" label="$2" waited=0
+  info "停止${label}（PID $pid）"
+  kill "$pid" 2>/dev/null || true
+  while [ "$waited" -lt "$STOP_TIMEOUT" ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "${label}未在 ${STOP_TIMEOUT}s 内退出，强制结束"
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+}
+
 stop_watchdog() {
-  local pid waited=0
+  local pid
   pid="$(watchdog_pid 2>/dev/null || true)"
   if [ -z "$pid" ]; then
     info "看门狗未在运行"
     return 0
   fi
-  info "停止看门狗（PID $pid）"
-  kill "$pid" 2>/dev/null || true
-  while [ "$waited" -lt "$STOP_TIMEOUT" ]; do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    warn "看门狗未在 ${STOP_TIMEOUT}s 内退出，强制结束"
-    kill -9 "$pid" 2>/dev/null || true
-    sleep 1
-  fi
-  if [ -f "$WATCHDOG_PID_FILE" ]; then
-    rm -f "$WATCHDOG_PID_FILE" 2>/dev/null
-  fi
+  stop_pid "$pid" "看门狗"
+  rm -f "$WATCHDOG_PID_FILE" 2>/dev/null || true
   ok "看门狗已停止"
 }
 
 stop_app_process() {
-  local pid waited=0 extra=""
+  local pid extra=""
   pid="$(app_pid 2>/dev/null || true)"
   if [ -z "$pid" ]; then
     info "应用未在运行"
     return 0
   fi
-  info "停止应用（PID $pid）"
-  kill "$pid" 2>/dev/null || true
-  while [ "$waited" -lt "$STOP_TIMEOUT" ]; do
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    warn "应用未在 ${STOP_TIMEOUT}s 内退出，强制结束"
-    kill -9 "$pid" 2>/dev/null || true
-    sleep 1
-  fi
+  stop_pid "$pid" "应用"
   # 端口仍被占用说明还有残留（例如手动起过的实例），再做一次精确清理
   if port_in_use "$(app_port)"; then
     extra="$(scan_pids "-m app" | head -n 1)"
     if [ -n "$extra" ]; then
       warn "发现残留进程 PID $extra，一并结束"
-      kill "$extra" 2>/dev/null || true
-      sleep 1
-      kill -9 "$extra" 2>/dev/null || true
+      stop_pid "$extra" "残留应用"
     fi
   fi
-  if [ -f "$APP_PID_FILE" ]; then
-    rm -f "$APP_PID_FILE" 2>/dev/null
-  fi
+  rm -f "$APP_PID_FILE" 2>/dev/null || true
   ok "应用已停止"
+}
+
+# 按当前托管方式启动并做统一的访问地址提示。
+start_managed_app() {
+  if systemd_managed; then
+    systemd_start_service || return 1
+  else
+    start_app_internal || return 1
+    start_watchdog || warn "应用已启动，但看门狗没起来（不影响使用，可稍后重试）"
+  fi
+  show_access_url
 }
 
 start_app() {
   section "启动应用"
   ensure_runtime || return 1
-  if systemd_unit_installed && systemd_available; then
-    systemd_start_service || return 1
-    show_access_url
-    return 0
-  fi
-  start_app_internal || return 1
-  start_watchdog || warn "应用已启动，但看门狗没起来（不影响使用，可稍后重试）"
-  show_access_url
-  return 0
+  start_managed_app
 }
 
 stop_app() {
   section "停止应用"
   # 先停看门狗，否则它会把刚停掉的应用又拉起来
   stop_watchdog
-  if systemd_unit_installed && systemd_available; then
+  if systemd_managed; then
     systemd_stop_service || return 1
   fi
   stop_app_process
-  sleep 1
   if app_running; then
-    warn "看门狗在退出前又拉起过一次应用，再次停止"
+    warn "应用仍在运行，再次停止"
     stop_app_process
+  fi
+  if app_running; then
+    fail "无法确认应用已停止"
+    return 1
   fi
   return 0
 }
 
 restart_app() {
-  stop_app
+  stop_app || return 1
   start_app
 }
 
@@ -1173,17 +1201,10 @@ show_status() {
   printf '        %s\n' "$WATCHDOG_LOG"
 }
 
-action_install() {
-  section "检测环境并安装"
-  ensure_runtime || return 1
-  return 0
-}
-
 action_status() {
   show_status
   printf '\n'
   tail_log "$APP_LOG" 15
-  return 0
 }
 
 # 配置菜单用的单项修改：只修改当前选中的配置项
@@ -1279,36 +1300,43 @@ ask_access_key() {
   return 0
 }
 
+# 每行按「键|默认值|输入类型|说明」维护，摘要与编辑菜单读取同一份配置定义。
+CONFIG_ROWS=(
+  'DATABASE_PATH|data/options.db|plain|SQLite 数据库文件路径'
+  'HOST|0.0.0.0|plain|Web 服务监听地址'
+  'PORT|8000|plain|Web 服务监听端口（1024-65535）'
+  'ACCESS_KEY||access|页面和 API 访问密钥'
+  'MARKET_PROXY|（空）|plain|上游行情接口代理地址（留空表示不使用代理）'
+  'DEFAULT_SYMBOLS|QQQ|plain|默认页面标的（兼容逗号分隔，仅取第一项）'
+  'RAW_RETENTION_DAYS|30|plain|历史数据保留天数（每天自动清理）'
+  'DATABASE_MAX_MB|256M|plain|SQLite 体积上限（512 / 512M / 1G，0 表示不限制）'
+  'HISTORY_MAX_AGE_SECONDS|3600|plain|日线历史回源间隔（秒）'
+  'EXTREMES_MAX_AGE_SECONDS|86400|plain|历史极值回源间隔（秒）'
+  'SCHEDULER_ENABLED|true|plain|是否启用定时历史清理和数据库维护（true/false）'
+  'UPSTREAM_CONCURRENCY|6|plain|单进程上游最大并发数'
+  'UPSTREAM_WAIT_SECONDS|20|plain|等待上游并发槽位的最长秒数'
+  'WEB_WORKERS|1|plain|Web worker 数量（小内存机器保持 1）'
+  'LOW_MEMORY|auto|plain|低内存保护（auto/true/false，512MB 及以下自动开启）'
+  'ALPACA_API_KEY||secret|Alpaca API Key（夜盘股票行情）'
+  'ALPACA_API_SECRET||secret|Alpaca API Secret（夜盘股票行情）'
+)
+
 show_config_summary() {
-  local access_key alpaca_key alpaca_secret
-  access_key="$(read_env_value ACCESS_KEY "")"
-  alpaca_key="$(read_env_value ALPACA_API_KEY "")"
-  alpaca_secret="$(read_env_value ALPACA_API_SECRET "")"
-  printf '  配置文件：%s\n' "$ENV_FILE"
-  printf '  1) DATABASE_PATH=%s\n' "$(read_env_value DATABASE_PATH data/options.db)"
-  printf '  2) HOST=%s\n' "$(read_env_value HOST 0.0.0.0)"
-  printf '  3) PORT=%s\n' "$(read_env_value PORT 8000)"
-  printf '  4) ACCESS_KEY=%s\n' "$(mask_access_key "$access_key")"
-  printf '  5) MARKET_PROXY=%s\n' "$(read_env_value MARKET_PROXY "（空）")"
-  printf '  6) DEFAULT_SYMBOLS=%s\n' "$(read_env_value DEFAULT_SYMBOLS QQQ)"
-  printf '  7) REFRESH_INTERVAL_SECONDS=%s\n' "$(read_env_value REFRESH_INTERVAL_SECONDS 30)"
-  printf '  8) RAW_RETENTION_DAYS=%s\n' "$(read_env_value RAW_RETENTION_DAYS 30)"
-  printf '  9) CLEANUP_INTERVAL_SECONDS=%s\n' "$(read_env_value CLEANUP_INTERVAL_SECONDS 86400)"
-  printf ' 10) DATABASE_MAX_MB=%s\n' "$(read_env_value DATABASE_MAX_MB 256M)"
-  printf ' 11) HISTORY_MAX_AGE_SECONDS=%s\n' "$(read_env_value HISTORY_MAX_AGE_SECONDS 3600)"
-  printf ' 12) EXTREMES_MAX_AGE_SECONDS=%s\n' "$(read_env_value EXTREMES_MAX_AGE_SECONDS 86400)"
-  printf ' 13) SCHEDULER_ENABLED=%s\n' "$(read_env_value SCHEDULER_ENABLED true)"
-  printf ' 14) UPSTREAM_CONCURRENCY=%s\n' "$(read_env_value UPSTREAM_CONCURRENCY 6)"
-  printf ' 15) UPSTREAM_WAIT_SECONDS=%s\n' "$(read_env_value UPSTREAM_WAIT_SECONDS 20)"
-  printf ' 16) WEB_WORKERS=%s\n' "$(read_env_value WEB_WORKERS 1)"
-  printf ' 17) AUTO_REFRESH_SECONDS=%s\n' "$(read_env_value AUTO_REFRESH_SECONDS 30)"
-  printf ' 18) LOW_MEMORY=%s\n' "$(read_env_value LOW_MEMORY auto)"
-  printf ' 19) ALPACA_API_KEY=%s\n' "$(mask_access_key "$alpaca_key")"
-  printf ' 20) ALPACA_API_SECRET=%s\n' "$(mask_access_key "$alpaca_secret")"
+  local index=0 key default_value type description value
+  printf '  配置文件：%s  # 当前读取的配置文件\n' "$ENV_FILE"
+  for row in "${CONFIG_ROWS[@]}"; do
+    IFS='|' read -r key default_value type description <<<"$row"
+    value="$(read_env_value "$key" "$default_value")"
+    case "$type" in access | secret) value="$(mask_access_key "$value")" ;; esac
+    printf ' %2d) %s=%s  # %s' "$((index + 1))" "$key" "$value" "$description"
+    case "$type" in access | secret) printf '（已脱敏）' ;; esac
+    printf '\n'
+    index=$((index + 1))
+  done
 }
 
 validate_config_values() {
-  local port limit workers concurrency wait_seconds auto_refresh low_memory
+  local port limit workers concurrency wait_seconds low_memory
   port="$(read_env_value PORT 8000)"
   case "$port" in
     '' | *[!0-9]*)
@@ -1332,9 +1360,6 @@ validate_config_values() {
   [ "$workers" -ge 1 ] || { fail "WEB_WORKERS 必须大于等于 1"; return 1; }
   [ "$concurrency" -ge 1 ] || { fail "UPSTREAM_CONCURRENCY 必须大于等于 1"; return 1; }
   [ "$wait_seconds" -ge 1 ] || { fail "UPSTREAM_WAIT_SECONDS 必须大于等于 1"; return 1; }
-  auto_refresh="$(read_env_value AUTO_REFRESH_SECONDS 60)"
-  case "$auto_refresh" in '' | *[!0-9]*) fail "AUTO_REFRESH_SECONDS 必须是正整数"; return 1 ;; esac
-  [ "$auto_refresh" -ge 1 ] || { fail "AUTO_REFRESH_SECONDS 必须大于等于 1"; return 1; }
   low_memory="$(read_env_value LOW_MEMORY auto)"
   case "$(printf '%s' "$low_memory" | tr '[:upper:]' '[:lower:]')" in
     '' | auto | true | false | 1 | 0 | yes | no | on | off) ;;
@@ -1344,7 +1369,7 @@ validate_config_values() {
 }
 
 action_config() {
-  local choice="" answer="" before="" after=""
+  local choice="" answer="" before="" after="" index key description type default_value
   section "修改配置（.env）"
   ensure_env_file || return 1
   before="$(cksum "$ENV_FILE" 2>/dev/null || true)"
@@ -1355,28 +1380,19 @@ action_config() {
     printf '请选择要修改的配置项：'
     read -r choice || break
     case "$choice" in
-      1) ask_env_value DATABASE_PATH "SQLite 数据库路径" ;;
-      2) ask_env_value HOST "监听地址（0.0.0.0 表示允许局域网访问）" ;;
-      3) ask_env_value PORT "监听端口（1024-65535）" ;;
-      4) ask_access_key ;;
-      5) ask_env_value MARKET_PROXY "上游行情接口代理地址（留空表示不使用代理）" ;;
-      6) ask_env_value DEFAULT_SYMBOLS "默认标的（多个用英文逗号分隔）" ;;
-      7) ask_env_value REFRESH_INTERVAL_SECONDS "后台刷新间隔（秒）" ;;
-      8) ask_env_value RAW_RETENTION_DAYS "历史数据保留天数" ;;
-      9) ask_env_value CLEANUP_INTERVAL_SECONDS "历史清理间隔（秒）" ;;
-      10) ask_env_value DATABASE_MAX_MB "SQLite 体积上限（512 / 512M / 1G，0 表示不限制）" ;;
-      11) ask_env_value HISTORY_MAX_AGE_SECONDS "日线历史回源间隔（秒）" ;;
-      12) ask_env_value EXTREMES_MAX_AGE_SECONDS "历史极值回源间隔（秒）" ;;
-      13) ask_env_value SCHEDULER_ENABLED "是否启用后台刷新和清理（true/false）" ;;
-      14) ask_env_value UPSTREAM_CONCURRENCY "单进程上游最大并发数" ;;
-      15) ask_env_value UPSTREAM_WAIT_SECONDS "等待上游并发槽位的最长秒数" ;;
-      16) ask_env_value WEB_WORKERS "Web worker 数量（小内存机器保持 1）" ;;
-      17) ask_env_value AUTO_REFRESH_SECONDS "页面自动刷新间隔（秒）" ;;
-      18) ask_env_value LOW_MEMORY "低内存保护（auto/true/false，512MB 及以下自动开启）" ;;
-      19) ask_secret_env_value ALPACA_API_KEY "Alpaca API Key（夜盘股票行情）" ;;
-      20) ask_secret_env_value ALPACA_API_SECRET "Alpaca API Secret（夜盘股票行情）" ;;
       0 | "") break ;;
-      *) warn "无效选择：$choice" ;;
+      *[!0-9]* | 0*) warn "无效选择：$choice"; continue ;;
+    esac
+    index=$((choice - 1))
+    if [ "$index" -lt 0 ] || [ "$index" -ge "${#CONFIG_ROWS[@]}" ]; then
+      warn "无效选择：$choice"
+      continue
+    fi
+    IFS='|' read -r key default_value type description <<<"${CONFIG_ROWS[index]}"
+    case "$type" in
+      access) ask_access_key ;;
+      secret) ask_secret_env_value "$key" "$description" ;;
+      *) ask_env_value "$key" "$description" ;;
     esac
   done
   validate_config_values || return 1
@@ -1435,27 +1451,87 @@ uninstall_runtime() {
   return 0
 }
 
+menu_status_hint() {
+  local pid port
+  port="$(app_port)"
+  pid="$(app_pid 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    if health_ok; then
+      printf '  当前服务：运行正常（端口 %s）\n' "$port"
+    else
+      printf '  当前服务：进程存在但健康检查未通过（端口 %s）\n' "$port"
+    fi
+  else
+    printf '  当前服务：未运行（端口 %s）\n' "$port"
+  fi
+}
+
+# 菜单选项统一用「编号|标题|动作」声明，展示与分发不再各维护一份 case。
+run_menu() {
+  local title="$1" prompt="$2" mode="$3" choice entry number label action result found
+  shift 3
+  while true; do
+    if [ "$mode" = main ]; then
+      printf '\n%s================= Option Scope 运维菜单 =================%s\n' "$C_BOLD" "$C_RESET"
+    else
+      section "$title"
+    fi
+    if [ "$mode" = main ]; then
+      menu_status_hint
+    fi
+    for entry in "$@"; do
+      IFS='|' read -r number label action <<<"$entry"
+      if [ "$action" = group ]; then
+        printf '\n  %s\n' "$label"
+      else
+        printf '  %2s) %s\n' "$number" "$label"
+      fi
+    done
+    if [ "$mode" = main ]; then
+      printf '\n%s---------------------------------------------------------%s\n' "$C_BOLD" "$C_RESET"
+      printf '  输入 0 退出；直接回车刷新菜单\n'
+      printf '%s=========================================================%s\n' "$C_BOLD" "$C_RESET"
+    else
+      printf '\n  输入 0 返回\n'
+    fi
+    printf '%s' "$prompt"
+    if ! read -r choice; then
+      return 0
+    fi
+    [ -n "$choice" ] || { [ "$mode" = main ] && continue || return 0; }
+    found=false
+    result=0
+    for entry in "$@"; do
+      IFS='|' read -r number label action <<<"$entry"
+      if [ "$choice" = "$number" ]; then
+        found=true
+        case "$action" in
+          quit) return 0 ;;
+          return) return 0 ;;
+          *) "$action"; result=$? ;;
+        esac
+        break
+      fi
+    done
+    [ "$found" = true ] || warn "无效选择：$choice"
+    if [ "$mode" != main ]; then
+      return "$result"
+    fi
+  done
+}
+
+action_install_runtime() {
+  section "检测环境并安装"
+  ensure_runtime
+}
+
 action_service() {
-  local choice=""
-  section "服务管理"
-  printf '  1) 重启应用\n'
-  printf '  2) 更新依赖并重启（改过 pyproject.toml 时用）\n'
-  printf '  3) 卸载运行环境（停止服务并删除 .venv/.run/logs）\n'
-  printf '  4) 安装/启用 systemd 服务（生产环境推荐）\n'
-  printf '  5) 移除 systemd 服务（恢复 shell 看门狗）\n'
-  printf '  0) 返回\n'
-  printf '请选择：'
-  read -r choice || return 0
-  case "$choice" in
-    1) restart_app ;;
-    2) update_deps_and_restart ;;
-    3) uninstall_runtime ;;
-    4) install_systemd_service ;;
-    5) remove_systemd_service ;;
-    0 | "") return 0 ;;
-    *) warn "无效选择：$choice" ;;
-  esac
-  return 0
+  run_menu "高级服务管理" "请选择：" once \
+    '1|更新依赖并重启（改过 pyproject.toml 时用）|update_deps_and_restart' \
+    '2|安装/启用 systemd 服务（生产环境推荐）|install_systemd_service' \
+    '3|移除 systemd 服务（恢复 shell 看门狗）|remove_systemd_service' \
+    '4|卸载运行环境（停止服务并删除 .venv/.run/logs）|uninstall_runtime' \
+    '0|返回|return'
 }
 
 # 环境自检：把「装不上 / 起不来 / 取不到数」的常见原因一次性列出来
@@ -1589,7 +1665,7 @@ Option Scope 运维脚本用法：
   ./run.sh install-service     安装并启用 systemd 常驻服务（生产环境推荐）
   ./run.sh remove-service      移除 systemd 服务，恢复 shell 看门狗
   ./run.sh foreground          前台运行应用（供 systemd 使用）
-  ./run.sh update             更新应用：停止 → 拉取最新源码 → 依赖检查 → 重启（菜单第 3 项）
+  ./run.sh update             更新应用：停止 → 拉取最新源码 → 依赖检查 → 重启（菜单第 6 项）
   ./run.sh help               显示本帮助
 从零安装（当前目录下没有源码时先自动拉取，再继续执行）：
   bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
@@ -1597,54 +1673,25 @@ Option Scope 运维脚本用法：
 TXT
 }
 
-show_menu() {
-  printf '\n%s================= Option Scope 运维菜单 =================%s\n' "$C_BOLD" "$C_RESET"
-  printf '  1) 检测环境并安装依赖（已安装的步骤自动跳过）\n'
-  printf '  2) 启动应用（后台运行 + 看门狗守护）\n'
-  printf '  3) 更新应用（停止 → 拉取最新源码 → 依赖检查 → 重启）\n'
-  printf '  4) 服务管理（重启 / systemd / 更新依赖 / 卸载运行环境）\n'
-  printf '  5) 修改配置（.env 交互式编辑）\n'
-  printf '  6) 停止应用（含看门狗）\n'
-  printf '  7) 查看状态与日志\n'
-  printf '  8) 数据库工具（清理 / 备份 / 统计）\n'
-  printf '  9) 环境自检（doctor）\n'
-  printf '  0) 退出\n'
-  printf '%s=========================================================%s\n' "$C_BOLD" "$C_RESET"
-}
+MAIN_MENU_ROWS=(
+  '|日常操作|group'
+  '1|查看服务状态和日志|action_status'
+  '2|启动应用|start_app'
+  '3|停止应用|stop_app'
+  '4|重启应用|restart_app'
+  '5|修改配置|action_config'
+  '|安装与维护|group'
+  '6|更新应用并重启|action_update'
+  '7|检测环境并安装/修复依赖|action_install_runtime'
+  '8|数据库工具（清理 / 备份 / 统计）|action_database'
+  '9|环境自检|action_doctor'
+  '10|高级服务管理（systemd / 依赖更新 / 卸载）|action_service'
+  '0|退出|quit'
+)
 
 menu_loop() {
-  local choice=""
-  while true; do
-    show_menu
-    printf '请选择操作 [0-9]：'
-    if ! read -r choice; then
-      printf '\n'
-      break
-    fi
-    case "$choice" in
-      1) action_install ;;
-      2) action_start ;;
-      3) action_update ;;
-      4) action_service ;;
-      5) action_config ;;
-      6) action_stop ;;
-      7) action_status ;;
-      8) action_database ;;
-      9) action_doctor ;;
-      0 | q | quit | exit) break ;;
-      "") ;;
-      *) warn "无效选择：$choice" ;;
-    esac
-  done
+  run_menu "运维菜单" "请选择操作（输入编号）：" main "${MAIN_MENU_ROWS[@]}"
   info "已退出。"
-}
-
-action_start() {
-  start_app
-}
-
-action_stop() {
-  stop_app
 }
 
 # ---------- 引导安装：curl | bash 场景 ----------
@@ -1676,32 +1723,49 @@ ensure_git() {
   return 1
 }
 
-# 没有 git 时的兜底：直接下载分支源码包并解压
-download_archive() {
-  local target="$1" tmp="" extracted=""
+# 下载并解压源码包；引导安装和覆盖更新复用同一套检查与临时目录清理。
+ARCHIVE_TMP=""
+ARCHIVE_SRC=""
+fetch_archive_tree() {
+  local prefix="$1" label="$2"
+  ARCHIVE_TMP=""
+  ARCHIVE_SRC=""
   has_cmd curl || { fail "缺少 curl，无法下载源码包"; return 1; }
   has_cmd tar || { fail "缺少 tar，无法解压源码包"; return 1; }
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/us_stocks.XXXXXX")" || return 1
-  info "下载源码压缩包：$ARCHIVE_URL"
-  if ! curl -LfsS "$ARCHIVE_URL" | tar -xz -C "$tmp"; then
+  ARCHIVE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")" || return 1
+  info "下载${label}：$ARCHIVE_URL"
+  if ! curl -LfsS "$ARCHIVE_URL" | tar -xz -C "$ARCHIVE_TMP"; then
     fail "源码包下载或解压失败，请检查网络或代理"
-    rm -rf "$tmp"
+    rm -rf "$ARCHIVE_TMP"
+    ARCHIVE_TMP=""
     return 1
   fi
-  extracted="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  if [ -z "$extracted" ]; then
+  ARCHIVE_SRC="$(find "$ARCHIVE_TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  if [ -z "$ARCHIVE_SRC" ]; then
     fail "源码包内容异常（未找到解压目录）"
-    rm -rf "$tmp"
+    rm -rf "$ARCHIVE_TMP"
+    ARCHIVE_TMP=""
     return 1
   fi
+}
+
+cleanup_archive_tree() {
+  [ -z "$ARCHIVE_TMP" ] || rm -rf "$ARCHIVE_TMP"
+  ARCHIVE_TMP=""
+  ARCHIVE_SRC=""
+}
+
+# 没有 git 时的兜底：直接下载分支源码包并解压
+download_archive() {
+  local target="$1"
+  fetch_archive_tree us_stocks "源码压缩包" || return 1
   mkdir -p "$(dirname "$target")"
-  if ! mv "$extracted" "$target"; then
+  if ! mv "$ARCHIVE_SRC" "$target"; then
     fail "移动到 $target 失败"
-    rm -rf "$tmp"
+    cleanup_archive_tree
     return 1
   fi
-  rm -rf "$tmp"
-  return 0
+  cleanup_archive_tree
 }
 
 bootstrap_if_needed() {
@@ -1788,20 +1852,12 @@ is_runtime_entry() {
 
 # 下载分支压缩包并按顶层条目覆盖源码；运行期数据一律跳过
 overlay_archive() {
-  local target="$1" tmp="" src="" entry name
-  has_cmd curl || { fail "缺少 curl，无法下载源码包"; return 1; }
-  has_cmd tar || { fail "缺少 tar，无法解压源码包"; return 1; }
-  tmp="$(mktemp -d "${TMPDIR:-/tmp}/us_stocks_update.XXXXXX")" || return 1
-  info "下载最新源码：$ARCHIVE_URL"
-  if ! curl -LfsS "$ARCHIVE_URL" | tar -xz -C "$tmp"; then
-    fail "源码包下载或解压失败，请检查网络或代理"
-    rm -rf "$tmp"
-    return 1
-  fi
-  src="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  if [ -z "$src" ] || [ ! -f "$src/run.sh" ] || [ ! -d "$src/app" ]; then
+  local target="$1" src="" entry name
+  fetch_archive_tree us_stocks_update "最新源码" || return 1
+  src="$ARCHIVE_SRC"
+  if [ ! -f "$src/run.sh" ] || [ ! -d "$src/app" ]; then
     fail "源码包内容异常（缺少 run.sh 或 app）"
-    rm -rf "$tmp"
+    cleanup_archive_tree
     return 1
   fi
   # 逐个顶层条目覆盖。写成三段通配是为了带上点开头的文件（.gitignore、.env.example 等），
@@ -1816,11 +1872,11 @@ overlay_archive() {
     rm -rf "${target:?}/$name"
     if ! cp -a "$entry" "$target/$name"; then
       fail "覆盖 $name 失败"
-      rm -rf "$tmp"
+      cleanup_archive_tree
       return 1
     fi
   done
-  rm -rf "$tmp"
+  cleanup_archive_tree
   ok "源码已覆盖更新（.env / data / logs / .venv 均未改动）"
   return 0
 }
@@ -1860,16 +1916,25 @@ update_source() {
   overlay_archive "$target"
 }
 
+resume_app_after_update() {
+  local message="$1" status=0
+  warn "$message"
+  start_app || status=$?
+  return "$status"
+}
+
 action_update() {
   section "更新应用"
   local before="" after="" rc=0
   before="$(source_revision "$PROJECT_DIR")"
-  # 1) 先停服务：避免更新源码时新旧代码混跑
-  stop_app
+  # 1) 先停服务：避免更新源码时新旧代码混跑；停止失败就取消更新。
+  if ! stop_app; then
+    resume_app_after_update "无法确认应用已停止，取消源码更新" || true
+    return 1
+  fi
   # 2) 取最新源码；失败就用现有版本把服务拉回来，不让应用一直停着
   if ! update_source; then
-    warn "源码未更新，改为用现有源码重启"
-    start_app
+    resume_app_after_update "源码未更新，改为用现有源码重启" || true
     return 1
   fi
   after="$(source_revision "$PROJECT_DIR")"
@@ -1903,12 +1968,12 @@ main() {
   bootstrap_if_needed "$@" || return 1
   case "$cmd" in
     "") menu_loop ;;
-    1 | install) action_install ;;
-    2 | start) action_start ;;
+    1 | install) action_install_runtime ;;
+    2 | start) start_app ;;
     3 | update | upgrade) action_update ;;
     4 | service) action_service ;;
     5 | config) action_config ;;
-    6 | stop) action_stop ;;
+    6 | stop) stop_app ;;
     7 | status) action_status ;;
     8 | db | database) action_database ;;
     9 | doctor | check) action_doctor ;;
@@ -2007,30 +2072,21 @@ PY
 }
 
 action_database() {
-  local choice="" db_path size
-  section "数据库工具"
+  local db_path size
+  section "数据库概况"
   db_path="$(resolve_db_path)"
   if [ -f "$db_path" ]; then
     size="$(database_size_bytes "$db_path")"
     printf '  路径：%s\n' "$db_path"
-    printf '  体积：%s（上限 %sMB，0 表示不限制）\n' "$(human_size "$size")" "$(read_env_value DATABASE_MAX_MB 0)"
+    printf '  体积：%s（配置上限 %s，0 表示不限制）\n' "$(human_size "$size")" "$(read_env_value DATABASE_MAX_MB 0)"
   else
     printf '  路径：%s（尚未创建）\n' "$db_path"
   fi
-  printf '\n  1) 立即清理历史数据\n'
-  printf '  2) 备份数据库（在线安全备份）\n'
-  printf '  3) 查看各表记录数\n'
-  printf '  0) 返回\n'
-  printf '请选择：'
-  read -r choice || return 0
-  case "$choice" in
-    1) cleanup_database ;;
-    2) backup_database ;;
-    3) database_stats ;;
-    0 | "") return 0 ;;
-    *) warn "无效选择：$choice" ;;
-  esac
-  return 0
+  run_menu "数据库工具" "请选择：" once \
+    '1|立即清理历史数据|cleanup_database' \
+    '2|备份数据库（在线安全备份）|backup_database' \
+    '3|查看各表记录数|database_stats' \
+    '0|返回|return'
 }
 
 # ---------- 入口 ----------

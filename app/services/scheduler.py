@@ -11,23 +11,24 @@ from typing import Any
 from app.config import Settings
 from app.runtime import effective_database_max_mb
 from app.services.concurrency import get_heavy_gate
-from app.services.snapshots import SnapshotService
 from app.db import Database
 
 logger = logging.getLogger(__name__)
+DAILY_CLEANUP_INTERVAL_SECONDS = 86400
 
 
 class Scheduler:
-    def __init__(self, settings: Settings, snapshots: SnapshotService, database: Database):
+    """Run database housekeeping only; market snapshots refresh on active SSE demand."""
+
+    def __init__(self, settings: Settings, database: Database):
         self.settings = settings
-        self.snapshots = snapshots
         self.database = database
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._owner = uuid4().hex
         self._announced_database_cap = False
-        self._lease_name = "option-snapshot-scheduler"
-        self._lease_seconds = max(120, settings.refresh_interval_seconds * 3)
+        self._lease_name = "option-database-housekeeping"
+        self._lease_seconds = DAILY_CLEANUP_INTERVAL_SECONDS * 2
 
     async def start(self) -> None:
         if self.settings.scheduler_enabled and self._task is None:
@@ -38,10 +39,10 @@ class Scheduler:
                 self._lease_seconds,
             )
             if not acquired:
-                logger.info("当前 worker 不持有后台调度租约，跳过重复调度")
+                logger.info("当前 worker 不持有数据库维护租约，跳过重复维护")
                 return
             self._stop.clear()
-            self._task = asyncio.create_task(self._loop(), name="option-snapshot-scheduler")
+            self._task = asyncio.create_task(self._loop(), name="option-database-housekeeping")
 
     async def stop(self) -> None:
         self._stop.set()
@@ -67,17 +68,8 @@ class Scheduler:
 
     async def _loop(self) -> None:
         await self._guard(self._prune_legacy_raw_json, "启动清理冗余报文")
-        # 小内存机器上，启动立刻刷新会和用户打开的第一个标的抢同一块内存。
-        if self.settings.low_memory:
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=15)
-            except asyncio.TimeoutError:
-                pass
-            if self._stop.is_set():
-                return
-        await self._guard(self._refresh_once, "定时刷新")
+        await self._guard(self._cleanup_once, "启动历史数据清理")
         await self._guard(self._cleanup_by_size, "体积清理")
-        elapsed = 0
         while not self._stop.is_set():
             lease_alive = await asyncio.to_thread(
                 self.database.try_acquire_lease,
@@ -86,26 +78,17 @@ class Scheduler:
                 self._lease_seconds,
             )
             if not lease_alive:
-                logger.warning("后台调度租约已被其他 worker 接管，当前调度退出")
+                logger.warning("数据库维护租约已被其他 worker 接管，当前维护退出")
                 break
-            interval = self.settings.cleanup_interval_seconds if elapsed >= self.settings.cleanup_interval_seconds else self.settings.refresh_interval_seconds
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                await asyncio.wait_for(self._stop.wait(), timeout=DAILY_CLEANUP_INTERVAL_SECONDS)
             except asyncio.TimeoutError:
-                if elapsed >= self.settings.cleanup_interval_seconds:
-                    await self._guard(self._cleanup_expired, "历史数据定时清理")
-                    elapsed = 0
-                else:
-                    await self._guard(self._refresh_once, "定时刷新")
-                    elapsed += self.settings.refresh_interval_seconds
+                await self._guard(self._cleanup_once, "历史数据定时清理")
                 await self._guard(self._cleanup_by_size, "体积清理")
 
-    async def _cleanup_expired(self) -> None:
+    async def _cleanup_once(self) -> None:
         """按保留天数删除过期历史数据。"""
         await asyncio.to_thread(self.database.cleanup, self.settings.raw_retention_days)
-
-    async def _refresh_once(self) -> None:
-        await asyncio.to_thread(self.snapshots.refresh_default, self.settings.default_symbols)
 
     async def _prune_legacy_raw_json(self) -> None:
         """启动时清空旧版本写入的冗余报文列，一次回收几十 MB 死数据。"""

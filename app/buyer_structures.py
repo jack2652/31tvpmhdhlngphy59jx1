@@ -20,6 +20,7 @@ from app.gamma import (
     norm_cdf,
     option_expiry,
 )
+from app.buyer_ranking import _rank_key, _too_similar, _select_diverse
 
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
 HORIZON_TRADING_DAYS = 5
@@ -38,7 +39,6 @@ YEAR_SECONDS = 365 * 24 * 3600
 # 低于内在价值 2% 的报价视为失真，避免用不可成交的价格反解波动率。
 INTRINSIC_SLACK = 0.98
 
-
 def _number(value: Any) -> float | None:
     try:
         result = float(value)
@@ -46,13 +46,11 @@ def _number(value: Any) -> float | None:
         return None
     return result if math.isfinite(result) else None
 
-
 def _as_now(now: datetime | None) -> datetime:
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     return current.astimezone(timezone.utc)
-
 
 def _horizon_end(now: datetime, trading_days: int) -> datetime:
     """从当前时刻起跳过周末，得到未来 N 个交易日的同一钟点。"""
@@ -64,10 +62,8 @@ def _horizon_end(now: datetime, trading_days: int) -> datetime:
             remaining -= 1
     return cursor
 
-
 def _years_between(start: datetime, end: datetime) -> float:
     return (end - start).total_seconds() / YEAR_SECONDS
-
 
 def _mid_quote(row: dict[str, Any]) -> tuple[float, float] | None:
     """返回 (中间价, 买卖价差占中间价比例)，无有效双边报价时返回 None。"""
@@ -80,17 +76,14 @@ def _mid_quote(row: dict[str, Any]) -> tuple[float, float] | None:
         return None
     return mid, (ask - bid) / mid
 
-
 def _dte(expiration: str, now: datetime) -> int | None:
     expiry = option_expiry(expiration)
     if expiry is None:
         return None
     return max((expiry.astimezone(MARKET_TIMEZONE).date() - now.astimezone(MARKET_TIMEZONE).date()).days, 0)
 
-
 def _normal_pdf(value: float) -> float:
     return math.exp(-0.5 * value * value) / math.sqrt(2 * math.pi)
-
 
 def _greeks(spot: float, strike: float, volatility: float, years: float, contract_type: str) -> dict[str, float] | None:
     if spot <= 0 or strike <= 0 or volatility <= 0 or years <= 0:
@@ -115,7 +108,6 @@ def _greeks(spot: float, strike: float, volatility: float, years: float, contrac
     vega = spot * _normal_pdf(d1) * math.sqrt(years)
     return {"delta": delta, "theta_per_day": theta / 365, "vega": vega}
 
-
 def _touch_probability(price: float, spot: float, volatility: float | None, years: float | None) -> float | None:
     """与价位模块相同的零漂移首次触及概率，保留完整精度供排序。"""
     if spot <= 0 or price <= 0 or not volatility or not years or volatility <= 0 or years <= 0:
@@ -126,14 +118,12 @@ def _touch_probability(price: float, spot: float, volatility: float | None, year
     distance = abs(math.log(price / spot))
     return min(1.0, 2.0 * norm_cdf(-distance / sigma_time))
 
-
 def _level_strength(row: dict[str, Any]) -> float | None:
     for key in ("score", "model_score"):
         value = _number(row.get(key))
         if value is not None:
             return min(1.0, max(0.0, value))
     return None
-
 
 def _target_price(
     direction: str,
@@ -181,14 +171,12 @@ def _target_price(
     fallback = spot * (1 + TARGET_FALLBACK_RATIO if direction == "call" else 1 - TARGET_FALLBACK_RATIO)
     return fallback, "情景参考位", _touch_probability(fallback, spot, volatility, horizon_years)
 
-
 def _spread_score(spread_ratio: float) -> float:
     if spread_ratio <= 0.02:
         return 1.0
     if spread_ratio >= MAX_QUOTE_SPREAD_RATIO:
         return 0.0
     return max(0.0, 1 - (spread_ratio - 0.02) / 0.08)
-
 
 def _liquidity_label(spread_ratio: float, activity: float) -> str:
     if spread_ratio <= 0.02 and activity >= 0.6:
@@ -197,13 +185,11 @@ def _liquidity_label(spread_ratio: float, activity: float) -> str:
         return "可接受"
     return "偏弱"
 
-
 def _activity_score(row: dict[str, Any], maximum: float) -> float:
     activity = max(_number(row.get("volume")) or 0, 0) + max(_number(row.get("open_interest")) or 0, 0)
     if maximum <= 0:
         return 0.0
     return min(1.0, math.log1p(activity) / math.log1p(maximum))
-
 
 def _fallback_iv(row: dict[str, Any], iv_model: dict[str, dict[str, Any]]) -> float | None:
     value = _number(row.get("model_iv"))
@@ -213,11 +199,9 @@ def _fallback_iv(row: dict[str, Any], iv_model: dict[str, dict[str, Any]]) -> fl
         return None
     return value
 
-
 def _below_intrinsic(mid: float, spot: float, strike: float, is_call: bool) -> bool:
     intrinsic = max(spot - strike, 0.0) if is_call else max(strike - spot, 0.0)
     return mid < intrinsic * INTRINSIC_SLACK
-
 
 def _reference_iv(groups: list[list[dict[str, Any]]], spot: float) -> float | None:
     """用最近到期日、最靠近现价且双边都有报价的执行价代表短线波动。
@@ -246,7 +230,6 @@ def _reference_iv(groups: list[list[dict[str, Any]]], spot: float) -> float | No
     samples.sort()
     return samples[len(samples) // 2]
 
-
 def _future_mark(row: dict[str, Any], spot: float, price: float, horizon_years: float, is_call: bool) -> float:
     """用这条腿自己的波动率做情景价，再平移到当前中间价，避免模型价和市价的落差混进盈亏。"""
     strike = row["strike"]
@@ -257,21 +240,17 @@ def _future_mark(row: dict[str, Any], spot: float, price: float, horizon_years: 
     today = black_scholes_price(spot, strike, row["iv"], row["years"], is_call)
     return max(0.0, row["mid"] + future - today)
 
-
 def _half_spread(row: dict[str, Any]) -> float:
     return row["mid"] * row["spread_ratio"] / 2
-
 
 def _expected_return(target_return: float, unchanged_return: float, touch: float | None) -> float:
     probability = touch if touch is not None else 0.5
     return probability * target_return + (1.0 - probability) * unchanged_return
 
-
 def _iv_source_label(*rows: dict[str, Any]) -> str:
     if rows and all(row.get("iv_source") == "contract" for row in rows):
         return "合约中间价反解"
     return "到期日模型估算"
-
 
 def _single_quality(row: dict[str, Any], target: float, spot: float) -> float:
     delta_quality = max(0.0, 1 - abs(abs(row["delta"]) - 0.58) / 0.58)
@@ -286,7 +265,6 @@ def _single_quality(row: dict[str, Any], target: float, spot: float) -> float:
         + theta_quality * 0.15
         + target_quality * 0.15
     )))
-
 
 def _single_style(row: dict[str, Any], direction: str, spot: float) -> tuple[str, str, str]:
     strike = row["strike"]
@@ -307,7 +285,6 @@ def _single_style(row: dict[str, Any], direction: str, spot: float) -> tuple[str
         "到期更远，时间衰减压力更小",
         "权利金更高，同样行情下收益率更低",
     )
-
 
 def _single_structure(
     row: dict[str, Any],
@@ -366,7 +343,6 @@ def _single_structure(
         "quote_method": "买卖价中间价",
     }
 
-
 def _long_rows(group: list[dict[str, Any]], direction: str, spot: float) -> list[dict[str, Any]]:
     is_call = direction == "call"
     low, high = (spot * 0.90, spot * 1.08) if is_call else (spot * 0.92, spot * 1.10)
@@ -380,7 +356,6 @@ def _long_rows(group: list[dict[str, Any]], direction: str, spot: float) -> list
     if abs(nearest["strike"] - spot) <= spot * 0.15:
         return [nearest]
     return []
-
 
 def _short_rows(
     group: list[dict[str, Any]],
@@ -404,7 +379,6 @@ def _short_rows(
     if abs(nearest["strike"] - long["strike"]) <= spot * 0.25:
         return [nearest]
     return []
-
 
 def _vertical_structure(
     long: dict[str, Any],
@@ -498,75 +472,6 @@ def _vertical_structure(
         "net_vega": long["vega"] - short["vega"],
     }
 
-
-def _rank_key(item: dict[str, Any]) -> tuple[float, float]:
-    expected = item.get("expected_return")
-    if expected is None or not math.isfinite(expected):
-        expected = -math.inf
-    return expected, item.get("score") or 0.0
-
-
-def _too_similar(left: dict[str, Any], right: dict[str, Any], spot: float) -> bool:
-    if left["kind"] != right["kind"] or left["expiration"] != right["expiration"]:
-        return False
-    if left["strikes"] == right["strikes"]:
-        return True
-    tolerance = max(spot * 0.015, 0.01)
-    if abs(left["strikes"][0] - right["strikes"][0]) > tolerance:
-        return False
-    if left["kind"] == "single":
-        return True
-    return abs(left["strikes"][-1] - right["strikes"][-1]) <= tolerance
-
-
-def _select_diverse(ranked: list[dict[str, Any]], limit: int, spot: float) -> list[dict[str, Any]]:
-    """先按期望收益取不同到期和执行价，再保证单腿和价差至少各留一条。"""
-    selected: list[dict[str, Any]] = []
-    seen: set[int] = set()
-
-    def add(item: dict[str, Any]) -> bool:
-        marker = id(item)
-        if marker in seen:
-            return False
-        seen.add(marker)
-        selected.append(item)
-        return True
-
-    for item in ranked:
-        if len(selected) >= limit:
-            break
-        if any(_too_similar(item, kept, spot) for kept in selected):
-            continue
-        add(item)
-
-    def ensure(kind: str) -> None:
-        if any(item["kind"] == kind for item in selected):
-            return
-        candidate = next((item for item in ranked if item["kind"] == kind), None)
-        if candidate is None:
-            return
-        if len(selected) < limit:
-            add(candidate)
-            return
-        replaceable = [item for item in selected if item["kind"] != kind]
-        if not replaceable:
-            return
-        worst = min(replaceable, key=_rank_key)
-        selected.remove(worst)
-        seen.discard(id(worst))
-        add(candidate)
-
-    ensure("single")
-    ensure("vertical")
-    if len(selected) < limit:
-        for item in ranked:
-            if len(selected) >= limit:
-                break
-            add(item)
-    selected.sort(key=_rank_key, reverse=True)
-    return selected[:limit]
-
-
 def _empty(reason: str, horizon_trading_days: int = HORIZON_TRADING_DAYS) -> dict[str, Any]:
     return {
         "available": False,
@@ -581,7 +486,6 @@ def _empty(reason: str, horizon_trading_days: int = HORIZON_TRADING_DAYS) -> dic
         "iv_source": "server",
         "quote_method": "仅使用有效买卖价中间价",
     }
-
 
 def _quoted_contracts(
     rows: Iterable[dict[str, Any]],
@@ -622,7 +526,6 @@ def _quoted_contracts(
         }
     return list(quoted.values())
 
-
 def _enrich(
     rows: list[dict[str, Any]],
     spot: float,
@@ -657,7 +560,6 @@ def _enrich(
             row["activity_score"] = _activity_score(row, maximum)
     return enriched
 
-
 def _search_groups(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -667,7 +569,6 @@ def _search_groups(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     chosen = sweet or groups
     chosen.sort(key=lambda group: (group[0]["dte"], group[0]["expiration"]))
     return chosen
-
 
 def _direction_candidates(
     groups: list[list[dict[str, Any]]],
@@ -703,7 +604,6 @@ def _direction_candidates(
                 candidates.append(structure)
     candidates.sort(key=_rank_key, reverse=True)
     return _select_diverse(candidates, DIRECTION_STRUCTURE_LIMIT, spot)
-
 
 def build_buyer_structures(
     chain_rows: Iterable[dict[str, Any]] | None,

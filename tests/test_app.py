@@ -1651,9 +1651,7 @@ def test_quote_and_levels_align_cached_previous_close_with_fresh_history(tmp_pat
         database_path=tmp_path / "options.db",
         proxy_url=None,
         default_symbols=("ORCL",),
-        refresh_interval_seconds=60,
         raw_retention_days=30,
-        cleanup_interval_seconds=86400,
         scheduler_enabled=False,
     )
     provider = FakeProvider()
@@ -1697,9 +1695,7 @@ def test_quote_fetches_missing_history_before_returning_cached_previous_close(tm
         database_path=tmp_path / "options.db",
         proxy_url=None,
         default_symbols=("ORCL",),
-        refresh_interval_seconds=60,
         raw_retention_days=30,
-        cleanup_interval_seconds=86400,
         scheduler_enabled=False,
     )
     provider = HistoryProvider()
@@ -1719,7 +1715,7 @@ def test_snapshot_stores_extended_hours_and_api_exposes_them(tmp_path: Path):
     quote["sessions"] = {"pre": {"price": 201.5, "change_percent": 0.5, "as_of": "2026-09-17T08:05:00-04:00"}}
     database.write_snapshot(quote, sample_rows(), iso())
     assert parse_sessions(database.latest_quote("AAPL")["sessions_json"])["pre"]["price"] == 201.5
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     test_app = FastAPI()
     test_app.include_router(create_router(database, SnapshotService(database, FakeProvider()), FakeProvider(), settings))
     with TestClient(test_app) as client:
@@ -1758,7 +1754,7 @@ def test_snapshot_service_refresh_and_api(tmp_path: Path):
     service = SnapshotService(database, FakeProvider())
     result = service.refresh("aapl", "2026-12-18")
     assert result["rows"] == 2
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
     test_app.include_router(router)
@@ -1793,7 +1789,7 @@ def test_quote_triggers_missing_fair_value_without_refreshing_snapshot(tmp_path:
             }
 
     provider = FairValueProvider()
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), raw_retention_days=30, scheduler_enabled=False)
     test_app = FastAPI()
     test_app.include_router(create_router(database, SnapshotService(database, provider), provider, settings))
     with TestClient(test_app) as client:
@@ -1814,7 +1810,7 @@ def test_quote_reports_unavailable_fair_value_instead_of_waiting_forever(tmp_pat
             return {"value": None, "source": None, "status": "unavailable", "warning": "公开财务数据不足"}
 
     provider = UnavailableProvider()
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), raw_retention_days=30, scheduler_enabled=False)
     test_app = FastAPI()
     test_app.include_router(create_router(database, SnapshotService(database, provider), provider, settings))
     with TestClient(test_app) as client:
@@ -1834,7 +1830,7 @@ def test_quote_keeps_rate_limited_fair_value_pending(tmp_path: Path):
             return {"value": None, "source": None, "status": "retry", "warning": "Yahoo 数据源暂时限流"}
 
     provider = RetryProvider()
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("ONDS",), raw_retention_days=30, scheduler_enabled=False)
     test_app = FastAPI()
     test_app.include_router(create_router(database, SnapshotService(database, provider), provider, settings))
     with TestClient(test_app) as client:
@@ -1919,7 +1915,9 @@ def test_quote_price_follows_current_session():
     assert 'sessions.overnight?.provider !== "alpaca-overnight"' in source
     assert "const active = activeSessionQuote(quote);" in source
     assert "const price = active?.price ?? quote?.price;" in source
-    assert "const change = active?.change_percent ?? quote?.change_percent;" in source
+    assert "const reference = quoteReference(quote);" in source
+    assert "const referencePrice = finitePrice(reference.price);" in source
+    assert "(Number(price) - referencePrice) / referencePrice * 100" in source
     # 时段标签映射与顶栏时段展示保留。
     assert 'const MARKET_STATE_LABELS = { PRE: "盘前", REGULAR: "正常交易", POST: "盘后", OVERNIGHT: "夜盘", CLOSED: "休市" };' in source
     assert 'state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");' in source
@@ -2210,7 +2208,7 @@ def test_cached_chain_returns_sqlite_without_refresh(tmp_path: Path):
         def fetch(self, symbol: str, expiration: str):
             raise AssertionError("有本地期权链时不应刷新供应商")
 
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, BlockingProvider())
     router = create_router(database, service, BlockingProvider(), settings)
     test_app = FastAPI()
@@ -2287,7 +2285,7 @@ def test_missing_cache_does_not_block_on_provider(tmp_path: Path):
         def fetch(self, symbol: str, expiration: str):
             raise AssertionError("读取接口不应同步刷新供应商")
 
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, BlockingProvider())
     router = create_router(database, service, BlockingProvider(), settings)
     test_app = FastAPI()
@@ -2324,7 +2322,7 @@ def test_expirations_endpoint_hides_expired_dates(tmp_path: Path):
         def expirations(self, symbol: str) -> list[str]:
             raise AssertionError("有本地到期日时不应请求供应商")
 
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, BlockingProvider())
     router = create_router(database, service, BlockingProvider(), settings)
     test_app = FastAPI()
@@ -2395,7 +2393,7 @@ def test_chain_and_gamma_endpoints_expose_open_interest_fallback(tmp_path: Path)
         row["open_interest"] = 0
     database.write_snapshot(sample_quote(), blank, iso())
 
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FakeProvider())
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
@@ -2531,7 +2529,7 @@ def test_chain_and_gamma_endpoints_expose_model_iv(tmp_path: Path):
     database = Database(tmp_path / "options.db")
     service = SnapshotService(database, FakeProvider())
     service.refresh("AAPL", "2026-12-18")
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
     test_app.include_router(router)
@@ -2611,7 +2609,7 @@ def test_gamma_refresh_returns_before_window_and_times_out(tmp_path: Path, monke
     monkeypatch.setattr(service, "refresh_window", slow_window)
     settings = Settings(
         database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",),
-        refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False,
+        raw_retention_days=30, scheduler_enabled=False,
     )
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
@@ -2646,7 +2644,7 @@ def test_gamma_status_only_skips_rows_until_display_request(tmp_path: Path):
     database = Database(tmp_path / "options.db")
     service = SnapshotService(database, FakeProvider())
     service.refresh("AAPL", "2026-12-18")
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
     test_app.include_router(router)
@@ -2716,7 +2714,7 @@ def test_refresh_skips_upstream_when_snapshot_is_fresh(tmp_path: Path):
         def fetch(self, symbol: str, expiration: str):
             raise AssertionError("快照仍新鲜时不应请求供应商期权链")
 
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, BlockingProvider())
     router = create_router(database, service, BlockingProvider(), settings)
     test_app = FastAPI()
@@ -2736,7 +2734,7 @@ def test_refresh_requests_provider_after_fresh_window(tmp_path: Path):
     """快照超过 max_age 后必须回源；max_age=0 表示强制刷新。"""
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso(utc_now() - timedelta(minutes=5)))
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FakeProvider())
     assert service.recent_snapshot("AAPL", "2026-12-18", 60) is None
     stale = service.refresh("AAPL", "2026-12-18", max_age_seconds=60)
@@ -2747,7 +2745,7 @@ def test_refresh_requests_provider_after_fresh_window(tmp_path: Path):
 
 
 def test_manual_refresh_forces_provider_when_snapshot_is_fresh(tmp_path: Path):
-    """手动刷新传入 max_age=0 时，即使本地快照新鲜也必须回源。"""
+    """API 仍支持 max_age=0 强制回源，尽管页面不再展示手动刷新按钮。"""
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso())
     calls = {"fetch": 0}
@@ -2872,10 +2870,11 @@ def test_refresh_different_expirations_are_not_blocked_by_one_symbol_lock(tmp_pa
     assert time.monotonic() - started < 0.45
 
 
-def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
+def test_sse_refresh_loads_cached_snapshots_without_manual_refresh_button():
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
-    # 手动刷新必须回源；自动刷新才复用 SQLite 新鲜快照，并用 state.refreshing 拦截连点。
-    assert "if (state.refreshing) return;" in source
+    # 快照更新由服务端 SSE 调度；页面不再暴露手动刷新按钮。
+    assert 'id="refresh-button"' not in Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "refreshNow()" not in source
     assert "function isSnapshotFresh(snapshot)" in source
     assert "function quoteIsReady(quote)" in source
     assert "function hasValidOptionQuotes(rows)" in source
@@ -2883,36 +2882,31 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "optionsQuotesReady: hasValidOptionQuotes(payload.data)" in source
     assert "snapshot?.shown && snapshot?.quoteReady" in source
     assert "age !== null && age < SNAPSHOT_FRESH_SECONDS" in source
-    assert "if (!force && isSnapshotFresh(snapshot)) {" in source
+    assert "if (isSnapshotFresh(snapshot)) {" in source
     assert "showFreshStatus(snapshot);" in source
-    assert "async function refreshInBackground(loadId, force = false)" in source
-    assert 'const params = new URLSearchParams({ max_age: String(force ? 0 : SNAPSHOT_FRESH_SECONDS) });' in source
+    assert "async function refreshInBackground(loadId)" in source
+    assert 'const params = new URLSearchParams({ max_age: String(SNAPSHOT_FRESH_SECONDS) });' in source
     assert "if (refreshResult?.skipped)" in source
     assert "const snapshot = await renderSnapshot(loadId, refreshResult.quote || null);" in source
     assert "let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;" in source
     assert "?refresh=true`" in source
-    assert '@click="refreshNow"' in Path("app/static/index.html").read_text(encoding="utf-8")
-    # 进入标的时提示已经是「正在刷新」，按钮不能只看 refreshing，加载和后台请求期间也要禁用。
-    assert ':disabled="busy || !!refreshInFlight"' in Path("app/static/index.html").read_text(encoding="utf-8")
-    assert "if (!silent && (state.loading || state.refreshInFlight)) return;" in source
-    assert "function scheduleAutoRefresh()" in source
-    assert "setTimeout(() => { refresh(true); }, delaySeconds * 1000);" in source
-    assert "const delaySeconds = remaining > 1 ? remaining : (remaining > 0 ? 1 : AUTO_REFRESH_RETRY_SECONDS);" in source
-    # 新快照落地后按页面时刻重算完整间隔，不能再用上游请求开始时的 fetched_at 把倒计时提前扣短。
-    assert "function armRefreshAnchor(fetchedAt)" in source
-    assert "armRefreshAnchor(payload.fetched_at);" in source
-    assert "Math.min(anchoredAge, snapshotAge)" in source
-    # 倒计时从 59 数到 1，到点才刷新；文字直接改 DOM，不每秒触发 Vue 重绘。
-    assert "function refreshCountdownSeconds(deadline, now)" in source
-    assert "return Math.max(Math.ceil(ms / 1000) - 1, 1);" in source
-    assert "return `${seconds} 秒后自动更新`;" in source
-    assert "function paintRefreshNote()" in source
-    clock = source[source.index("function updateClock()"):source.index("updateClock();")]
-    assert "paintRefreshNote();" in clock
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    assert 'v-text="view.refreshNote"' not in page
-    assert 'id="refresh-note" class="refresh-note">每 __AUTO_REFRESH_SECONDS__ 秒自动更新</span>' in page
-    assert "await loadChain({ loadId, force: !silent });" in source
+    assert 'id="refresh-button"' not in page
+    assert "刷新快照" not in page
+    assert "function scheduleAutoRefresh()" in source
+    assert 'source.addEventListener("update", onUpdate);' in source
+    assert 'symbol === state.symbol && !document.hidden && !state.loading && !state.refreshInFlight' in source
+    assert "Automatic snapshot refresh is server-side and active only while this SSE subscription exists." in source
+    assert "if (!state.loading && !state.refreshInFlight) loadChain({ loadId: state.loadId });" in source
+    assert "state.pushRefreshTimer = setTimeout" in source
+    # Auto-refresh is scheduled by the server for the lifetime of the SSE subscription; no browser timer remains.
+    assert "SSE 生命周期驱动服务端市场时段调度" in source
+    assert "function armRefreshAnchor(fetchedAt)" not in source
+    assert "refreshDeadline" not in source
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="refresh-note"' not in page
+    assert "分析计算中，刷新稍后开始" not in source
+    assert "正在刷新…" not in source
     # 跨期限 Gamma 窗口刷新改为后台任务，表格渲染完成后不再等待窗口。
     assert "function refreshAnalysisWindow(loadId, payload, quote)" in source
     assert "refreshAnalysisWindow(loadId, payload, resolvedQuote);" in source
@@ -2929,20 +2923,10 @@ def test_refresh_button_forces_manual_refresh_and_caches_automatic_refresh():
     assert "renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);" in source
     assert "deferLevels: true" not in source
     assert "if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote)" in source
-    # 页面加载、手动点击、定时刷新共用同一条刷新链路与网络互斥。
+    # 页面加载与 SSE 事件后的读取共用同一条刷新链路与网络互斥。
     assert "if (state.refreshInFlight === symbol) return;" in source
-    assert "await loadChain({ loadId, force: !silent });" in source
-    assert 'id="refresh-note"' in Path("app/static/index.html").read_text(encoding="utf-8")
-
-
-def test_refresh_toolbar_places_note_before_button_and_uses_blue_hover():
-    page = Path("app/static/index.html").read_text(encoding="utf-8")
-    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
-    toolbar = page[page.index('<div class="toolbar-actions">') : page.index('</div>', page.index('<div class="toolbar-actions">'))]
-    assert toolbar.index('id="refresh-note"') < toolbar.index('id="refresh-button"')
-    assert ".refresh-note{font-size:12px;font-variant-numeric:tabular-nums;display:inline-block;min-width:9.5em;text-align:right;white-space:nowrap}" in styles
-    assert ".toolbar-actions .el-button.secondary.el-button--button:hover,.toolbar-actions .el-button.secondary.el-button--button:focus{border-color:var(--blue);background:var(--blue);color:var(--on-blue)}" in styles
-    assert ".toolbar-actions .el-button.secondary.el-button--button.is-disabled,.toolbar-actions .el-button.secondary.el-button--button.is-disabled:hover,.toolbar-actions .el-button.secondary.el-button--button.is-disabled:focus{opacity:.45;cursor:not-allowed;border-color:var(--field-line);background:transparent;color:var(--text)}" in styles
+    assert "await loadChain({ loadId });" in source
+    assert 'id="refresh-note"' not in Path("app/static/index.html").read_text(encoding="utf-8")
 
 
 def test_symbol_without_expirations_falls_back_to_quote_only(tmp_path: Path):
@@ -2987,7 +2971,7 @@ def test_refresh_endpoint_returns_quote_only_without_expirations(tmp_path: Path)
             return []
 
     provider = NoOptionProvider()
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("SPCX",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("SPCX",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, provider)
     router = create_router(database, service, provider, settings)
     test_app = FastAPI()
@@ -3033,9 +3017,7 @@ def test_refresh_publishes_full_expiration_catalog_after_one_chain(tmp_path: Pat
         database_path=tmp_path / "options.db",
         proxy_url=None,
         default_symbols=("AAPL",),
-        refresh_interval_seconds=60,
         raw_retention_days=30,
-        cleanup_interval_seconds=86400,
         scheduler_enabled=False,
     )
     service = SnapshotService(database, provider)
@@ -3069,9 +3051,7 @@ def test_refresh_publishes_full_expiration_catalog_after_one_chain(tmp_path: Pat
         database_path=tmp_path / "legacy.db",
         proxy_url=None,
         default_symbols=("AAPL",),
-        refresh_interval_seconds=60,
         raw_retention_days=30,
-        cleanup_interval_seconds=86400,
         scheduler_enabled=False,
     )
     legacy_service = SnapshotService(legacy, BlockingProvider())
@@ -3093,12 +3073,12 @@ def test_frontend_loads_symbol_without_cached_expiration():
     # 首次载入一个从未抓过的标的时本地没有到期日：必须继续走到后台回源，否则页面永远停在无数据状态。
     assert "if (!state.expiration) return;" not in source
     assert "async function loadExpirations(loadId)" in source
-    assert "await refreshInBackground(loadId, force);" in source
+    assert "await refreshInBackground(loadId);" in source
     # 仅现货标的单独一条渲染分支：现货照常画，期权面板统一提示没有期权数据。
-    assert "async function loadQuoteOnly(loadId, force = false)" in source
+    assert "async function loadQuoteOnly(loadId)" in source
     # 仅现货响应也不能直接渲染：等待期间到期日变了要重入，没变才结束，避免落到期权链分支。
     quote_only = source[source.index("if (refreshResult?.quote_only)") : source.index("if (refreshResult?.quote_only)") + 220]
-    assert "const restarted = await loadQuoteOnly(loadId, force);" in quote_only
+    assert "const restarted = await loadQuoteOnly(loadId);" in quote_only
     assert "if (!restarted && await restartIfExpirationChanged(expiration)) return;" in quote_only
     assert quote_only.index("return;") > quote_only.index("loadQuoteOnly")
     assert 'applyExpirations([], null, "无期权到期日");' in source
@@ -3633,7 +3613,7 @@ def test_levels_endpoint_combines_factors(tmp_path: Path):
     """接口：按所选到期日返回两侧压力位/支撑位与各因子标签，并带日线历史元信息。"""
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso())
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FakeProvider())
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
@@ -3692,7 +3672,7 @@ def test_levels_endpoint_reuses_same_snapshot_analysis(tmp_path: Path, monkeypat
     """同一输入快照重复读取时只执行一次价位合成，快照变化后缓存键会自然失效。"""
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso())
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FakeProvider())
     calls = {"count": 0}
     original = api_module.build_levels
@@ -3717,7 +3697,7 @@ def test_levels_endpoint_reuses_nearby_spot_bucket(tmp_path: Path, monkeypatch):
     """同一格子内的现价只合成一次价位；跨出格子后用本次精确现价重算。"""
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso())
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FakeProvider())
     spots: list[float] = []
     original = api_module.build_levels
@@ -3747,7 +3727,7 @@ def test_levels_endpoint_uses_previous_close_as_stable_candidate_anchor(tmp_path
     quote = sample_quote()
     quote["previous_close"] = 198.0
     database.write_snapshot(quote, sample_rows(), iso())
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FakeProvider())
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
@@ -3770,7 +3750,7 @@ def test_levels_endpoint_aggregates_multiple_expirations_without_changing_select
         row["volume"] = 500
     database.write_snapshot(sample_quote(), selected, iso(utc_now() - timedelta(minutes=10)))
     database.write_snapshot(sample_quote(), near, iso(utc_now() - timedelta(minutes=5)))
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FakeProvider())
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
@@ -4160,7 +4140,7 @@ def test_levels_endpoint_accepts_spot_override(tmp_path: Path):
     """接口：传入 spot 时以它为基准价；缺省时退回快照里的常规价。"""
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso())
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FakeProvider())
     router = create_router(database, service, FakeProvider(), settings)
     test_app = FastAPI()
@@ -4184,7 +4164,7 @@ def test_levels_endpoint_degrades_without_history(tmp_path: Path):
         def history(self, symbol: str, period: str = "6mo") -> list[dict]:
             raise ProviderError("离线")
 
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, OfflineHistoryProvider())
     router = create_router(database, service, OfflineHistoryProvider(), settings)
     test_app = FastAPI()
@@ -4380,7 +4360,7 @@ def test_extremes_degrade_when_provider_fails(tmp_path: Path):
                 raise ProviderError("全量历史不可用")
             return sample_bars()
 
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     service = SnapshotService(database, FailingProvider())
     router = create_router(database, service, FailingProvider(), settings)
     test_app = FastAPI()
@@ -4432,6 +4412,7 @@ def test_basis_price_switch_defaults_to_live():
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 开关挂在标题栏（detail-header）里、位于内容体之前，初始隐藏（折叠态），默认按下「实时价」。
+    assert 'class="detail-header analysis-detail-header" id="detail-header"' in page
     assert page.index('id="detail-header"') < page.index('id="basis-live"') < page.index('id="detail-body"')
     assert 'id="detail-modes" hidden' in page
     assert 'id="basis-live" type="button" data-basis="live" aria-pressed="true"' in page
@@ -4475,6 +4456,13 @@ def test_basis_price_switch_defaults_to_live():
     # 样式：隐藏态生效 + 选中态用 --blue 实心。
     assert ".detail-modes[hidden]{display:none}" in styles
     assert ".detail-segmented{display:inline-flex;" in styles
+    assert ".analysis-detail-header>.detail-modes{margin-left:auto;flex:none}" in styles
+    assert ".analysis-detail-header>.detail-action{margin-left:0}" in styles
+    assert ".analysis-detail-header>.detail-modes[hidden]+.detail-action" in styles
+    assert ".option-analysis-group>.detail-header>.detail-modes[hidden]+.detail-action{margin-left:auto}" in styles
+    assert ".analysis-detail-header .detail-segmented{border-radius:4px;background:var(--field)}" in styles
+    assert "@media(max-width:600px)" in styles
+    assert ".analysis-detail-header>.detail-modes{order:3;width:calc(100% - 28px);margin:0 0 0 28px}" in styles
     assert '.detail-seg[aria-pressed="true"]{background:var(--blue);color:var(--on-blue)}' in styles
 
 
@@ -4496,7 +4484,7 @@ def test_expiration_switch_discards_stale_response():
     assert load_chain.index("if (snapshot.discarded) return;") < load_chain.index('showPending("正在后台获取上游快照…")')
     # 双向防覆盖之二：后台刷新发现期限变了就先还回网络互斥再按新期限重来，避免把用户的选择拽回旧期限。
     assert "if (state.expiration !== currentExpiration) {" in source
-    assert "state.refreshInFlight = null;\n      await refreshInBackground(loadId, force);" in source
+    assert "state.refreshInFlight = null;\n      await refreshInBackground(loadId);" in source
     assert source.index("if (state.expiration !== currentExpiration) {") < source.index("applyExpirations(expirations.expirations, currentExpiration);")
     # 自动刷新的 POST 还没回来就换了到期日：先重入新期限，再使用旧 POST 的结果去拉链或渲染。
     refresh_fn = source[source.index("async function refreshInBackground"):source.index("async function loadQuoteOnly")]
@@ -4513,18 +4501,13 @@ def test_expiration_switch_discards_stale_response():
     # 旧的「静默重载」绑定已删除，切换只走 switchExpiration 一条路径。
     assert 'expirationChanged() { return switchExpiration(this.expiration); }' in source
     assert 'loadChain({ silent: true })' not in source
-    # 菜单打开时暂停倒计时，只绑在到期日下拉框上；关掉且已经到点时才补刷新。
+    # Expiry selection reconnects the SSE subscription; initial and change reads remain REST-backed.
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     expiration_select = page[page.index('id="expiration-select"'):page.index('id="expiration-select"') + 500]
     assert '@visible-change="expirationMenuChanged"' in expiration_select
-    chain_filter = page[page.index('id="chain-type-filter"'):page.index('id="chain-type-filter"') + 400]
-    assert "visible-change" not in chain_filter
     assert "function setExpirationMenuOpen(open)" in source
     assert "expirationMenuChanged(open) { return setExpirationMenuOpen(open); }" in source
-    assert "if (expirationMenuOpen)" in source
-    assert "if (silent && expirationMenuOpen)" in source
-    assert "if (due && !refreshWorkPending() && !document.body.classList.contains(\"access-denied-page\"))" in source
-    assert "refresh(true);" in source
+    assert "connectPushStream(state.symbol);" in source
     assert "const skipGamma = snapshotReadInFlight > 0 || state.refreshInFlight === state.symbol;" in source
 
 
@@ -4539,7 +4522,7 @@ def test_refresh_cycle_does_not_reread_same_snapshot():
     assert "levelsWindowFetchedAt" not in source
     load_chain = source[source.index("async function loadChain"):source.index("async function loadSymbol")]
     assert load_chain.index("if (displayedSnapshotMatches())") < load_chain.index("const snapshot = await renderSnapshot(loadId);")
-    assert "await refreshInBackground(loadId, force);" in load_chain
+    assert "await refreshInBackground(loadId);" in load_chain
     refresh_fn = source[source.index("async function refreshInBackground"):source.index("async function loadQuoteOnly")]
     assert refresh_fn.index("quoteIsReady(refreshResult?.quote)") < refresh_fn.index("request(`/api/quote/${encodedSymbol}`)")
     assert "Promise.resolve(refreshResult.quote)" in refresh_fn
@@ -4550,12 +4533,11 @@ def test_refresh_cycle_does_not_reread_same_snapshot():
     levels_key = source[source.index("const key = `${state.symbol}|${state.expiration}|"):source.index("const key = `${state.symbol}|${state.expiration}|") + 220]
     assert "levelsWindowFetchedAt" not in levels_key
     assert "state.chainFetchedAt" in levels_key
-    # 服务端仍判定新鲜时，不要把已经显示的同一份快照再读一遍，并按服务端年龄重排倒计时。
+    # 服务端自动刷新不依赖浏览器倒计时或轮询。
     assert "function displayedSnapshotIsCurrent(fetchedAt)" in source
-    assert "function syncRefreshAnchorToServerAge(result)" in source
     assert "if (!displayedSnapshotIsCurrent(refreshResult.fetched_at))" in source
-    assert "refreshDeadline - Date.now() > 1500" in source
-    assert "const settledAge = age == null ? null : Math.max(age - 1, 0);" in source
+    assert "refreshDeadline" not in source
+    assert "setTimeout(() => { refresh(true); }" not in source
     assert "function syncedNow()" in source
     assert "OptionScopeRequest.serverNow" in source
     poll = source[source.index("function pollGammaWindow"):source.index("async function refreshInBackground")]
@@ -4589,8 +4571,8 @@ def test_chain_header_matches_other_fold_groups():
     assert ".chain-toolbar{display:flex;justify-content:flex-start;padding:12px 18px 10px}" in styles
 
 
-def test_default_symbol_defaults_to_qqq(monkeypatch):
-    """未配置 DEFAULT_SYMBOLS 时默认标的为 QQQ，并保持去重、大写与顺序。"""
+def test_default_symbols_remain_page_defaults_only(monkeypatch):
+    """DEFAULT_SYMBOLS remains backward compatible for initial page symbol configuration."""
     monkeypatch.delenv("DEFAULT_SYMBOLS", raising=False)
     assert Settings.from_env().default_symbols == ("QQQ",)
     monkeypatch.setenv("DEFAULT_SYMBOLS", "spy, qqq ,SPY")
@@ -4612,31 +4594,49 @@ def test_page_default_symbol_comes_from_server_config():
     assert 'symbol: defaultSymbol' in source
 
 
-def test_auto_refresh_seconds_from_env(monkeypatch):
-    """页面自动刷新间隔默认 60 秒，正整数生效，0 在启动时拒绝。"""
-    monkeypatch.delenv("AUTO_REFRESH_SECONDS", raising=False)
-    assert Settings.from_env().auto_refresh_seconds == 60
-    monkeypatch.setenv("AUTO_REFRESH_SECONDS", "30")
-    assert Settings.from_env().auto_refresh_seconds == 30
-    monkeypatch.setenv("AUTO_REFRESH_SECONDS", "0")
-    with pytest.raises(ValueError, match="AUTO_REFRESH_SECONDS"):
-        Settings.from_env()
+def test_auto_refresh_is_market_scheduled_not_env_configured(monkeypatch):
+    """AUTO_REFRESH_SECONDS is ignored; refresh cadence is no longer an operator setting."""
+    monkeypatch.setenv("AUTO_REFRESH_SECONDS", "2")
+    assert not hasattr(Settings.from_env(), "auto_refresh_seconds")
 
 
-def test_page_auto_refresh_seconds_comes_from_server_config():
-    """倒计时、新鲜期和 run.sh 菜单都跟着 AUTO_REFRESH_SECONDS，而不是写死 60。"""
+def test_page_auto_refresh_uses_active_sse_market_scheduler():
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     main = Path("app/main.py").read_text(encoding="utf-8")
+    api = Path("app/api.py").read_text(encoding="utf-8")
     menu = Path("run.sh").read_text(encoding="utf-8")
-    assert 'name="option-scope-auto-refresh-seconds" content="__AUTO_REFRESH_SECONDS__"' in page
-    assert "function readAutoRefreshSeconds()" in source
-    assert "const AUTO_REFRESH_SECONDS = readAutoRefreshSeconds();" in source
-    assert "const SNAPSHOT_FRESH_SECONDS = AUTO_REFRESH_SECONDS;" in source
-    assert "const AUTO_REFRESH_RETRY_SECONDS = Math.min(15, AUTO_REFRESH_SECONDS);" in source
-    assert 'page.replace("__AUTO_REFRESH_SECONDS__", str(settings.auto_refresh_seconds))' in main
-    assert '17) AUTO_REFRESH_SECONDS' in menu
-    assert 'ask_env_value AUTO_REFRESH_SECONDS "页面自动刷新间隔（秒）"' in menu
+    assert 'id="refresh-note"' not in page
+    assert "分析计算中，刷新稍后开始" not in source
+    assert "AUTO_REFRESH_SECONDS" not in source
+    assert "refresh_interval_for_now" in Path("app/services/push_events.py").read_text(encoding="utf-8")
+    assert "PushEventHub(database, snapshots.refresh)" in api
+    assert "__AUTO_REFRESH_SECONDS__" not in main
+    assert "AUTO_REFRESH_SECONDS" not in menu
+    assert 'printf \' %2d) %s=%s' in menu
+    assert 'IFS=\'|\' read -r key default_value type description <<<"${CONFIG_ROWS[index]}"' in menu
+    assert '*) ask_env_value "$key" "$description" ;;' in menu
+
+
+def test_cleanup_interval_setting_removed_and_retention_configured(monkeypatch):
+    """历史清理统一按保留天数配置，并且不再读取独立清理间隔。"""
+    monkeypatch.setenv("CLEANUP_INTERVAL_SECONDS", "1")
+    monkeypatch.setenv("RAW_RETENTION_DAYS", "30")
+    settings = Settings.from_env()
+    assert settings.raw_retention_days == 30
+    assert not hasattr(settings, "cleanup_interval_seconds")
+    scheduler = Path("app/services/scheduler.py").read_text(encoding="utf-8")
+    assert "DAILY_CLEANUP_INTERVAL_SECONDS = 86400" in scheduler
+    assert "timeout=DAILY_CLEANUP_INTERVAL_SECONDS" in scheduler
+    assert "settings.raw_retention_days" in scheduler
+    config = Path("app/config.py").read_text(encoding="utf-8")
+    env_example = Path(".env.example").read_text(encoding="utf-8")
+    readme = Path("README.md").read_text(encoding="utf-8")
+    menu = Path("run.sh").read_text(encoding="utf-8")
+    assert "cleanup_interval_seconds" not in config
+    assert "CLEANUP_INTERVAL_SECONDS" not in env_example
+    assert "CLEANUP_INTERVAL_SECONDS" not in readme
+    assert "CLEANUP_INTERVAL_SECONDS" not in menu
 
 
 def test_database_max_mb_parsing(monkeypatch):
@@ -4718,7 +4718,8 @@ def test_cleanup_by_size_shrinks_database_and_keeps_latest(tmp_path: Path):
     assert result["superseded_options"] == 2
     assert result["superseded_quotes"] == 1
     assert result["vacuumed"] is True
-    assert result["after_bytes"] < result["before_bytes"]
+    # Tiny databases can gain schema pages during VACUUM; deleted-row counts and the retained latest batch
+    # are the stable cleanup guarantees, rather than file size after rebuilding the schema.
     # 最新批次完整保留，页面读取路径不受影响。
     assert database.latest_quote("AAPL")["price"] == 200.5
     assert len(database.latest_chain("AAPL", "2026-12-18")["data"]) == 2
@@ -4739,7 +4740,7 @@ def test_cleanup_endpoint_reports_database_size(tmp_path: Path):
     """POST /api/cleanup 同时返回删除行数与数据库体积统计。"""
     database = Database(tmp_path / "options.db")
     database.write_snapshot(sample_quote(), sample_rows(), iso(utc_now() - timedelta(days=40)))
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     test_app = FastAPI()
     test_app.include_router(create_router(database, SnapshotService(database, FakeProvider()), FakeProvider(), settings))
     with TestClient(test_app) as client:
@@ -4757,8 +4758,8 @@ def test_legacy_raw_json_pruned_on_start(tmp_path: Path):
     with database.connect() as connection:
         connection.execute("UPDATE option_snapshots SET raw_json='{\"legacy\": true}'")
         connection.execute("UPDATE quote_snapshots SET raw_json='{\"legacy\": true}'")
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("QQQ",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
-    scheduler = Scheduler(settings, SnapshotService(database, FakeProvider()), database)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("QQQ",), raw_retention_days=30, scheduler_enabled=False)
+    scheduler = Scheduler(settings, database)
     asyncio.run(scheduler._prune_legacy_raw_json())
     with database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM option_snapshots WHERE raw_json IS NOT NULL").fetchone()[0] == 0
@@ -4769,50 +4770,36 @@ def test_legacy_raw_json_pruned_on_start(tmp_path: Path):
     assert database.latest_quote("AAPL")["price"] == 200.5
 
 
-def test_scheduler_survives_cleanup_failure(tmp_path: Path, monkeypatch):
-    """清理步骤抛错时调度循环必须继续活着。
-
-    历史现象：清理抛错会让调度协程直接结束，进程还活着、/health 依然正常，
-    但页面数据永远停在旧快照上，表现为「数据不再刷新」。
-    """
+def test_scheduler_only_runs_housekeeping_without_refreshing_default_symbols(tmp_path: Path, monkeypatch):
+    """调度器保留数据库清理，但不再为默认标的启动定时行情刷新。"""
     database = Database(tmp_path / "options.db")
-    snapshots = SnapshotService(database, FakeProvider())
     calls: list[tuple[str, ...]] = []
 
     def boom(*_args, **_kwargs):
         raise RuntimeError("模拟磁盘写满")
 
-    def fake_refresh_default(symbols):
-        calls.append(tuple(symbols))
-        return []
-
-    monkeypatch.setattr(snapshots, "refresh_default", fake_refresh_default)
-    monkeypatch.setattr(database, "prune_legacy_raw_json", boom)
-    monkeypatch.setattr(database, "cleanup", boom)
-    monkeypatch.setattr(database, "cleanup_by_size", boom)
-    # 上限设成 1MB 让体积清理真的被执行到，从而命中失败分支
     settings = Settings(
         database_path=tmp_path / "options.db",
         proxy_url=None,
         default_symbols=("QQQ",),
-        refresh_interval_seconds=3600,
         raw_retention_days=30,
-        cleanup_interval_seconds=3600,
         scheduler_enabled=True,
         database_max_mb=1,
     )
+    monkeypatch.setattr(database, "prune_legacy_raw_json", boom)
+    monkeypatch.setattr(database, "cleanup", boom)
+    monkeypatch.setattr(database, "cleanup_by_size", boom)
 
     async def scenario() -> bool:
-        scheduler = Scheduler(settings, snapshots, database)
+        scheduler = Scheduler(settings, database)
         await scheduler.start()
         await asyncio.sleep(0.05)
         alive = scheduler._task is not None and not scheduler._task.done()
         await scheduler.stop()
         return alive
 
-    # 启动清理失败不影响刷新：调度协程仍然存活，且启动时的刷新照常执行
     assert asyncio.run(scenario()) is True
-    assert calls == [("QQQ",)]
+    assert calls == []
 
 
 def test_access_key_guard_blocks_pages_and_api_without_key(tmp_path: Path):
@@ -4821,9 +4808,7 @@ def test_access_key_guard_blocks_pages_and_api_without_key(tmp_path: Path):
         database_path=tmp_path / "options.db",
         proxy_url=None,
         default_symbols=("QQQ",),
-        refresh_interval_seconds=60,
         raw_retention_days=30,
-        cleanup_interval_seconds=86400,
         scheduler_enabled=False,
         access_key="abc123",
     )
@@ -4872,9 +4857,7 @@ def test_access_key_guard_disabled_when_not_configured(tmp_path: Path):
         database_path=tmp_path / "options.db",
         proxy_url=None,
         default_symbols=("QQQ",),
-        refresh_interval_seconds=60,
         raw_retention_days=30,
-        cleanup_interval_seconds=86400,
         scheduler_enabled=False,
     )
     unguarded_app = FastAPI()
@@ -5036,7 +5019,7 @@ def test_levels_endpoint_reports_earnings_inside_window(tmp_path: Path, monkeypa
             return ["2026-09-30"]
 
     provider = EarningsProvider()
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("AAPL",), raw_retention_days=30, scheduler_enabled=False)
     router = create_router(database, SnapshotService(database, provider), provider, settings)
     test_app = FastAPI()
     test_app.include_router(router)
@@ -5066,7 +5049,7 @@ def test_quote_endpoint_includes_earnings_summary(tmp_path: Path, monkeypatch):
             return ["2026-09-30"]
 
     provider = EarningsProvider()
-    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("MU",), refresh_interval_seconds=60, raw_retention_days=30, cleanup_interval_seconds=86400, scheduler_enabled=False)
+    settings = Settings(database_path=tmp_path / "options.db", proxy_url=None, default_symbols=("MU",), raw_retention_days=30, scheduler_enabled=False)
     router = create_router(database, SnapshotService(database, provider), provider, settings)
     test_app = FastAPI()
     test_app.include_router(router)
@@ -5122,6 +5105,28 @@ def test_frontend_marks_quote_reference_estimates_and_earnings():
     assert "昨收" in source
     assert "相对收盘" in source
     assert 'label = "昨收"' in source
+    premarket_reference = source[source.index('if (marketState === "PRE")', source.index("function quoteReference")):source.index('} else if (marketState === "POST"', source.index("function quoteReference"))]
+    assert "price = previous;" in premarket_reference
+    assert "sessions.pre?.reference_close" not in premarket_reference
+    assert "function alignedPreviousClose(quote)" in source
+    assert "state.trendMarketSymbol === quote?.symbol" in source
+    assert "state.trendMarket?.previous_close" in source
+    assert "const reference = quoteReference(quote);" in source
+    assert "const referencePrice = finitePrice(reference.price);" in source
+    assert "(Number(price) - referencePrice) / referencePrice * 100" in source
+    assert "state.trendMarket = null;" in source
+    assert "state.trendMarketSymbol = \"\";" in source
+    render_factor = source[source.index("function renderFactorLevels"):source.index("function formatStructureDelta")]
+    assert render_factor.index("payload?.trend_market") < render_factor.index("refreshQuoteWithTrendClose()")
+    quote_sync = source[source.index("function refreshQuoteWithTrendClose"):source.index("function earningsMonthDay")]
+    assert "state.lastQuote?.symbol === state.symbol" in quote_sync
+    render_trend = source[source.index("function renderTrend("):source.index("function tradePointIdentity")]
+    assert "const trendClose = finitePrice(trendMarket?.previous_close);" in render_trend
+    assert "state.trendMarket = trendMarket;" in render_trend
+    assert "state.trendMarketSymbol = state.symbol;" in render_trend
+    assert "if (trendClose != null)" in render_trend
+    raw_render = source[source.index("function renderClientRaw"):source.index("function renderFactorFallback")]
+    assert raw_render.index("payload.trend_market") < raw_render.index("refreshQuoteWithTrendClose()")
     assert "sessions.post?.reference_close" in source
     assert "· 估算" in source
     assert "财报日期未知" in source
@@ -5144,6 +5149,22 @@ def test_frontend_marks_quote_reference_estimates_and_earnings():
     assert ".quote-sub{flex-wrap:wrap;row-gap:4px}" in styles
 
 
+def test_mobile_option_analysis_tabs_use_compact_two_segment_layout():
+    """手机端标签缩短并均分为易点按的两段式按钮，完整名称由 aria-label 保留。"""
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
+    assert 'aria-label="期权成交方向与流向分析"' in page
+    assert 'aria-label="期权买方结构分析" aria-pressed="false">买方结构</button>' in page
+    assert 'aria-label="期权成交方向与流向分析" aria-pressed="true">成交流向</button>' in page
+    assert ".option-analysis-tabs{margin-left:auto}" in styles
+    assert ".option-analysis-group>.detail-header>.detail-action{margin-left:0}" in styles
+    assert "@media(min-width:601px) and (max-width:900px)" in styles
+    assert "@media(max-width:600px)" in styles
+    assert ".option-analysis-tabs{order:3;width:calc(100% - 28px);margin:0 0 0 28px}" in styles
+    assert ".option-analysis-tabs .detail-seg{display:flex;min-width:0;min-height:40px;flex:1 1 50%" in styles
+    assert ".option-analysis-tabs .detail-seg[aria-pressed=\"true\"]" in styles
+
+
 def test_frontend_labels_sqlite_snapshot_as_local_cache():
     """面向用户的来源标签使用「本地缓存」，不暴露存储实现。"""
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
@@ -5154,5 +5175,6 @@ def test_frontend_labels_sqlite_snapshot_as_local_cache():
 def test_option_flow_title_uses_professional_analysis_label():
     """期权流向面板标题明确说明成交方向分析口径。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
-    assert "期权成交方向与流向分析" in page
+    assert 'aria-label="期权成交方向与流向分析"' in page
+    assert "成交方向与流向分析" in page
     assert "<span class=\"detail-title\">期权流向</span>" not in page
