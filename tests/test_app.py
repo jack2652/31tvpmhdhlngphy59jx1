@@ -5178,3 +5178,18 @@ def test_option_flow_title_uses_professional_analysis_label():
     assert 'aria-label="期权成交方向与流向分析"' in page
     assert "成交方向与流向分析" in page
     assert "<span class=\"detail-title\">期权流向</span>" not in page
+
+
+def test_empty_option_flow_does_not_overwrite_last_nonempty_result():
+    """相邻快照没有新增成交量时保留上次有效流向，避免冷门标的显示空的 0 数据。"""
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+    helper = source[source.index("function hasOptionFlowData"):source.index("function renderOptionFlow")]
+    render = source[source.index("function renderOptionFlow"):source.index("// 时段标签", source.index("function renderOptionFlow"))]
+    assert "if (!payload?.available) return false;" in helper
+    assert "side.buy_volume, side.sell_volume, side.unknown_volume" in helper
+    assert "side.concentration, side.top_strikes" in helper
+    assert "|| !hasOptionFlowData(payload)) return;" in render
+    assert render.index("!hasOptionFlowData(payload)") < render.index("state.view.flow = {")
+    snapshot_render = source[source.index("async function loadSnapshotForRender"):source.index("// 跨期限 Gamma 窗口刷新最慢")]
+    assert "// 暂时拿不到期权链时不清空已显示的流向" in snapshot_render
+    assert 'resetOptionFlow("当前期限暂无可用期权快照")' not in snapshot_render

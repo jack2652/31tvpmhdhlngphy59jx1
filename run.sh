@@ -457,6 +457,115 @@ port_owner() {
   return 0
 }
 
+# 只枚举监听指定 TCP 端口的进程（不把连接到该端口的客户端误判为占用者）。
+port_listener_pids() {
+  local port="$1"
+  {
+    if has_cmd ss; then
+      ss -H -ltnp "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 || true
+    fi
+    if has_cmd lsof; then
+      lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+    fi
+  } | sort -u
+}
+
+# 交互式结束指定 TCP 监听端口的进程；先展示 PID 并确认，再发 TERM。
+action_kill_port() {
+  local port="${1:-}" answer="" pid="" owns_app=false
+  local -a pids=() remaining=()
+  if [ -z "$port" ]; then
+    printf '  输入要释放的 TCP 端口：'
+    read -r port || return 0
+  fi
+  case "$port" in
+    '' | *[!0-9]*) fail "端口必须是 1 到 65535 的数字"; return 2 ;;
+  esac
+  if [ "${#port}" -gt 5 ] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    fail "端口必须在 1 到 65535 之间"
+    return 2
+  fi
+  if ! has_cmd ss && ! has_cmd lsof; then
+    fail "缺少 ss/lsof，无法安全识别监听进程；请安装 iproute2 或 lsof 后重试"
+    return 1
+  fi
+  mapfile -t pids < <(port_listener_pids "$port")
+  if [ "${#pids[@]}" -eq 0 ]; then
+    if has_cmd ss; then
+      ss -H -ltn "sport = :$port" 2>/dev/null
+    fi
+    info "TCP 端口 $port 没有可识别的监听进程"
+    return 0
+  fi
+  printf '  TCP 端口 %s 的监听进程：\n' "$port"
+  for pid in "${pids[@]}"; do
+    case "$pid" in '' | *[!0-9]*) continue ;; esac
+    ps -p "$pid" -o pid=,comm= 2>/dev/null || printf '    PID %s（进程详情不可读）\n' "$pid"
+    if proc_matches "$pid" "-m app"; then
+      owns_app=true
+    fi
+  done
+  printf '  确认向以上进程发送 SIGTERM 并释放端口？[y/N]：'
+  read -r answer || answer=""
+  case "$answer" in y | Y | yes | YES) ;; *) info "已取消，未结束任何进程"; return 0 ;; esac
+
+  # 当前项目由看门狗或 systemd 管理时走正常停服流程，避免刚杀掉就被自动拉起。
+  if [ "$owns_app" = true ]; then
+    warn "检测到当前 Option Scope 服务；将通过正常停服流程停止它"
+    stop_app || return 1
+    mapfile -t pids < <(port_listener_pids "$port")
+    if [ "${#pids[@]}" -gt 0 ]; then
+      warn "端口上出现了其他监听进程；为避免结束未确认的进程，请重新运行本功能检查"
+      return 1
+    fi
+  fi
+  if [ "${#pids[@]}" -gt 0 ]; then
+    local waited=0 signal_status=0
+    for pid in "${pids[@]}"; do
+      if [ "$pid" = 1 ]; then
+        warn "拒绝结束 PID 1（系统初始化进程）"
+        continue
+      fi
+      kill -TERM "$pid" 2>/dev/null || run_root kill -TERM "$pid" || signal_status=1
+    done
+    [ "$signal_status" -eq 0 ] || warn "部分进程未能发送 SIGTERM；可能需要更高权限"
+    while [ "$waited" -lt 5 ]; do
+      mapfile -t remaining < <(port_listener_pids "$port")
+      [ "${#remaining[@]}" -gt 0 ] || break
+      sleep 1
+      waited=$((waited + 1))
+    done
+    mapfile -t remaining < <(port_listener_pids "$port")
+    local -a force_pids=()
+    for pid in "${remaining[@]}"; do
+      [ "$pid" = 1 ] || force_pids+=("$pid")
+    done
+    if [ "${#force_pids[@]}" -gt 0 ]; then
+      printf '  仍存活的 PID：%s\n' "${force_pids[*]}"
+      printf '  是否对这些进程发送 SIGKILL 强制结束？[y/N]：'
+      read -r answer || answer=""
+      case "$answer" in
+        y | Y | yes | YES)
+          local force_status=0 force_pid
+          for force_pid in "${force_pids[@]}"; do
+            kill -KILL "$force_pid" 2>/dev/null || run_root kill -KILL "$force_pid" || force_status=1
+          done
+          [ "$force_status" -eq 0 ] || return 1
+          ok "已发送 SIGKILL"
+          ;;
+        *) warn "未强制结束；进程可能仍占用端口"; return 1 ;;
+      esac
+    else
+      ok "监听进程已退出"
+    fi
+  fi
+  if port_in_use "$port"; then
+    warn "端口 $port 仍有响应，可能有其他进程刚刚接管；请重新检查"
+    return 1
+  fi
+  ok "TCP 端口 $port 已释放"
+}
+
 # HTTP 健康检查：比「进程还在」更能反映服务是否真的可用
 health_ok() {
   "$(runtime_python)" - "$(app_port)" <<'PY' >/dev/null 2>&1
@@ -1521,8 +1630,11 @@ run_menu() {
 }
 
 action_install_runtime() {
-  section "检测环境并安装"
-  ensure_runtime
+  section "检测环境并安装/修复依赖"
+  ensure_python || return 1
+  ensure_venv || return 1
+  ensure_deps || return 1
+  ok "环境和依赖已就绪；应用未启动，请在主菜单选择 2) 启动应用"
 }
 
 action_service() {
@@ -1662,6 +1774,7 @@ Option Scope 运维脚本用法：
   ./run.sh                    打开交互菜单
   ./run.sh 2                  直接执行第 2 项（适合脚本、计划任务调用）
   ./run.sh start|stop|restart|status|doctor|install|config|db
+  ./run.sh kill-port [端口]     交互确认后结束监听该 TCP 端口的进程
   ./run.sh install-service     安装并启用 systemd 常驻服务（生产环境推荐）
   ./run.sh remove-service      移除 systemd 服务，恢复 shell 看门狗
   ./run.sh foreground          前台运行应用（供 systemd 使用）
@@ -1684,8 +1797,9 @@ MAIN_MENU_ROWS=(
   '6|更新应用并重启|action_update'
   '7|检测环境并安装/修复依赖|action_install_runtime'
   '8|数据库工具（清理 / 备份 / 统计）|action_database'
-  '9|环境自检|action_doctor'
-  '10|高级服务管理（systemd / 依赖更新 / 卸载）|action_service'
+  '9|高级服务管理（systemd / 依赖更新 / 卸载）|action_service'
+  '10|结束占用指定 TCP 端口的程序|action_kill_port'
+  '11|环境自检|action_doctor'
   '0|退出|quit'
 )
 
@@ -1977,6 +2091,7 @@ main() {
     7 | status) action_status ;;
     8 | db | database) action_database ;;
     9 | doctor | check) action_doctor ;;
+    kill-port) action_kill_port "${2:-}" ;;
     restart) restart_app ;;
     install-service | service-install) install_systemd_service ;;
     remove-service | service-remove) remove_systemd_service ;;

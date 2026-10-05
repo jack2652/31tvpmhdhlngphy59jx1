@@ -2738,11 +2738,22 @@ function resetOptionFlow(reason = "需要两份相邻期权链快照才能估算
   };
 }
 
+function hasOptionFlowData(payload) {
+  if (!payload?.available) return false;
+  return [payload.call, payload.put].some((side) => {
+    if (!side) return false;
+    const totals = [side.buy_volume, side.sell_volume, side.unknown_volume];
+    if (totals.some((value) => Number.isFinite(Number(value)) && Number(value) > 0)) return true;
+    return [side.concentration, side.top_strikes].some((rows) =>
+      Array.isArray(rows) && rows.some((row) => Number.isFinite(Number(row?.volume)) && Number(row.volume) > 0));
+  });
+}
+
 function renderOptionFlow(payload) {
-  if (!payload || payload.expiration && state.expiration && payload.expiration !== state.expiration) {
-    resetOptionFlow();
-    return;
-  }
+  // 无新增成交、接口暂不可用或迟到的旧期限响应都不覆盖当前有效流向；
+  // 换标的/期限时由相应加载流程显式 resetOptionFlow。
+  if (!payload || (payload.expiration && state.expiration && payload.expiration !== state.expiration)
+    || !hasOptionFlowData(payload)) return;
   const signal = payload.signal || {};
   const hasWindow = Boolean(payload.current_fetched_at && payload.previous_fetched_at);
   const windowLabel = hasWindow
@@ -3163,7 +3174,7 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
   const resolvedQuote = quoteIsReady(quote) ? quote : fallbackQuote;
   applyCachedQuote(resolvedQuote);
   if (!payload?.data?.length) {
-    resetOptionFlow("当前期限暂无可用期权快照");
+    // 暂时拿不到期权链时不清空已显示的流向；标的/期限切换会单独重置面板。
     return { shown: false, source: payload?.source || resolvedQuote?.source || null, fetchedAt: payload?.fetched_at || null, quote: resolvedQuote };
   }
   state.analysisReady = gammaProfileReady(analysis) || state.analysisReady;
