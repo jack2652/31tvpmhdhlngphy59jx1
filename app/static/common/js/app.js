@@ -147,7 +147,7 @@ const state = {
         rowspan: 1,
       },
     },
-    chainTitle: "选择到期日查看期权链",
+    chainTitle: "期权链 · 选择到期日查看",
     dataSource: "尚未加载",
     fetchedAt: "快照时间 --",
     chainHeatNote: "等待数据",
@@ -229,7 +229,7 @@ function closestElement(target, selector) {
   return null;
 }
 
-// 主题：默认黑夜模式，用户可在右上角切换到白天；偏好写入 localStorage，刷新后保持。
+// 主题：默认白天模式，用户可在右上角切换到黑夜；偏好写入 localStorage，刷新后保持。
 const THEME_KEY = "option-scope-theme";
 const ACCESS_KEY_STORAGE = "option-scope-access-key";
 // 按钮文案展示当前生效的主题名称。
@@ -251,12 +251,12 @@ function applyTheme(theme) {
 function initTheme() {
   let stored = null;
   try { stored = localStorage.getItem(THEME_KEY); } catch (error) { stored = null; }
-  applyTheme(stored === "light" ? "light" : "dark");
+  applyTheme(stored === "dark" ? "dark" : "light");
 }
 
 // 折叠组通用逻辑：内容体用 hidden 控制显隐（[hidden] 在 flex/grid 上下文里会被覆盖，样式里补了 [hidden]{display:none}），
 // 按钮同步 aria-expanded 与「展开/收起」文案，展开状态记在 sessionStorage——同一标签页里换标的、跳 URL 不必重复展开，
-// 关掉标签页就回到各自默认状态（分析详情与期权链默认折叠、图表默认展开）。
+// 关掉标签页就回到各自默认状态（趋势分析默认展开、期权分析与期权链默认折叠、图表默认展开）。
 function bindFoldGroup({ headerId, toggleId, bodyId, actionId, storageKey, defaultExpanded, onChange, shouldIgnore }) {
   const header = byId(headerId);
   const body = byId(bodyId);
@@ -280,8 +280,8 @@ function bindFoldGroup({ headerId, toggleId, bodyId, actionId, storageKey, defau
   });
 }
 
-// 分析详情折叠组：趋势通道、加仓价位与压力位/支撑位四张明细表，默认折叠。
-const DETAIL_KEY = "option-scope-detail";
+// 分析详情折叠组：趋势通道、加仓价位与压力位/支撑位四张明细表，默认展开。
+const DETAIL_KEY = "option-scope-detail-v2";
 
 function initDetailGroup() {
   bindFoldGroup({
@@ -290,7 +290,7 @@ function initDetailGroup() {
     bodyId: "detail-body",
     actionId: "detail-action",
     storageKey: DETAIL_KEY,
-    defaultExpanded: false,
+    defaultExpanded: true,
     // 基准价开关只在展开时出现：折叠态下不占位，也避免误点。
     onChange: (expanded) => { const modes = byId("detail-modes"); if (modes) modes.hidden = !expanded; },
     // 标题栏里混着「基准价」开关：命中开关就切口径，开关容器里的空白则不改折叠状态，避免贴着按钮点空时把面板收了。
@@ -334,8 +334,8 @@ function initChartGroup() {
   });
 }
 
-// 期权流向与买方结构共用一个折叠组，内部按钮只切换视图，不折叠外层面板。
-const OPTION_ANALYSIS_KEY = "option-scope-option-analysis";
+// 期权流向与买方结构共用一个默认折叠的分组，内部按钮只切换视图，不折叠外层面板。
+const OPTION_ANALYSIS_KEY = "option-scope-option-analysis-v2";
 
 function initOptionAnalysisGroup() {
   bindFoldGroup({
@@ -344,7 +344,7 @@ function initOptionAnalysisGroup() {
     bodyId: "option-analysis-fold",
     actionId: "option-analysis-action",
     storageKey: OPTION_ANALYSIS_KEY,
-    defaultExpanded: true,
+    defaultExpanded: false,
     // 面板折叠时隐藏视图切换按钮，避免折叠标题栏仍显示内部操作控件。
     onChange: (expanded) => {
       const tabs = byId("option-analysis-tabs");
@@ -2943,7 +2943,7 @@ function renderChain(payload, quote, analysisPayload) {
   state.expiration = payload.expiration;
   // 基准价开关切换时要用最近一次快照重算，这里留一份引用。
   state.lastQuote = quote || null;
-  state.view.chainTitle = `${payload.symbol} · ${payload.expiration}`;
+  state.view.chainTitle = `期权链 · ${payload.symbol} · ${payload.expiration}`;
   // 期权链始终从本地缓存读取，这里按快照新鲜度标注来源，避免刚抓完还显示“缓存”造成误解。
   const snapshotAge = payload.fetched_at ? (Date.now() - new Date(payload.fetched_at).getTime()) / 1000 : null;
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
@@ -3045,7 +3045,7 @@ function showPending(message) {
     state.view.fairOptimistic = "--";
     state.view.fairOptimisticSource = "等待远期盈利数据";
   }
-  state.view.chainTitle = `${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
+  state.view.chainTitle = `期权链 · ${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
   state.view.dataSource = "后台刷新中";
   state.view.fetchedAt = "快照时间 --";
   state.view.totalCount = "--";

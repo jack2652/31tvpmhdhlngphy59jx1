@@ -112,6 +112,7 @@ def index():
     # 时间戳只用于缓存键，不参与业务数据计算；使用纳秒可覆盖同一秒内的快速更新。
     asset_paths = (
         static_dir / "common/css/styles.css",
+        static_dir / "common/img/option-scope-mark.svg",
         static_dir / "common/js/request.js",
         static_dir / "common/js/charts.js",
         static_dir / "common/js/app.js",

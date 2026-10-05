@@ -1948,8 +1948,8 @@ def test_palette_uses_green_up_red_down_tokens():
     assert 'state.view.quoteChangeColor = change == null ? "var(--muted)" : (change < 0 ? "var(--down)" : "var(--up)");' in source
 
 
-def test_theme_defaults_to_dark_with_light_override():
-    """主题：默认黑夜模式，白天通过 data-theme="light" 覆盖，偏好写入 localStorage 记忆。"""
+def test_theme_defaults_to_light_with_dark_override():
+    """主题：默认白天模式，黑夜通过 data-theme="dark" 覆盖，偏好写入 localStorage 记忆。"""
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     html = Path("app/static/index.html").read_text(encoding="utf-8")
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
@@ -1957,10 +1957,10 @@ def test_theme_defaults_to_dark_with_light_override():
     assert ":root{color-scheme:dark;" in styles
     assert ':root[data-theme="light"]{color-scheme:light;' in styles
     assert "--bg:#0b1118" in styles and "--bg:#f2f5f9" in styles
-    # 首屏引导脚本：默认黑夜，只有本地存过白天偏好时才切白天，避免刷新闪烁；
+    # 首屏引导脚本：默认白天，读取本地保存的黑夜/白天偏好，避免刷新闪烁；
     # 浏览器禁用本地存储时必须静默回退，不能抛出异常导致整段脚本中断。
-    assert 'var theme="dark";' in html
-    assert 'if(localStorage.getItem("option-scope-theme")==="light")theme="light";' in html
+    assert 'var theme="light";' in html
+    assert 'if(stored==="dark"||stored==="light")theme=stored;' in html
     assert "catch(error){}document.documentElement.dataset.theme=theme;" in html
     assert 'id="theme-toggle"' in html
     assert ':class="view.themeIcon"' in html
@@ -1970,6 +1970,7 @@ def test_theme_defaults_to_dark_with_light_override():
     assert "function initTheme()" in source
     assert "initTheme();" in source
     assert 'state.view.themeIcon = next === "light" ? "el-icon-sunny" : "el-icon-moon-night";' in source
+    assert 'applyTheme(stored === "dark" ? "dark" : "light");' in source
     # 正文规则走主题令牌；允许后续主题分组继续声明颜色变量。
     body = "\n".join(line for index, line in enumerate(styles.splitlines(), 1) if index not in (2, 3))
     assert "--flow-body:#" in body
@@ -2085,6 +2086,7 @@ def test_chain_panel_collapses_by_default():
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
     # 折叠按钮挂在标题行左侧（caret + 展开/收起），受控内容是包住工具栏、表格与图例的 chain-fold
     assert 'id="chain-toggle" type="button" aria-expanded="false" aria-controls="chain-fold"' in page
+    assert '<span class="eyebrow">OPTIONS CHAIN</span><h1 id="chain-title" v-text="view.chainTitle">期权链 · 选择到期日查看</h1>' in page
     assert 'id="chain-action"' in page
     assert 'id="chain-fold" hidden' in page
     fold = page[page.index('id="chain-fold"') : page.index('</section>', page.index('id="chain-fold"'))]
@@ -2102,6 +2104,8 @@ def test_chain_panel_collapses_by_default():
     assert "defaultExpanded: false," in chain_group
     assert "function initChainGroup()" in source
     assert "initChainGroup();" in source
+    assert 'state.view.chainTitle = `期权链 · ${payload.symbol} · ${payload.expiration}`;' in source
+    assert 'state.view.chainTitle = `期权链 · ${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;' in source
     # 通用实现按 storageKey 读写本次会话的偏好
     assert "sessionStorage.getItem(storageKey)" in source and "sessionStorage.setItem(storageKey" in source
     # 标题行右侧是数据来源与快照时间，点它不折叠
@@ -4372,8 +4376,8 @@ def test_extremes_degrade_when_provider_fails(tmp_path: Path):
     assert "全量历史不可用" in payload["history"]["extremes_warning"]
     # 压力位/支撑位与趋势通道仍照常返回
     assert payload["support"] and payload["trend"]["direction"] in {"up", "down", "range"}
-def test_analysis_detail_group_collapses_by_default():
-    """分析详情折叠面板：趋势通道 + 交易计划 + 压力位/支撑位包在一个默认折叠的分组里，点标题展开。"""
+def test_analysis_detail_group_expands_by_default():
+    """分析详情折叠面板：趋势通道 + 交易计划 + 压力位/支撑位默认展开，仍记忆标签页内偏好。"""
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
     styles = Path("app/static/common/css/styles.css").read_text(encoding="utf-8")
@@ -4386,16 +4390,17 @@ def test_analysis_detail_group_collapses_by_default():
     assert 'id="buy-levels"' not in body and 'id="sell-levels"' not in body
     order = [body.index(token) for token in ('id="trend-body"', 'id="add-levels"', 'id="support-levels"', 'id="resistance-levels"')]
     assert order == sorted(order)
-    # 默认折叠：body 带 hidden，按钮 aria-expanded=false
-    assert 'id="detail-body" hidden' in page
-    assert 'id="detail-toggle" type="button" aria-expanded="false" aria-controls="detail-body"' in page
+    # 默认展开：body 不带 hidden，按钮 aria-expanded=true，右侧显示「收起」
+    assert 'id="detail-body" hidden' not in page
+    assert 'id="detail-toggle" type="button" aria-expanded="true" aria-controls="detail-body"' in page
+    assert '<span class="detail-action" id="detail-action">收起</span>' in page
     assert 'id="detail-hint"' not in page and 'id="detail-action"' in page
     # 展开状态记在 sessionStorage，换标的后仍保持；折叠逻辑走通用实现 bindFoldGroup
-    assert 'const DETAIL_KEY = "option-scope-detail";' in source
+    assert 'const DETAIL_KEY = "option-scope-detail-v2";' in source
     assert "function initDetailGroup()" in source
     assert "initDetailGroup();" in source
     assert "sessionStorage.getItem(storageKey)" in source and "sessionStorage.setItem(storageKey" in source
-    assert 'const DETAIL_KEY = "option-scope-detail";' in source
+    assert 'const DETAIL_KEY = "option-scope-detail-v2";' in source
     assert "function bindFoldGroup(" in source
     assert 'bodyId: "detail-body",' in source
     # 折叠态样式：hidden 生效 + caret 旋转
@@ -4891,6 +4896,7 @@ def test_access_key_supports_browsers_with_disabled_storage():
     # URL key 存在时必须无条件写回内存，storage 写入失败也不能把它置空。
     assert "state.accessKey = queryKey;" in source
     # 首屏主题脚本也不能因为存储被禁用而抛错。
+    assert 'var theme="light";' in page
     assert "catch(error){}document.documentElement.dataset.theme=theme;" in page
 
 
@@ -5165,6 +5171,21 @@ def test_mobile_option_analysis_tabs_use_compact_two_segment_layout():
     assert ".option-analysis-tabs .detail-seg[aria-pressed=\"true\"]" in styles
 
 
+def test_page_title_and_brand_describe_market_and_options_analysis():
+    """浏览器标题和页眉品牌覆盖行情与期权分析，而非仅称快照。"""
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "<title>美股行情与期权分析 | Option Scope</title>" in page
+    assert '<strong>美股行情与期权分析</strong><small>OPTION SCOPE</small>' in page
+    assert '<link rel="icon" type="image/svg+xml" href="/static/common/img/option-scope-mark.svg?v=__ASSET_VERSION__">' in page
+    assert '<img class="brand-mark" src="/static/common/img/option-scope-mark.svg?v=__ASSET_VERSION__" alt="Option Scope" width="34" height="34">' in page
+    assert '<span class="brand-mark">OS</span>' not in page
+    assert "美股期权快照</title>" not in page
+    assert '<small>美股期权快照</small>' not in page
+    logo = Path("app/static/common/img/option-scope-mark.svg").read_text(encoding="utf-8")
+    assert '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"' in logo
+    assert 'stroke="url(#trend)"' in logo
+
+
 def test_frontend_labels_sqlite_snapshot_as_local_cache():
     """面向用户的来源标签使用「本地缓存」，不暴露存储实现。"""
     source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
@@ -5193,3 +5214,23 @@ def test_empty_option_flow_does_not_overwrite_last_nonempty_result():
     snapshot_render = source[source.index("async function loadSnapshotForRender"):source.index("// 跨期限 Gamma 窗口刷新最慢")]
     assert "// 暂时拿不到期权链时不清空已显示的流向" in snapshot_render
     assert 'resetOptionFlow("当前期限暂无可用期权快照")' not in snapshot_render
+
+
+
+def test_analysis_panels_use_requested_default_fold_states():
+    """趋势分析默认展开、期权流向默认折叠；新版 session 键不继承旧状态。"""
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    source = Path("app/static/common/js/app.js").read_text(encoding="utf-8")
+
+    assert 'id="detail-toggle" type="button" aria-expanded="true" aria-controls="detail-body"' in page
+    assert 'id="detail-body" hidden' not in page
+    assert '<span class="detail-action" id="detail-action">收起</span>' in page
+    assert 'id="option-analysis-toggle" type="button" aria-expanded="false" aria-controls="option-analysis-fold"' in page
+    assert 'id="option-analysis-fold" hidden' in page
+    assert '<span class="detail-action" id="option-analysis-action">展开</span>' in page
+    detail_setup = source[source.index("function initDetailGroup()"):source.index("// 期权链折叠组")]
+    option_setup = source[source.index("function initOptionAnalysisGroup()"):source.index("function setOptionAnalysisView")]
+    assert 'const DETAIL_KEY = "option-scope-detail-v2";' in source
+    assert "defaultExpanded: true," in detail_setup
+    assert 'const OPTION_ANALYSIS_KEY = "option-scope-option-analysis-v2";' in source
+    assert "defaultExpanded: false," in option_setup

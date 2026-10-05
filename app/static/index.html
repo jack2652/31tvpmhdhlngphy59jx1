@@ -4,16 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="option-scope-access-required" content="__ACCESS_KEY_REQUIRED__">
-  <title>Option Scope | 美股期权快照</title>
-  <script>/* 首屏主题引导：默认黑夜模式，仅在本地存有白天偏好时切换到白天，避免刷新闪烁；存储被禁用时静默回退。 */(function(){var theme="dark";try{if(localStorage.getItem("option-scope-theme")==="light")theme="light";}catch(error){}document.documentElement.dataset.theme=theme;})();</script>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d1117'/%3E%3Ctext x='16' y='22' font-size='14' text-anchor='middle' fill='%234ade80' font-family='sans-serif'%3EOS%3C/text%3E%3C/svg%3E">
+  <title>美股行情与期权分析 | Option Scope</title>
+  <script>/* 首屏主题引导：默认白天模式，读取本地偏好后再恢复用户选择，避免刷新闪烁；存储被禁用时静默回退。 */(function(){var theme="light";try{var stored=localStorage.getItem("option-scope-theme");if(stored==="dark"||stored==="light")theme=stored;}catch(error){}document.documentElement.dataset.theme=theme;})();</script>
+  <link rel="icon" type="image/svg+xml" href="/static/common/img/option-scope-mark.svg?v=__ASSET_VERSION__">
   <link rel="stylesheet" href="/static/element-ui@2.15.14/css/index.min.css">
   <link rel="stylesheet" href="/static/common/css/styles.css?v=__ASSET_VERSION__">
 </head>
 <body>
   <div id="app" v-cloak>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark">OS</span><div><strong>OPTION SCOPE</strong><small>美股期权快照</small></div></div>
+    <div class="brand"><img class="brand-mark" src="/static/common/img/option-scope-mark.svg?v=__ASSET_VERSION__" alt="Option Scope" width="34" height="34"><div><strong>美股行情与期权分析</strong><small>OPTION SCOPE</small></div></div>
     <div class="top-actions">
       <div class="top-meta"><span class="live-dot"></span><span id="market-state" v-text="view.marketState">等待数据</span><span class="divider"></span><span id="clock">--:--:--</span></div>
       <el-button id="theme-toggle" class="theme-toggle" type="text" circle :title="view.themeLabel" aria-pressed="false" @click="toggleTheme"><i :class="view.themeIcon" aria-hidden="true"></i></el-button>
@@ -43,7 +43,7 @@
 
     <section class="detail-group panel" id="analysis-detail">
       <div class="detail-header analysis-detail-header" id="detail-header">
-        <button class="detail-toggle" id="detail-toggle" type="button" aria-expanded="false" aria-controls="detail-body">
+        <button class="detail-toggle" id="detail-toggle" type="button" aria-expanded="true" aria-controls="detail-body">
           <span class="detail-caret" aria-hidden="true"></span>
           <span class="detail-text"><span class="eyebrow">ANALYSIS DETAIL</span><span class="detail-title">趋势通道 · 加仓价位 · 压力位/支撑位</span></span>
         </button>
@@ -53,9 +53,9 @@
             <button class="detail-seg" id="basis-close" type="button" data-basis="close" aria-pressed="false" title="按盘后价重算（沿用原口径，盘后数据缺失时回退盘前价）">盘后价</button>
           </div>
         </div>
-        <span class="detail-action" id="detail-action">展开</span>
+        <span class="detail-action" id="detail-action">收起</span>
       </div>
-      <div class="detail-body" id="detail-body" hidden>
+      <div class="detail-body" id="detail-body">
         <section class="analysis-levels-grid">
           <section class="plan-grid">
           <article class="panel plan-panel trend-panel">
@@ -149,7 +149,7 @@
 
     <section class="detail-group panel option-analysis-group" id="option-analysis-group">
       <div class="detail-header" id="option-analysis-header">
-        <button class="detail-toggle" id="option-analysis-toggle" type="button" aria-expanded="true" aria-controls="option-analysis-fold">
+        <button class="detail-toggle" id="option-analysis-toggle" type="button" aria-expanded="false" aria-controls="option-analysis-fold">
           <span class="detail-caret" aria-hidden="true"></span>
           <span class="detail-text"><span class="eyebrow">OPTION ANALYSIS</span><span class="detail-title">期权流向与买方结构分析</span></span>
         </button>
@@ -159,9 +159,9 @@
             <button class="detail-seg" type="button" data-option-view="buyer" aria-label="期权买方结构分析" aria-pressed="false">买方结构</button>
           </div>
         </div>
-        <span class="detail-action" id="option-analysis-action">收起</span>
+        <span class="detail-action" id="option-analysis-action">展开</span>
       </div>
-      <div class="detail-body option-analysis-fold" id="option-analysis-fold">
+      <div class="detail-body option-analysis-fold" id="option-analysis-fold" hidden>
     <div class="option-flow-fold" id="option-flow-fold" data-option-view-panel="flow">
         <div class="option-flow-panel">
           <div class="flow-overview"><div><span class="flow-kicker">相邻快照</span><p>用成交量增量和买卖价位置判断主动买卖</p></div><div class="flow-signal" :class="`flow-signal-${view.flow.signalClass}`"><strong v-text="view.flow.signalLabel">等待相邻快照</strong><span v-text="view.flow.signalDetail">需要两份相邻期权链快照才能估算流向</span></div></div>
@@ -226,7 +226,7 @@
     <section class="data-panel panel">
       <div class="detail-header" id="chain-header">
         <button class="detail-toggle" id="chain-toggle" type="button" aria-expanded="false" aria-controls="chain-fold" aria-label="期权链明细"><span class="detail-caret" aria-hidden="true"></span></button>
-        <div class="detail-text"><span class="eyebrow">期权链</span><h1 id="chain-title" v-text="view.chainTitle">选择到期日查看期权链</h1></div>
+        <div class="detail-text"><span class="eyebrow">OPTIONS CHAIN</span><h1 id="chain-title" v-text="view.chainTitle">期权链 · 选择到期日查看</h1></div>
         <div class="panel-status"><span id="data-source" v-text="view.dataSource">尚未加载</span><span class="divider"></span><span id="fetched-at" v-text="view.fetchedAt">快照时间 --</span></div>
         <span class="detail-action" id="chain-action">展开</span>
       </div>
