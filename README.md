@@ -1,29 +1,10 @@
 # Option Scope
 
-## 一键安装（推荐）
+Option Scope 是一个美股行情与期权分析工具，涵盖现货行情、期权链、成交流向、买方结构和关键价位分析。当前分支提供纯 Go 服务，HTTP 层使用 Gin，数据存入 SQLite；前端是无需 Node 构建的 HTML、CSS 和 JavaScript 静态资源，并通过 `//go:embed` 编入服务二进制。
 
-在任意一台 Ubuntu / Debian / CentOS / RHEL / Rocky / Alma / Alpine 机器上，直接执行这一行（无需事先下载源码、无需手动上传部署）：
+## Go 服务
 
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
-```
-
-脚本会先把仓库克隆到当前目录下的 `us_stocks/`（该目录已是仓库时改跑 `git pull` 更新到最新源码），然后切换进去打开交互菜单：菜单第 7 项仅检测/安装/修复 Python 环境与依赖，不启动应用；第 2 项启动（后台运行 + 看门狗守护）。第 9 项是高级服务管理，第 10 项可结束占用指定 TCP 端口的程序，第 11 项是环境自检。
-
-| 需求 | 命令 |
-| --- | --- |
-| 打开交互菜单（默认） | `bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)` |
-| 首次安装完成后启动应用 | `bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh) 2` |
-| 换安装目录 | `INSTALL_DIR=/opt/us_stocks bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)` |
-| 换远端（镜像 / SSH） | `GIT_REMOTE_URL=git@github.com:jack2652/31tvpmhdhlngphy59jx1.git bash <(curl -Ls <脚本地址>)` |
-
-几点说明：默认安装目录是执行命令时所在目录下的 `us_stocks/`（用 `INSTALL_DIR` 可改成 `/opt/...` 这类路径）；重复执行同一条命令等同于「升级到最新源码」，`.env` 配置与 `data/` 数据库都在忽略名单里，不会被动到；机器上没装 git 时脚本会先用系统包管理器装，装不上则退化为下载源码压缩包（这种安装方式后续不能自动增量更新）；`pip` 依赖只在 `pyproject.toml` 变化时才重装，日常拉新代码几乎不花时间。
-
-一个可快速部署的美股行情与期权分析工具，涵盖现货行情、期权链、成交流向、买方结构和关键价位分析。品牌名称为 Option Scope，页面主标题使用「美股行情与期权分析」。后端使用 FastAPI，行情与期权链来自上游行情接口，快照落盘到 SQLite，前端是无需 Node 构建的原生 HTML/CSS/JavaScript。
-
-## Go 重写分支（`go-rewrite`）
-
-本分支用于逐步把后端迁移到 Go，HTTP 层使用 Gin，不是 Cloudflare Workers/Wasm 版本。Python 基线保留在同级目录 `us_stocks_py/`，作为可运行版本、API 行为参考和迁移期间的回退实现；在 Go 完整覆盖全部接口前不会删除 Python 文件，也不会影响 `main` 分支。该目录中的 `run.sh` 只管理 Python 版本。Go 版静态资源从 `web/static` 通过 `//go:embed` 编进服务二进制；交叉编译发布包只需部署 Go 服务二进制和 `.env` 配置，不需要 Go 工具链、源码或静态目录。Go 生产切换和服务托管脚本后续单独规划。
+当前分支为纯 Go 实现，不依赖其他语言运行环境。交叉编译时使用 `CGO_ENABLED=0`，部署端不需要 Go 工具链、源码或单独的静态资源目录。部署目录需包含对应架构的服务二进制、`run.sh` 和 `.env.example`；SQLite 数据默认保存在 `data/options.db`。
 
 当前 Go 服务入口为 `cmd/go-server/main.go`，使用：
 
@@ -52,7 +33,9 @@ go test -race -p 1 ./...
 go vet ./...
 ```
 
-当前 Go 版已实现 `/api/flow` 的 SQLite 快照分析、Yahoo/Cboe/Alpaca 行情与期权 provider 组件、基于报价的 IV/Gamma、历史日线/极值/Beta/财报缓存协调、SQLite 服务租约、跨实例快照合并、可恢复的 Gamma 后台分批任务，以及由服务协调行情数据和快照输入的 Go `/api/levels` 分析（含斐波那契、筹码峰值、承接候选、期权磁吸、合并排序、历史留出校准和计划输出）；容量上限阶梯清理和每日维护也已迁移。levels 已有锁定时间的端到端 Python golden，覆盖空数据、买卖结构、候选合并及计划输出，并新增多快照聚合、计划条数和历史留出边界用例；盘前/盘后/夜盘/休市组合仍需更广输入回归。市场 regime 已有 20 组 Python v39 固定输入 golden。Go 估值已覆盖金融、REIT、能源/矿业、互联网、公用事业、国防、邮轮、移动科技、重资产转型、芯片及 AI 存储等模型；Python 的 17 项 `industry_key_map`、行业数据质量 warning、市值调和诊断和利息覆盖率精度已补齐；分类矩阵覆盖只提供行业 key、缺少行业文本的 17 类输入，并修复 REIT 标签、AI 暴露诊断及 mobility/financial 优先级差异。全部行业决策与估值公式仍需更广输入差分。Yahoo 行情、历史、期权、估值指标、财务报表和财报日历优先使用 `go-yfinance v1.7.0`；保留的原始 Yahoo 补充请求仅覆盖该 SDK 未建模的 Gamma/null 存在性、行业 key、专用指标和部分历史股份字段。Go 全量测试、race、vet、运行脚本保护、隔离后端 API smoke 及交叉编译发布包切换测试通过；Python 基线回归为 258 passed。实时 OpenAPI 路径定义及 8 组错误/正常 HTTP 请求与 Python 相同。Go 与 Python 在相同 SQLite 副本上执行容量清理后关键表行数、文件大小和 SQLite 完整性结果一致；Go 数据库工具已完成在线备份及隔离恢复验证。Gamma 任务事件清理现按 Python 的 `MAX(id)-20000` 窗口保留，并覆盖 ID 跳号。Yahoo 代理 `http://127.0.0.1:10808` 曾实测连通，但当前 Yahoo 返回 HTTP 429，Cboe/Alpaca 生产权限和可靠上游场景仍需验证。生产数据库备份/回滚、多实例故障恢复和 Go/Python 生产切换演练仍未完成；Go 仍不是生产默认后端。本轮没有访问真实服务器，也未执行合并、提交或推送。
+服务包含 `/api/flow` 快照分析、Yahoo/Cboe/Alpaca 行情与期权 provider、基于报价的 IV/Gamma、历史日线/极值/Beta/财报缓存协调、SQLite 服务租约、跨实例快照合并、Gamma 后台分批任务，以及 `/api/levels` 压力位与支撑位分析（包括斐波那契、筹码峰值、承接候选、期权磁吸、合并排序、校准与计划输出）。容量上限阶梯清理和每日维护也由 Go 服务执行。市场 regime 和估值模型均有 Go 测试覆盖。估值模型涵盖金融、REIT、能源/矿业、互联网、公用事业、国防、邮轮、移动科技、重资产转型、芯片及 AI 存储等类别；Yahoo 行情、历史、期权、估值指标、财务报表和财报日历优先使用 `go-yfinance v1.7.0`，少量补充请求用于 SDK 尚未建模的字段。
+
+项目包含 Go 全量测试、race 检查、vet、API 契约、运行脚本保护和交叉编译发布包验证。市场数据依赖外部上游服务；Yahoo 可能限流，Cboe 与 Alpaca 的生产可用性取决于账号权限和上游状态。生产部署前应验证数据源访问、数据库备份恢复和服务恢复流程。
 
 ## 能做什么
 
@@ -74,7 +57,7 @@ go vet ./...
 - SQLite 使用 WAL 和索引，适合单机或单实例快速部署。
 - 页面自上而下依次为：标的现货与成交统计卡 → 分析详情折叠组（默认展开：趋势通道与交易计划（推荐买入 / 加仓 / 卖出）→ 压力位/支撑位数据表）→ 图表区（Gamma 敞口、压力位/支撑位柱状图、成交量分布、持仓量分布）→ 期权流向与买方结构分析（默认折叠）→ 期权链明细（默认折叠）。折叠组的展开状态记在 sessionStorage：趋势分析与图表默认展开，期权分析与期权链默认折叠；同一标签页内换标的不会改变，重开页面各自回到默认。
 
-配色沿用美股行情惯例「绿涨红跌」：上涨、看涨（Call）、压力位统一为绿，下跌、看跌（Put）、支撑位统一为红。Go 版颜色令牌集中在 `web/static/common/css/styles.css`：黑夜主题（默认）在 `:root`，白天主题在 `:root[data-theme="light"]`，两套同名令牌一一对应。Python 基线静态资源副本仍位于 `us_stocks_py/app/static`。
+配色沿用美股行情惯例「绿涨红跌」：上涨、看涨（Call）、压力位统一为绿，下跌、看跌（Put）、支撑位统一为红。颜色令牌集中在 `web/static/common/css/styles.css`：黑夜主题（默认）在 `:root`，白天主题在 `:root[data-theme="light"]`，两套同名令牌一一对应。
 
 主行情接口在这里提供的是行情和盘中期权链快照，Cboe 公共接口提供盘外延迟期权链；两者都不是交易所逐笔成交流，也不保证每分钟都有新的市场数据。Cboe 的未平仓量属于上一交易日数据，适合盘前、盘后和夜盘分析但不是盘外实时 OI。生产使用前请确认所用行情数据源的使用条款与授权范围。
 
@@ -89,104 +72,67 @@ Gamma 敞口使用 Black-Scholes 根据标的价格、执行价、隐含波动�
 - [SpotGamma：Gamma Flip](https://support.spotgamma.com/hc/en-us/articles/15413261162387-Gamma-Flip)：将 Gamma Flip 定义为做市商估算 Gamma 正负切换的价格。
 - [ZeroGEX：Gamma Flip Calculation](https://zerogex.io/guides/gamma-flip-calculation-before-vs-after)：公开说明近似实现，使用 `Gamma × OI × 100 × S² × 0.01`，Call 为正、Put 为负，在假设的标的价格网格上重新计算 Gamma。本工具未采用其 `DTE/5` 多期限权重，因为个股盘中 0DTE 会被过度压低，导致 AAPL 这类标的零点明显偏离现价。
 - [Quant Data：What Is Zero Gamma](https://quantdata.uk/guides/what-is-zero-gamma)：给出近 45 天、冻结 IV、现价 ±10% 搜索区间等可复现选择。
-- [sgdividends/spx-dealer-gamma](https://github.com/sgdividends/spx-dealer-gamma)：公开 Python 实现，使用 ±15% / 121 点扫描和 Black-Scholes 重算。
 
 不同平台的零 Gamma 不会天然相同：富途、SpotGamma 等可能使用不同的期权数据时刻、到期日范围、隐含波动率来源、未平仓量过滤和 0DTE 权重。当前工具使用上游快照，因此目标是口径透明、结果可复算，而不是承诺与某个商业平台逐分复刻。
 
-## 启动
+## 部署与启动
 
-推荐直接用运维脚本 `run.sh`（幂等，重复执行安全，Ubuntu/Debian、CentOS/RHEL、Alpine 通用）：
+部署包需要包含与服务器架构匹配的 Go 服务二进制、`run.sh` 和 `.env.example`。二进制支持 Linux amd64 与 arm64，静态页面资源已嵌入其中。若从源码构建：
 
 ```bash
-./run.sh            # 交互菜单：启动/停止/重启、配置、数据库、环境安装与自检、更新、高级服务管理、端口释放
-./run.sh install   # 按 GO_BACKEND 检测所选后端；Go 只检查预编译程序，不启动应用（等价菜单第 7 项）
-./run.sh 2          # 启动应用；若环境缺失会先准备环境，再后台启动并挂看门狗守护
-./run.sh status     # 查看运行状态（状态和日志对应主菜单第 1 项）
-./run.sh stop       # 停止应用与看门狗
-./run.sh restart    # 停止后重新启动应用
-GO_BACKEND=go ./run.sh install  # 选择 Go 后端时检查发布包中的预编译程序
-./run.sh kill-port 8080  # 确认后结束占用 TCP 8080 的进程；不带端口时交互输入
+bash ./scripts/build-go-release.sh linux amd64
+cp dist/option-scope-linux-amd64 ./option-scope-linux-amd64
 ```
 
-选项 7 只负责检查 Python、创建虚拟环境、安装/修复依赖，不创建 `.env`，也不启动应用；需要再手动选择选项 2 启动。选项 2 会补齐缺少的运行环境和 `.env`，然后启动应用。对应手动命令为 `python -m venv .venv`、`.venv/bin/pip install -e .`、`cp .env.example .env` 和 `.venv/bin/python -m app`；已经就绪的步骤会跳过（依赖指纹变了才重装）。启动后应用与看门狗都以 `setsid` 脱离会话在后台运行，
-无 systemd 的环境下看门狗每 15 秒检查一次健康状态，连续 2 次失败或进程消失会自动拉起；
-日志写到 `logs/app.log`、`logs/watchdog.log`，超过 5MB 自动轮转。
-脚本的退出码沿用对应动作的结果（成功 0、失败非 0），可直接用在计划任务或监控里。
+ARM64 构建将命令参数改为 `arm64`，并将生成的二进制复制为 `option-scope-linux-arm64`。将二进制与 `run.sh` 放在同一目录后，使用运维脚本准备配置并启动：
 
-生产服务器建议安装 systemd 托管，避免 SSH 断开、服务器重启或 Python 进程被 OOM 杀掉后出现 Cloudflare 521：
+```bash
+./run.sh install   # 检查二进制、创建配置文件和运行目录
+./run.sh start     # 后台启动服务；无 systemd 时使用 shell 看门狗
+./run.sh status
+./run.sh logs
+```
+
+首次启动时脚本会从 `.env.example` 创建 `.env`，并自动生成 `ACCESS_KEY`。页面地址为 `http://服务器地址:端口/?key=访问密钥`，默认端口为 8000。服务运行后，可用 `./run.sh stop` 停止、`./run.sh restart` 重启；也可执行 `./run.sh install-service` 安装 systemd 服务。脚本支持的其他操作见 `./run.sh help`。
+
+也可在配置 `.env` 后直接以前台方式运行二进制：
+
+```bash
+cp .env.example .env
+./option-scope-linux-amd64
+```
+
+服务从二进制所在目录读取 `.env`；进程环境变量优先。默认数据库位于二进制旁的 `data/options.db`，相对 `DATABASE_PATH` 也以二进制所在目录为基准。`HOST` 和 `PORT` 可设置监听地址与端口。
+
+交互菜单的配置项可编辑 `ACCESS_KEY`、代理和 Alpaca 夜盘凭据。密钥输入不会回显；保存后可选择重启服务。`ACCESS_KEY` 留空时不启用访问保护，生产和局域网部署建议保留访问密钥。URL 中的密钥会进入浏览器历史记录，请避免公开分享完整地址。
+
+生产环境可安装 systemd 服务：
 
 ```bash
 ./run.sh install-service
 ./run.sh status
 ```
 
-该命令会生成并启用 `option-scope.service`，以项目目录所属的普通用户运行，进程异常后 3 秒自动重启，并设置为开机启动。
-查看服务日志：`journalctl -u option-scope.service -f`。卸载 systemd 托管并恢复 shell 看门狗：`./run.sh remove-service`。
+服务异常后 systemd 会自动重启。查看服务日志：`journalctl -u option-scope.service -f`；卸载托管：`./run.sh remove-service`。没有 systemd 的容器可以使用内置 shell 看门狗，并通过 `./run.sh enable-autostart` 配置开机启动。
 
-如果仍出现 521，先在服务器本机执行 `curl -fsS http://127.0.0.1:${PORT:-8000}/health`：
-本机失败说明应用或端口没有监听，查看 `systemctl status option-scope.service` 和 `journalctl -u option-scope.service`；
-本机成功而公网失败，则检查 Cloudflare 到源站端口、防火墙、安全组和反向代理配置，521 不是应用代码能单独修复的。
+遇到 Cloudflare 521 时，先在服务器本机执行 `curl -fsS http://127.0.0.1:8000/health`。本机请求失败时检查 `./run.sh status` 和 `./run.sh logs`；本机成功而公网失败时，再检查 Cloudflare 到源站端口、防火墙、安全组和反向代理配置。
 
-手动启动方式：
+### 启动问题排查
 
-```bash
-python -m venv .venv
-.venv/bin/pip install -e '.[dev]'
-cp .env.example .env
-.venv/bin/python -m app
-```
-
-服务默认监听 `0.0.0.0:8000`。新版启动脚本会生成 `ACCESS_KEY`，本机访问
-`http://127.0.0.1:8000/?key=你的访问密钥`，局域网地址把主机名换成运行主机的实际 IP。
-首次带 `?key=` 打开后，页面导航和后续 AJAX 请求都会继续在 URL 上携带 key；
-浏览器同时会把 key 写入 `localStorage` 作为备用读取来源。如果浏览器禁用 `localStorage`，
-会自动回退 `sessionStorage` 和当前页面内存，不会因为存储策略不同而丢掉访问凭证；
-URL 和本地存储都没有 key 时才显示 403。
-手动启动时需要自行在 `.env` 填写 `ACCESS_KEY`，留空表示不启用访问保护，适合只在本机临时调试。
-URL 中的密钥会进入浏览器历史记录，
-请避免在公开截图或聊天中直接分享完整地址。
-
-应用会自动读取可执行文件所在目录下的 `.env`；默认数据库为可执行文件旁 `data/options.db`，也可以在 `.env` 中设置绝对或相对于该目录的 `DATABASE_PATH`。进程启动前导出的环境变量优先于 `.env`。
-交互菜单第 5 项会以数字菜单逐项修改配置，包含 `ACCESS_KEY` 和 Alpaca 夜盘凭据：`ALPACA_API_KEY`、`ALPACA_API_SECRET` 输入时不会回显，摘要只显示掩码；输入 `clear` 可清空凭据。修改后应用运行中会询问是否立即重启。第 10 项可按输入的 TCP 端口列出监听进程，经确认后发送 `SIGTERM`；进程仍未退出时再确认是否发送 `SIGKILL`。
-
-也可以直接使用 `.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000`。可通过 `HOST` 和 `PORT` 环境变量覆盖 `python -m app` 的默认值。
-
-## 常见问题
-
-### 安装依赖时提示 `Killed`（内存不足 / OOM）
-
-菜单第 7 项或 `pip install` 中途出现 `Killed`（退出码 137），含义是进程被系统的 OOM Killer 杀掉了：
-内存不够用，**不是**网络、软件源或代码问题。脚本检测到这种情况会直接打印当前内存和下面的处理办法：
-
-1. 先停掉正在运行的应用再装：`./run.sh stop`（应用本身常驻 150-250M，装依赖时内存占用会翻倍）；
-2. 临时加 1G Swap，装完可保留也可删除：
-
-   ```bash
-   fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
-   ```
-
-   没有 `fallocate` 的镜像（busybox）改用 `dd if=/dev/zero of=/swapfile bs=1M count=1024`；
-   非特权 LXC 容器可能禁止 `swapon`，那就走第 3 条。
-3. 调大容器/主机内存上限到 1G 以上（建模机磁盘 512M 也建议内存 ≥ 1G）；
-4. 内存实在加不上时分步安装，降低单次峰值：
-
-   ```bash
-   .venv/bin/pip install --no-cache-dir pandas
-   .venv/bin/pip install --no-cache-dir -e .
-   ```
-
-确认是否 OOM：`dmesg | tail -20`，或 `cat /sys/fs/cgroup/memory.events`（出现 `oom_kill` 计数即可确认）。
-Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半装状态的软件包再重试。
+- 二进制无法运行：确认服务器为 Linux amd64 或 arm64，并检查文件名和执行权限。`run.sh doctor` 会检查环境和服务配置。
+- 端口被占用：执行 `./run.sh status` 查看服务；确认无关进程占用后，可修改 `.env` 中的 `PORT`。
+- 进程因内存不足退出：查看 `./run.sh logs` 和系统 OOM 记录；小内存机器可保持 `LOW_MEMORY=auto`，并适当降低 `UPSTREAM_CONCURRENCY`。
+- 确认服务健康：`curl -fsS http://127.0.0.1:8000/health`。
 
 ## 配置
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DATABASE_PATH` | `data/options.db` | SQLite 文件路径 |
-| `HOST` | `0.0.0.0` | `python -m app` 的监听地址 |
-| `PORT` | `8000` | `python -m app` 的监听端口 |
+| `HOST` | `0.0.0.0` | 服务监听地址 |
+| `PORT` | `8000` | 服务监听端口 |
 | `ACCESS_KEY` | 空 | 页面与 API 访问密钥；`run.sh` 首次启动自动生成 16 位小写字母 + 数字 |
-| `MARKET_PROXY` | 空 | Go 版出站行情与期权请求使用的代理地址，支持 `http`、`https`、`socks5` 和 `socks5h`，例如 `http://127.0.0.1:10808` |
+| `MARKET_PROXY` | 空 | 出站行情与期权请求使用的代理地址，支持 `http`、`https`、`socks5` 和 `socks5h`，例如 `http://127.0.0.1:10808` |
 | `ALPACA_API_KEY` | 空 | Alpaca Basic API Key；配置后仅在美东夜盘补充股票现货行情，未配置时沿用原行情源 |
 | `ALPACA_API_SECRET` | 空 | Alpaca Basic API Secret；`run.sh config` 菜单中隐藏输入，摘要不会显示原文 |
 | `DEFAULT_SYMBOLS` | `QQQ` | 页面未带 `?symbol=` 时使用的默认标的（兼容逗号分隔配置，取第一项）；不再触发后台刷新 |
@@ -195,12 +141,11 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 | `HISTORY_MAX_AGE_SECONDS` | `3600` | 日线历史（斐波那契/筹码分布/承接位）的回源间隔 |
 | `EXTREMES_MAX_AGE_SECONDS` | `86400` | 52 周和历史最高/最低价的回源间隔 |
 | `SCHEDULER_ENABLED` | `true` | 是否启用定时历史清理和数据库维护；不控制行情刷新 |
-| `UPSTREAM_CONCURRENCY` | `auto` | Go 默认按启动时剩余 cgroup/物理可用内存预算（预留 64 MiB 后每槽位估算 160 MiB）和容器可用 CPU 动态计算；整数值作为人工上限。Python 版读取 `auto` 时使用原有默认并发 6 |
-| `UPSTREAM_TIMEOUT_SECONDS` | `12` | Go 上游 Yahoo / Alpaca 请求超时秒数，与 Python 默认值一致 |
-| `CBOE_TIMEOUT_SECONDS` | `15` | Go 的 Cboe 期权请求超时秒数，与 Python 默认值一致 |
+| `UPSTREAM_CONCURRENCY` | `auto` | 按启动时可用内存预算和容器可用 CPU 动态计算；整数值作为并发上限。默认并发上限为 6 |
+| `UPSTREAM_TIMEOUT_SECONDS` | `12` | Yahoo / Alpaca 请求超时秒数 |
+| `CBOE_TIMEOUT_SECONDS` | `15` | Cboe 期权请求超时秒数 |
 | `UPSTREAM_WAIT_SECONDS` | `20` | 等待上游并发槽位的最长时间，超时后优先使用本地旧快照 |
-| `WEB_WORKERS` | `1` | Web worker 数量；增加前请确认部署机器内存足够。低内存模式会把大于 1 的值降回 1 |
-| `LOW_MEMORY` | `auto` | Go 后端 `auto` 在内存上限不超过 4GiB 或启动时可用内存不超过 2GiB 时开启保护；也可强制 `true` / `false`。开启后后台重任务采用保守并发、缓存缩小，并按剩余磁盘收紧数据库上限；基础报价与期限目录仍使用共享并发预算 |
+| `LOW_MEMORY` | `auto` | 在内存上限不超过 4GiB 或启动时可用内存不超过 2GiB 时自动开启保护；也可强制 `true` / `false`。开启后后台重任务采用保守并发、缓存缩小，并按剩余磁盘收紧数据库上限；基础报价与期限目录仍使用共享并发预算 |
 
 表中「默认值」是环境变量缺失时代码的回退值；`.env.example` 面向小磁盘环境，
 已经把 `DATABASE_MAX_MB` 预设为 `256M`、`RAW_RETENTION_DAYS` 预设为 `7`，改成 `0` / 更大的天数即可放宽。
@@ -208,7 +153,7 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 ### 小磁盘部署（LXC / 512M 磁盘）
 
 512M 磁盘不要按 256M 的数据库来预留。低内存保护开启时会按剩余空间再收紧上限，
-并给系统、虚拟环境和 SQLite 临时文件留出余量。显式填写的 `DATABASE_MAX_MB` 只会更小，不会比这个预算更大。
+并给系统、Go 服务和 SQLite 临时文件留出余量。显式填写的 `DATABASE_MAX_MB` 只会更小，不会比这个预算更大。
 
 把 `DATABASE_MAX_MB` 设为磁盘容量的一半到六成（512M 磁盘建议 `200`-`300`，1G 磁盘建议 `500`-`600`），
 后台维护任务每天检查数据库体积（未超限时只读取文件大小，开销可忽略），
@@ -244,16 +189,19 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 - `POST /api/cleanup`
 - `GET /health`
 
-数据库菜单支持在线安全备份，也支持从备份恢复。恢复会先要求确认、停止服务、检查备份 SQLite 完整性和应用表结构，再保留原数据库及 sidecar 作为回滚副本后替换；操作失败会尝试恢复原文件。Python 后端用 Python 标准库执行恢复；Go 后端使用发布包中的 `bin/option-scope-go-db restore <backup-path>`。直接运行 Go 数据库恢复工具时，应用服务仍须先停止。
+数据库菜单支持在线安全备份，也支持从备份恢复。恢复会先要求确认、停止服务、检查备份 SQLite 完整性和应用表结构，再保留原数据库及 sidecar 作为回滚副本后替换；操作失败会尝试恢复原文件。发布包中的 `bin/option-scope-go-db restore <backup-path>` 可执行恢复。直接运行数据库恢复工具时，应用服务须先停止。
 
 配置 `ACCESS_KEY` 后，所有页面和 `/api/*` 请求都必须携带正确的 `?key=` 或 `X-Access-Key` 请求头；
 只有 `/static/*` 与 `/health` 例外，分别用于加载页面资源和本机看门狗健康检查。
 
 ## 本地验证
 
+在已安装 Go 工具链的开发机上运行：
+
 ```bash
-.venv/bin/python -m pytest -q
-.venv/bin/python -m compileall -q app tests
+go test -p 1 ./...
+go test -race -p 1 ./...
+go vet ./...
 ```
 
-测试使用 mock provider，不会依赖外部行情服务；启动应用后的真实数据请求需要网络连接。
+单元测试和 API 测试使用 mock 或隔离环境，不要求访问真实行情上游。真实行情请求需要网络连接及可用的数据源。
