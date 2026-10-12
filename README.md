@@ -21,6 +21,39 @@ bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/
 
 一个可快速部署的美股行情与期权分析工具，涵盖现货行情、期权链、成交流向、买方结构和关键价位分析。品牌名称为 Option Scope，页面主标题使用「美股行情与期权分析」。后端使用 FastAPI，行情与期权链来自上游行情接口，快照落盘到 SQLite，前端是无需 Node 构建的原生 HTML/CSS/JavaScript。
 
+## Go 重写分支（`go-rewrite`）
+
+本分支用于逐步把后端迁移到 Go，HTTP 层使用 Gin，不是 Cloudflare Workers/Wasm 版本。Python 基线保留在同级目录 `us_stocks_py/`，作为可运行版本、API 行为参考和迁移期间的回退实现；在 Go 完整覆盖全部接口前不会删除 Python 文件，也不会影响 `main` 分支。该目录中的 `run.sh` 只管理 Python 版本。Go 版静态资源从 `web/static` 通过 `//go:embed` 编进服务二进制；交叉编译发布包只需部署 Go 服务二进制和 `.env` 配置，不需要 Go 工具链、源码或静态目录。Go 生产切换和服务托管脚本后续单独规划。
+
+当前 Go 服务入口为 `cmd/go-server/main.go`，使用：
+
+- Gin 路由、中间件、静态资源和 SSE；活跃 SSE 订阅按美东时段及 XNYS 假日、历史临时休市和提前收盘规则调度快照刷新（约 20/60/300 秒），同标的刷新串行合并，失败时退避；
+- `modernc.org/sqlite` 通过标准 `database/sql` 读写现有 `data/options.db`，启动时只做兼容性列检查。驱动完全由 Go 实现，不依赖 CGO 或目标机 libc，数据库使用标准 SQLite 文件格式；
+- Yahoo 行情、历史、到期日、财报日历和估值可用能力优先通过 `github.com/wnjoon/go-yfinance` 获取。当前依赖为 `v1.7.0`；期权链只对 SDK 尚未暴露的 Gamma 和缺失值/null 存在性保留窄字段适配，fundamentals timeseries 也只补 SDK 当前未提供的时间序列字段。SDK 增加这些字段/API 后，应优先切回 SDK 并删除对应适配。所有行情适配器共享同一个 `UPSTREAM_CONCURRENCY` 并发门（默认上限 6，由启动时可用内存和 CPU 动态收紧），Yahoo、CBOE、Alpaca、估值与刷新统一受此预算约束；基础报价与期限目录可在预算允许时并行，低内存下 Gamma、估值基准和历史等重任务仍采用串行或小批次策略；
+- 启动时读取当前可执行文件所在目录的 `.env` 中未由进程环境设置的变量（支持 `KEY=value`、引号值、注释及 `export KEY=value`）；默认 SQLite 文件位于二进制旁的 `data/options.db`，`.env` 中的相对 `DATABASE_PATH` 也相对于二进制目录解析；原始 Yahoo 补充请求、Cboe、Alpaca 和维护工具 API 请求统一经 `internal/outboundhttp` 构造和发送，Yahoo SDK 请求由 SDK 自己管理连接，但使用同一包提供的 `MARKET_PROXY`、Chrome JA3 和 User-Agent 配置；`RAW_RETENTION_DAYS`（默认 30 天）配置清理保留期；
+- 与现有前端兼容的 `/quote`、`/expirations`、`/chain`、`refresh`、`events`、`status`、`health` 路由，以及按 `RAW_RETENTION_DAYS` 清理历史数据、按数据库体积上限阶梯回收冗余快照的 `/api/cleanup`；`SCHEDULER_ENABLED` 开启时还会通过 SQLite 服务租约执行每日维护。
+
+在开发机交叉编译 Linux 发布包（默认 `linux/amd64`）：
+
+```bash
+# 直接用 bash 调用，不要求脚本文件具有可执行权限
+bash ./scripts/build-go-release.sh linux amd64
+# 交叉编译到 ARM64
+bash ./scripts/build-go-release.sh linux arm64
+```
+
+脚本直接生成 `dist/option-scope-linux-amd64` 单个可执行文件（ARM64 示例见命令），使用 `CGO_ENABLED=0` 和 `-trimpath -ldflags='-s -w'` 构建，并通过 `//go:embed` 将源码目录 `web/static` 内的页面资源打包进去。部署时只需传输该二进制；配置通过进程环境或同目录 `.env` 提供，服务可由 systemd 或其他进程管理器启动。
+
+在开发机运行 Go 验证：
+
+```bash
+go test -p 1 ./...
+go test -race -p 1 ./...
+go vet ./...
+```
+
+当前 Go 版已实现 `/api/flow` 的 SQLite 快照分析、Yahoo/Cboe/Alpaca 行情与期权 provider 组件、基于报价的 IV/Gamma、历史日线/极值/Beta/财报缓存协调、SQLite 服务租约、跨实例快照合并、可恢复的 Gamma 后台分批任务，以及由服务协调行情数据和快照输入的 Go `/api/levels` 分析（含斐波那契、筹码峰值、承接候选、期权磁吸、合并排序、历史留出校准和计划输出）；容量上限阶梯清理和每日维护也已迁移。levels 已有锁定时间的端到端 Python golden，覆盖空数据、买卖结构、候选合并及计划输出，并新增多快照聚合、计划条数和历史留出边界用例；盘前/盘后/夜盘/休市组合仍需更广输入回归。市场 regime 已有 20 组 Python v39 固定输入 golden。Go 估值已覆盖金融、REIT、能源/矿业、互联网、公用事业、国防、邮轮、移动科技、重资产转型、芯片及 AI 存储等模型；Python 的 17 项 `industry_key_map`、行业数据质量 warning、市值调和诊断和利息覆盖率精度已补齐；分类矩阵覆盖只提供行业 key、缺少行业文本的 17 类输入，并修复 REIT 标签、AI 暴露诊断及 mobility/financial 优先级差异。全部行业决策与估值公式仍需更广输入差分。Yahoo 行情、历史、期权、估值指标、财务报表和财报日历优先使用 `go-yfinance v1.7.0`；保留的原始 Yahoo 补充请求仅覆盖该 SDK 未建模的 Gamma/null 存在性、行业 key、专用指标和部分历史股份字段。Go 全量测试、race、vet、运行脚本保护、隔离后端 API smoke 及交叉编译发布包切换测试通过；Python 基线回归为 258 passed。实时 OpenAPI 路径定义及 8 组错误/正常 HTTP 请求与 Python 相同。Go 与 Python 在相同 SQLite 副本上执行容量清理后关键表行数、文件大小和 SQLite 完整性结果一致；Go 数据库工具已完成在线备份及隔离恢复验证。Gamma 任务事件清理现按 Python 的 `MAX(id)-20000` 窗口保留，并覆盖 ID 跳号。Yahoo 代理 `http://127.0.0.1:10808` 曾实测连通，但当前 Yahoo 返回 HTTP 429，Cboe/Alpaca 生产权限和可靠上游场景仍需验证。生产数据库备份/回滚、多实例故障恢复和 Go/Python 生产切换演练仍未完成；Go 仍不是生产默认后端。本轮没有访问真实服务器，也未执行合并、提交或推送。
+
 ## 能做什么
 
 - 查询指定标的的当前价格、涨跌幅和市场状态。载入标的或切换到期日后，地址栏会写入 `?symbol=` 和 `expiration=`，刷新页面会恢复当前选择；未指定标的时使用 `DEFAULT_SYMBOLS` 的第一项（默认 `QQQ`）。换标的时到期日默认回到新标的的第一个（最近）到期日——各标的到期日序列不同（有的每周五、有的每天、有的半月）；同一标的重复载入则保留当前选择。
@@ -41,7 +74,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/
 - SQLite 使用 WAL 和索引，适合单机或单实例快速部署。
 - 页面自上而下依次为：标的现货与成交统计卡 → 分析详情折叠组（默认展开：趋势通道与交易计划（推荐买入 / 加仓 / 卖出）→ 压力位/支撑位数据表）→ 图表区（Gamma 敞口、压力位/支撑位柱状图、成交量分布、持仓量分布）→ 期权流向与买方结构分析（默认折叠）→ 期权链明细（默认折叠）。折叠组的展开状态记在 sessionStorage：趋势分析与图表默认展开，期权分析与期权链默认折叠；同一标签页内换标的不会改变，重开页面各自回到默认。
 
-配色沿用美股行情惯例「绿涨红跌」：上涨、看涨（Call）、压力位统一为绿，下跌、看跌（Put）、支撑位统一为红。颜色令牌集中在 `app/static/common/css/styles.css`：黑夜主题（默认）在 `:root`，白天主题在 `:root[data-theme="light"]`，两套同名令牌一一对应。
+配色沿用美股行情惯例「绿涨红跌」：上涨、看涨（Call）、压力位统一为绿，下跌、看跌（Put）、支撑位统一为红。Go 版颜色令牌集中在 `web/static/common/css/styles.css`：黑夜主题（默认）在 `:root`，白天主题在 `:root[data-theme="light"]`，两套同名令牌一一对应。Python 基线静态资源副本仍位于 `us_stocks_py/app/static`。
 
 主行情接口在这里提供的是行情和盘中期权链快照，Cboe 公共接口提供盘外延迟期权链；两者都不是交易所逐笔成交流，也不保证每分钟都有新的市场数据。Cboe 的未平仓量属于上一交易日数据，适合盘前、盘后和夜盘分析但不是盘外实时 OI。生产使用前请确认所用行情数据源的使用条款与授权范围。
 
@@ -66,11 +99,12 @@ Gamma 敞口使用 Black-Scholes 根据标的价格、执行价、隐含波动�
 
 ```bash
 ./run.sh            # 交互菜单：启动/停止/重启、配置、数据库、环境安装与自检、更新、高级服务管理、端口释放
-./run.sh install   # 只检测/安装/修复 Python 环境和依赖，不启动应用（等价菜单第 7 项）
+./run.sh install   # 按 GO_BACKEND 检测所选后端；Go 只检查预编译程序，不启动应用（等价菜单第 7 项）
 ./run.sh 2          # 启动应用；若环境缺失会先准备环境，再后台启动并挂看门狗守护
 ./run.sh status     # 查看运行状态（状态和日志对应主菜单第 1 项）
 ./run.sh stop       # 停止应用与看门狗
 ./run.sh restart    # 停止后重新启动应用
+GO_BACKEND=go ./run.sh install  # 选择 Go 后端时检查发布包中的预编译程序
 ./run.sh kill-port 8080  # 确认后结束占用 TCP 8080 的进程；不带端口时交互输入
 ```
 
@@ -112,7 +146,7 @@ URL 和本地存储都没有 key 时才显示 403。
 URL 中的密钥会进入浏览器历史记录，
 请避免在公开截图或聊天中直接分享完整地址。
 
-应用会自动读取项目根目录下的 `.env`；也可以直接在启动命令前导出环境变量。
+应用会自动读取可执行文件所在目录下的 `.env`；默认数据库为可执行文件旁 `data/options.db`，也可以在 `.env` 中设置绝对或相对于该目录的 `DATABASE_PATH`。进程启动前导出的环境变量优先于 `.env`。
 交互菜单第 5 项会以数字菜单逐项修改配置，包含 `ACCESS_KEY` 和 Alpaca 夜盘凭据：`ALPACA_API_KEY`、`ALPACA_API_SECRET` 输入时不会回显，摘要只显示掩码；输入 `clear` 可清空凭据。修改后应用运行中会询问是否立即重启。第 10 项可按输入的 TCP 端口列出监听进程，经确认后发送 `SIGTERM`；进程仍未退出时再确认是否发送 `SIGKILL`。
 
 也可以直接使用 `.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000`。可通过 `HOST` 和 `PORT` 环境变量覆盖 `python -m app` 的默认值。
@@ -152,7 +186,7 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 | `HOST` | `0.0.0.0` | `python -m app` 的监听地址 |
 | `PORT` | `8000` | `python -m app` 的监听端口 |
 | `ACCESS_KEY` | 空 | 页面与 API 访问密钥；`run.sh` 首次启动自动生成 16 位小写字母 + 数字 |
-| `MARKET_PROXY` | 空 | 主行情接口和 Cboe 盘外期权接口使用的代理地址，例如 `http://127.0.0.1:7890` |
+| `MARKET_PROXY` | 空 | Go 版出站行情与期权请求使用的代理地址，支持 `http`、`https`、`socks5` 和 `socks5h`，例如 `http://127.0.0.1:10808` |
 | `ALPACA_API_KEY` | 空 | Alpaca Basic API Key；配置后仅在美东夜盘补充股票现货行情，未配置时沿用原行情源 |
 | `ALPACA_API_SECRET` | 空 | Alpaca Basic API Secret；`run.sh config` 菜单中隐藏输入，摘要不会显示原文 |
 | `DEFAULT_SYMBOLS` | `QQQ` | 页面未带 `?symbol=` 时使用的默认标的（兼容逗号分隔配置，取第一项）；不再触发后台刷新 |
@@ -161,17 +195,19 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 | `HISTORY_MAX_AGE_SECONDS` | `3600` | 日线历史（斐波那契/筹码分布/承接位）的回源间隔 |
 | `EXTREMES_MAX_AGE_SECONDS` | `86400` | 52 周和历史最高/最低价的回源间隔 |
 | `SCHEDULER_ENABLED` | `true` | 是否启用定时历史清理和数据库维护；不控制行情刷新 |
-| `UPSTREAM_CONCURRENCY` | `6` | 单进程访问上游行情源的最大并发数 |
+| `UPSTREAM_CONCURRENCY` | `auto` | Go 默认按启动时剩余 cgroup/物理可用内存预算（预留 64 MiB 后每槽位估算 160 MiB）和容器可用 CPU 动态计算；整数值作为人工上限。Python 版读取 `auto` 时使用原有默认并发 6 |
+| `UPSTREAM_TIMEOUT_SECONDS` | `12` | Go 上游 Yahoo / Alpaca 请求超时秒数，与 Python 默认值一致 |
+| `CBOE_TIMEOUT_SECONDS` | `15` | Go 的 Cboe 期权请求超时秒数，与 Python 默认值一致 |
 | `UPSTREAM_WAIT_SECONDS` | `20` | 等待上游并发槽位的最长时间，超时后优先使用本地旧快照 |
 | `WEB_WORKERS` | `1` | Web worker 数量；增加前请确认部署机器内存足够。低内存模式会把大于 1 的值降回 1 |
-| `LOW_MEMORY` | `auto` | `auto` 在内存不超过 512MB 时开启保护；也可强制 `true` / `false`。开启后重任务串行、缓存缩小，并按剩余磁盘收紧数据库上限 |
+| `LOW_MEMORY` | `auto` | Go 后端 `auto` 在内存上限不超过 4GiB 或启动时可用内存不超过 2GiB 时开启保护；也可强制 `true` / `false`。开启后后台重任务采用保守并发、缓存缩小，并按剩余磁盘收紧数据库上限；基础报价与期限目录仍使用共享并发预算 |
 
 表中「默认值」是环境变量缺失时代码的回退值；`.env.example` 面向小磁盘环境，
 已经把 `DATABASE_MAX_MB` 预设为 `256M`、`RAW_RETENTION_DAYS` 预设为 `7`，改成 `0` / 更大的天数即可放宽。
 
 ### 小磁盘部署（LXC / 512M 磁盘）
 
-512M 磁盘不要按 256M 的数据库来预留。`LOW_MEMORY=auto` 在 512MB 及以下内存的机器上会按剩余空间再收紧上限，
+512M 磁盘不要按 256M 的数据库来预留。低内存保护开启时会按剩余空间再收紧上限，
 并给系统、虚拟环境和 SQLite 临时文件留出余量。显式填写的 `DATABASE_MAX_MB` 只会更小，不会比这个预算更大。
 
 把 `DATABASE_MAX_MB` 设为磁盘容量的一半到六成（512M 磁盘建议 `200`-`300`，1G 磁盘建议 `500`-`600`），
@@ -207,6 +243,8 @@ Alpine 上如果 `apk` 装包过程中被中断，先执行 `apk fix` 修复半�
 - `GET /api/status/{symbol}`
 - `POST /api/cleanup`
 - `GET /health`
+
+数据库菜单支持在线安全备份，也支持从备份恢复。恢复会先要求确认、停止服务、检查备份 SQLite 完整性和应用表结构，再保留原数据库及 sidecar 作为回滚副本后替换；操作失败会尝试恢复原文件。Python 后端用 Python 标准库执行恢复；Go 后端使用发布包中的 `bin/option-scope-go-db restore <backup-path>`。直接运行 Go 数据库恢复工具时，应用服务仍须先停止。
 
 配置 `ACCESS_KEY` 后，所有页面和 `/api/*` 请求都必须携带正确的 `?key=` 或 `X-Access-Key` 请求头；
 只有 `/static/*` 与 `/health` 例外，分别用于加载页面资源和本机看门狗健康检查。

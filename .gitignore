@@ -41,8 +41,11 @@ htmlcov/
 !.env.example
 
 # ---------- 运行期数据（应用与 run.sh 生成） ----------
-# 进程 PID、依赖指纹等运行状态
+# 进程 PID 与依赖指纹
 .run/
+# 手工在源码树中生成的 Go 可执行文件；发布包由 scripts/build-go-release.sh 生成到 dist/。
+/bin/option-scope-go
+/bin/option-scope-go-db
 # 日志（应用日志、看门狗日志、压缩后的 .1 轮转文件）
 logs/
 *.log

@@ -1,59 +1,69 @@
 #!/usr/bin/env bash
-# Option Scope 部署与运维脚本（菜单式）
+# Option Scope 部署与运维脚本（菜单式，纯 Go 版）
 #
 # 适用系统：Ubuntu / Debian（apt）、CentOS / RHEL / Rocky / Alma（dnf、yum）、Alpine（apk）
-# 适用架构：x86_64、aarch64、armv7l 等，取决于发行版是否提供对应的 Python 与预编译包
-# 运行方式：源码运行（不打包二进制）——建虚拟环境 → 装依赖 → 准备 .env → 后台启动
+# 适用架构：Linux x86_64（amd64）、aarch64（arm64）
+# 运行方式：直接运行与 run.sh 同目录的预编译二进制：
+#   - option-scope-linux-amd64
+#   - option-scope-linux-arm64
 #
 # 用法：
-#   ./run.sh                打开交互菜单
-#   ./run.sh 2              直接执行第 2 项（也可用在开机脚本里）
-#   ./run.sh status|stop    直接查看状态 / 停止应用
-#   ./run.sh __watchdog     内部使用：看门狗主循环
-#
-# 从零安装（无需事先下载源码，会自动克隆/更新到最新版本）：
-#   bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
-#   bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh) 2   直接安装并启动
-#   INSTALL_DIR=/opt/us_stocks bash <(curl -Ls .../run.sh)    自定义安装目录（默认 ./us_stocks）
-#
-# 说明：脚本自身幂等，重复执行安全；所有路径都基于脚本所在目录，可在任意工作目录调用。
+#   ./run.sh                      打开交互菜单
+#   ./run.sh start|stop|restart   启动 / 停止 / 重启
+#   ./run.sh status               查看运行状态
+#   ./run.sh logs [行数]          查看应用日志（默认 80 行）
+#   ./run.sh config               修改 .env（保存后可自动重启）
+#   ./run.sh doctor               环境自检
+#   ./run.sh trim-logs            立即把日志裁剪到 200 行
+#   ./run.sh kill-port [端口]     交互确认后结束监听该 TCP 端口的进程
+#   ./run.sh install-service      安装并启用 systemd 常驻服务（需要 systemd）
+#   ./run.sh remove-service       移除 systemd 服务
+#   ./run.sh enable-autostart     配置开机自启（crontab @reboot，适配容器）
+#   ./run.sh disable-autostart    取消开机自启
+#   ./run.sh foreground           前台运行（供 systemd 使用）
+#   ./run.sh __watchdog           内部使用：看门狗主循环
 set -u
 set -o pipefail
 
 # ---------- 基础路径与常量 ----------
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$PROJECT_DIR/.venv"
-VENV_PY="$VENV_DIR/bin/python"
-VENV_PIP="$VENV_DIR/bin/pip"
 ENV_FILE="$PROJECT_DIR/.env"
 ENV_EXAMPLE="$PROJECT_DIR/.env.example"
-PYPROJECT="$PROJECT_DIR/pyproject.toml"
 RUN_DIR="$PROJECT_DIR/.run"
 LOG_DIR="$PROJECT_DIR/logs"
 APP_LOG="$LOG_DIR/app.log"
 WATCHDOG_LOG="$LOG_DIR/watchdog.log"
+CRON_LOG="$LOG_DIR/cron.log"
 APP_PID_FILE="$RUN_DIR/app.pid"
 WATCHDOG_PID_FILE="$RUN_DIR/watchdog.pid"
-DEPS_STAMP="$RUN_DIR/deps.stamp"
 SYSTEMD_UNIT_NAME="option-scope.service"
 SYSTEMD_UNIT_FILE="/etc/systemd/system/$SYSTEMD_UNIT_NAME"
 
-# Python 版本下限，与 pyproject.toml 的 requires-python 保持一致
-PYTHON_MIN_MAJOR=3
-PYTHON_MIN_MINOR=11
-WATCHDOG_INTERVAL=15          # 无 systemd 环境的降级看门狗检查间隔（秒）
-WATCHDOG_FAIL_LIMIT=2         # 连续失败两次即重启，缩短源站不可用窗口
-START_TIMEOUT=60              # 启动后等待健康检查的最长秒数
-STOP_TIMEOUT=10               # 优雅退出等待秒数，超时强制结束
-LOG_MAX_KB=$((5 * 1024))      # 单个日志上限，超过就轮转，避免 512M 容器被日志写满
+# 应用二进制：与 run.sh 同目录，按 CPU 架构自动选择
+APP_BINARY=""
+BINARY_ARCH=""
+
+WATCHDOG_INTERVAL=15
+WATCHDOG_FAIL_LIMIT=2
+START_TIMEOUT=60
+STOP_TIMEOUT=10
+
+# 日志裁剪：只保留最后 N 行，原地覆盖不换 inode（避免 Go 进程 fd 悬空）
+LOG_MAX_LINES="${LOG_MAX_LINES:-200}"    # 应用 / 看门狗日志最多保留行数
+LOG_MAX_KB="${LOG_MAX_KB:-512}"          # 单文件字节兜底（防单行超长撑爆）
+CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-500}"
+CRON_LOG_MAX_KB="${CRON_LOG_MAX_KB:-1024}"
+
+AUTOSTART_TAG="# option-scope-autostart"
 
 # ---------- 输出样式 ----------
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_RED=$'\033[31m'
   C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+  C_DIM=$'\033[2m'
 else
-  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_DIM=""
 fi
 
 info()    { printf '%s[信息]%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
@@ -61,6 +71,7 @@ ok()      { printf '%s[完成]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn()    { printf '%s[注意]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 fail()    { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
 section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+dim()     { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
 die()     { fail "$*"; exit 1; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -75,7 +86,6 @@ init_privilege() {
   fi
 }
 
-# 以 root 身份执行命令：root 直跑，普通用户自动加 sudo，都没有时给出可复制的命令
 run_root() {
   case "$SUDO" in
     "") "$@" ;;
@@ -96,235 +106,35 @@ detect_system() {
     OS_NAME="${PRETTY_NAME:-${NAME:-未知发行版}}"
   fi
   ARCH="$(uname -m)"
-  if has_cmd apt-get; then
-    PKG_MANAGER="apt"
-  elif has_cmd dnf; then
-    PKG_MANAGER="dnf"
-  elif has_cmd yum; then
-    PKG_MANAGER="yum"
-  elif has_cmd apk; then
-    PKG_MANAGER="apk"
-  elif has_cmd zypper; then
-    PKG_MANAGER="zypper"
-  else
-    PKG_MANAGER=""
+  if has_cmd apt-get; then PKG_MANAGER="apt"
+  elif has_cmd dnf; then PKG_MANAGER="dnf"
+  elif has_cmd yum; then PKG_MANAGER="yum"
+  elif has_cmd apk; then PKG_MANAGER="apk"
+  elif has_cmd zypper; then PKG_MANAGER="zypper"
+  else PKG_MANAGER=""
   fi
 }
 
-# 安装系统软件包，自动选择 apt / dnf / yum / apk / zypper
-pkg_install() {
-  [ "$#" -gt 0 ] || return 0
-  local status=0
-  case "$PKG_MANAGER" in
-    apt)
-      run_root apt-get update -qq && run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
-      ;;
-    dnf) run_root dnf install -y "$@" ;;
-    yum) run_root yum install -y "$@" ;;
-    apk) run_root apk add --no-cache "$@" ;;
-    zypper) run_root zypper --non-interactive install "$@" ;;
+setup_binary_path() {
+  case "$ARCH" in
+    x86_64 | amd64)   BINARY_ARCH="amd64" ;;
+    aarch64 | arm64)  BINARY_ARCH="arm64" ;;
     *)
-      fail "未识别的包管理器，请手动安装：$*"
-      return 1
+      BINARY_ARCH=""
+      APP_BINARY=""
+      return 0
       ;;
   esac
-  status=$?
-  # 被 OOM Killer 干掉时给出针对性提示，避免误判成「软件源挂了」
-  if is_oom_status "$status"; then
-    warn "包管理器进程被系统强制结束（Killed）——内存不足（OOM），不是软件源或网络问题"
-    printf '        当前内存：%s\n' "$(memory_summary)"
-    oom_advice
-    if [ "$PKG_MANAGER" = "apk" ]; then
-      warn "apk 被中断可能留下半装状态，内存恢复后先执行：apk fix"
-    fi
-  fi
-  return "$status"
+  APP_BINARY="$PROJECT_DIR/option-scope-linux-$BINARY_ARCH"
 }
 
-# ---------- Python 与依赖 ----------
-python_version_of() {
-  "$1" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null
-}
-
-# 判断解释器版本是否满足项目要求（requires-python >= 3.11）
-python_is_supported() {
-  "$1" -c "import sys; sys.exit(0 if sys.version_info >= (${PYTHON_MIN_MAJOR}, ${PYTHON_MIN_MINOR}) else 1)" 2>/dev/null
-}
-
-# 按「高版本优先」寻找可用解释器，返回其绝对路径
-find_supported_python() {
-  local name path
-  for name in python3.13 python3.12 python3.11 python3; do
-    path="$(command -v "$name" 2>/dev/null)" || continue
-    if python_is_supported "$path"; then
-      printf '%s' "$path"
-      return 0
-    fi
-  done
-  return 1
-}
-
-print_python_help() {
-  cat <<'TXT'
-  手动安装示例（挑一条执行后重新运行本脚本）：
-    Ubuntu 24.04+ / Debian 12+ ：sudo apt-get install -y python3 python3-venv python3-pip
-    Ubuntu 22.04（自带 3.10）  ：sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt-get install -y python3.11 python3.11-venv python3.11-dev
-    CentOS / Rocky 9           ：sudo dnf install -y python3.11 python3.11-pip
-    Alpine 3.19+               ：sudo apk add python3 py3-pip
-TXT
-}
-
-ensure_python() {
-  local found
-  if found="$(find_supported_python)"; then
-    ok "Python 已就绪：$found（$("$found" --version 2>&1)）"
-    SYSTEM_PYTHON="$found"
-    return 0
-  fi
-  warn "未找到 Python ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR}+，尝试自动安装"
-  case "$PKG_MANAGER" in
-    apt) pkg_install python3 python3-venv python3-pip ;;
-    apk) pkg_install python3 py3-pip ;;
-    dnf | yum) pkg_install python3 python3-pip ;;
-    *) warn "未识别的包管理器，跳过自动安装" ;;
-  esac
-  if found="$(find_supported_python)"; then
-    ok "Python 安装完成：$found"
-    SYSTEM_PYTHON="$found"
-    return 0
-  fi
-  # 系统仓库版本仍不达标时，再尝试高版本包名（CentOS/Rocky 9、Debian 常见做法）
-  warn "系统自带 Python 版本低于 ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR}，尝试安装高版本解释器"
-  case "$PKG_MANAGER" in
-    apt) pkg_install python3.11 python3.11-venv python3.11-dev ;;
-    dnf | yum) pkg_install python3.11 python3.11-pip ;;
-  esac
-  if found="$(find_supported_python)"; then
-    ok "Python 安装完成：$found"
-    SYSTEM_PYTHON="$found"
-    return 0
-  fi
-  fail "无法自动安装 Python ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR}+"
-  print_python_help
-  return 1
-}
-
-ensure_venv() {
-  if [ -x "$VENV_PY" ] && "$VENV_PY" -c 'import sys' >/dev/null 2>&1; then
-    ok "虚拟环境已存在：$VENV_DIR（跳过创建）"
-    return 0
-  fi
-  local interpreter="${SYSTEM_PYTHON:-}"
-  if [ -z "$interpreter" ]; then
-    interpreter="$(find_supported_python)" || {
-      fail "没有可用的 Python 解释器"
-      return 1
-    }
-  fi
-  info "创建虚拟环境：$VENV_DIR"
-  # --clear 会清空目标目录后重建，避免残留上一次失败的半成品环境
-  if ! "$interpreter" -m venv --clear "$VENV_DIR" >/dev/null 2>&1; then
-    warn "创建虚拟环境失败，尝试补齐 venv/pip 系统包后重试"
-    case "$PKG_MANAGER" in
-      apt) pkg_install python3-venv python3-pip ;;
-      apk) pkg_install py3-pip ;;
-      dnf | yum) pkg_install python3-pip ;;
-    esac
-    "$interpreter" -m venv --clear "$VENV_DIR" >/dev/null 2>&1 || {
-      fail "创建虚拟环境失败，请手动执行：$interpreter -m venv $VENV_DIR"
-      return 1
-    }
-  fi
-  if [ ! -x "$VENV_PIP" ]; then
-    "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1 || true
-  fi
-  [ -x "$VENV_PIP" ] || {
-    fail "虚拟环境缺少 pip，请安装 pip 后重试"
-    return 1
-  }
-  ok "虚拟环境创建完成"
-}
-
-# pip 安装失败时补齐编译工具链（Alpine 的 musl 环境最容易踩到）
-install_build_deps() {
-  info "安装编译依赖（numpy/pandas/lxml 等可能需要现场编译）"
-  case "$PKG_MANAGER" in
-    apt) pkg_install build-essential python3-dev ;;
-    apk) pkg_install build-base python3-dev linux-headers ;;
-    dnf | yum) pkg_install gcc gcc-c++ make python3-devel ;;
-    *) return 1 ;;
-  esac
-}
-
-# 运行依赖是否可导入：通过项目自己的行情入口验证，顺带确认上游 SDK 已装好。
-# 用子 shell 切到项目目录，保证脚本在任意工作目录调用都能导入 app 包。
-deps_importable() {
-  (
-    cd "$PROJECT_DIR" || exit 1
-    "$VENV_PY" -c 'import fastapi, uvicorn, pandas, dotenv, app.providers.market as market; market.load_upstream_sdk()'
-  ) >/dev/null 2>&1
-}
-
-ensure_deps() {
-  [ -x "$VENV_PIP" ] || { fail "缺少虚拟环境，请先执行第 1 项"; return 1; }
-  local target="$PROJECT_DIR" stamp pip_status=0
-  # 依赖指纹：pyproject.toml 内容 + Python 版本，任一变化就重装
-  stamp="$(cksum "$PYPROJECT" 2>/dev/null | awk '{print $1}')-$(python_version_of "$VENV_PY")"
-  if [ -f "$DEPS_STAMP" ] && [ "$(cat "$DEPS_STAMP" 2>/dev/null)" = "$stamp" ] \
-     && deps_importable; then
-    ok "依赖已安装且与当前代码匹配（跳过安装）"
-    return 0
-  fi
-  info "安装项目依赖：pip install -e ."
-  # 应用在跑时会一起占内存，小内存机器上容易把 pip 挤到被 OOM 杀掉
-  if app_running; then
-    warn "检测到应用正在运行：安装依赖时内存占用会翻倍，若被 Killed 请先执行 ./run.sh 6 停掉应用"
-  fi
-  "$VENV_PIP" install -e "$target" --disable-pip-version-check || pip_status=$?
-  if [ "$pip_status" -ne 0 ]; then
-    # 内存不足导致的中断重试也没用，直接给出可操作的结论，不去装编译工具白费时间
-    if is_oom_status "$pip_status"; then
-      fail "依赖安装被系统强制结束（Killed）——内存不足（OOM），不是网络或代码问题"
-      printf '        当前内存：%s\n' "$(memory_summary)"
-      oom_advice
-      return 1
-    fi
-    warn "依赖安装失败，补齐编译依赖后重试一次"
-    install_build_deps || true
-    pip_status=0
-    "$VENV_PIP" install -e "$target" --disable-pip-version-check || pip_status=$?
-    if [ "$pip_status" -ne 0 ]; then
-      if is_oom_status "$pip_status"; then
-        fail "重试仍被系统强制结束（Killed）——内存不足（OOM），不是网络或代码问题"
-        printf '        当前内存：%s\n' "$(memory_summary)"
-        oom_advice
-        return 1
-      fi
-      fail "依赖安装失败。可尝试：设置 PIP_INDEX_URL 换国内镜像、检查网络/代理，或先安装编译工具后重试"
-      return 1
-    fi
-  fi
-  mkdir -p "$RUN_DIR"
-  printf '%s' "$stamp" > "$DEPS_STAMP"
-  ok "依赖安装完成"
-}
-
-# 生成 16 位小写字母 + 数字访问密钥；优先 Python，其次 OpenSSL，最后直接用系统随机源。
+# ---------- 访问密钥生成 ----------
 generate_access_key() {
   local key=""
-  if has_cmd python3; then
-    key="$("$(command -v python3)" - <<'PY'
-import secrets
-import string
-
-alphabet = string.ascii_lowercase + string.digits
-print("".join(secrets.choice(alphabet) for _ in range(16)))
-PY
-)"
-  elif has_cmd openssl; then
+  if has_cmd openssl; then
     key="$(openssl rand -hex 8)"
   else
-    key="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | dd bs=16 count=1 2>/dev/null | tr -d '\n')"
+    key="$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | dd bs=1 count=16 2>/dev/null | tr -d '\n')"
   fi
   case "$key" in
     '' | *[!a-z0-9]*) return 1 ;;
@@ -333,45 +143,31 @@ PY
   printf '%s' "$key"
 }
 
-ensure_env_file() {
-  if [ ! -f "$ENV_FILE" ]; then
-    [ -f "$ENV_EXAMPLE" ] || { fail "缺少模板文件 $ENV_EXAMPLE"; return 1; }
-    cp "$ENV_EXAMPLE" "$ENV_FILE" || return 1
-    ok "已由 .env.example 生成 $ENV_FILE"
-  else
-    ok "配置文件已存在：$ENV_FILE（跳过生成）"
-  fi
-
-  # 旧版 .env 没有 ACCESS_KEY，或用户误留空时自动补齐，避免升级后把访问保护静默关掉。
-  local access_key=""
-  access_key="$(read_env_value ACCESS_KEY "")"
-  if [ -n "$access_key" ]; then
-    info "访问密钥已配置（网址需要携带 ?key=...）"
-    return 0
-  fi
-  access_key="$(generate_access_key)" || {
-    fail "无法生成访问密钥，请确认系统存在 python3、openssl 或可用的 /dev/urandom"
-    return 1
-  }
-  write_env_value ACCESS_KEY "$access_key" || return 1
-  ok "已生成访问密钥 ACCESS_KEY=$access_key"
-}
-
-# 读取 .env 中的配置项（取最后一次出现的值），不存在或留空时返回默认值。
-# 用一次 awk 代替 grep/tail/cut/tr/sed 多段管道，减少每次调用启动的子进程数。
-read_env_value() {
+# ---------- .env 读写 ----------
+read_env_file_value() {
   local key="$1" default_value="$2"
   if [ -f "$ENV_FILE" ]; then
     awk -v key="$key" -v fallback="$default_value" '
+      BEGIN { sq = sprintf("%c", 39) }
       {
         line = $0
         sub(/^[[:space:]]*/, "", line)
+        sub(/^export[[:space:]]+/, "", line)
         prefix = key "="
         if (index(line, prefix) == 1) {
           value = substr(line, length(prefix) + 1)
           gsub(/\r/, "", value)
           sub(/^[[:space:]]*/, "", value)
           sub(/[[:space:]]*$/, "", value)
+          quoted = ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") || (substr(value, 1, 1) == sq && substr(value, length(value), 1) == sq))
+          if (!quoted) {
+            sub(/[[:space:]]+#.*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            quoted = ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") || (substr(value, 1, 1) == sq && substr(value, length(value), 1) == sq))
+          }
+          if (quoted) {
+            value = substr(value, 2, length(value) - 2)
+          }
         }
       }
       END { print value != "" ? value : fallback }
@@ -381,70 +177,310 @@ read_env_value() {
   fi
 }
 
-# 写入配置项：已存在则就地替换（并清掉重复项），不存在则追加
+read_env_value() {
+  local key="$1" default_value="$2"
+  if [[ -v $key ]]; then
+    printf '%s' "${!key}"
+  else
+    read_env_file_value "$key" "$default_value"
+  fi
+}
+
 write_env_value() {
-  local key="$1" value="$2" tmp
+  local key="$1" value="$2" tmp metadata mode owner_uid owner_gid current_uid current_gid
   [ -f "$ENV_FILE" ] || ensure_env_file || return 1
-  tmp="$(mktemp "${TMPDIR:-/tmp}/runsh.XXXXXX")" || return 1
+  metadata="$(stat -c '%a %u %g' "$ENV_FILE" 2>/dev/null)" || {
+    fail "无法读取 $ENV_FILE 的权限与属主"
+    return 1
+  }
+  read -r mode owner_uid owner_gid <<<"$metadata"
+  current_uid="$(id -u)"
+  current_gid="$(id -g)"
+  tmp="$(mktemp "$PROJECT_DIR/.env.XXXXXX")" || return 1
   if awk -v k="$key" -v v="$value" '
     BEGIN { written = 0 }
     $0 ~ "^[[:space:]]*" k "=" { if (!written) { print k "=" v; written = 1 } ; next }
     { print }
     END { if (!written) print k "=" v }
-  ' "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"; then
+  ' "$ENV_FILE" > "$tmp" && chmod "$mode" "$tmp" &&
+      { [ "$current_uid" -eq 0 ] && chown "$owner_uid:$owner_gid" "$tmp" ||
+        { [ "$current_uid" -eq "$owner_uid" ] && { [ "$current_gid" -eq "$owner_gid" ] || chgrp "$owner_gid" "$tmp"; } || chown "$owner_uid:$owner_gid" "$tmp"; }; } &&
+      mv -f "$tmp" "$ENV_FILE"; then
     return 0
   fi
   rm -f "$tmp" 2>/dev/null
   return 1
 }
 
-# 一次性把「Python / 虚拟环境 / 依赖 / .env」准备好，已就绪的部分自动跳过
+ensure_env_file() {
+  if [ ! -f "$ENV_FILE" ]; then
+    if [ -f "$ENV_EXAMPLE" ]; then
+      cp "$ENV_EXAMPLE" "$ENV_FILE" || return 1
+      ok "已由 .env.example 生成 $ENV_FILE"
+    else
+      cat >"$ENV_FILE" <<'ENVEOF'
+# Option Scope 配置
+HOST=0.0.0.0
+PORT=8000
+ACCESS_KEY=
+DATABASE_PATH=data/options.db
+DATABASE_MAX_MB=256M
+RAW_RETENTION_DAYS=30
+SCHEDULER_ENABLED=true
+ENVEOF
+      ok "已生成默认 $ENV_FILE"
+    fi
+    chmod 600 "$ENV_FILE" || { rm -f "$ENV_FILE"; return 1; }
+    if [ "$(id -u)" -eq 0 ] && has_cmd stat; then
+      local project_owner
+      project_owner="$(stat -c '%u:%g' "$PROJECT_DIR" 2>/dev/null)" || return 1
+      chown "$project_owner" "$ENV_FILE" || { rm -f "$ENV_FILE"; return 1; }
+    fi
+  else
+    if [ "$(id -u)" -eq 0 ] && has_cmd stat; then
+      local project_owner env_owner
+      project_owner="$(stat -c '%u:%g' "$PROJECT_DIR" 2>/dev/null)" || return 1
+      env_owner="$(stat -c '%u:%g' "$ENV_FILE" 2>/dev/null)" || return 1
+      if [ "${env_owner%%:*}" != "${project_owner%%:*}" ]; then
+        chown "$project_owner" "$ENV_FILE" || { fail "无法将 $ENV_FILE 交给项目服务用户"; return 1; }
+      fi
+    fi
+    chmod u+r "$ENV_FILE" || { fail "无法授予项目服务用户读取 $ENV_FILE 的权限"; return 1; }
+  fi
+
+  local access_key=""
+  access_key="$(read_env_value ACCESS_KEY "")"
+  [ -n "$access_key" ] && return 0
+  access_key="$(generate_access_key)" || {
+    fail "无法生成访问密钥，请确认系统存在 openssl 或可用的 /dev/urandom"
+    return 1
+  }
+  write_env_value ACCESS_KEY "$access_key" || return 1
+  ok "已生成访问密钥 ACCESS_KEY=$access_key"
+}
+
+ensure_app_binary() {
+  if [ -z "$APP_BINARY" ]; then
+    fail "当前架构 $ARCH 不受支持（仅支持 linux-amd64 / linux-arm64）"
+    return 1
+  fi
+  if [ ! -x "$APP_BINARY" ]; then
+    if [ -f "$APP_BINARY" ]; then
+      warn "二进制缺少执行权限，尝试 chmod +x：$APP_BINARY"
+      chmod +x "$APP_BINARY" 2>/dev/null || true
+    fi
+    if [ ! -x "$APP_BINARY" ]; then
+      fail "应用二进制缺失或不可执行：$APP_BINARY"
+      fail "请将 option-scope-linux-$BINARY_ARCH 与 run.sh 放在同一目录"
+      return 1
+    fi
+  fi
+  return 0
+}
+
 ensure_runtime() {
-  ensure_python || return 1
-  ensure_venv || return 1
-  ensure_deps || return 1
   ensure_env_file || return 1
+  ensure_app_binary || return 1
   mkdir -p "$RUN_DIR" "$LOG_DIR"
   return 0
+}
+
+# ---------- 日志裁剪（保留最后 N 行，原地覆盖不换 inode） ----------
+# 说明：
+#   - spawn_detached 用 >> 打开日志，Go 进程持有 fd 且 O_APPEND。
+#   - 直接 cat 临时文件 > logfile 覆盖，inode 不变，Go fd 继续有效。
+#   - 不能用 mv 替换，会换 inode 导致后续写入进"已删除"的文件。
+trim_log_file() {
+  local log="$1" max_lines="${2:-$LOG_MAX_LINES}" max_kb="${3:-$LOG_MAX_KB}"
+  local lines size tmp
+  [ -f "$log" ] || return 0
+
+  # 先按字节兜底（防单行超长把文件撑爆）
+  case "$max_kb" in '' | *[!0-9]*) ;; *)
+    if [ "$max_kb" -gt 0 ]; then
+      size="$(wc -c <"$log" 2>/dev/null | tr -d '[:space:]')"
+      case "$size" in '' | *[!0-9]*) size=0 ;; esac
+      if [ "$size" -gt $((max_kb * 1024)) ]; then
+        tmp="$(mktemp "${log}.trim.XXXXXX")" || return 0
+        if tail -c $((max_kb * 1024)) "$log" >"$tmp" 2>/dev/null; then
+          cat "$tmp" >"$log" 2>/dev/null || true
+        fi
+        rm -f "$tmp" 2>/dev/null
+      fi
+    fi
+    ;;
+  esac
+
+  # 再按行数裁剪
+  case "$max_lines" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$max_lines" -gt 0 ] || return 0
+  lines="$(wc -l <"$log" 2>/dev/null | tr -d '[:space:]')"
+  case "$lines" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$lines" -gt "$max_lines" ] || return 0
+
+  tmp="$(mktemp "${log}.trim.XXXXXX")" || return 0
+  if tail -n "$max_lines" "$log" >"$tmp" 2>/dev/null; then
+    cat "$tmp" >"$log" 2>/dev/null || true
+  fi
+  rm -f "$tmp" 2>/dev/null
+}
+
+trim_all_logs() {
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  trim_log_file "$APP_LOG"       "$LOG_MAX_LINES"      "$LOG_MAX_KB"
+  trim_log_file "$WATCHDOG_LOG"  "$LOG_MAX_LINES"      "$LOG_MAX_KB"
+  trim_log_file "$CRON_LOG"      "$CRON_LOG_MAX_LINES" "$CRON_LOG_MAX_KB"
+}
+
+# ---------- 托管方式诊断 ----------
+systemd_diagnose() {
+  if ! has_cmd systemctl; then
+    printf '未安装 systemctl 命令'
+    return 1
+  fi
+  if [ -d /run/systemd/system ]; then
+    return 0
+  fi
+  local pid1_comm=""
+  if [ -r /proc/1/comm ]; then
+    pid1_comm="$(tr -d '\n' </proc/1/comm 2>/dev/null)"
+  fi
+  if [ -n "$pid1_comm" ] && [ "$pid1_comm" != "systemd" ]; then
+    printf 'PID 1 不是 systemd（当前为 %s，常见于 LXC / Docker 容器）' "${pid1_comm:-未知}"
+    return 1
+  fi
+  printf 'systemd 未作为系统服务管理器运行（/run/systemd/system 不存在）'
+  return 1
+}
+
+systemd_available() {
+  systemd_diagnose >/dev/null 2>&1
+}
+
+systemd_unit_installed() {
+  [ -f "$SYSTEMD_UNIT_FILE" ]
+}
+
+systemd_managed() {
+  systemd_available && systemd_unit_installed
+}
+
+systemd_service_active() {
+  systemd_managed && systemctl is-active --quiet "$SYSTEMD_UNIT_NAME"
+}
+
+hosting_mode() {
+  if systemd_managed; then
+    printf 'systemd'
+  elif app_running || watchdog_running; then
+    printf 'watchdog'
+  else
+    printf 'none'
+  fi
+}
+
+hosting_mode_label() {
+  case "$(hosting_mode)" in
+    systemd) printf 'systemd（开机自启，崩溃自动重启）' ;;
+    watchdog) printf 'shell 看门狗（每 %ss 检查，崩溃自动拉起）' "$WATCHDOG_INTERVAL" ;;
+    none) printf '未运行' ;;
+  esac
+}
+
+# ---------- 开机自启（crontab @reboot） ----------
+autostart_installed() {
+  has_cmd crontab || return 1
+  crontab -l 2>/dev/null | grep -qF "$AUTOSTART_TAG"
+}
+
+autostart_line() {
+  printf '@reboot cd %q && nohup bash %q start >>%q 2>&1 & %s' \
+    "$PROJECT_DIR" "$SCRIPT_PATH" "$CRON_LOG" "$AUTOSTART_TAG"
+}
+
+setup_autostart() {
+  section "配置开机自启（crontab @reboot）"
+  if systemd_managed; then
+    warn "当前已用 systemd 托管，无需 crontab；开机自启由 systemd 保证"
+    return 0
+  fi
+  if ! has_cmd crontab; then
+    fail "未安装 crontab 命令"
+    printf '  安装方式（挑一条执行后重试）：\n'
+    printf '    Debian/Ubuntu：apt-get install -y cron && service cron start\n'
+    printf '    CentOS/Rocky ：dnf install -y cronie && systemctl enable --now crond\n'
+    printf '    Alpine       ：apk add busybox-initscripts && rc-update add crond\n'
+    printf '  注意：容器里若没有 init 系统，cron 服务需要由宿主或 supervisor 拉起\n'
+    return 1
+  fi
+  local tmp
+  tmp="$(mktemp)" || return 1
+  crontab -l 2>/dev/null | grep -vF "$AUTOSTART_TAG" > "$tmp" || true
+  printf '%s\n' "$(autostart_line)" >> "$tmp"
+  if crontab "$tmp"; then
+    rm -f "$tmp"
+    ok "已写入 crontab：@reboot 时自动执行 ./run.sh start"
+    printf '  crontab 记录：%s\n' "$(autostart_line)"
+    printf '  说明：容器启动后由 cron 触发，会走 shell 看门狗模式（无需 systemd）\n'
+    if ! crontab -l 2>/dev/null | grep -q .; then
+      warn "crontab 内容为空，请确认 cron 服务已启用"
+    fi
+    return 0
+  fi
+  rm -f "$tmp"
+  fail "写入 crontab 失败"
+  return 1
+}
+
+remove_autostart() {
+  section "取消开机自启"
+  if ! has_cmd crontab; then
+    info "未安装 crontab，无需处理"
+    return 0
+  fi
+  if ! autostart_installed; then
+    info "未发现开机自启记录"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp)" || return 1
+  crontab -l 2>/dev/null | grep -vF "$AUTOSTART_TAG" > "$tmp" || true
+  if crontab "$tmp"; then
+    rm -f "$tmp"
+    ok "已移除开机自启记录"
+    return 0
+  fi
+  rm -f "$tmp"
+  fail "更新 crontab 失败"
+  return 1
 }
 
 # ---------- 进程 / 端口 / 日志辅助 ----------
 timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
-# 运行期使用的解释器：优先虚拟环境，缺失时回退系统 python3（只读检查场景）
-runtime_python() {
-  if [ -x "$VENV_PY" ]; then
-    printf '%s' "$VENV_PY"
-  elif has_cmd python3; then
-    command -v python3
-  else
-    printf '%s' "$VENV_PY"
-  fi
-}
-
-# 读取 .env 里的监听端口；缺失或非法时回落到 8000（与 app/__main__.py 默认值一致）
 app_port() {
-  local port
-  port="$(read_env_value PORT 8000)"
+  local port="${PORT:-}"
+  if [ -z "$port" ]; then
+    port="$(read_env_value PORT 8000)"
+  fi
   case "$port" in
     '' | *[!0-9]*) port=8000 ;;
   esac
   printf '%s' "$port"
 }
 
-# 判断本机端口是否已被监听（纯 socket 探测，busybox 没有 ss 也能用）
 port_in_use() {
-  "$(runtime_python)" - "$1" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-
-sock = socket.socket()
-sock.settimeout(1)
-sys.exit(0 if sock.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)
-PY
+  local port="$1"
+  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    return 0
+  fi
+  if has_cmd nc; then
+    nc -z -w 1 127.0.0.1 "$port" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
 }
 
-# 打印占用端口的进程，方便判断是不是上一次没停干净的实例
 port_owner() {
   local port="$1"
   if has_cmd ss; then
@@ -457,7 +493,6 @@ port_owner() {
   return 0
 }
 
-# 只枚举监听指定 TCP 端口的进程（不把连接到该端口的客户端误判为占用者）。
 port_listener_pids() {
   local port="$1"
   {
@@ -470,7 +505,6 @@ port_listener_pids() {
   } | sort -u
 }
 
-# 交互式结束指定 TCP 监听端口的进程；先展示 PID 并确认，再发 TERM。
 action_kill_port() {
   local port="${1:-}" answer="" pid="" owns_app=false
   local -a pids=() remaining=()
@@ -501,7 +535,7 @@ action_kill_port() {
   for pid in "${pids[@]}"; do
     case "$pid" in '' | *[!0-9]*) continue ;; esac
     ps -p "$pid" -o pid=,comm= 2>/dev/null || printf '    PID %s（进程详情不可读）\n' "$pid"
-    if proc_matches "$pid" "-m app"; then
+    if [ -n "$APP_BINARY" ] && proc_matches "$pid" "$APP_BINARY"; then
       owns_app=true
     fi
   done
@@ -509,7 +543,6 @@ action_kill_port() {
   read -r answer || answer=""
   case "$answer" in y | Y | yes | YES) ;; *) info "已取消，未结束任何进程"; return 0 ;; esac
 
-  # 当前项目由看门狗或 systemd 管理时走正常停服流程，避免刚杀掉就被自动拉起。
   if [ "$owns_app" = true ]; then
     warn "检测到当前 Option Scope 服务；将通过正常停服流程停止它"
     stop_app || return 1
@@ -566,25 +599,51 @@ action_kill_port() {
   ok "TCP 端口 $port 已释放"
 }
 
-# HTTP 健康检查：比「进程还在」更能反映服务是否真的可用
-health_ok() {
-  "$(runtime_python)" - "$(app_port)" <<'PY' >/dev/null 2>&1
-import sys
-import urllib.error
-import urllib.request
-
-url = "http://127.0.0.1:%s/health" % sys.argv[1]
-try:
-    with urllib.request.urlopen(url, timeout=3) as response:
-        sys.exit(0 if response.status == 200 else 1)
-except (urllib.error.URLError, OSError, ValueError):
-    sys.exit(1)
-PY
+health_host() {
+  local host
+  host="$(read_env_value HOST 0.0.0.0)"
+  case "$host" in
+    '' | 0.0.0.0 | :: | 0:0:0:0:0:0:0:0 | '*') host=127.0.0.1 ;;
+  esac
+  printf '%s' "$host"
 }
 
-# 通过 /proc 精确识别属于本项目的进程：命令行匹配 + 工作目录匹配，避免误伤同名进程
+health_url_host() {
+  local host="$1"
+  case "$host" in
+    *:*) printf '[%s]' "$host" ;;
+    *) printf '%s' "$host" ;;
+  esac
+}
+
+health_ok() {
+  local host url
+  host="$(health_host)"
+  url="http://$(health_url_host "$host"):$(app_port)/health"
+  if has_cmd curl; then
+    curl -fsS --max-time 3 "$url" >/dev/null 2>&1
+    return $?
+  fi
+  if has_cmd wget; then
+    wget -q -T 3 -O /dev/null "$url" >/dev/null 2>&1
+    return $?
+  fi
+  (
+    local response
+    exec 2>/dev/null
+    exec 3<>"/dev/tcp/$host/$(app_port)" || exit 1
+    printf 'GET /health HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n' "$(health_url_host "$host")" >&3 || exit 1
+    IFS= read -r -t 3 response <&3 || exit 1
+    case "$response" in
+      'HTTP/1.0 200 '* | 'HTTP/1.1 200 '*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+  )
+}
+
 proc_matches() {
   local pid="$1" keyword="$2" cmd cwd
+  [ -n "$keyword" ] || return 1
   [ -d "/proc/$pid" ] || return 1
   cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)" || return 1
   case "$cmd" in
@@ -597,6 +656,7 @@ proc_matches() {
 
 scan_pids() {
   local keyword="$1" pid
+  [ -n "$keyword" ] || return 0
   [ -d /proc ] || return 0
   for pid in /proc/[0-9]*; do
     pid="${pid#/proc/}"
@@ -607,14 +667,12 @@ scan_pids() {
   done
 }
 
-# 读取 PID 文件并校验它确实指向本项目的进程，失效时回退到 /proc 扫描
 resolve_pid() {
   local pid_file="$1" keyword="$2" pid=""
   if [ -f "$pid_file" ]; then
     pid="$(tr -d '[:space:]' <"$pid_file" 2>/dev/null)"
   fi
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    # 没有 /proc（非 Linux）时只看进程是否存在
     if [ ! -d /proc ] || proc_matches "$pid" "$keyword"; then
       printf '%s' "$pid"
       return 0
@@ -632,12 +690,32 @@ resolve_pid() {
   return 1
 }
 
-app_pid() { resolve_pid "$APP_PID_FILE" "-m app"; }
+app_pid() {
+  local pid=""
+  [ -n "$APP_BINARY" ] || return 1
+  if [ -f "$APP_PID_FILE" ]; then
+    pid="$(tr -d '[:space:]' <"$APP_PID_FILE" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      if [ ! -d /proc ] || proc_matches "$pid" "$APP_BINARY"; then
+        printf '%s' "$pid"
+        return 0
+      fi
+    fi
+  fi
+  pid="$(scan_pids "$APP_BINARY" | head -n 1)"
+  if [ -n "$pid" ]; then
+    printf '%s\n' "$pid" >"$APP_PID_FILE" 2>/dev/null || true
+    printf '%s' "$pid"
+    return 0
+  fi
+  [ -f "$APP_PID_FILE" ] && rm -f "$APP_PID_FILE" 2>/dev/null || true
+  return 1
+}
+
 watchdog_pid() { resolve_pid "$WATCHDOG_PID_FILE" "__watchdog"; }
 app_running() { app_pid >/dev/null 2>&1; }
 watchdog_running() { watchdog_pid >/dev/null 2>&1; }
 
-# 进程已运行时长，busybox 的 ps 不支持时返回「未知」
 process_uptime() {
   local etime=""
   if has_cmd ps; then
@@ -647,7 +725,6 @@ process_uptime() {
   printf '%s' "$etime"
 }
 
-# 本机内网 IP，用于打印访问地址；探测不到时回退 127.0.0.1
 local_ip() {
   local ip=""
   if has_cmd hostname; then
@@ -660,7 +737,6 @@ local_ip() {
   printf '%s' "$ip"
 }
 
-# 打印访问地址（监听 0.0.0.0 时同时给出内网地址）
 show_access_url() {
   local port host access_key
   port="$(app_port)"
@@ -680,20 +756,6 @@ show_access_url() {
   fi
 }
 
-# 日志超过上限就轮转：先复制成 .1 再清空原文件，保证服务已打开的文件句柄继续可用
-rotate_log_if_needed() {
-  local log="$1" size=""
-  [ -f "$log" ] || return 0
-  size="$(wc -c <"$log" 2>/dev/null | tr -d '[:space:]')"
-  case "$size" in
-    '' | *[!0-9]*) return 0 ;;
-  esac
-  [ "$size" -gt $((LOG_MAX_KB * 1024)) ] || return 0
-  cp "$log" "$log.1" 2>/dev/null || true
-  : >"$log"
-}
-
-# 打印日志末尾若干行，缺文件时给一句提示
 tail_log() {
   local log="$1" lines="${2:-30}"
   if [ -s "$log" ]; then
@@ -704,7 +766,6 @@ tail_log() {
   fi
 }
 
-# 把字节数转成便于阅读的单位
 human_size() {
   local bytes="$1"
   case "$bytes" in
@@ -721,13 +782,6 @@ human_size() {
   fi
 }
 
-# ---------- 内存探测：小内存机器上「安装依赖被 Killed」几乎都是内存不足（OOM） ----------
-# 退出码 137 = 128 + 9，即进程收到 SIGKILL；在容器里通常由内存超限触发
-is_oom_status() {
-  [ "${1:-0}" = "137" ]
-}
-
-# 可用内存（MB），优先 MemAvailable，取不到时退回 MemFree；无法读取时输出空
 mem_available_mb() {
   local kb
   kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null)"
@@ -738,7 +792,6 @@ mem_available_mb() {
   esac
 }
 
-# 物理内存总量（MB）
 mem_total_mb() {
   local kb
   kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
@@ -748,7 +801,6 @@ mem_total_mb() {
   esac
 }
 
-# Swap 总量（MB），0 表示没有交换空间
 mem_swap_mb() {
   local kb
   kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
@@ -758,18 +810,16 @@ mem_swap_mb() {
   esac
 }
 
-# cgroup（LXC / Docker）内存上限（MB）；未限制时输出空
 cgroup_mem_limit_mb() {
   local value=""
   if [ -r /sys/fs/cgroup/memory.max ]; then
     value="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
-  elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+  elif [ -r /sys/fs/cgroup/memory.memory.limit_in_bytes ]; then
     value="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
   fi
   case "$value" in
     '' | max | *[!0-9]*) printf '' ;;
     *)
-      # 极大的数字表示「不限制」，避免换算成天文数字
       if [ "$value" -ge 1152921504606846976 ] 2>/dev/null; then
         printf ''
       else
@@ -779,41 +829,6 @@ cgroup_mem_limit_mb() {
   esac
 }
 
-# auto/true 且内存不超过 512MB 时，启动前限制 glibc arena。
-low_memory_requested() {
-  local value limit
-  value="$(read_env_value LOW_MEMORY auto)"
-  value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-  case "$value" in
-    1 | true | yes | on) return 0 ;;
-    0 | false | no | off) return 1 ;;
-  esac
-  limit="$(cgroup_mem_limit_mb)"
-  if [ -z "$limit" ]; then
-    limit="$(mem_total_mb)"
-  fi
-  case "$limit" in
-    '' | *[!0-9]*) return 1 ;;
-  esac
-  [ "$limit" -le 512 ]
-}
-
-# 在子 shell 里导出分配器参数，避免菜单进程自己被这些变量粘住。
-apply_low_memory_allocator() {
-  if low_memory_requested; then
-    export MALLOC_ARENA_MAX=1
-    export MALLOC_TRIM_THRESHOLD_=131072
-    export MALLOC_MMAP_THRESHOLD_=131072
-    export PYTHONDONTWRITEBYTECODE=1
-    export OPTION_SCOPE_LOW_MEMORY_REEXEC=1
-    printf '[%s] 低内存保护：已限制 malloc arena，重任务将串行执行\n' "$(timestamp)" >>"$APP_LOG"
-    return 0
-  fi
-  unset MALLOC_ARENA_MAX MALLOC_TRIM_THRESHOLD_ MALLOC_MMAP_THRESHOLD_ OPTION_SCOPE_LOW_MEMORY_REEXEC
-  return 0
-}
-
-# 一行内存概况：可用 / 总量 / Swap / 容器上限
 memory_summary() {
   local avail total swap limit text
   avail="$(mem_available_mb)"; total="$(mem_total_mb)"
@@ -823,22 +838,6 @@ memory_summary() {
   printf '%s' "$text"
 }
 
-# 内存不足（OOM）时的处理建议，供安装依赖、装系统包两处复用
-oom_advice() {
-  printf '        处理办法（按推荐顺序任选一条）：\n'
-  printf '          1) 先停掉正在运行的应用再重试安装（安装时内存占用会翻倍）：./run.sh 6\n'
-  printf '          2) 临时加 1G Swap（装完依赖即可保留或删除）：\n'
-  printf '             fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile\n'
-  printf '             没有 fallocate 时改用：dd if=/dev/zero of=/swapfile bs=1M count=1024\n'
-  printf '             （LXC 容器可能禁止 swapon，此时改用第 3 条）\n'
-  printf '          3) 调大容器/主机内存上限到 1G 以上，或换一台内存充足的机器安装\n'
-  printf '          4) 内存无法增加时改成分步安装，降低单次峰值：\n'
-  printf '             .venv/bin/pip install --no-cache-dir pandas\n'
-  printf '             .venv/bin/pip install --no-cache-dir -e .\n'
-  printf '        确认是否 OOM：dmesg | tail -20，或 cat /sys/fs/cgroup/memory.events\n'
-}
-
-# SQLite 文件（含 WAL/SHM）实际占用字节数
 database_size_bytes() {
   local db_path="$1" total=0 suffix candidate size
   for suffix in "" "-wal" "-shm"; do
@@ -854,7 +853,6 @@ database_size_bytes() {
   printf '%s' "$total"
 }
 
-# .env 中 DATABASE_PATH 解析成绝对路径（相对路径以项目根目录为基准）
 resolve_db_path() {
   local db_path
   db_path="$(read_env_value DATABASE_PATH data/options.db)"
@@ -865,10 +863,8 @@ resolve_db_path() {
 }
 
 # ---------- 应用启停与看门狗 ----------
-# 看门狗自己的日志行，带时间戳和固定前缀，便于 tail 时区分
 wd_log() { printf '[%s] [看门狗] %s\n' "$(timestamp)" "$*"; }
 
-# 以脱离当前会话的方式启动后台命令（不依赖 systemd / cron，LXC、Alpine 都能用）
 spawn_detached() {
   local log="$1"
   shift
@@ -877,26 +873,8 @@ spawn_detached() {
   else
     nohup "$@" >>"$log" 2>&1 </dev/null &
   fi
+  printf '%s\n' "$!"
   return 0
-}
-
-# ---------- systemd 服务托管 ----------
-# 生产环境优先使用 systemd：它能在服务器开机、进程崩溃和 OOM 后重新拉起应用。
-# 没有 systemd 的容器继续使用下方的 shell 看门狗，不强行安装服务文件。
-systemd_available() {
-  has_cmd systemctl && [ -d /run/systemd/system ]
-}
-
-systemd_unit_installed() {
-  [ -f "$SYSTEMD_UNIT_FILE" ]
-}
-
-systemd_managed() {
-  systemd_available && systemd_unit_installed
-}
-
-systemd_service_active() {
-  systemd_managed && systemctl is-active --quiet "$SYSTEMD_UNIT_NAME"
 }
 
 systemd_service_account() {
@@ -910,7 +888,6 @@ systemd_service_account() {
   printf '%s\t%s' "$owner" "$group"
 }
 
-# 轮询 HTTP 健康检查，供 systemd 和后台启动共用；可选监视 PID 以快速发现启动即崩。
 wait_for_health() {
   local timeout="$1" stop_if_app_dies="${2:-false}" elapsed=0 missing=0 pid=""
   while [ "$elapsed" -lt "$timeout" ]; do
@@ -922,7 +899,6 @@ wait_for_health() {
       pid="$(app_pid 2>/dev/null || true)"
       if [ -z "$pid" ]; then
         missing=$((missing + 1))
-        # 连续 5 秒没有应用进程，视为启动即崩，不必等满超时。
         [ "$missing" -lt 5 ] || return 2
       else
         missing=0
@@ -937,13 +913,13 @@ wait_for_health() {
 systemd_start_service() {
   local waited=0
   run_root systemctl start "$SYSTEMD_UNIT_NAME" || return 1
-  # systemctl start 只代表进程被拉起，仍需确认 HTTP 端口已经接受请求。
   if waited="$(wait_for_health 45)"; then
     ok "systemd 服务已启动，健康检查通过（耗时 ${waited}s）"
     return 0
   fi
   fail "systemd 服务启动后 45s 内未通过健康检查"
   run_root systemctl status "$SYSTEMD_UNIT_NAME" --no-pager 2>&1 | tail -n 30 || true
+  systemd_stop_service || warn "停止 systemd 服务失败，请检查 $SYSTEMD_UNIT_NAME 状态"
   return 1
 }
 
@@ -955,14 +931,69 @@ systemd_stop_service() {
   return 0
 }
 
+rollback_systemd_install() {
+  local backup="$1" had_unit="$2" was_active="$3" was_enabled="$4" was_app="$5" was_watchdog="$6"
+  local failed=0
+  if [ "$had_unit" = true ]; then
+    run_root install -m 0644 "$backup" "$SYSTEMD_UNIT_FILE" || failed=1
+  else
+    run_root rm -f "$SYSTEMD_UNIT_FILE" || failed=1
+  fi
+  run_root systemctl daemon-reload || failed=1
+  run_root systemctl disable "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1 || true
+  case "$was_enabled" in
+    enabled | enabled-runtime) run_root systemctl enable "$SYSTEMD_UNIT_NAME" || failed=1 ;;
+    *) ;;
+  esac
+  if [ "$had_unit" = true ]; then
+    if [ "$was_active" = true ]; then
+      run_root systemctl start "$SYSTEMD_UNIT_NAME" || failed=1
+    else
+      run_root systemctl stop "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1 || true
+    fi
+  elif [ "$was_app" = true ]; then
+    start_app || failed=1
+  elif [ "$was_watchdog" = true ]; then
+    start_watchdog || failed=1
+  fi
+  return "$failed"
+}
+
 install_systemd_service() {
-  local tmp="" service_user="" service_group=""
   section "安装 systemd 服务"
   if ! systemd_available; then
-    fail "当前系统未运行 systemd，无法安装 $SYSTEMD_UNIT_NAME；将继续使用 shell 看门狗"
+    local reason
+    reason="$(systemd_diagnose)"
+    warn "当前环境不支持 systemd：$reason"
+    printf '\n'
+    printf '  这意味着：应用无法由 systemd 托管（不能依赖“systemctl enable”实现开机自启）。\n'
+    printf '  替代方案：\n'
+    printf '   1) 使用内置 shell 看门狗：./run.sh start 后会自动拉起一个看门狗进程，\n'
+    printf '      每 %s 秒检查一次应用存活，崩溃/健康检查失败会自动重启。\n' "$WATCHDOG_INTERVAL"
+    printf '   2) 需要开机自启：./run.sh enable-autostart（写入 crontab @reboot）。\n'
+    printf '      前提是容器里启用了 cron 服务，或宿主机在容器启动时调用本脚本。\n'
+    printf '   3) 若你希望启用 systemd，请参考：\n'
+    printf '      Proxmox LXC：编辑 /etc/pve/lxc/<vmid>.conf，加入\n'
+    printf '        lxc.apparmor.profile: unconfined\n'
+    printf '        lxc.cap.drop:\n'
+    printf '      然后重启容器，再回来安装 systemd 服务。\n'
+    printf '\n'
     return 1
   fi
+  local tmp="" backup="" service_user="" service_group=""
+  local had_unit=false was_active=false was_enabled="disabled" was_app=false was_watchdog=false
   ensure_runtime || return 1
+  if systemd_unit_installed; then
+    had_unit=true
+    backup="$(mktemp "${TMPDIR:-/tmp}/option-scope.service.old.XXXXXX")" || return 1
+    run_root cp -p "$SYSTEMD_UNIT_FILE" "$backup" || { rm -f "$backup"; return 1; }
+    systemd_service_active && was_active=true
+    was_enabled="$(run_root systemctl is-enabled "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+  else
+    backup="$(mktemp "${TMPDIR:-/tmp}/option-scope.service.old.XXXXXX")" || return 1
+  fi
+  app_running && was_app=true
+  watchdog_running && was_watchdog=true
   IFS=$'\t' read -r service_user service_group <<<"$(systemd_service_account)"
   if [ -z "$service_user" ] || [ "$service_user" = "root" ]; then
     service_user="root"
@@ -990,7 +1021,6 @@ TimeoutStopSec=30
 KillSignal=SIGINT
 KillMode=mixed
 LimitNOFILE=8192
-Environment=PYTHONUNBUFFERED=1
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=option-scope
@@ -998,19 +1028,26 @@ SyslogIdentifier=option-scope
 [Install]
 WantedBy=multi-user.target
 UNIT
-  # 先停旧的后台实例，避免 systemd 与 shell 看门狗同时抢端口。
   stop_app || {
     rm -f "$tmp"
+    rollback_systemd_install "$backup" "$had_unit" "$was_active" "$was_enabled" "$was_app" "$was_watchdog" || warn "恢复旧服务状态失败"
+    rm -f "$backup"
     return 1
   }
   if ! run_root install -m 0644 "$tmp" "$SYSTEMD_UNIT_FILE"; then
     rm -f "$tmp"
+    rollback_systemd_install "$backup" "$had_unit" "$was_active" "$was_enabled" "$was_app" "$was_watchdog" || warn "恢复旧服务状态失败"
+    rm -f "$backup"
     return 1
   fi
   rm -f "$tmp"
-  run_root systemctl daemon-reload || return 1
-  run_root systemctl enable "$SYSTEMD_UNIT_NAME" || return 1
-  systemd_start_service || return 1
+  if ! run_root systemctl daemon-reload || ! run_root systemctl enable "$SYSTEMD_UNIT_NAME" || ! systemd_start_service; then
+    fail "systemd 安装未完成，正在恢复原 unit 与服务状态"
+    rollback_systemd_install "$backup" "$had_unit" "$was_active" "$was_enabled" "$was_app" "$was_watchdog" || warn "恢复旧服务状态失败，请检查 $SYSTEMD_UNIT_NAME"
+    rm -f "$backup"
+    return 1
+  fi
+  rm -f "$backup"
   ok "systemd 服务已安装并设置为开机自动启动"
   printf '  查看状态：systemctl status %s\n' "$SYSTEMD_UNIT_NAME"
   printf '  查看日志：journalctl -u %s -f\n' "$SYSTEMD_UNIT_NAME"
@@ -1020,14 +1057,15 @@ UNIT
 remove_systemd_service() {
   section "移除 systemd 服务"
   if ! systemd_available; then
-    warn "当前系统未运行 systemd"
+    local reason
+    reason="$(systemd_diagnose)"
+    warn "当前环境不支持 systemd：$reason"
     return 0
   fi
   if ! systemd_unit_installed; then
     info "未找到 $SYSTEMD_UNIT_FILE"
     return 0
   fi
-  # 先停掉当前实例，避免移除服务文件后留下一个旧的前台进程占用端口。
   stop_app || return 1
   run_root systemctl disable --now "$SYSTEMD_UNIT_NAME" >/dev/null 2>&1 || true
   run_root rm -f "$SYSTEMD_UNIT_FILE" || return 1
@@ -1036,37 +1074,21 @@ remove_systemd_service() {
   return 0
 }
 
-# 启动应用必须用虚拟环境里的解释器，避免污染系统 Python
-app_python() {
-  if [ -x "$VENV_PY" ]; then
-    printf '%s' "$VENV_PY"
-    return 0
-  fi
-  fail "虚拟环境不可用：$VENV_PY（请先执行菜单第 1 项完成环境安装）"
-  return 1
-}
-
-# systemd 使用的前台入口：不 fork、不启动 shell 看门狗，让 systemd 直接监管 Python 进程。
 foreground_app() {
-  local py
-  ensure_env_file || return 1
-  py="$(app_python)" || return 1
-  mkdir -p "$RUN_DIR" "$LOG_DIR"
+  ensure_runtime || return 1
   cd "$PROJECT_DIR" || return 1
-  apply_low_memory_allocator || return 1
-  exec "$py" -m app
+  exec "$APP_BINARY"
 }
 
-# 启动应用进程本体（不含看门狗）：已在运行直接返回，端口被占用则打印占用者
 start_app_internal() {
-  local port existing py waited=0 pid="" wait_status=0
+  local port existing waited=0 pid="" wait_status=0
   port="$(app_port)"
   existing="$(app_pid 2>/dev/null || true)"
   if [ -n "$existing" ]; then
     info "应用已在运行（PID $existing），跳过启动"
     return 0
   fi
-  py="$(app_python)" || return 1
+  ensure_app_binary || return 1
   if port_in_use "$port"; then
     fail "端口 $port 已被占用，无法启动应用"
     port_owner "$port" | sed 's/^/    /'
@@ -1074,10 +1096,9 @@ start_app_internal() {
     return 1
   fi
   mkdir -p "$RUN_DIR" "$LOG_DIR"
-  printf '[%s] 启动应用：%s -m app（端口 %s）\n' "$(timestamp)" "$py" "$port" >>"$APP_LOG"
-  # 工作目录必须是项目根目录：python -m app 与进程识别（/proc/<pid>/cwd）都依赖它。
-  # 分配器环境变量只传给应用进程。
-  ( cd "$PROJECT_DIR" && apply_low_memory_allocator && spawn_detached "$APP_LOG" "$py" -m app )
+  trim_all_logs
+  printf '[%s] 启动应用：%s（端口 %s）\n' "$(timestamp)" "$APP_BINARY" "$port" >>"$APP_LOG"
+  pid="$( cd "$PROJECT_DIR" && spawn_detached "$APP_LOG" "$APP_BINARY" )" || return 1
   wait_status=0
   waited="$(wait_for_health "$START_TIMEOUT" true)" || wait_status=$?
   if [ "$wait_status" -eq 0 ]; then
@@ -1090,11 +1111,16 @@ start_app_internal() {
   else
     fail "启动失败：${START_TIMEOUT}s 内未通过健康检查"
   fi
+  if [ -n "$pid" ]; then
+    stop_pid "$pid" "启动失败的应用"
+    if [ -f "$APP_PID_FILE" ] && [ "$(tr -d '[:space:]' <"$APP_PID_FILE" 2>/dev/null)" = "$pid" ]; then
+      rm -f "$APP_PID_FILE" 2>/dev/null || true
+    fi
+  fi
   tail_log "$APP_LOG" 20
   return 1
 }
 
-# 启动看门狗（每分钟检查一次应用是否还在，异常自动拉起）
 start_watchdog() {
   local pid waited=0
   pid="$(watchdog_pid 2>/dev/null || true)"
@@ -1104,7 +1130,7 @@ start_watchdog() {
   fi
   mkdir -p "$RUN_DIR" "$LOG_DIR"
   printf '[%s] 启动看门狗（检查间隔 %s 秒）\n' "$(timestamp)" "$WATCHDOG_INTERVAL" >>"$WATCHDOG_LOG"
-  ( cd "$PROJECT_DIR" && spawn_detached "$WATCHDOG_LOG" bash "$SCRIPT_PATH" __watchdog )
+  ( cd "$PROJECT_DIR" && spawn_detached "$WATCHDOG_LOG" bash "$SCRIPT_PATH" __watchdog ) >/dev/null
   while [ "$waited" -lt 10 ]; do
     sleep 1
     waited=$((waited + 1))
@@ -1118,7 +1144,6 @@ start_watchdog() {
   return 1
 }
 
-# 通用 PID 优雅停止：先发 TERM，限时等待，超时后 KILL。
 stop_pid() {
   local pid="$1" label="$2" waited=0
   info "停止${label}（PID $pid）"
@@ -1154,9 +1179,8 @@ stop_app_process() {
     return 0
   fi
   stop_pid "$pid" "应用"
-  # 端口仍被占用说明还有残留（例如手动起过的实例），再做一次精确清理
-  if port_in_use "$(app_port)"; then
-    extra="$(scan_pids "-m app" | head -n 1)"
+  if port_in_use "$(app_port)" && [ -n "$APP_BINARY" ]; then
+    extra="$(scan_pids "$APP_BINARY" | head -n 1)"
     if [ -n "$extra" ]; then
       warn "发现残留进程 PID $extra，一并结束"
       stop_pid "$extra" "残留应用"
@@ -1166,13 +1190,16 @@ stop_app_process() {
   ok "应用已停止"
 }
 
-# 按当前托管方式启动并做统一的访问地址提示。
 start_managed_app() {
   if systemd_managed; then
     systemd_start_service || return 1
   else
     start_app_internal || return 1
-    start_watchdog || warn "应用已启动，但看门狗没起来（不影响使用，可稍后重试）"
+    if start_watchdog; then
+      info "当前使用 shell 看门狗托管（每 ${WATCHDOG_INTERVAL}s 检查一次）"
+    else
+      warn "应用已启动，但看门狗没起来（不影响使用，可稍后重试）"
+    fi
   fi
   show_access_url
 }
@@ -1185,7 +1212,6 @@ start_app() {
 
 stop_app() {
   section "停止应用"
-  # 先停看门狗，否则它会把刚停掉的应用又拉起来
   stop_watchdog
   if systemd_managed; then
     systemd_stop_service || return 1
@@ -1207,11 +1233,9 @@ restart_app() {
   start_app
 }
 
-# 看门狗主循环：日志轮转 → 进程存活 → 健康检查 → 必要时拉起（无 systemd 时使用）
 watchdog_loop() {
   local fails=0 pid="" other=""
   mkdir -p "$RUN_DIR" "$LOG_DIR"
-  # 防止重复运行：已经有别的看门狗活着时直接退出，避免两个看门狗互相抢着重启
   if [ -f "$WATCHDOG_PID_FILE" ]; then
     other="$(tr -d '[:space:]' <"$WATCHDOG_PID_FILE" 2>/dev/null)"
     if [ -n "$other" ] && [ "$other" != "$$" ] && kill -0 "$other" 2>/dev/null; then
@@ -1222,37 +1246,33 @@ watchdog_loop() {
   printf '%s\n' "$$" >"$WATCHDOG_PID_FILE"
   wd_log "看门狗启动（PID $$，间隔 ${WATCHDOG_INTERVAL}s，连续 ${WATCHDOG_FAIL_LIMIT} 次健康检查失败才重启）"
   while true; do
-    rotate_log_if_needed "$WATCHDOG_LOG"
-    if [ -x "$VENV_PY" ]; then
-      rotate_log_if_needed "$APP_LOG"
-      pid="$(app_pid 2>/dev/null || true)"
-      if [ -z "$pid" ]; then
-        wd_log "应用未在运行，尝试拉起（$(memory_summary)）"
-        fails=0
-        if start_app_internal >/dev/null 2>&1; then
-          wd_log "应用已恢复"
-        else
-          wd_log "拉起失败，${WATCHDOG_INTERVAL}s 后重试"
-          tail_log "$APP_LOG" 5 >>"$WATCHDOG_LOG" 2>/dev/null
-        fi
-      elif health_ok; then
-        fails=0
+    # 每轮都把日志裁剪到上限，避免 512M 小硬盘被写满
+    trim_all_logs
+    pid="$(app_pid 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+      wd_log "应用未在运行，尝试拉起（$(memory_summary)）"
+      fails=0
+      if start_app_internal >/dev/null 2>&1; then
+        wd_log "应用已恢复"
       else
-        fails=$((fails + 1))
-        wd_log "健康检查失败（第 $fails 次，PID $pid）"
-        if [ "$fails" -ge "$WATCHDOG_FAIL_LIMIT" ]; then
-          wd_log "连续失败达到 $WATCHDOG_FAIL_LIMIT 次，重启应用"
-          fails=0
-          stop_app_process
-          if start_app_internal >/dev/null 2>&1; then
-            wd_log "应用已重启"
-          else
-            wd_log "重启失败，${WATCHDOG_INTERVAL}s 后重试"
-          fi
+        wd_log "拉起失败，${WATCHDOG_INTERVAL}s 后重试"
+        tail_log "$APP_LOG" 5 >>"$WATCHDOG_LOG" 2>/dev/null
+      fi
+    elif health_ok; then
+      fails=0
+    else
+      fails=$((fails + 1))
+      wd_log "健康检查失败（第 $fails 次，PID $pid）"
+      if [ "$fails" -ge "$WATCHDOG_FAIL_LIMIT" ]; then
+        wd_log "连续失败达到 $WATCHDOG_FAIL_LIMIT 次，重启应用"
+        fails=0
+        stop_app_process
+        if start_app_internal >/dev/null 2>&1; then
+          wd_log "应用已重启"
+        else
+          wd_log "重启失败，${WATCHDOG_INTERVAL}s 后重试"
         fi
       fi
-    else
-      wd_log "虚拟环境不可用（$VENV_PY），等待下一次检查"
     fi
     sleep "$WATCHDOG_INTERVAL"
   done
@@ -1262,24 +1282,29 @@ watchdog_loop() {
 show_status() {
   local port pid db_path size limit systemd_state systemd_enabled
   section "运行状态"
-  printf '  系统：%s（架构 %s，包管理器 %s）\n' "$OS_NAME" "$ARCH" "${PKG_MANAGER:-未知}"
+  printf '  系统：%s（架构 %s / %s，包管理器 %s）\n' "$OS_NAME" "$ARCH" "${BINARY_ARCH:-未知}" "${PKG_MANAGER:-未知}"
   printf '  项目目录：%s\n' "$PROJECT_DIR"
-  if [ -x "$VENV_PY" ]; then
-    printf '  虚拟环境：%s（Python %s）\n' "$VENV_DIR" "$(python_version_of "$VENV_PY")"
+  if [ -n "$APP_BINARY" ] && [ -x "$APP_BINARY" ]; then
+    printf '  应用二进制：%s\n' "$APP_BINARY"
   else
-    printf '  虚拟环境：%s（未安装）\n' "$VENV_DIR"
+    printf '  应用二进制：%s（缺失）\n' "${APP_BINARY:-未识别架构}"
   fi
   port="$(app_port)"
-  if systemd_unit_installed; then
-    if systemd_available; then
-      systemd_state="$(systemctl is-active "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
-      systemd_enabled="$(systemctl is-enabled "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
-      printf '  systemd：%s（状态 %s，开机启动 %s）\n' "$SYSTEMD_UNIT_NAME" "${systemd_state:-未知}" "${systemd_enabled:-未知}"
-    else
-      printf '  systemd：已安装服务文件，但当前环境未运行 systemd\n'
-    fi
+  if systemd_managed; then
+    systemd_state="$(systemctl is-active "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+    systemd_enabled="$(systemctl is-enabled "$SYSTEMD_UNIT_NAME" 2>/dev/null || true)"
+    printf '  托管方式：systemd（状态 %s，开机启动 %s）\n' "${systemd_state:-未知}" "${systemd_enabled:-未知}"
+  elif systemd_unit_installed; then
+    printf '  托管方式：systemd 服务文件存在，但当前环境未运行 systemd\n'
   else
-    printf '  systemd：未安装（使用 shell 看门狗）\n'
+    printf '  托管方式：shell 看门狗（无 systemd；每 %s 秒检查一次）\n' "$WATCHDOG_INTERVAL"
+  fi
+  if autostart_installed; then
+    printf '  开机自启：已配置（crontab @reboot）\n'
+  elif systemd_managed; then
+    printf '  开机自启：由 systemd 保证\n'
+  else
+    printf '  开机自启：未配置（菜单可设置：./run.sh enable-autostart）\n'
   fi
   pid="$(app_pid 2>/dev/null || true)"
   if [ -n "$pid" ]; then
@@ -1293,7 +1318,9 @@ show_status() {
   fi
   pid="$(watchdog_pid 2>/dev/null || true)"
   if [ -n "$pid" ]; then
-    printf '  看门狗：运行中（PID %s，每 %s 秒检查一次）\n' "$pid" "$WATCHDOG_INTERVAL"
+    printf '  看门狗：运行中（PID %s）\n' "$pid"
+  elif systemd_managed; then
+    printf '  看门狗：未使用（由 systemd 托管）\n'
   else
     printf '  看门狗：未运行（应用异常退出后不会自动拉起）\n'
   fi
@@ -1302,12 +1329,21 @@ show_status() {
   limit="$(read_env_value DATABASE_MAX_MB 0)"
   if [ -f "$db_path" ]; then
     size="$(database_size_bytes "$db_path")"
-    printf '  数据库：%s（%s，上限 %sMB）\n' "$db_path" "$(human_size "$size")" "$limit"
+    printf '  数据库：%s（%s，上限 %s）\n' "$db_path" "$(human_size "$size")" "$limit"
   else
     printf '  数据库：%s（尚未创建）\n' "$db_path"
   fi
-  printf '  日志：%s\n' "$APP_LOG"
-  printf '        %s\n' "$WATCHDOG_LOG"
+  # 日志概况
+  local app_lines wd_lines app_bytes wd_bytes
+  app_lines="$(wc -l <"$APP_LOG" 2>/dev/null | tr -d '[:space:]')"
+  wd_lines="$(wc -l <"$WATCHDOG_LOG" 2>/dev/null | tr -d '[:space:]')"
+  app_bytes="$(wc -c <"$APP_LOG" 2>/dev/null | tr -d '[:space:]')"
+  wd_bytes="$(wc -c <"$WATCHDOG_LOG" 2>/dev/null | tr -d '[:space:]')"
+  printf '  日志：app.log %s 行 / %s，watchdog.log %s 行 / %s\n' \
+    "${app_lines:-0}" "$(human_size "${app_bytes:-0}")" \
+    "${wd_lines:-0}" "$(human_size "${wd_bytes:-0}")"
+  printf '        裁剪上限：%s 行 / %s KB（可在 .env 外设置 LOG_MAX_LINES / LOG_MAX_KB）\n' \
+    "$LOG_MAX_LINES" "$LOG_MAX_KB"
 }
 
 action_status() {
@@ -1316,7 +1352,40 @@ action_status() {
   tail_log "$APP_LOG" 15
 }
 
-# 配置菜单用的单项修改：只修改当前选中的配置项
+action_logs() {
+  section "应用日志"
+  tail_log "$APP_LOG" "${1:-80}"
+  printf '  完整日志：%s\n' "$APP_LOG"
+  printf '  看门狗日志：%s\n' "$WATCHDOG_LOG"
+}
+
+action_trim_logs() {
+  section "裁剪日志"
+  local before_app before_wd before_app_b before_wd_b
+  before_app="$(wc -l <"$APP_LOG" 2>/dev/null | tr -d '[:space:]')"
+  before_wd="$(wc -l <"$WATCHDOG_LOG" 2>/dev/null | tr -d '[:space:]')"
+  before_app_b="$(wc -c <"$APP_LOG" 2>/dev/null | tr -d '[:space:]')"
+  before_wd_b="$(wc -c <"$WATCHDOG_LOG" 2>/dev/null | tr -d '[:space:]')"
+  printf '  app.log      当前 %s 行 / %s\n' "${before_app:-0}" "$(human_size "${before_app_b:-0}")"
+  printf '  watchdog.log 当前 %s 行 / %s\n' "${before_wd:-0}" "$(human_size "${before_wd_b:-0}")"
+  printf '  裁剪上限：%s 行 / %s KB\n' "$LOG_MAX_LINES" "$LOG_MAX_KB"
+  trim_all_logs
+  local after_app after_wd after_app_b after_wd_b
+  after_app="$(wc -l <"$APP_LOG" 2>/dev/null | tr -d '[:space:]')"
+  after_wd="$(wc -l <"$WATCHDOG_LOG" 2>/dev/null | tr -d '[:space:]')"
+  after_app_b="$(wc -c <"$APP_LOG" 2>/dev/null | tr -d '[:space:]')"
+  after_wd_b="$(wc -c <"$WATCHDOG_LOG" 2>/dev/null | tr -d '[:space:]')"
+  ok "已裁剪："
+  printf '  app.log      %s 行 / %s → %s 行 / %s\n' \
+    "${before_app:-0}" "$(human_size "${before_app_b:-0}")" \
+    "${after_app:-0}" "$(human_size "${after_app_b:-0}")"
+  printf '  watchdog.log %s 行 / %s → %s 行 / %s\n' \
+    "${before_wd:-0}" "$(human_size "${before_wd_b:-0}")" \
+    "${after_wd:-0}" "$(human_size "${after_wd_b:-0}")"
+  return 0
+}
+
+# ---------- 配置菜单 ----------
 ask_env_value() {
   local key="$1" desc="$2" current="" input=""
   current="$(read_env_value "$key" "")"
@@ -1332,7 +1401,6 @@ ask_env_value() {
   return 0
 }
 
-# 机密配置项使用隐藏输入，避免 API Key / Secret 出现在终端回显或日志中。
 ask_secret_env_value() {
   local key="$1" desc="$2" current="" input=""
   current="$(read_env_value "$key" "")"
@@ -1343,7 +1411,6 @@ ask_secret_env_value() {
     IFS= read -r -s input < /dev/tty || input=""
     printf '\n'
   else
-    # 非交互测试/脚本输入没有终端时，保持可管道化行为。
     read -r input || input=""
   fi
   if [ -z "$input" ]; then
@@ -1409,7 +1476,6 @@ ask_access_key() {
   return 0
 }
 
-# 每行按「键|默认值|输入类型|说明」维护，摘要与编辑菜单读取同一份配置定义。
 CONFIG_ROWS=(
   'DATABASE_PATH|data/options.db|plain|SQLite 数据库文件路径'
   'HOST|0.0.0.0|plain|Web 服务监听地址'
@@ -1422,17 +1488,16 @@ CONFIG_ROWS=(
   'HISTORY_MAX_AGE_SECONDS|3600|plain|日线历史回源间隔（秒）'
   'EXTREMES_MAX_AGE_SECONDS|86400|plain|历史极值回源间隔（秒）'
   'SCHEDULER_ENABLED|true|plain|是否启用定时历史清理和数据库维护（true/false）'
-  'UPSTREAM_CONCURRENCY|6|plain|单进程上游最大并发数'
+  'UPSTREAM_CONCURRENCY|auto|plain|单进程上游并发上限（auto 或正整数）'
   'UPSTREAM_WAIT_SECONDS|20|plain|等待上游并发槽位的最长秒数'
-  'WEB_WORKERS|1|plain|Web worker 数量（小内存机器保持 1）'
-  'LOW_MEMORY|auto|plain|低内存保护（auto/true/false，512MB 及以下自动开启）'
+  'LOW_MEMORY|auto|plain|低内存保护（auto:内存≤4GiB或可用≤2GiB时开启）'
   'ALPACA_API_KEY||secret|Alpaca API Key（夜盘股票行情）'
   'ALPACA_API_SECRET||secret|Alpaca API Secret（夜盘股票行情）'
 )
 
 show_config_summary() {
-  local index=0 key default_value type description value
-  printf '  配置文件：%s  # 当前读取的配置文件\n' "$ENV_FILE"
+  local index=0 key default_value type description value row
+  printf '  配置文件：%s\n' "$ENV_FILE"
   for row in "${CONFIG_ROWS[@]}"; do
     IFS='|' read -r key default_value type description <<<"$row"
     value="$(read_env_value "$key" "$default_value")"
@@ -1445,7 +1510,7 @@ show_config_summary() {
 }
 
 validate_config_values() {
-  local port limit workers concurrency wait_seconds low_memory
+  local port limit concurrency wait_seconds low_memory
   port="$(read_env_value PORT 8000)"
   case "$port" in
     '' | *[!0-9]*)
@@ -1460,14 +1525,16 @@ validate_config_values() {
   case "$(printf '%s' "$limit" | tr '[:lower:]' '[:upper:]')" in
     '' | *[!0-9MG]*) warn "DATABASE_MAX_MB=$limit 写法可能不合法，应用启动时会报错" ;;
   esac
-  workers="$(read_env_value WEB_WORKERS 1)"
-  concurrency="$(read_env_value UPSTREAM_CONCURRENCY 6)"
+  concurrency="$(read_env_value UPSTREAM_CONCURRENCY auto)"
   wait_seconds="$(read_env_value UPSTREAM_WAIT_SECONDS 20)"
-  case "$workers" in '' | *[!0-9]*) fail "WEB_WORKERS 必须是正整数"; return 1 ;; esac
-  case "$concurrency" in '' | *[!0-9]*) fail "UPSTREAM_CONCURRENCY 必须是正整数"; return 1 ;; esac
+  case "$(printf '%s' "$concurrency" | tr '[:upper:]' '[:lower:]')" in
+    auto) ;;
+    '' | *[!0-9]*) fail "UPSTREAM_CONCURRENCY 必须是 auto 或正整数"; return 1 ;;
+  esac
   case "$wait_seconds" in '' | *[!0-9]*) fail "UPSTREAM_WAIT_SECONDS 必须是正整数"; return 1 ;; esac
-  [ "$workers" -ge 1 ] || { fail "WEB_WORKERS 必须大于等于 1"; return 1; }
-  [ "$concurrency" -ge 1 ] || { fail "UPSTREAM_CONCURRENCY 必须大于等于 1"; return 1; }
+  if [ "$(printf '%s' "$concurrency" | tr '[:upper:]' '[:lower:]')" != auto ]; then
+    [ "$concurrency" -ge 1 ] || { fail "UPSTREAM_CONCURRENCY 必须大于等于 1"; return 1; }
+  fi
   [ "$wait_seconds" -ge 1 ] || { fail "UPSTREAM_WAIT_SECONDS 必须大于等于 1"; return 1; }
   low_memory="$(read_env_value LOW_MEMORY auto)"
   case "$(printf '%s' "$low_memory" | tr '[:upper:]' '[:lower:]')" in
@@ -1522,21 +1589,11 @@ action_config() {
   return 0
 }
 
-update_deps_and_restart() {
-  section "更新依赖并重启"
-  # 删掉依赖指纹，强制 ensure_deps 重新安装一次
-  if [ -f "$DEPS_STAMP" ]; then
-    rm -f "$DEPS_STAMP" 2>/dev/null
-  fi
-  ensure_runtime || return 1
-  restart_app
-}
-
 uninstall_runtime() {
   local answer="" target
   section "卸载运行环境"
-  printf '  将停止服务并删除：%s、%s、%s\n' "$VENV_DIR" "$RUN_DIR" "$LOG_DIR"
-  printf '  会保留：.env 配置、data 数据库、项目源码\n'
+  printf '  将停止服务并删除：%s、%s\n' "$RUN_DIR" "$LOG_DIR"
+  printf '  会保留：.env 配置、data 数据库、应用二进制与项目文件\n'
   printf '  确认继续？输入 yes 继续：'
   read -r answer || answer=""
   if [ "$answer" != "yes" ]; then
@@ -1544,8 +1601,7 @@ uninstall_runtime() {
     return 0
   fi
   stop_app
-  # 只删除明确列出的目录，并校验它们都在项目目录内，避免误删其他文件
-  for target in "$VENV_DIR" "$RUN_DIR" "$LOG_DIR"; do
+  for target in "$RUN_DIR" "$LOG_DIR"; do
     case "$target" in
       "$PROJECT_DIR"/*)
         if [ -e "$target" ]; then
@@ -1566,16 +1622,20 @@ menu_status_hint() {
   pid="$(app_pid 2>/dev/null || true)"
   if [ -n "$pid" ]; then
     if health_ok; then
-      printf '  当前服务：运行正常（端口 %s）\n' "$port"
+      printf '  状态：%s运行中%s（端口 %s，%s）\n' "$C_GREEN" "$C_RESET" "$port" "$(hosting_mode_label)"
     else
-      printf '  当前服务：进程存在但健康检查未通过（端口 %s）\n' "$port"
+      printf '  状态：%s进程存在但健康检查未通过%s（端口 %s）\n' "$C_YELLOW" "$C_RESET" "$port"
     fi
   else
-    printf '  当前服务：未运行（端口 %s）\n' "$port"
+    printf '  状态：%s未运行%s（端口 %s）\n' "$C_DIM" "$C_RESET" "$port"
+  fi
+  if autostart_installed; then
+    printf '  开机自启：已配置\n'
+  elif systemd_managed; then
+    printf '  开机自启：由 systemd 保证\n'
   fi
 }
 
-# 菜单选项统一用「编号|标题|动作」声明，展示与分发不再各维护一份 case。
 run_menu() {
   local title="$1" prompt="$2" mode="$3" choice entry number label action result found
   shift 3
@@ -1629,37 +1689,72 @@ run_menu() {
   done
 }
 
-action_install_runtime() {
-  section "检测环境并安装/修复依赖"
-  ensure_python || return 1
-  ensure_venv || return 1
-  ensure_deps || return 1
-  ok "环境和依赖已就绪；应用未启动，请在主菜单选择 2) 启动应用"
-}
-
 action_service() {
-  run_menu "高级服务管理" "请选择：" once \
-    '1|更新依赖并重启（改过 pyproject.toml 时用）|update_deps_and_restart' \
-    '2|安装/启用 systemd 服务（生产环境推荐）|install_systemd_service' \
-    '3|移除 systemd 服务（恢复 shell 看门狗）|remove_systemd_service' \
-    '4|卸载运行环境（停止服务并删除 .venv/.run/logs）|uninstall_runtime' \
-    '0|返回|return'
+  if systemd_available; then
+    run_menu "高级服务管理" "请选择：" once \
+      '1|安装/启用 systemd 服务（生产环境推荐）|install_systemd_service' \
+      '2|移除 systemd 服务（恢复 shell 看门狗）|remove_systemd_service' \
+      '3|卸载运行环境（停止服务并删除 .run / logs）|uninstall_runtime' \
+      '0|返回|return'
+  else
+    local reason
+    reason="$(systemd_diagnose)"
+    local options=(
+      "info|systemd 不可用：$reason|show_systemd_help"
+      '2|配置开机自启（crontab @reboot）|setup_autostart'
+      '3|取消开机自启|remove_autostart'
+      '4|卸载运行环境（停止服务并删除 .run / logs）|uninstall_runtime'
+      '0|返回|return'
+    )
+    if autostart_installed; then
+      options[1]='2|更新开机自启（已配置）|setup_autostart'
+    fi
+    run_menu "高级服务管理（无 systemd 模式）" "请选择：" once "${options[@]}"
+  fi
 }
 
-# 环境自检：把「装不上 / 起不来 / 取不到数」的常见原因一次性列出来
+show_systemd_help() {
+  local reason
+  reason="$(systemd_diagnose)"
+  section "关于 systemd"
+  printf '  检测结果：%s\n' "$reason"
+  printf '\n'
+  printf '  影响：应用无法由 systemd 托管，也不会自动开机启动。\n'
+  printf '  替代：使用内置 shell 看门狗 + crontab @reboot（见本菜单第 2 项）。\n'
+  printf '\n'
+  printf '  如果你确实想在容器里启用 systemd：\n'
+  printf '   - Proxmox LXC：编辑 /etc/pve/lxc/<vmid>.conf，加入：\n'
+  printf '       lxc.apparmor.profile: unconfined\n'
+  printf '       lxc.cap.drop:\n'
+  printf '     然后重启容器。\n'
+  printf '   - Docker：改用“宿主 systemd 拉起容器 + 容器内直接运行二进制”的架构，\n'
+  printf '     容器内不建议跑 systemd。\n'
+  printf '\n'
+}
+
 action_doctor() {
   local problems=0 port="" host="" avail_kb="" avail="" db_path="" db_size="" limit="" proxy="" access_key=""
   local mem_avail="" mem_total="" mem_swap=""
   section "环境自检"
-  printf '  系统：%s（架构 %s，包管理器 %s）\n' "$OS_NAME" "$ARCH" "${PKG_MANAGER:-未知}"
-  # 内存与 Swap：小内存 LXC 上「装依赖被 Killed」的根因就在这里
+  printf '  系统：%s（架构 %s / %s，包管理器 %s）\n' "$OS_NAME" "$ARCH" "${BINARY_ARCH:-未知}" "${PKG_MANAGER:-未知}"
+  printf '  项目目录：%s\n' "$PROJECT_DIR"
   printf '  内存：%s\n' "$(memory_summary)"
+
+  if systemd_available; then
+    printf '  [通过] systemd 可用\n'
+  else
+    local reason
+    reason="$(systemd_diagnose)"
+    printf '  [提示] systemd 不可用：%s\n' "$reason"
+    printf '         可使用 shell 看门狗托管；开机自启用 crontab @reboot（菜单第 7 项）\n'
+  fi
+
   mem_avail="$(mem_available_mb)"; mem_total="$(mem_total_mb)"; mem_swap="$(mem_swap_mb)"
   case "$mem_avail" in
     '' | *[!0-9]*) ;;
     *)
-      if [ "$mem_avail" -lt 300 ]; then
-        printf '  [注意] 可用内存不足 300M：安装依赖时容易被 OOM 杀掉，先 ./run.sh 6 停应用，或临时加 1G Swap\n'
+      if [ "$mem_avail" -lt 200 ]; then
+        printf '  [注意] 可用内存不足 200M：应用可能起不来或频繁被 OOM 杀掉\n'
       fi
       ;;
   esac
@@ -1667,32 +1762,18 @@ action_doctor() {
     *[!0-9:]* | :* | *:) ;;
     *)
       if [ "$mem_swap" = "0" ] && [ "$mem_total" -lt 800 ]; then
-        printf '  [注意] 内存只有 %sM 且没有 Swap：装系统包与 pip 依赖都可能被杀，建议临时挂载 1G Swap\n' "$mem_total"
+        printf '  [注意] 内存只有 %sM 且没有 Swap：建议临时挂载 1G Swap\n' "$mem_total"
       fi
       ;;
   esac
-  if has_cmd python3; then
-    printf '  [通过] 系统 Python：%s（%s）\n' "$(command -v python3)" "$(python_version_of "$(command -v python3)")"
-  else
-    printf '  [问题] 未找到 python3，请先执行菜单第 1 项\n'
+  if [ -z "$BINARY_ARCH" ]; then
+    printf '  [问题] 当前架构 %s 不受支持（仅提供 linux-amd64 / linux-arm64）\n' "$ARCH"
     problems=$((problems + 1))
-  fi
-  if [ -x "$VENV_PY" ]; then
-    printf '  [通过] 虚拟环境：%s（Python %s）\n' "$VENV_DIR" "$(python_version_of "$VENV_PY")"
-    if deps_importable; then
-      printf '  [通过] 运行依赖导入正常\n'
-    else
-      printf '  [问题] 依赖不完整或损坏，请执行菜单第 1 项重装\n'
-      problems=$((problems + 1))
-    fi
-    if "$VENV_PY" -m pip check >/dev/null 2>&1; then
-      printf '  [通过] pip check 未发现依赖冲突\n'
-    else
-      printf '  [注意] pip check 报告依赖冲突：\n'
-      "$VENV_PY" -m pip check 2>&1 | sed 's/^/        /'
-    fi
+  elif [ -x "$APP_BINARY" ]; then
+    printf '  [通过] 应用二进制：%s\n' "$APP_BINARY"
   else
-    printf '  [问题] 虚拟环境缺失：%s\n' "$VENV_DIR"
+    printf '  [问题] 应用二进制缺失或不可执行：%s\n' "$APP_BINARY"
+    printf '         请将 option-scope-linux-%s 与 run.sh 放在同一目录\n' "$BINARY_ARCH"
     problems=$((problems + 1))
   fi
   if [ -f "$ENV_FILE" ]; then
@@ -1700,14 +1781,14 @@ action_doctor() {
     host="$(read_env_value HOST 0.0.0.0)"
     printf '  [通过] 配置文件：%s（HOST=%s PORT=%s）\n' "$ENV_FILE" "$host" "$port"
   else
-    printf '  [注意] 缺少 %s，首次启动会由 .env.example 自动生成\n' "$ENV_FILE"
+    printf '  [注意] 缺少 %s，首次启动会自动生成\n' "$ENV_FILE"
     port="$(app_port)"
   fi
   access_key="$(read_env_value ACCESS_KEY "")"
   if [ -n "$access_key" ]; then
     printf '  [通过] 访问密钥：已配置（页面和 API 必须携带 ?key= 或 X-Access-Key）\n'
   else
-    printf '  [问题] ACCESS_KEY 为空：访问保护未启用，请执行菜单第 1 或第 2 项自动生成\n'
+    printf '  [问题] ACCESS_KEY 为空：访问保护未启用，可修改配置自动生成\n'
     problems=$((problems + 1))
   fi
   if app_running && health_ok; then
@@ -1736,23 +1817,29 @@ action_doctor() {
   if [ -f "$db_path" ]; then
     db_size="$(database_size_bytes "$db_path")"
     limit="$(read_env_value DATABASE_MAX_MB 0)"
-    printf '  数据库：%s / 上限 %sMB\n' "$(human_size "$db_size")" "$limit"
+    printf '  数据库：%s / 上限 %s\n' "$(human_size "$db_size")" "$limit"
+  fi
+  # 日志概况
+  if [ -d "$LOG_DIR" ]; then
+    local total_log_bytes=0 f s
+    for f in "$APP_LOG" "$WATCHDOG_LOG" "$CRON_LOG"; do
+      [ -f "$f" ] || continue
+      s="$(wc -c <"$f" 2>/dev/null | tr -d '[:space:]')"
+      case "$s" in '' | *[!0-9]*) s=0 ;; esac
+      total_log_bytes=$((total_log_bytes + s))
+    done
+    printf '  日志目录：%s（合计 %s；单文件上限 %s 行 / %s KB）\n' \
+      "$LOG_DIR" "$(human_size "$total_log_bytes")" "$LOG_MAX_LINES" "$LOG_MAX_KB"
+    if [ "$avail_kb" -ge 0 ] 2>/dev/null; then
+      avail=$((avail_kb * 1024))
+      if [ "$total_log_bytes" -gt $((avail / 10)) ]; then
+        printf '  [注意] 日志占用超过磁盘剩余空间的 10%%，可执行 ./run.sh trim-logs\n'
+      fi
+    fi
   fi
   proxy="$(read_env_value MARKET_PROXY "")"
   if [ -n "$proxy" ]; then
-    if "$(runtime_python)" - "$proxy" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-from urllib.parse import urlparse
-
-parts = urlparse(sys.argv[1])
-host = parts.hostname or "127.0.0.1"
-port = parts.port or (443 if parts.scheme == "https" else 80)
-sock = socket.socket()
-sock.settimeout(3)
-sys.exit(0 if sock.connect_ex((host, port)) == 0 else 1)
-PY
-    then
+    if proxy_reachable "$proxy"; then
       printf '  [通过] 代理可连接：%s\n' "$proxy"
     else
       printf '  [注意] 代理无法连接：%s（行情取数会失败，请确认代理已启动）\n' "$proxy"
@@ -1767,22 +1854,65 @@ PY
   return 0
 }
 
+proxy_reachable() {
+  local proxy="$1" scheme authority host port rest
+  scheme="${proxy%%://*}"
+  authority="${proxy#*://}"
+  authority="${authority%%/*}"
+  authority="${authority##*@}"
+  if [[ "$authority" == \[* ]]; then
+    host="${authority#\[}"
+    host="${host%%\]*}"
+    rest="${authority#*\]}"
+    case "$rest" in
+      :*) port="${rest#:}" ;;
+      *) port="" ;;
+    esac
+  else
+    case "$authority" in
+      *:*) host="${authority%:*}"; port="${authority##*:}" ;;
+      *) host="$authority"; port="" ;;
+    esac
+  fi
+  [ -n "$host" ] || host=127.0.0.1
+  [ -n "$port" ] || { [ "$scheme" = https ] && port=443 || port=80; }
+  case "$port" in '' | *[!0-9]*) return 1 ;; esac
+  if has_cmd nc; then
+    nc -z -w 3 "$host" "$port" >/dev/null 2>&1
+  else
+    (exec 3<>"/dev/tcp/$host/$port") >/dev/null 2>&1
+  fi
+}
+
 # ---------- 菜单与入口 ----------
 usage() {
   cat <<'TXT'
 Option Scope 运维脚本用法：
-  ./run.sh                    打开交互菜单
-  ./run.sh 2                  直接执行第 2 项（适合脚本、计划任务调用）
-  ./run.sh start|stop|restart|status|doctor|install|config|db
+  ./run.sh                      打开交互菜单
+  ./run.sh start                启动应用（无 systemd 时自动带 shell 看门狗）
+  ./run.sh stop                 停止应用
+  ./run.sh restart              重启应用
+  ./run.sh status               查看运行状态与最近日志
+  ./run.sh logs [行数]          查看应用日志（默认末尾 80 行）
+  ./run.sh config               修改 .env 配置（保存后可自动重启）
+  ./run.sh trim-logs            立即把日志裁剪到上限（默认 200 行）
+  ./run.sh doctor               环境自检
   ./run.sh kill-port [端口]     交互确认后结束监听该 TCP 端口的进程
-  ./run.sh install-service     安装并启用 systemd 常驻服务（生产环境推荐）
-  ./run.sh remove-service      移除 systemd 服务，恢复 shell 看门狗
-  ./run.sh foreground          前台运行应用（供 systemd 使用）
-  ./run.sh update             更新应用：停止 → 拉取最新源码 → 依赖检查 → 重启（菜单第 6 项）
-  ./run.sh help               显示本帮助
-从零安装（当前目录下没有源码时先自动拉取，再继续执行）：
-  bash <(curl -Ls https://raw.githubusercontent.com/jack2652/31tvpmhdhlngphy59jx1/main/run.sh)
-说明：脚本幂等，已就绪的步骤会自动跳过；路径全部基于脚本所在目录。
+  ./run.sh install-service      安装并启用 systemd 常驻服务（需要 systemd）
+  ./run.sh remove-service       移除 systemd 服务
+  ./run.sh enable-autostart     配置开机自启（crontab @reboot，适配容器）
+  ./run.sh disable-autostart    取消开机自启
+  ./run.sh foreground           前台运行（供 systemd 使用）
+  ./run.sh help                 显示本帮助
+说明：脚本幂等，路径全部基于脚本所在目录。
+      应用二进制需与 run.sh 放在同一目录，按架构自动选择：
+        option-scope-linux-amd64  （x86_64）
+        option-scope-linux-arm64  （aarch64 / arm64）
+      容器（LXC / Docker）无 systemd 时，托管方式自动降级为 shell 看门狗；
+      开机自启可选用 crontab @reboot：./run.sh enable-autostart
+      日志裁剪：每轮看门狗自动裁剪到 LOG_MAX_LINES 行（默认 200），
+      原地覆盖不换 inode。可通过环境变量调整：
+        LOG_MAX_LINES=100 ./run.sh start
 TXT
 }
 
@@ -1792,14 +1922,13 @@ MAIN_MENU_ROWS=(
   '2|启动应用|start_app'
   '3|停止应用|stop_app'
   '4|重启应用|restart_app'
-  '5|修改配置|action_config'
+  '5|修改配置（保存后可自动重启）|action_config'
+  '6|查看应用日志|action_logs'
   '|安装与维护|group'
-  '6|更新应用并重启|action_update'
-  '7|检测环境并安装/修复依赖|action_install_runtime'
-  '8|数据库工具（清理 / 备份 / 统计）|action_database'
-  '9|高级服务管理（systemd / 依赖更新 / 卸载）|action_service'
-  '10|结束占用指定 TCP 端口的程序|action_kill_port'
-  '11|环境自检|action_doctor'
+  '7|服务管理（systemd / 开机自启 / 卸载）|action_service'
+  '8|结束占用指定 TCP 端口的程序|action_kill_port'
+  '9|环境自检|action_doctor'
+  '10|立即裁剪日志|action_trim_logs'
   '0|退出|quit'
 )
 
@@ -1808,295 +1937,32 @@ menu_loop() {
   info "已退出。"
 }
 
-# ---------- 引导安装：curl | bash 场景 ----------
-# 通过 `bash <(curl -Ls <脚本地址>)` 或 `curl -Ls <脚本地址> | bash` 运行时，脚本自身并不在项目目录里
-# （BASH_SOURCE 指向 /dev/fd/*），PROJECT_DIR 会解析成 /dev，所有路径都会失效。
-# 因此这里先把仓库下载到本地，再切换到真实目录把后续流程交给同一份脚本继续执行。
-GIT_REMOTE_URL="${GIT_REMOTE_URL:-https://github.com/jack2652/31tvpmhdhlngphy59jx1.git}"
-ARCHIVE_URL="${ARCHIVE_URL:-https://codeload.github.com/jack2652/31tvpmhdhlngphy59jx1/tar.gz/refs/heads/main}"
-
-# 判断当前脚本是否就运行在完整源码目录里
-in_project_checkout() {
-  # shellcheck disable=SC2153
-  [ -f "$PROJECT_DIR/pyproject.toml" ] && [ -d "$PROJECT_DIR/app" ]
-}
-
-# 自动更新源码需要 git；缺失时尝试用系统包管理器装上，装不上则退化为压缩包下载
-ensure_git() {
-  if has_cmd git; then
-    ok "git 已就绪：$(git --version 2>/dev/null)"
-    return 0
-  fi
-  warn "未找到 git，尝试自动安装"
-  pkg_install git || true
-  if has_cmd git; then
-    ok "git 安装完成"
-    return 0
-  fi
-  warn "自动安装 git 失败，改用源码压缩包方式（后续无法自动增量更新）"
-  return 1
-}
-
-# 下载并解压源码包；引导安装和覆盖更新复用同一套检查与临时目录清理。
-ARCHIVE_TMP=""
-ARCHIVE_SRC=""
-fetch_archive_tree() {
-  local prefix="$1" label="$2"
-  ARCHIVE_TMP=""
-  ARCHIVE_SRC=""
-  has_cmd curl || { fail "缺少 curl，无法下载源码包"; return 1; }
-  has_cmd tar || { fail "缺少 tar，无法解压源码包"; return 1; }
-  ARCHIVE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/${prefix}.XXXXXX")" || return 1
-  info "下载${label}：$ARCHIVE_URL"
-  if ! curl -LfsS "$ARCHIVE_URL" | tar -xz -C "$ARCHIVE_TMP"; then
-    fail "源码包下载或解压失败，请检查网络或代理"
-    rm -rf "$ARCHIVE_TMP"
-    ARCHIVE_TMP=""
-    return 1
-  fi
-  ARCHIVE_SRC="$(find "$ARCHIVE_TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  if [ -z "$ARCHIVE_SRC" ]; then
-    fail "源码包内容异常（未找到解压目录）"
-    rm -rf "$ARCHIVE_TMP"
-    ARCHIVE_TMP=""
-    return 1
-  fi
-}
-
-cleanup_archive_tree() {
-  [ -z "$ARCHIVE_TMP" ] || rm -rf "$ARCHIVE_TMP"
-  ARCHIVE_TMP=""
-  ARCHIVE_SRC=""
-}
-
-# 没有 git 时的兜底：直接下载分支源码包并解压
-download_archive() {
-  local target="$1"
-  fetch_archive_tree us_stocks "源码压缩包" || return 1
-  mkdir -p "$(dirname "$target")"
-  if ! mv "$ARCHIVE_SRC" "$target"; then
-    fail "移动到 $target 失败"
-    cleanup_archive_tree
-    return 1
-  fi
-  cleanup_archive_tree
-}
-
-bootstrap_if_needed() {
-  if in_project_checkout; then
-    return 0
-  fi
-  # 引导只允许发生一次：目标目录内容异常时再次 exec 会无限套娃，这里直接报错退出
-  if [ "${OPTION_SCOPE_BOOTSTRAP_DONE:-0}" = "1" ]; then
-    fail "引导安装后仍未进入完整源码目录，请手动检查安装目录后重试"
-    return 1
-  fi
-  section "首次安装：获取最新源码"
-  local target="${INSTALL_DIR:-$PWD/us_stocks}"
-  case "$target" in
-    /*) ;;
-    *) target="$PWD/$target" ;;
-  esac
-  info "脚本来自 ${BASH_SOURCE[0]}，安装目录：$target"
-  if [ -d "$target/.git" ]; then
-    info "检测到已存在的仓库，更新到最新版本"
-    if has_cmd git && git -C "$target" pull --ff-only --quiet 2>/dev/null; then
-      ok "源码已更新到最新版本"
-    else
-      warn "自动更新失败（缺少 git 或存在本地修改），继续使用现有源码：$target"
-    fi
-  elif [ -e "$target" ]; then
-    fail "目标目录已存在且不是 git 仓库：$target"
-    fail "请换一个安装目录，例如：INSTALL_DIR=/opt/us_stocks bash <(curl -Ls <脚本地址>)"
-    return 1
-  else
-    if ensure_git; then
-      info "克隆源码：$GIT_REMOTE_URL"
-      if ! git clone --depth 1 --quiet "$GIT_REMOTE_URL" "$target"; then
-        fail "克隆失败，请检查网络或代理设置"
-        return 1
-      fi
-    else
-      download_archive "$target" || return 1
-    fi
-    ok "源码已下载到 $target"
-  fi
-  # 内容校验：缺文件就报错，避免 exec 出去以后又回到引导逻辑里空转
-  if [ ! -f "$target/pyproject.toml" ] || [ ! -d "$target/app" ] || [ ! -f "$target/run.sh" ]; then
-    fail "源码不完整（缺少 run.sh / pyproject.toml / app）：$target"
-    return 1
-  fi
-  if [ ! -x "$target/run.sh" ]; then
-    chmod +x "$target/run.sh" 2>/dev/null || true
-  fi
-  cd "$target" || { fail "无法进入目录：$target"; return 1; }
-  info "切换到项目目录，继续执行脚本"
-  export OPTION_SCOPE_BOOTSTRAP_DONE=1
-  # 用 `curl | bash` 时标准输入是管道，菜单读不到按键；能打开终端就重新接回 /dev/tty
-  if [ ! -t 0 ] && (exec </dev/tty) 2>/dev/null; then
-    exec bash "$target/run.sh" "$@" </dev/tty
-  fi
-  exec bash "$target/run.sh" "$@"
-}
-
-# ---------- 更新应用：停止 → 取最新源码 → 用新代码重启 ----------
-# 源码优先走 git（只动有变化的文件，且能看出更新前后的版本号）；没有 git 或用户确认覆盖时，
-# 下载分支压缩包后按顶层条目覆盖。无论哪条路径，运行期数据都保留：
-# .env（配置）、data/（数据库）、logs/（日志）、.run/（PID）、.venv/（虚拟环境）。
-# git 仓库当前版本号（短哈希）；不是仓库时输出空
-source_revision() {
-  local target="$1"
-  if [ -d "$target/.git" ] && has_cmd git; then
-    git -C "$target" rev-parse --short HEAD 2>/dev/null
-  fi
-}
-
-# 顶层条目是否属于「运行期数据」——这类内容永远不覆盖。
-# 注意：模式必须直接写在 case 里；若放进变量再用 for 遍历，shell 会把 `.env.*`
-# 这类通配符按当前目录展开成实际文件名，导致匹配失效。
-is_runtime_entry() {
-  local name="$1"
-  case "$name" in
-    # .env.example 是随代码走的模板，必须跟着更新，不能当成用户的 .env 跳过
-    .env.example) return 1 ;;
-    .env | .env.* | data | logs | .run | .venv | .git | backup) return 0 ;;
-  esac
-  return 1
-}
-
-# 下载分支压缩包并按顶层条目覆盖源码；运行期数据一律跳过
-overlay_archive() {
-  local target="$1" src="" entry name
-  fetch_archive_tree us_stocks_update "最新源码" || return 1
-  src="$ARCHIVE_SRC"
-  if [ ! -f "$src/run.sh" ] || [ ! -d "$src/app" ]; then
-    fail "源码包内容异常（缺少 run.sh 或 app）"
-    cleanup_archive_tree
-    return 1
-  fi
-  # 逐个顶层条目覆盖。写成三段通配是为了带上点开头的文件（.gitignore、.env.example 等），
-  # 单写 "$src"/* 时 shell 不匹配隐藏文件，这些文件永远更新不到。
-  for entry in "$src"/* "$src"/.[!.]* "$src"/..?*; do
-    [ -e "$entry" ] || continue
-    name="$(basename "$entry")"
-    if is_runtime_entry "$name"; then
-      info "保留运行期内容：$name"
-      continue
-    fi
-    rm -rf "${target:?}/$name"
-    if ! cp -a "$entry" "$target/$name"; then
-      fail "覆盖 $name 失败"
-      cleanup_archive_tree
-      return 1
-    fi
-  done
-  cleanup_archive_tree
-  ok "源码已覆盖更新（.env / data / logs / .venv 均未改动）"
-  return 0
-}
-
-# 本地有未提交修改时，只有交互确认才允许覆盖，避免把服务器上的改动冲掉
-confirm_overwrite() {
-  local answer=""
-  if [ ! -t 0 ]; then
-    fail "检测到本地未提交的修改，非交互场景不自动覆盖"
-    fail "请先处理这些修改（提交或备份），再执行更新"
-    return 1
-  fi
-  printf '  用远端源码覆盖当前工作区？本地未提交的修改会丢失。输入 y 覆盖：'
-  read -r answer || answer=""
-  case "$answer" in
-    y | Y | yes | YES) return 0 ;;
-    *) info "已取消覆盖，保留现有源码"; return 1 ;;
-  esac
-}
-
-# 取最新源码：git 优先，失败或非仓库时退回压缩包覆盖
-update_source() {
-  local target="$PROJECT_DIR"
-  if [ -d "$target/.git" ] && has_cmd git; then
-    if git -C "$target" diff --quiet 2>/dev/null && git -C "$target" diff --cached --quiet 2>/dev/null; then
-      info "git 拉取最新源码：$GIT_REMOTE_URL"
-      if git -C "$target" pull --ff-only --quiet; then
-        ok "源码已更新到最新版本"
-        return 0
-      fi
-      warn "git 拉取失败（网络不可达或远端有冲突）"
-    else
-      warn "检测到本地未提交的修改，跳过 git 拉取"
-    fi
-    confirm_overwrite || return 1
-  fi
-  overlay_archive "$target"
-}
-
-resume_app_after_update() {
-  local message="$1" status=0
-  warn "$message"
-  start_app || status=$?
-  return "$status"
-}
-
-action_update() {
-  section "更新应用"
-  local before="" after="" rc=0
-  before="$(source_revision "$PROJECT_DIR")"
-  # 1) 先停服务：避免更新源码时新旧代码混跑；停止失败就取消更新。
-  if ! stop_app; then
-    resume_app_after_update "无法确认应用已停止，取消源码更新" || true
-    return 1
-  fi
-  # 2) 取最新源码；失败就用现有版本把服务拉回来，不让应用一直停着
-  if ! update_source; then
-    resume_app_after_update "源码未更新，改为用现有源码重启" || true
-    return 1
-  fi
-  after="$(source_revision "$PROJECT_DIR")"
-  if [ -n "$before" ] && [ -n "$after" ]; then
-    if [ "$before" = "$after" ]; then
-      info "代码已是最新版本（$after）"
-    else
-      ok "版本：$before → $after"
-    fi
-  fi
-  # 3) 交给目录里那份（可能刚更新过的）脚本启动：依赖指纹变了会自动重装
-  info "用更新后的代码启动应用"
-  bash "$PROJECT_DIR/run.sh" start
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    fail "更新完成，但启动失败（退出码 $rc）：请查看 ./run.sh status 与日志"
-    return "$rc"
-  fi
-  return 0
-}
-
 main() {
   local cmd="${1:-}"
+  init_privilege
+  detect_system
+  setup_binary_path
   if [ "$cmd" = "__watchdog" ]; then
     watchdog_loop
     return 0
   fi
-  init_privilege
-  detect_system
-  # 不在源码目录里（curl | bash 场景）时先拉取源码，再切换过去继续执行
-  bootstrap_if_needed "$@" || return 1
   case "$cmd" in
     "") menu_loop ;;
-    1 | install) action_install_runtime ;;
-    2 | start) start_app ;;
-    3 | update | upgrade) action_update ;;
-    4 | service) action_service ;;
-    5 | config) action_config ;;
-    6 | stop) stop_app ;;
-    7 | status) action_status ;;
-    8 | db | database) action_database ;;
-    9 | doctor | check) action_doctor ;;
-    kill-port) action_kill_port "${2:-}" ;;
+    start) start_app ;;
+    stop) stop_app ;;
     restart) restart_app ;;
+    status) action_status ;;
+    logs | log) action_logs "${2:-80}" ;;
+    config) action_config ;;
+    trim-logs | trim) action_trim_logs ;;
+    doctor | check) action_doctor ;;
+    install | install-runtime) ensure_runtime && ok "运行环境已就绪，可在主菜单选择 2) 启动应用" ;;
+    kill-port) action_kill_port "${2:-}" ;;
     install-service | service-install) install_systemd_service ;;
     remove-service | service-remove) remove_systemd_service ;;
+    enable-autostart | autostart) setup_autostart ;;
+    disable-autostart | no-autostart) remove_autostart ;;
     foreground | serve) foreground_app ;;
-    log | logs) tail_log "$APP_LOG" "${2:-50}" ;;
     -h | --help | help) usage ;;
     *)
       fail "未知参数：$cmd"
@@ -2106,105 +1972,6 @@ main() {
   esac
 }
 
-# 立即清理历史数据：服务在跑就走 API，没跑就直接操作数据库文件
-cleanup_database() {
-  section "清理历史数据"
-  if app_running; then
-    info "服务正在运行，调用 POST /api/cleanup"
-    "$(runtime_python)" - "$(app_port)" "$(read_env_value ACCESS_KEY "")" <<'PY'
-import json
-import sys
-import urllib.request
-
-headers = {"X-Access-Key": sys.argv[2]} if sys.argv[2] else {}
-request = urllib.request.Request(
-    "http://127.0.0.1:%s/api/cleanup" % sys.argv[1],
-    headers=headers,
-    method="POST",
-)
-try:
-    with urllib.request.urlopen(request, timeout=120) as response:
-        print(json.dumps(json.load(response), ensure_ascii=False, indent=2))
-except Exception as exc:  # noqa: BLE001 - 命令行工具，直接把错误显示给用户
-    sys.exit("调用失败：%s" % exc)
-PY
-  else
-    info "服务未运行，直接操作数据库文件"
-    ( cd "$PROJECT_DIR" && "$VENV_PY" - <<'PY'
-from app.config import Settings
-from app.db import Database
-
-settings = Settings.from_env()
-db = Database(settings.database_path)
-print("删除过期记录：", db.cleanup(settings.raw_retention_days))
-print("按体积清理：", db.cleanup_by_size(settings.database_max_mb * 1048576))
-PY
-    )
-  fi
-  return 0
-}
-
-# 在线备份：VACUUM INTO 由 SQLite 自己保证一致性，服务运行中也能安全执行
-backup_database() {
-  local db_path target
-  section "备份数据库"
-  db_path="$(resolve_db_path)"
-  if [ ! -f "$db_path" ]; then
-    fail "数据库文件不存在：$db_path"
-    return 1
-  fi
-  mkdir -p "$PROJECT_DIR/backup"
-  target="$PROJECT_DIR/backup/options-$(date +%Y%m%d-%H%M%S).db"
-  "$(runtime_python)" - "$db_path" "$target" <<'PY'
-import sqlite3
-import sys
-
-source, dest = sys.argv[1], sys.argv[2]
-with sqlite3.connect(source) as connection:
-    connection.execute("VACUUM INTO ?", (dest,))
-print("备份文件：", dest)
-PY
-}
-
-database_stats() {
-  section "数据表统计"
-  ( cd "$PROJECT_DIR" && "$VENV_PY" - <<'PY'
-from app.config import Settings
-from app.db import Database
-
-settings = Settings.from_env()
-db = Database(settings.database_path)
-with db.connect() as connection:
-    tables = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-    ).fetchall()
-    for (name,) in tables:
-        count = connection.execute("SELECT COUNT(*) FROM %s" % name).fetchone()[0]
-        print("  %-28s %d" % (name, count))
-PY
-  )
-  return 0
-}
-
-action_database() {
-  local db_path size
-  section "数据库概况"
-  db_path="$(resolve_db_path)"
-  if [ -f "$db_path" ]; then
-    size="$(database_size_bytes "$db_path")"
-    printf '  路径：%s\n' "$db_path"
-    printf '  体积：%s（配置上限 %s，0 表示不限制）\n' "$(human_size "$size")" "$(read_env_value DATABASE_MAX_MB 0)"
-  else
-    printf '  路径：%s（尚未创建）\n' "$db_path"
-  fi
-  run_menu "数据库工具" "请选择：" once \
-    '1|立即清理历史数据|cleanup_database' \
-    '2|备份数据库（在线安全备份）|backup_database' \
-    '3|查看各表记录数|database_stats' \
-    '0|返回|return'
-}
-
-# ---------- 入口 ----------
-# 放在文件最末尾：此时所有函数都已定义，且脚本退出码等于对应动作的返回值，
-# 便于计划任务、监控脚本据此判断成功（0）与失败（非 0）。
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
