@@ -147,6 +147,156 @@
       </div>
     </section>
 
+    <section class="detail-group panel chan-panel" id="chan-analysis" aria-labelledby="chan-title" :aria-busy="chanLoading ? 'true' : 'false'">
+      <div class="detail-header">
+        <button class="detail-toggle" type="button" :aria-expanded="chanExpanded ? 'true' : 'false'" aria-controls="chan-body" @click="toggleChanPanel">
+          <span class="detail-caret" aria-hidden="true"></span>
+          <span class="detail-text"><span class="eyebrow">CHAN STRUCTURE</span><span class="detail-title" id="chan-title">缠论 · 当前位置与走势推演</span></span>
+          <span class="detail-action">{{ chanExpanded ? '收起' : '展开' }}</span>
+        </button>
+      </div>
+      <div class="detail-body chan-body" id="chan-body" v-show="chanExpanded">
+        <div class="chan-summary">
+          <div class="chan-summary-read"><span class="chan-section-label">{{ chanFrame.label }} · 当前判断</span><h2>{{ chanFrame.guidance.title }}</h2><p>{{ chanFrame.guidance.focus }}</p></div>
+          <div class="chan-meta"><span>现价 {{ view.chan.spot }}</span><span>行情缓存 {{ view.chan.historyTime }}</span><span role="status">{{ chanLoading ? '正在计算…' : (view.chan.refreshing ? '历史行情后台更新中' : '按已收盘行情计算') }}</span></div>
+        </div>
+        <div class="chan-overview">
+          <article v-for="item in [view.chan.daily, view.chan.weekly]" :key="item.label" class="chan-overview-item"><h3>{{ item.label }}背景</h3><strong>{{ item.position }}</strong><span>中枢 {{ item.center }}</span><p>{{ item.confirmed }} 根已确认笔 · 截至 {{ item.asOf }}</p></article>
+        </div>
+        <div class="chan-controls">
+          <div class="chan-chart-controls"><h3>价格结构</h3><div class="detail-segmented" role="group" aria-label="缠论图表周期">
+            <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'daily' ? 'true' : 'false'" @click="chanPeriod = 'daily'">日线</button>
+            <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'weekly' ? 'true' : 'false'" @click="chanPeriod = 'weekly'">周线</button>
+          </div></div>
+          <span>{{ chanFrame.bars }} 根收盘 K 线 · {{ chanFrame.confirmed }} 根已确认笔 · 截至 {{ chanFrame.asOf }}</span>
+          <div v-if="chanFrame.chart && chanFrame.chart.keyLevels.length" class="chan-key-level-summary" role="list" aria-label="关键观察价位">
+            <div v-for="level in chanFrame.chart.keyLevels" :key="level.key" class="chan-key-level-chip" :class="'chan-key-level-chip-' + level.tone" role="listitem" :title="level.title"><span>{{ level.label }}</span><strong>{{ level.priceLabel }}</strong></div>
+          </div>
+        </div>
+        <div class="chan-chart" v-if="chanFrame.chart" v-chan-chart-hover="chanFrame.chart" @click="dismissChanScenarioOnTouch($event)">
+          <svg :key="chanPeriod" viewBox="0 0 960 340" role="img" tabindex="0" :aria-label="chanFrame.chart.title" aria-describedby="chan-chart-description chan-chart-readout">
+            <desc id="chan-chart-description">{{ chanFrame.chart.description }}</desc>
+            <defs><marker id="chan-route-arrow" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" class="chan-projection-arrow"></path></marker></defs>
+            <!-- 各图层分别维护列表，避免 K 线、日期标签、中枢与笔的 key 在同级重复。 -->
+            <g key="chan-grid">
+              <g v-for="row in chanFrame.chart.grid" :key="row.key"><line x1="18" :x2="chanFrame.chart.plotRight" :y1="row.y" :y2="row.y" class="chart-grid"></line><text v-if="row.labelVisible" :x="chanFrame.chart.plotRight + 10" :y="row.y + 4" class="chan-chart-label">{{ row.label }}</text></g>
+            </g>
+            <g key="chan-centers">
+              <rect v-for="zone in chanFrame.chart.centers" :key="zone.key" :x="zone.x" :y="zone.y" :width="zone.width" :height="zone.height" class="chan-center" :class="{ 'chan-center-latest': zone.latest }"></rect>
+            </g>
+            <g key="chan-candles">
+              <g v-for="bar in chanFrame.chart.candles" :key="bar.key" :class="'chan-candle-' + bar.direction"><line :x1="bar.x" :x2="bar.x" :y1="bar.high" :y2="bar.low"></line><rect :x="bar.x - bar.bodyWidth / 2" :y="bar.body" :width="bar.bodyWidth" :height="bar.bodyHeight"></rect></g>
+            </g>
+            <g key="chan-strokes">
+              <line v-for="pen in chanFrame.chart.strokes" :key="pen.key" :x1="pen.x1" :y1="pen.y1" :x2="pen.x2" :y2="pen.y2" class="chan-stroke" :class="{ 'chan-stroke-pending': !pen.confirmed }"></line>
+            </g>
+            <g key="chan-endpoints">
+              <g v-for="point in chanFrame.chart.points" :key="point.key"><circle :cx="point.x" :cy="point.y" r="2.6" class="chan-endpoint" :class="{ 'chan-endpoint-pending': !point.confirmed }"></circle><text :x="point.labelX" :y="point.labelY" text-anchor="middle" class="chan-endpoint-label">{{ point.label }}</text></g>
+            </g>
+            <g key="chan-turning-markers">
+              <g v-for="marker in chanFrame.chart.markers" :key="marker.key"><circle :cx="marker.x" :cy="marker.y" r="5" class="chan-turning-marker" :class="{ 'chan-turning-marker-watch': marker.watch }"></circle><text :x="marker.labelX" :y="marker.labelY" text-anchor="middle" class="chan-turning-label">{{ marker.label }}</text></g>
+            </g>
+            <g key="chan-key-levels">
+              <g v-for="level in chanFrame.chart.keyLevels" :key="level.key" :class="'chan-key-level-' + level.tone"><title>{{ level.title }}</title><line :x1="level.x1" :x2="level.x2" :y1="level.y" :y2="level.y" class="chan-key-level-line"></line></g>
+            </g>
+            <g key="chan-projection-lane" v-if="chanFrame.chart.projections.length">
+              <rect :x="chanFrame.chart.historyRight" :y="chanFrame.chart.plotTop" :width="chanFrame.chart.plotRight - chanFrame.chart.historyRight" :height="chanFrame.chart.plotBottom - chanFrame.chart.plotTop" class="chan-projection-lane"></rect>
+              <text :x="chanFrame.chart.historyRight + 8" y="31" class="chan-projection-caption">条件情景 · 非预测</text>
+            </g>
+            <g key="chan-projections">
+              <g v-for="route in chanFrame.chart.projections" :key="route.key" :class="'chan-projection-' + route.tone" @mouseenter="showChanScenario(route.key, $event)" @mouseleave="hideChanScenario($event)" @click.stop="toggleChanScenario(route.key, $event)" role="group" :aria-label="route.label + '：' + route.condition + '。悬停或轻触查看完整说明'" :aria-describedby="chanHoveredScenario === route.key ? 'chan-scenario-card-' + route.key : null">
+                <path :d="route.path" class="chan-projection-hit-area" aria-hidden="true"></path>
+                <path :d="route.path" class="chan-projection-path" marker-end="url(#chan-route-arrow)"></path>
+                <circle v-for="point in route.points" :key="point.key" :cx="point.x" :cy="point.y" r="3" class="chan-projection-point"></circle>
+              </g>
+            </g>
+            <g key="chan-dates">
+              <text v-for="date in chanFrame.chart.dates" :key="date.label" :x="date.x" :y="date.y" :text-anchor="date.x < 100 ? 'start' : (date.x > 750 ? 'end' : 'middle')" class="chan-chart-label">{{ date.label }}</text>
+            </g>
+            <g key="chan-spot" v-if="chanFrame.chart.spot">
+              <line x1="18" :x2="chanFrame.chart.historyRight" :y1="chanFrame.chart.spot.y" :y2="chanFrame.chart.spot.y" class="chan-spot"></line>
+              <rect :x="chanFrame.chart.spot.x" :y="chanFrame.chart.spot.boxY" :width="chanFrame.chart.spot.width" :height="chanFrame.chart.spot.height" rx="2" class="chan-spot-badge"></rect>
+              <text :x="chanFrame.chart.spot.textX" :y="chanFrame.chart.spot.textY" text-anchor="middle" class="chan-spot-label">现价 {{ chanFrame.chart.spot.label }}</text>
+            </g>
+            <!-- 悬停图层独立于 Vue 数据，移动鼠标时只更新光标，不重绘整张 K 线图。 -->
+            <g v-pre class="chan-crosshair-layer" aria-hidden="true" visibility="hidden">
+              <line class="chart-crosshair"></line><line class="chart-crosshair-h"></line>
+              <g class="chart-tag chart-tag-x"><rect rx="2" height="18"></rect><text></text></g>
+              <g class="chart-tag chart-tag-y"><rect rx="2" height="18"></rect><text></text></g>
+            </g>
+          </svg>
+          <div v-pre class="chart-tooltip chan-chart-tooltip" id="chan-chart-readout" hidden></div>
+          <template v-if="chanFrame.chart && chanFrame.chart.projections"><article v-for="route in chanFrame.chart.projections" v-if="chanHoveredScenario === route.key" :id="'chan-scenario-card-' + route.key" :key="route.key + '-card'" class="chan-projection-float-card" :class="'chan-projection-' + route.tone" :style="{ left: chanScenarioCardX + 'px' }" @mouseenter="showChanScenario(route.key, $event)" @mouseleave="hideChanScenario($event)" @click.stop><h4><span class="chan-scenario-title">{{ route.label }}</span><span class="chan-route-meta"><strong>倾向 {{ route.tiltScore }}/100</strong><span>{{ route.status }}</span></span></h4><p class="chan-tilt-note">综合日周位置、确认笔与有效信号的规则倾向分 · 非历史胜率</p><dl><div><dt>观察</dt><dd>{{ route.expectation }}</dd></div><div><dt>条件</dt><dd>{{ route.condition }}</dd></div><div><dt>失效</dt><dd>{{ route.invalidation }}</dd></div></dl></article></template>
+        </div>
+        <div v-else class="levels-empty">历史行情到达后展示 K 线、笔与中枢</div>
+        <div class="chan-legend"><span><i class="chan-legend-pen"></i>已确认笔</span><span><i class="chan-legend-pen chan-legend-pending"></i>形成中的笔</span><span><i class="chan-legend-center"></i>笔中枢</span><span><i class="chan-legend-level"></i>近期高低点／中枢边界</span><span><i class="chan-legend-projection"></i>右侧为条件情景推演</span><span>倾向分为规则估算，非统计概率</span><span>带 *：形成中的端点价格</span></div>
+        <dl class="chan-facts"><div><dt>最近中枢</dt><dd>{{ chanFrame.boundary }}<small>{{ chanFrame.structure }}</small></dd></div><div><dt>最近一笔</dt><dd>{{ chanFrame.stroke }}<small>{{ chanFrame.observation }}</small></dd></div></dl>
+        <div class="chan-turning">
+          <details class="chan-fold chan-plan-fold" :open="chanFolds.plan" @toggle="rememberChanFold('plan', $event)">
+            <summary><h3 class="chan-fold-title" id="chan-turning-title">错过底部／顶部，现在怎么做<span class="chan-fold-meta">{{ chanFrame.label }} · 新仓与持仓分别判断</span></h3></summary>
+            <div class="chan-plan-body">
+              <div v-if="chanFrame.plan.movement" class="chan-reading"><h4>{{ chanFrame.plan.movement.title }}</h4><p>{{ chanFrame.plan.movement.text }}</p></div>
+              <div class="chan-plan-grid">
+                <article v-for="decision in chanFrame.plan.cards" :key="decision.side" :class="'chan-plan-' + decision.tone">
+                  <header><span class="chan-section-label">{{ decision.label }}</span><h4>{{ decision.action }}</h4></header>
+                  <p>{{ decision.reason }}</p>
+                  <dl><div><dt>下一步</dt><dd>{{ decision.next }}</dd></div><div><dt>保护与退出条件</dt><dd>{{ decision.protection }}</dd></div></dl>
+                </article>
+              </div>
+              <dl v-if="chanFrame.plan.metrics.length" class="chan-plan-metrics"><div v-for="metric in chanFrame.plan.metrics" :key="metric.label"><dt>{{ metric.label }}</dt><dd>{{ metric.value }}</dd><small>{{ metric.note }}</small></div></dl>
+              <p v-if="chanFrame.plan.context" class="chan-plan-context">{{ chanFrame.plan.context }}</p>
+              <p class="chan-guidance-note">{{ chanFrame.plan.note }}这是当前结构下的条件式判断，未读取个人持仓、成本和风险预算。</p>
+            </div>
+          </details>
+          <details class="chan-fold chan-turning-evidence" :open="chanFolds.evidence" @toggle="rememberChanFold('evidence', $event)">
+            <summary>抄底／逃顶候选与识别依据<span class="chan-fold-meta">{{ chanFrame.turning[0].status }} / {{ chanFrame.turning[1].status }}</span></summary>
+            <div class="chan-turning-grid">
+              <article v-for="setup in chanFrame.turning" :key="setup.side" :class="'chan-turning-' + setup.phase">
+                <header><span class="chan-section-label">{{ setup.label }}</span><h4>{{ setup.title }}</h4><span class="chan-turning-status">{{ setup.status }}</span></header>
+                <p>{{ setup.detail }}</p>
+                <dl v-if="setup.phase !== 'empty'" class="chan-turning-prices"><div><dt>{{ setup.side === 'buy' ? '原来的低点' : '原来的高点' }}</dt><dd>{{ setup.price }}</dd></div><div><dt>{{ setup.side === 'buy' ? '跌至此价失效' : '涨至此价失效' }}</dt><dd>{{ setup.boundary }}</dd></div><div><dt>MACD 推动力度比</dt><dd>{{ setup.ratio }}</dd></div></dl>
+                <dl class="chan-turning-steps"><div><dt>当前结构与确认条件</dt><dd>{{ setup.condition }}</dd></div><div><dt>接下来观察</dt><dd>{{ setup.nextStep }}</dd></div><div v-if="setup.phase !== 'empty'"><dt>价格条件</dt><dd>{{ setup.trigger }}</dd></div></dl>
+                <small v-if="setup.phase !== 'empty'">极值 {{ setup.date }} · 首次识别 {{ setup.observedAt }} · 阶段识别 {{ setup.phaseAt }}</small>
+              </article>
+            </div>
+            <p class="chan-guidance-note">底部／顶部观察采用当前周期的笔力度与回试形态，不等同于完整一类、二类买卖点。图上标记落在原始极值处，实际识别时间更晚。形成中的观察可变化；候选不保证反转，本项目尚无对应胜率统计。</p>
+          </details>
+          <details class="chan-fold chan-terms" :open="chanFolds.terms" @toggle="rememberChanFold('terms', $event)">
+            <summary>术语怎么理解：反向笔、回踩、反抽、保护位</summary>
+            <dl><div v-for="term in chanFrame.plan.terms" :key="term.name"><dt>{{ term.name }}</dt><dd>{{ term.detail }}</dd></div></dl>
+          </details>
+        </div>
+        <section class="chan-guidance" aria-labelledby="chan-guidance-title">
+          <div class="chan-section-heading"><h3 id="chan-guidance-title">关键价位与判断依据</h3><span>先看近期高低点，再看中枢边界</span></div>
+          <div class="chan-guidance-grid">
+            <div class="chan-evidence-block"><h4>判断依据</h4><ul class="chan-evidence" v-if="chanFrame.guidance.evidence.length"><li v-for="reason in chanFrame.guidance.evidence" :key="reason">{{ reason }}</li></ul><p v-else class="chan-muted">等待已收盘行情。</p></div>
+            <div class="chan-levels-wrap" v-if="chanFrame.guidance.levels.length">
+              <table class="chan-levels-table"><caption>{{ chanFrame.label }}关键观察价位</caption><thead><tr><th scope="col">位置</th><th scope="col">价格</th><th scope="col">距现价</th><th scope="col">观察变化</th></tr></thead><tbody><tr v-for="level in chanFrame.guidance.levels" :key="level.key"><th scope="row">{{ level.label }}<small>{{ level.source }} · {{ level.date }}</small></th><td>{{ level.price }}</td><td>{{ level.distance }}</td><td>{{ level.purpose }}</td></tr></tbody></table>
+            </div>
+          </div>
+          <p class="chan-guidance-note">{{ chanFrame.guidance.note }}</p>
+        </section>
+        <section class="chan-signals" aria-labelledby="chan-signals-title">
+          <h3 id="chan-signals-title">结构信号</h3>
+          <div class="chan-signal-content"><p>{{ chanFrame.guidance.signalReason }}</p><article v-for="signal in chanFrame.signals" :key="signal.key"><strong>{{ signal.label }} · {{ signal.statusLabel }}</strong><p>{{ signal.detail }}</p><small>{{ signal.dateLabel }} · {{ signal.invalidationLabel }}<span v-if="signal.ratioLabel"> · {{ signal.ratioLabel }}</span></small></article></div>
+        </section>
+        <section class="chan-scenarios" aria-labelledby="chan-scenario-title">
+          <div class="chan-section-heading"><h3 id="chan-scenario-title">接下来具体看什么</h3><span>收盘价格条件满足后，仍需后续结构确认</span></div>
+          <div class="chan-scenario-grid">
+            <article v-for="scenario in chanFrame.guidance.scenarios" :key="scenario.direction">
+              <header><h4>{{ scenario.label }}</h4><p class="chan-scenario-status">{{ scenario.status }}</p></header>
+              <dl><div><dt>确认条件</dt><dd>{{ scenario.condition }}</dd></div><div><dt>下一观察位</dt><dd>{{ scenario.expectation }}</dd></div><div><dt>重新评估条件</dt><dd>{{ scenario.invalidation }}</dd></div></dl>
+            </article>
+          </div>
+          <p v-if="!chanFrame.guidance.scenarios.length" class="chan-explanation">尚未形成可配对的笔高低点，等待结构形成后列出具体观察路径。</p>
+        </section>
+        <div class="chan-footnotes">
+          <div class="chan-data-note" v-if="view.chan.warnings.length || chanFrame.warnings.length"><h3>数据与结构提示</h3><ul class="chan-warnings"><li v-for="(warning, index) in view.chan.warnings.concat(chanFrame.warnings)" :key="index">{{ warning }}</li></ul></div>
+          <details class="chan-rules" :open="chanFolds.rules" @toggle="rememberChanFold('rules', $event)"><summary>计算规则与确认口径</summary><ul><li v-for="rule in view.chan.rules" :key="rule">{{ rule }}</li></ul><p>图中中枢使用笔的重叠区。底部／顶部与第三类买卖位置均为候选；完整递归级别及次级别确认尚未纳入。结构位置时间早于识别时间，实时判断以识别时间为准。</p></details>
+        </div>
+      </div>
+    </section>
+
     <section class="detail-group panel option-analysis-group" id="option-analysis-group">
       <div class="detail-header" id="option-analysis-header">
         <button class="detail-toggle" id="option-analysis-toggle" type="button" aria-expanded="false" aria-controls="option-analysis-fold">
@@ -247,6 +397,8 @@
   <script src="/static/common/js/request.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/charts.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/buyer-client.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-plan.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/app.js?v=__ASSET_VERSION__"></script>
 </body>
 </html>

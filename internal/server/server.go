@@ -192,8 +192,11 @@ type Service struct {
 	valuationAttempts     map[string]time.Time
 	valuationRegimes      map[string]cachedValuationRegime
 	historyLocks          map[string]*historyLockEntry
+	historyRefreshJobs    map[string]bool
+	historyRefreshAfter   map[string]time.Time
 	levelsFlights         map[string]*levelsCacheFlight
 	analyticsPrefetch     map[string]bool
+	chanHistoryJobs       map[string]bool
 	snapshotRefreshJobs   map[string]bool
 	gammaHeavyGate        chan struct{}
 	background            context.Context
@@ -271,7 +274,7 @@ func NewWithProvider(cfg config.Config, repository *store.SQLite, marketProvider
 		quotes: make(map[string]cachedQuote), expires: make(map[string][]string),
 		chains: make(map[string]cachedChain), events: eventLog{nextID: 1, payloads: make(map[string]map[string]any)},
 		refreshGates: make(map[string]*refreshGate), subscriptions: make(map[string]eventSubscription),
-		gammaJobs: make(map[string]*gammaJob), valuationJobs: make(map[string]bool), valuationAttempts: make(map[string]time.Time), valuationRegimes: make(map[string]cachedValuationRegime), historyLocks: make(map[string]*historyLockEntry), levelsFlights: make(map[string]*levelsCacheFlight), analyticsPrefetch: make(map[string]bool), snapshotRefreshJobs: make(map[string]bool),
+		gammaJobs: make(map[string]*gammaJob), valuationJobs: make(map[string]bool), valuationAttempts: make(map[string]time.Time), valuationRegimes: make(map[string]cachedValuationRegime), historyLocks: make(map[string]*historyLockEntry), historyRefreshJobs: make(map[string]bool), historyRefreshAfter: make(map[string]time.Time), levelsFlights: make(map[string]*levelsCacheFlight), analyticsPrefetch: make(map[string]bool), chanHistoryJobs: make(map[string]bool), snapshotRefreshJobs: make(map[string]bool),
 		gammaHeavyGate: make(chan struct{}, gateLimit),
 		background:     background, stopBackground: stop, leaseOwner: hex.EncodeToString(ownerBytes[:]),
 	}
@@ -329,6 +332,7 @@ func (s *Service) Router() *gin.Engine {
 	api.GET("/flow/:symbol", s.flow)
 	api.GET("/gamma/:symbol", s.gamma)
 	api.GET("/levels/:symbol", s.levels)
+	api.GET("/chan/:symbol", s.chanAnalysis)
 	api.GET("/status/:symbol", s.status)
 	api.POST("/cleanup", s.cleanup)
 	return router
@@ -687,7 +691,7 @@ func (s *Service) index(c *gin.Context) {
 	content := strings.ReplaceAll(string(page), "__DEFAULT_SYMBOL__", defaultSymbol)
 	content = strings.ReplaceAll(content, "__ACCESS_KEY_REQUIRED__", strconv.FormatBool(s.cfg.AccessKey != ""))
 	versionHash := sha256.New()
-	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/app.js", "common/img/option-scope-mark.svg", "common/img/option-scope-favicon.svg"} {
+	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-client.js", "common/js/app.js", "common/img/option-scope-mark.svg", "common/img/option-scope-favicon.svg"} {
 		if contents, err := fs.ReadFile(assets, asset); err == nil {
 			_, _ = versionHash.Write(contents)
 		}
@@ -760,8 +764,8 @@ func (s *Service) quote(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"detail": err.Error()})
 		return
 	}
-	if quote.Price == nil {
-		if ok && cached.value.Price != nil {
+	if !validMarketPrice(quote.Price) {
+		if ok && validMarketPrice(cached.value.Price) {
 			quote := cached.value
 			s.mergeCachedValuation(symbol, &quote)
 			quote.Source = "sqlite"
@@ -916,6 +920,9 @@ func (s *Service) fetchQuoteOnce(ctx context.Context, symbol string, persist, sn
 }
 
 func (s *Service) persistQuoteSnapshot(symbol string, quote model.Quote) (model.Quote, error) {
+	if !validMarketPrice(quote.Price) {
+		return model.Quote{}, fmt.Errorf("refusing to replace cached quote for %s without a positive price", symbol)
+	}
 	persisted, err := s.store.SaveQuotePreservingFairValue(quote)
 	if err != nil {
 		return model.Quote{}, fmt.Errorf("save quote snapshot: %w", err)
@@ -925,7 +932,14 @@ func (s *Service) persistQuoteSnapshot(symbol string, quote model.Quote) (model.
 	return persisted, nil
 }
 
+func validMarketPrice(price *float64) bool {
+	return price != nil && !math.IsNaN(*price) && !math.IsInf(*price, 0) && *price > 0
+}
+
 func (s *Service) cacheQuote(symbol string, quote model.Quote) {
+	if !validMarketPrice(quote.Price) {
+		return
+	}
 	s.mu.Lock()
 	s.quotes[symbol] = cachedQuote{value: quote, at: time.Now()}
 	s.mu.Unlock()
@@ -966,24 +980,34 @@ func (s *Service) expirations(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": loadErr.Error()})
 		return
 	}
+	cachedExpirations, cacheErr := s.store.CachedExpirations(symbol)
+	if cacheErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": cacheErr.Error()})
+		return
+	}
 	values = activeExpirations(values)
+	cachedExpirations = activeExpirations(cachedExpirations)
 	if len(values) > 0 {
 		s.mu.Lock()
 		s.expires[symbol] = values
 		s.mu.Unlock()
 	}
 	if len(values) > 0 && !refresh {
-		c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, Source: "sqlite"})
+		c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "sqlite"})
 		return
 	}
 	if !refresh && (len(values) == 0 || !ok) {
-		c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: []string{}, Source: "pending"})
+		c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: []string{}, CachedExpirations: cachedExpirations, Source: "pending"})
 		return
 	}
 	upstreamValues, upstreamErr := s.provider.Expirations(c.Request.Context(), symbol)
 	if upstreamErr != nil {
+		if len(cachedExpirations) > 0 {
+			c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: cachedExpirations, CachedExpirations: cachedExpirations, Source: "sqlite", Warning: upstreamErr.Error()})
+			return
+		}
 		if len(values) > 0 {
-			c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, Source: "sqlite", Warning: upstreamErr.Error()})
+			c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "sqlite", Warning: upstreamErr.Error()})
 			return
 		}
 		c.JSON(http.StatusBadGateway, gin.H{"detail": upstreamErr.Error()})
@@ -991,6 +1015,12 @@ func (s *Service) expirations(c *gin.Context) {
 	}
 	values = upstreamValues
 	values = activeExpirations(values)
+	cachedExpirations, cacheErr = s.store.CachedExpirations(symbol)
+	if cacheErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": cacheErr.Error()})
+		return
+	}
+	cachedExpirations = activeExpirations(cachedExpirations)
 	if len(values) > 0 {
 		if err := s.store.SaveExpirations(symbol, values); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
@@ -1000,7 +1030,7 @@ func (s *Service) expirations(c *gin.Context) {
 		s.expires[symbol] = values
 		s.mu.Unlock()
 	}
-	c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, Source: "upstream"})
+	c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "upstream"})
 }
 
 var expirationPattern = regexp.MustCompile(`^\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}$`)
@@ -1763,6 +1793,20 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 		}
 		resultErr = err
 		return model.RefreshResponse{}, err
+	}
+	if !validMarketPrice(quote.Price) {
+		const warning = "上游返回空行情，继续使用 SQLite 缓存"
+		fallback, used, fallbackErr := s.staleRefreshResponse(ctx, symbol, requestedExpiration, warning)
+		if fallbackErr != nil {
+			resultErr = fallbackErr
+			return model.RefreshResponse{}, fallbackErr
+		}
+		if used {
+			result = fallback
+			return result, nil
+		}
+		resultErr = fmt.Errorf("upstream quote has no valid positive price for %s", symbol)
+		return model.RefreshResponse{}, resultErr
 	}
 	// In normal mode valuation can use the shared gate while the chain is being
 	// fetched. LOW_MEMORY keeps the first chain request ahead of background work.
@@ -2976,7 +3020,7 @@ func (s *Service) levels(c *gin.Context) {
 		}
 	}()
 	if !s.validateQuery(c,
-		patternedStringQueryRule("expiration", true),
+		patternedStringQueryRule("expiration", false),
 		positiveFloatQueryRule("spot"),
 		boolQueryRule("raw"),
 		intQueryRule("raw_expirations", false, queryBound(1), queryBound(8)),
@@ -2988,11 +3032,14 @@ func (s *Service) levels(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
 		return
 	}
-	rawExpiration, _ := queryValue(c, "expiration")
-	expiration, err := strictExpiration(rawExpiration)
-	if err != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "expiration must use YYYY-MM-DD"})
-		return
+	rawExpiration, hasExpiration := queryValue(c, "expiration")
+	expiration := ""
+	if hasExpiration {
+		expiration, err = strictExpiration(rawExpiration)
+		if err != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "expiration must use YYYY-MM-DD"})
+			return
+		}
 	}
 	rawExpirationCount := 4
 	if _, present := queryValue(c, "raw_expirations"); present {

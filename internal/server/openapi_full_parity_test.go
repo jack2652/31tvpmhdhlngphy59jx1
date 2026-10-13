@@ -11,11 +11,26 @@ import (
 // Generated with app.main.app.openapi() using FastAPI 0.142.2. DATABASE_PATH
 // pointed at a temporary file so importing the app could not touch production data.
 // JSON is decoded before comparison so map order and Go's numeric types do not matter.
+// The Chan endpoint is an intentional Go addition to that original contract.
 const fastAPIOpenAPIFrozenSchema = `
 {
   "openapi": "3.1.0",
   "info": {"title": "Option Scope", "version": "0.1.0"},
   "paths": {
+    "/api/chan/{stock_symbol}": {
+      "get": {
+        "operationId": "chan_api_chan__stock_symbol__get", "summary": "Chan Structure",
+        "description": "日线与周线缠论笔结构：严格旧笔、笔中枢、当前位置、力度衰减线索和条件式走势推演。只读取历史缓存，缺失或过期时后台更新；spot 可传页面现价。未收盘日线、未完成周线和形成中的笔不用于中枢确认。笔中枢不代表递归级别；第三类位置只标记候选。",
+        "parameters": [
+          {"name": "stock_symbol", "in": "path", "required": true, "schema": {"type": "string", "title": "Stock Symbol"}},
+          {"name": "spot", "in": "query", "required": false, "schema": {"anyOf": [{"type": "number", "exclusiveMinimum": 0}, {"type": "null"}], "title": "Spot"}}
+        ],
+        "responses": {
+          "200": {"description": "Successful Response", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true, "title": "Response Chan Api Chan  Stock Symbol  Get"}}}},
+          "422": {"description": "Validation Error", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}}}
+        }
+      }
+    },
     "/api/events/{stock_symbol}": {
       "get": {
         "operationId": "events_api_events__stock_symbol__get",
@@ -120,10 +135,10 @@ const fastAPIOpenAPIFrozenSchema = `
     "/api/levels/{stock_symbol}": {
       "get": {
         "operationId": "levels_api_levels__stock_symbol__get", "summary": "Levels",
-        "description": "压力位/支撑位：技术面与近 45 天多期限期权持仓综合。\n\n\u0060\u0060raw=true\u0060\u0060 是轻量客户端计算模式。它只读取已经落库的日线和分析快照，\n不触发历史、Beta、财报回源，也不执行 \u0060\u0060build_levels\u0060\u0060；浏览器可以用这些\n原始数据计算趋势、极值和基础价位。原始数据不足时，前端显示期权分布回退，\n不在倒计时刷新链路里启动默认综合模式。\n\n\u0060spot\u0060 是前端传入的当前展示基准价；候选池优先使用快照中的前一交易日收盘价作为\n日内稳定锚点，避免实时价变化或实时价与盘后价切换时反复生成不同的价位簇。",
+        "description": "压力位/支撑位：技术面与近 45 天多期限期权持仓综合。\n\n\u0060\u0060raw=true\u0060\u0060 是轻量客户端计算模式。它只读取已经落库的日线和分析快照，\n不触发历史、Beta、财报回源，也不执行 \u0060\u0060build_levels\u0060\u0060；浏览器可以用这些\n原始数据计算趋势、极值和基础价位。原始数据不足时，前端显示期权分布回退，\n不在倒计时刷新链路里启动默认综合模式。\n\n\u0060expiration\u0060 可省略；省略时仅按已缓存的日线与分析快照计算，不筛选选中期限的期权链。\n\u0060spot\u0060 是前端传入的当前展示基准价；候选池优先使用快照中的前一交易日收盘价作为\n日内稳定锚点，避免实时价变化或实时价与盘后价切换时反复生成不同的价位簇。",
         "parameters": [
           {"name": "stock_symbol", "in": "path", "required": true, "schema": {"type": "string", "title": "Stock Symbol"}},
-          {"name": "expiration", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "title": "Expiration"}},
+          {"name": "expiration", "in": "query", "required": false, "schema": {"anyOf": [{"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}, {"type": "null"}], "title": "Expiration"}},
           {"name": "spot", "in": "query", "required": false, "schema": {"anyOf": [{"type": "number", "exclusiveMinimum": 0}, {"type": "null"}], "title": "Spot"}},
           {"name": "raw", "in": "query", "required": false, "schema": {"type": "boolean", "default": false, "title": "Raw"}},
           {"name": "raw_expirations", "in": "query", "required": false, "schema": {"type": "integer", "default": 4, "minimum": 1, "maximum": 8, "title": "Raw Expirations"}}

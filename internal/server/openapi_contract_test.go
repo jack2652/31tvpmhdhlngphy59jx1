@@ -43,6 +43,7 @@ func TestFastAPIOpenAPIBusinessRouteContracts(t *testing.T) {
 		"不触发历史、Beta、财报回源，也不执行 ``build_levels``；浏览器可以用这些\n" +
 		"原始数据计算趋势、极值和基础价位。原始数据不足时，前端显示期权分布回退，\n" +
 		"不在倒计时刷新链路里启动默认综合模式。\n\n" +
+		"`expiration` 可省略；省略时仅按已缓存的日线与分析快照计算，不筛选选中期限的期权链。\n" +
 		"`spot` 是前端传入的当前展示基准价；候选池优先使用快照中的前一交易日收盘价作为\n" +
 		"日内稳定锚点，避免实时价变化或实时价与盘后价切换时反复生成不同的价位簇。"
 	gammaDescription := "返回近期期限的链，供 Zero Gamma/Gamma Flip 曲线使用。\n\n" +
@@ -111,7 +112,7 @@ func TestFastAPIOpenAPIBusinessRouteContracts(t *testing.T) {
 			description: levelsDescription, responseTitle: "Response Levels Api Levels  Stock Symbol  Get",
 			parameters: []map[string]any{
 				pathSymbol,
-				query("expiration", true, requiredDateSchema("Expiration")),
+				query("expiration", false, optionalDateSchema("Expiration")),
 				query("spot", false, spotSchema),
 				query("raw", false, boolSchema("Raw", false)),
 				query("raw_expirations", false, intSchema("Raw Expirations", 4, 1, 8)),
@@ -124,6 +125,12 @@ func TestFastAPIOpenAPIBusinessRouteContracts(t *testing.T) {
 		{
 			path: "/api/cleanup", method: "post", operationID: "cleanup_api_cleanup_post", summary: "Cleanup",
 			responseTitle: "Response Cleanup Api Cleanup Post",
+		},
+		{
+			path: "/api/chan/{stock_symbol}", method: "get", operationID: "chan_api_chan__stock_symbol__get", summary: "Chan Structure",
+			description:   "日线与周线缠论笔结构：严格旧笔、笔中枢、当前位置、力度衰减线索和条件式走势推演。只读取历史缓存，缺失或过期时后台更新；spot 可传页面现价。未收盘日线、未完成周线和形成中的笔不用于中枢确认。笔中枢不代表递归级别；第三类位置只标记候选。",
+			responseTitle: "Response Chan Api Chan  Stock Symbol  Get",
+			parameters:    []map[string]any{pathSymbol, query("spot", false, spotSchema)}, validation: true,
 		},
 	}
 

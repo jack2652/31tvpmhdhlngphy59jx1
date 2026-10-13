@@ -18,6 +18,13 @@ const FAIR_VALUE_POLL_LIMIT = 50;
 const FAIR_VALUE_RETRY_INTERVAL_MS = 2500;
 
 const TREND_SIGNAL_TITLE = "规则估算，不是下单指令，也不包含财报跳空";
+const CHAN_FOLD_KEYS = {
+  panel: "option-scope-chan",
+  plan: "option-scope-chan-plan",
+  terms: "option-scope-chan-terms",
+  evidence: "option-scope-chan-evidence",
+  rules: "option-scope-chan-rules",
+};
 const state = {
   symbol: defaultSymbol,
   symbolInput: defaultSymbol,
@@ -26,6 +33,26 @@ const state = {
   expirationPlaceholder: "先载入标的",
   analysisReady: false,
   loadId: 0,
+  chanPeriod: "daily",
+  chanHoveredScenario: null,
+  chanScenarioCardX: 0,
+  chanScenarioHideTimer: null,
+  chanExpanded: readFoldState(CHAN_FOLD_KEYS.panel, false),
+  chanFolds: {
+    plan: readFoldState(CHAN_FOLD_KEYS.plan, false),
+    terms: readFoldState(CHAN_FOLD_KEYS.terms, false),
+    evidence: readFoldState(CHAN_FOLD_KEYS.evidence, false),
+    rules: readFoldState(CHAN_FOLD_KEYS.rules, false),
+  },
+  chanLoading: false,
+  chanPayload: null,
+  chanRequestId: 0,
+  chanInFlightSymbol: "",
+  chanLastRequestedAt: 0,
+  chanRetryTimer: null,
+  chanRetryAttempts: 0,
+  chanRefreshPending: false,
+  trendHistorySymbol: "",
   loading: false,
   refreshInFlight: null,
   fairValuePollTimer: null,
@@ -49,6 +76,10 @@ const state = {
   chainFetchedAt: null,
   chainFetchedSymbol: "",
   chainFetchedExpiration: "",
+  displayedChainSymbol: "",
+  displayedChainExpiration: "",
+  displayedChainFetchedAt: null,
+  displayedLevelsContext: "",
   levelsKey: "",
   levelsPayload: null,
   // 最近一次服务端综合结果；服务端快照更新优先改用客户端 raw 计算时保留复杂字段。
@@ -82,6 +113,7 @@ const state = {
   accessKey: "",
   storageAvailable: false,
   view: {
+    chan: OptionScopeChan.empty(),
     marketState: "等待数据",
     themeLabel: "白天",
     themeIcon: "el-icon-moon-night",
@@ -301,7 +333,7 @@ function displayedClientSnapshotRef() {
 
 function restoreDisplayedClientSnapshot(snapshot, message = "API 暂不可用", unavailable = true) {
   if (!snapshot || snapshot.symbol !== state.symbol) return false;
-  if (!restoreClientSnapshot(snapshot.symbol, snapshot.expiration)) return false;
+  if (!restoreClientSnapshot(snapshot.symbol, snapshot.expiration, true)) return false;
   if (unavailable) {
     markApiUnavailable(message);
   } else {
@@ -336,6 +368,8 @@ function rememberClientSnapshot() {
     savedAt: Date.now(),
   };
   if (!payload.quote || !payload.payload || !payload.view) return;
+  // Chan is independent of option expiration and refreshes from its own API.
+  delete payload.view.chan;
   const key = clientSnapshotKey(state.symbol, state.expiration);
   clientSnapshotCache.delete(key);
   clientSnapshotCache.set(key, payload);
@@ -345,7 +379,7 @@ function rememberClientSnapshot() {
   persistClientSnapshotCache();
 }
 
-function restoreClientSnapshot(symbol, expiration = "") {
+function restoreClientSnapshot(symbol, expiration = "", allowStale = false) {
   loadClientSnapshotCache();
   const exactKey = clientSnapshotKey(symbol, expiration);
   let cached = expiration ? clientSnapshotCache.get(exactKey) : null;
@@ -360,6 +394,11 @@ function restoreClientSnapshot(symbol, expiration = "") {
   const payload = cloneClientSnapshot(cached.payload);
   const view = cloneClientSnapshot(cached.view);
   if (!quote || !payload || !view) return false;
+  // A persisted page view is only a startup shortcut while both market data
+  // snapshots are recent. Stale data remains available to explicit outage
+  // recovery paths, where the UI labels it as a local cache.
+  if (!allowStale && (!quoteIsFresh(quote) || !snapshotTimestampIsFresh(payload.fetched_at))) return false;
+  delete view.chan;
   state.expiration = cached.expiration;
   state.expirationOptions = cloneClientSnapshot(cached.expirationOptions || []);
   state.lastQuote = quote;
@@ -368,6 +407,10 @@ function restoreClientSnapshot(symbol, expiration = "") {
   state.chainFetchedAt = cached.chainFetchedAt || payload.fetched_at || null;
   state.chainFetchedSymbol = cached.chainFetchedSymbol || symbol;
   state.chainFetchedExpiration = cached.chainFetchedExpiration || cached.expiration;
+  state.displayedChainSymbol = symbol;
+  state.displayedChainExpiration = cached.expiration || state.expiration;
+  state.displayedChainFetchedAt = payload.fetched_at || state.chainFetchedAt || null;
+  state.displayedLevelsContext = [symbol, state.expiration, state.levelBasisMode].join("|");
   state.analysisReady = Boolean(cached.analysisReady);
   Object.assign(state.view, view);
   if (quoteIsETF(quote)) applyETFValuationDefaults();
@@ -395,7 +438,7 @@ function restoreClientSnapshot(symbol, expiration = "") {
 
 function markApiUnavailable(message) {
   if (!hasRenderableClientSnapshot()) {
-    if (!restoreClientSnapshot(state.symbol, state.expiration)) return false;
+    if (!restoreClientSnapshot(state.symbol, state.expiration, true)) return false;
   }
   const detail = message || "API 暂不可用";
   state.view.lastStatus = `${detail}，保留本地缓存，等待 API 恢复`;
@@ -442,9 +485,24 @@ function initTheme() {
   applyTheme(stored === "dark" ? "dark" : "light");
 }
 
+// 手动选择优先于默认值；同一标签页内跨标的、刷新页面均保留。
+function readFoldState(storageKey, defaultExpanded) {
+  if (!storageKey) return defaultExpanded;
+  try {
+    const stored = sessionStorage.getItem(storageKey);
+    if (stored === "1") return true;
+    if (stored === "0") return false;
+  } catch (error) { /* 浏览器禁用存储时使用默认值。 */ }
+  return defaultExpanded;
+}
+
+function rememberFoldState(storageKey, expanded) {
+  if (!storageKey) return;
+  try { sessionStorage.setItem(storageKey, expanded ? "1" : "0"); } catch (error) { /* 存储不可用时保留当前页面状态。 */ }
+}
+
 // 折叠组通用逻辑：内容体用 hidden 控制显隐（[hidden] 在 flex/grid 上下文里会被覆盖，样式里补了 [hidden]{display:none}），
-// 按钮同步 aria-expanded 与「展开/收起」文案，展开状态记在 sessionStorage——同一标签页里换标的、跳 URL 不必重复展开，
-// 关掉标签页就回到各自默认状态（趋势分析默认展开、期权分析与期权链默认折叠、图表默认展开）。
+// 按钮同步 aria-expanded 与「展开/收起」文案，并在 sessionStorage 中保存状态。
 function bindFoldGroup({ headerId, toggleId, bodyId, actionId, storageKey, defaultExpanded, onChange, shouldIgnore }) {
   const header = byId(headerId);
   const body = byId(bodyId);
@@ -457,18 +515,16 @@ function bindFoldGroup({ headerId, toggleId, bodyId, actionId, storageKey, defau
     if (action) action.textContent = expanded ? "收起" : "展开";
     if (onChange) onChange(expanded);
   };
-  let stored = null;
-  try { stored = sessionStorage.getItem(storageKey); } catch (error) { stored = null; }
-  apply(stored === null ? defaultExpanded : stored === "1");
+  apply(readFoldState(storageKey, defaultExpanded));
   header.addEventListener("click", (event) => {
     if (shouldIgnore && shouldIgnore(event)) return;
     const expanded = body.hidden;
     apply(expanded);
-    try { sessionStorage.setItem(storageKey, expanded ? "1" : "0"); } catch (error) { /* 隐私模式等写入失败时忽略 */ }
+    rememberFoldState(storageKey, expanded);
   });
 }
 
-// 分析详情折叠组：趋势通道、加仓价位与压力位/支撑位四张明细表，默认展开。
+// 分析详情折叠组：默认展开，使用原存储键恢复已有的手动选择。
 const DETAIL_KEY = "option-scope-detail-v2";
 
 function initDetailGroup() {
@@ -506,7 +562,7 @@ function initChainGroup() {
   });
 }
 
-// 图表折叠组：Gamma 敞口、压力位/支撑位、成交量分布、持仓量分布四张图表，默认展开。
+// 图表折叠组：默认展开，位置变化不影响已保存的手动选择。
 const CHART_KEY = "option-scope-charts";
 
 function initChartGroup() {
@@ -676,6 +732,50 @@ function snapshotAgeSeconds(fetchedAt) {
   return Number.isNaN(time) ? null : Math.max((syncedNow() - time) / 1000, 0);
 }
 
+function snapshotTimestampIsFresh(fetchedAt, maxAgeSeconds = SNAPSHOT_FRESH_SECONDS) {
+  const age = snapshotAgeSeconds(fetchedAt);
+  return age !== null && age <= maxAgeSeconds;
+}
+
+function quoteIsFresh(quote, maxAgeSeconds = SNAPSHOT_FRESH_SECONDS) {
+  return quoteIsReady(quote) && snapshotTimestampIsFresh(quote?.fetched_at, maxAgeSeconds);
+}
+
+function quoteIsUsableSQLiteSnapshot(quote, symbol = state.symbol) {
+  const fetchedAt = quote?.fetched_at ? new Date(quote.fetched_at).getTime() : NaN;
+  return quote?.source === "sqlite"
+    && quoteIsReady(quote)
+    && (!quote.symbol || quote.symbol === symbol)
+    && Number.isFinite(fetchedAt);
+}
+
+function latestFreshQuote(symbol, ...quotes) {
+  return quotes
+    .filter((quote) => quoteIsFresh(quote) && (!quote.symbol || quote.symbol === symbol))
+    .sort((left, right) => new Date(right.fetched_at).getTime() - new Date(left.fetched_at).getTime())[0] || null;
+}
+
+function latestRenderableQuote(symbol, ...quotes) {
+  return latestFreshQuote(symbol, ...quotes)
+    || quotes.filter((quote) => quoteIsUsableSQLiteSnapshot(quote, symbol))
+      .sort((left, right) => new Date(right.fetched_at).getTime() - new Date(left.fetched_at).getTime())[0]
+    || null;
+}
+
+function quoteAndChainAreAligned(quote, fetchedAt, allowStaleSQLite = false) {
+  const cachedPair = allowStaleSQLite && quoteIsUsableSQLiteSnapshot(quote);
+  if ((!cachedPair && !quoteIsFresh(quote)) || !fetchedAt) return false;
+  if (!cachedPair && !snapshotTimestampIsFresh(fetchedAt)) return false;
+  const quoteAt = new Date(quote.fetched_at).getTime();
+  const chainAt = new Date(fetchedAt).getTime();
+  if (!Number.isFinite(quoteAt) || !Number.isFinite(chainAt)) return false;
+  // SQLite quote and option-chain batches are stored independently. A quote
+  // refresh can be newer than the latest cached chain by much more than 15s;
+  // both are still useful as a first paint while the coordinated refresh runs.
+  if (cachedPair) return true;
+  return Math.abs(quoteAt - chainAt) <= SNAPSHOT_FRESH_SECONDS * 1000;
+}
+
 function analysisRefreshBlocking(now = Date.now()) {
   return state.analysisBlockUntil > now;
 }
@@ -711,6 +811,7 @@ function applyPushedSnapshotPayload(message) {
   if (!quote || !chain?.data?.length || message.symbol !== state.symbol) return false;
   if (chain.expiration && state.expiration && chain.expiration !== state.expiration) return false;
   const loadId = state.loadId;
+  if (!quoteAndChainAreAligned(quote, chain.fetched_at)) return false;
   applyCachedQuote(quote);
   renderQuote(quote);
   renderChain(chain, quote, state.lastAnalysis?.analysisPayload || null);
@@ -755,8 +856,10 @@ function closePushStream() {
 }
 
 function queuePushedAnalyticsRefresh(symbol, loadId, eventId) {
+  if (symbol !== state.symbol || loadId !== state.loadId) return;
   if (eventId && eventId === state.analyticsRefreshEventId) return;
   if (eventId) state.analyticsRefreshEventId = eventId;
+  refreshChanAnalysis(true);
   state.pendingAnalyticsRefresh = { symbol, loadId, eventId, attempts: 0 };
   schedulePushedAnalyticsRefresh();
 }
@@ -776,6 +879,8 @@ function schedulePushedAnalyticsRefresh() {
     const encodedSymbol = encodeURIComponent(current.symbol);
     request(`/api/quote/${encodedSymbol}`).then((quote) => {
       if (current.symbol !== state.symbol || current.loadId !== state.loadId || quote?.symbol !== current.symbol) return;
+      quote = latestFreshQuote(current.symbol, quote, state.lastQuote);
+      if (!quote) return;
       applyCachedQuote(quote);
       renderQuote(quote);
       const points = state.lastAnalysis?.points;
@@ -841,12 +946,13 @@ function connectPushStream(symbol = state.symbol) {
       const pushedQuote = message.payload?.quote;
       if (pushedQuote?.symbol === symbol) {
         applyCachedQuote(pushedQuote);
-        renderQuote(pushedQuote);
+        renderQuote(pushedQuote, message.kind === "fair_value");
         return;
       }
+      const allowStaleValuation = message.kind === "fair_value";
       const loadId = state.loadId;
-      request(`/api/quote/${encodeURIComponent(symbol)}`).then((quote) => {
-        if (symbol === state.symbol && loadId === state.loadId && quote?.symbol === symbol) renderQuote(quote);
+    request(`/api/quote/${encodeURIComponent(symbol)}`).then((quote) => {
+        if (symbol === state.symbol && loadId === state.loadId && quote?.symbol === symbol) renderQuote(quote, allowStaleValuation);
       }).catch(() => {});
       return;
     }
@@ -886,7 +992,7 @@ function connectPushStream(symbol = state.symbol) {
         || currentQuote.fair_value_status === "retry")) {
       const loadId = state.loadId;
       request(`/api/quote/${encodeURIComponent(symbol)}`).then((quote) => {
-        if (symbol === state.symbol && loadId === state.loadId && quote?.symbol === symbol) renderQuote(quote);
+        if (symbol === state.symbol && loadId === state.loadId && quote?.symbol === symbol) renderQuote(quote, true);
       }).catch(() => {});
     }
     if (symbol === state.symbol && !document.hidden && !state.loading && !state.refreshInFlight) {
@@ -929,7 +1035,26 @@ function scheduleAutoRefresh() {
   }
 }
 function formatNumber(value, digits = 0) { if (value === null || value === undefined || value === "") return "--"; return Number(value).toLocaleString("en-US", { maximumFractionDigits: digits }); }
-function formatMoney(value) { return value == null ? "--" : Number(value).toFixed(2); }
+function moneyDecimals(value) {
+  const number = Math.abs(Number(value));
+  if (!Number.isFinite(number)) return 2;
+  if (number >= 1) return 2;
+  if (number >= 0.1) return 3;
+  if (number >= 0.01) return 4;
+  if (number >= 0.001) return 5;
+  if (number >= 0.0001) return 6;
+  if (number >= 0.00001) return 7;
+  return 8;
+}
+function formatMoney(value) {
+  if (value == null) return "--";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  const fixed = number.toFixed(moneyDecimals(number));
+  if (!fixed.includes(".")) return fixed;
+  const compact = fixed.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
+  return compact.includes(".") ? compact : `${compact}.00`;
+}
 // 买卖报价允许为 0（例如深度价外合约），只有缺失或非数字时显示占位符。
 function formatOptionQuote(value) {
   if (value === null || value === undefined || value === "") return "--";
@@ -1326,6 +1451,42 @@ function buildSimpleLevelViews(levels, spot, side, valueOf, formatValue, metricL
   }, index, spot, side));
 }
 
+function commitLevelViews(next, preserveEmpty = false) {
+  const context = [state.symbol, state.expiration, state.levelBasisMode].join("|");
+  const sameContext = state.displayedLevelsContext === context;
+  const previous = state.view.levels;
+  const usableRows = (rows) => (Array.isArray(rows) ? rows : []).filter((row) =>
+    row && !row.placeholder && Number.isFinite(Number(row.price)) && Number(row.price) > 0);
+  for (const key of ["resistance", "support", "add"]) {
+    if (!Array.isArray(next[key])) continue;
+    const incoming = usableRows(next[key]);
+    const keepPrevious = preserveEmpty && sameContext && incoming.length === 0 && usableRows(previous[key]).length > 0;
+    state.view.levels[key] = keepPrevious ? previous[key] : incoming;
+  }
+  state.displayedLevelsContext = context;
+  return state.view.levels;
+}
+
+function sameDisplayedLevelContext() {
+  return state.displayedLevelsContext === [state.symbol, state.expiration, state.levelBasisMode].join("|");
+}
+
+function renderCommittedLevelsChart(spot) {
+  const chartRows = (rows) => (rows || []).filter((row) =>
+    row && !row.placeholder && Number.isFinite(Number(row.price)) && Number(row.price) > 0)
+    .map((row) => ({
+      price: Number(row.price),
+      score: Number(row.score) || 0,
+      probability: row.probability,
+      factors: Array.isArray(row.factors) ? row.factors : String(row.factors || "").split(" · "),
+    }));
+  OptionScopeCharts.renderLevelsChart({
+    spot,
+    resistance: chartRows(state.view.levels.resistance),
+    support: chartRows(state.view.levels.support),
+  });
+}
+
 // 单因子回退时把选出的行权价转成柱状图口径：综合强度按本侧最大值归一（与多因子接口一致）。
 function fallbackLevelSeries(picked, valueOf, metricLabel) {
   const peak = Math.max(0, ...picked.map(valueOf)) || 1;
@@ -1353,18 +1514,24 @@ function renderLevels(points, spot) {
   }
   state.view.chart.levelsBasis = Number.isFinite(price) && price > 0 ? `基准 ${formatMoney(price)}` : "基准 --";
   if (!points.length || !Number.isFinite(price) || price <= 0) {
-    state.view.levels.resistance = [];
-    state.view.levels.support = [];
-    state.view.levels.add = [];
-    state.view.levels.placeholder = false;
-    state.view.levels.resistanceNote = `现价上方持仓最集中的 ${LEVEL_COUNT} 个价位`;
-    state.view.levels.supportNote = `现价下方持仓最集中的 ${LEVEL_COUNT} 个价位`;
-    state.view.levels.resistanceEmpty = "暂无数据";
-    state.view.levels.supportEmpty = "暂无数据";
-    state.view.levels.addEmpty = "暂无数据";
-    OptionScopeCharts.renderLevelsChart(null);
-    renderTrend(null);
-    renderPlan(null, price);
+    // SSE refresh temporarily clears fetched-snapshot validation fields, even
+    // though valid rows for this selected symbol/expiry/basis remain visible.
+    const preserveDisplayedLevels = sameDisplayedLevelContext() || displayedSnapshotContextMatches();
+    if (!preserveDisplayedLevels) OptionScopeCharts.renderLevelsChart(null);
+    const hasChanAnalysis = renderCurrentChanMarketAnalysis(price, preserveDisplayedLevels);
+    if (!preserveDisplayedLevels && !hasChanAnalysis) {
+      state.view.levels.resistance = [];
+      state.view.levels.support = [];
+      state.view.levels.add = [];
+      state.view.levels.placeholder = false;
+      state.view.levels.resistanceNote = `现价上方持仓最集中的 ${LEVEL_COUNT} 个价位`;
+      state.view.levels.supportNote = `现价下方持仓最集中的 ${LEVEL_COUNT} 个价位`;
+      state.view.levels.resistanceEmpty = "暂无数据";
+      state.view.levels.supportEmpty = "暂无数据";
+      state.view.levels.addEmpty = "暂无数据";
+      if (state.trendHistorySymbol !== state.symbol) renderTrend(null);
+      renderPlan(null, price);
+    }
     return;
   }
   const openInterest = points.reduce((sum, point) => sum + point.callOi + point.putOi, 0);
@@ -1381,25 +1548,38 @@ function renderLevels(points, spot) {
   const resistance = pickLevels(points, price, "above", callValue);
   const support = pickLevels(points, price, "below", putValue);
   const planSupport = pickLevels(points, price, "below", putValue, PLAN_COUNT * 2);
-  state.view.levels.resistance = buildSimpleLevelViews(resistance, price, "resistance", callValue, formatValue, metricLabel);
-  state.view.levels.support = buildSimpleLevelViews(support, price, "support", putValue, formatValue, metricLabel);
+  const keepCurrentLevels = sameDisplayedLevelContext();
+  const levelUpdates = {
+    resistance: buildSimpleLevelViews(resistance, price, "resistance", callValue, formatValue, metricLabel),
+    support: buildSimpleLevelViews(support, price, "support", putValue, formatValue, metricLabel),
+  };
+  // A new expiry/basis starts a new result set. Do not carry the prior add
+  // prices into that context if the fallback has no add candidates.
+  if (!keepCurrentLevels) levelUpdates.add = [];
+  commitLevelViews(levelUpdates, true);
   state.view.levels.placeholder = false;
-  state.view.levels.add = [];
-  state.view.levels.addEmpty = "暂无多因子加仓数据";
+  state.view.levels.addEmpty = state.view.levels.add.length ? "" : "暂无多因子加仓数据";
   // 单因子回退时柱状图按同一批行权价绘制，综合强度按本侧最大值归一。
   const resistanceSeries = fallbackLevelSeries(resistance, callValue, metricLabel);
   const supportSeries = fallbackLevelSeries(support, putValue, metricLabel);
-  OptionScopeCharts.renderLevelsChart({ spot: price, resistance: resistanceSeries, support: supportSeries });
-  // 回退口径没有日线历史，趋势通道留空；买卖点先展示期权候选的快速估算。
-  const provisionalTradePoints = clientTradePoints(state.view.levels.support, state.view.levels.resistance, price);
-  if (provisionalTradePoints.buy || provisionalTradePoints.sell) {
-    renderTrend(null, null, price, null, null, provisionalTradePoints);
-  } else {
-    renderTrend(null);
+  if (resistance.length || support.length || !keepCurrentLevels) {
+    renderCommittedLevelsChart(price);
   }
-  const planSupportSeries = fallbackLevelSeries(planSupport, putValue, metricLabel);
-  const planSplit = Math.min(PLAN_COUNT, Math.ceil(planSupportSeries.length / 2));
-  renderPlan({ add: planSupportSeries.slice(planSplit, planSplit + PLAN_COUNT) }, price);
+  // 回退口径没有日线历史，趋势通道留空；买卖点先展示期权候选的快速估算。
+  const hasChanAnalysis = renderCurrentChanMarketAnalysis(price, true);
+  if (!hasChanAnalysis) {
+    const provisionalTradePoints = clientTradePoints(state.view.levels.support, state.view.levels.resistance, price);
+    if (provisionalTradePoints.buy || provisionalTradePoints.sell) {
+      renderTrend(null, null, price, null, null, provisionalTradePoints);
+    } else {
+      renderTrend(null);
+    }
+  }
+  if (planSupport.length || !state.view.levels.add.some((level) => !level.placeholder)) {
+    const planSupportSeries = fallbackLevelSeries(planSupport, putValue, metricLabel);
+    const planSplit = Math.min(PLAN_COUNT, Math.ceil(planSupportSeries.length / 2));
+    renderPlan({ add: planSupportSeries.slice(planSplit, planSplit + PLAN_COUNT) }, price);
+  }
 }
 
 // 原始日线到达浏览器后，在本地完成不会产生副作用的计算。买方结构先使用报价回退，
@@ -1531,7 +1711,10 @@ function serverLevelsHasCompleteFields(payload) {
   return Boolean(
     payload
     && payload.trade_points
-    && levels.length > 0
+    && levels.some((level) => {
+      const price = Number(level?.price ?? level?.strike);
+      return Number.isFinite(price) && price > 0;
+    })
     && levels.every((level) => Object.prototype.hasOwnProperty.call(level, "probability")
       && Object.prototype.hasOwnProperty.call(level, "strength_tier")),
   );
@@ -1615,6 +1798,8 @@ function clientTradePoints(support, resistance, spot) {
 }
 
 function renderClientRaw(payload, points, spot) {
+  if (payload?.symbol && payload.symbol !== state.symbol) return;
+  if (payload?.expiration && state.expiration && payload.expiration !== state.expiration) return;
   const serverPayload = state.serverLevelsPayload;
   const bars = clientBars(payload); const trend = clientTrend(bars); const extremes = payload?.extremes || clientExtremes(bars);
   const rawRows = Array.isArray(payload?.options) && payload.options.length ? payload.options : null;
@@ -1635,13 +1820,16 @@ function renderClientRaw(payload, points, spot) {
   applyEarnings(payload?.earnings);
   state.view.chart.levelsBasis = Number.isFinite(Number(spot)) && Number(spot) > 0 ? `基准 ${formatMoney(Number(spot))}` : "基准 --";
   state.view.levels.placeholder = false;
-  state.view.levels.resistance = renderSide(displayedResistance, "resistance");
-  state.view.levels.support = renderSide(displayedSupport, "support");
   const addLevels = hasServerLevels && Array.isArray(serverPayload.plan?.add)
     ? serverPayload.plan.add
     : displayedSupport.slice(Math.ceil(displayedSupport.length / 2), Math.ceil(displayedSupport.length / 2) + PLAN_COUNT);
   const allSupport = displayedSupport.slice().sort((a, b) => a.price - b.price);
-  state.view.levels.add = renderSide(addLevels, "support", true);
+  const keepCurrentLevels = sameDisplayedLevelContext();
+  commitLevelViews({
+    resistance: renderSide(displayedResistance, "resistance"),
+    support: renderSide(displayedSupport, "support"),
+    add: renderSide(addLevels, "support", true),
+  }, true);
   const serverNote = hasServerLevels
     ? (serverPayload?._staleBasis ? "服务端综合结果 · 正在更新基准价，暂用上一份口径" : "服务端综合结果 · 暂用上一份快照")
     : `客户端计算 · ${displayedMetric}`;
@@ -1678,26 +1866,32 @@ function renderClientRaw(payload, points, spot) {
       };
     }
   }
-  OptionScopeCharts.renderLevelsChart({ spot, resistance: displayedResistance, support: displayedSupport });
+  if (displayedResistance.length || displayedSupport.length || !keepCurrentLevels) {
+    renderCommittedLevelsChart(spot);
+  }
   const tradePointContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
   const provisionalTradePoints = hasServerLevels
     ? serverPayload.trade_points
     : clientTradePoints(displayedSupport, displayedResistance, spot);
   const stableTradePoints = stabilizeTradePoints(provisionalTradePoints, tradePointContext);
-  renderTrend(
-    hasServerLevels && serverPayload.trend ? serverPayload.trend : trend,
-    hasServerLevels && serverPayload.extremes ? serverPayload.extremes : extremes,
-    spot,
-    hasServerLevels && serverPayload.history ? serverPayload.history : payload.history,
-    hasServerLevels ? serverPayload?.recommendation || null : null,
-    stableTradePoints,
-    serverPayload?.trade_points_horizon || null,
-    payload.trend_market,
-    payload.beta || (hasServerLevels ? serverPayload?.beta : null) || null,
-    hasServerLevels ? serverPayload?.stop_loss || null : null,
-    hasServerLevels ? (serverPayload?.support || []) : displayedSupport,
-  );
-  renderPlan({ add: addLevels }, spot);
+  if ((hasServerLevels && serverPayload.trend) || !renderCurrentChanMarketAnalysis(spot, true)) {
+    renderTrend(
+      hasServerLevels && serverPayload.trend ? serverPayload.trend : trend,
+      hasServerLevels && serverPayload.extremes ? serverPayload.extremes : extremes,
+      spot,
+      hasServerLevels && serverPayload.history ? serverPayload.history : payload.history,
+      hasServerLevels ? serverPayload?.recommendation || null : null,
+      stableTradePoints,
+      serverPayload?.trade_points_horizon || null,
+      payload.trend_market,
+      payload.beta || (hasServerLevels ? serverPayload?.beta : null) || null,
+      hasServerLevels ? serverPayload?.stop_loss || null : null,
+      hasServerLevels ? (serverPayload?.support || []) : displayedSupport,
+    );
+  }
+  if (hasServerLevels || state.chanPayload?.symbol !== state.symbol || !state.chanPayload?.market_analysis) {
+    renderPlan({ add: addLevels }, spot);
+  }
   refreshQuoteWithTrendClose();
   rememberClientSnapshot();
 }
@@ -1948,6 +2142,11 @@ function spotCacheBucket(value) {
 // 前端只负责渲染；同一标的、同一到期日、同一快照只请求一次，图表尺寸变化时复用已有结果。
 function loadFactorLevels(points, spot) {
   if (!points.length || !state.expiration) { renderLevels(points, spot); return; }
+  const hasSelectedChain = (state.chainFetchedSymbol === state.symbol && state.chainFetchedExpiration === state.expiration)
+    || (state.displayedChainSymbol === state.symbol && state.displayedChainExpiration === state.expiration);
+  // Chart resize/basis changes can fire while the selector already points at a
+  // new expiry but lastAnalysis still belongs to the expiry that was just left.
+  if (!hasSelectedChain) return;
   // 缓存键带上基准价口径：两个口径取到同一价格时（盘后/夜盘时段）也各自成键，切换必然重绘一次。
   // 现价按与后端相同的格子去重：格子内不再请求价位接口，跨出格子才用精确现价重算。
   // 不把 Gamma 窗口时间放进键。窗口完成后现价和选中期限都没变时，不再重算这组价位。
@@ -1960,7 +2159,11 @@ function loadFactorLevels(points, spot) {
     return;
   }
   const previousServerContext = state.serverLevelsContext;
-  const previousRawPayload = state.levelsPayload?.raw ? state.levelsPayload : null;
+  const previousRawPayload = state.levelsPayload?.raw
+    && state.levelsPayload.symbol === state.symbol
+    && state.levelsPayload.expiration === state.expiration
+    ? state.levelsPayload
+    : null;
   const previousContextParts = String(state.serverLevelsContext || "").split("|");
   const sameSymbolExpiration = previousContextParts[0] === state.symbol
     && previousContextParts[1] === state.expiration;
@@ -2102,7 +2305,9 @@ function levelDetailText(level) {
 }
 
 function buildFactorViews(levels, spot, side, isAdd = false) {
-  return (levels || []).map((level, index) => buildLevelView(level, index, spot, side, isAdd));
+  return (levels || [])
+    .map((level, index) => buildLevelView(level, index, spot, side, isAdd))
+    .filter((level) => Number.isFinite(level.price) && level.price > 0);
 }
 
 // 高低点行：52 周与历史最高/最低价（取自日线最高/最低价；悬停显示发生日期与距现价）。
@@ -2441,16 +2646,16 @@ function stabilizeTradePoints(points, context) {
 }
 
 // 交易计划价位表：价位区间 / 距现价 / 触及概率 / 综合依据；强化标签放在说明行。
-function renderPlanRows(levels, spot) {
-  state.view.levels.add = buildFactorViews(levels, spot, "support", true);
-  state.view.levels.addEmpty = levels?.length ? "" : "暂无可用价位";
+function renderPlanRows(levels, spot, preserveEmpty = true) {
+  commitLevelViews({ add: buildFactorViews(levels, spot, "support", true) }, preserveEmpty);
+  state.view.levels.addEmpty = state.view.levels.add.length ? "" : "暂无可用价位";
   state.view.levels.placeholder = false;
 }
 
 // 交易计划：前端只展示更深一档的加仓支撑，推荐买入与卖出直接看支撑位/压力位面板。
-function renderPlan(plan, spot) {
+function renderPlan(plan, spot, preserveEmpty = true) {
   const price = Number(spot);
-  renderPlanRows(plan?.add || [], price);
+  renderPlanRows(plan?.add || [], price, preserveEmpty);
 }
 
 // 期权报价可能在同一个 fetched_at 批次内被补写；缓存键不能只看行数，否则会继续展示旧的 IV/价差估算。
@@ -2505,6 +2710,8 @@ function renderClientBuyerFallback(rows, spot, support = [], resistance = [], di
 }
 
 function renderFactorLevels(payload) {
+  if (payload?.symbol && payload.symbol !== state.symbol) return;
+  if (payload?.expiration && state.expiration && payload.expiration !== state.expiration) return;
   applyEarnings(payload?.earnings);
   const spot = Number(payload?.spot);
   state.view.chart.levelsBasis = Number.isFinite(spot) && spot > 0 ? `基准 ${formatMoney(spot)}` : "基准 --";
@@ -2521,11 +2728,17 @@ function renderFactorLevels(payload) {
   state.view.levels.placeholder = false;
   state.view.levels.resistanceNote = scope + basisNote;
   state.view.levels.supportNote = scope + basisNote;
-  state.view.levels.resistance = buildFactorViews(payload?.resistance || [], spot, "resistance");
-  state.view.levels.support = buildFactorViews(payload?.support || [], spot, "support");
+  const completeLevels = serverLevelsHasCompleteFields(payload);
+  const keepCurrentLevels = sameDisplayedLevelContext();
+  const resistanceViews = buildFactorViews(payload?.resistance || [], spot, "resistance");
+  const supportViews = buildFactorViews(payload?.support || [], spot, "support");
+  const addViews = buildFactorViews(payload?.plan?.add || [], spot, "support", true);
+  commitLevelViews({ resistance: resistanceViews, support: supportViews, add: addViews }, !completeLevels);
   state.view.levels.resistanceEmpty = "现价这一侧暂无可用价位";
   state.view.levels.supportEmpty = "现价这一侧暂无可用价位";
-  OptionScopeCharts.renderLevelsChart(payload);
+  if (resistanceViews.length || supportViews.length || completeLevels || !keepCurrentLevels) {
+    renderCommittedLevelsChart(spot);
+  }
   // 服务端没有返回可用结构时保留 raw 首屏的客户端候选，避免综合接口的空结果把页面清空。
   if (payload?.buyer_structures?.available
     && Array.isArray(payload.buyer_structures.items)
@@ -2541,8 +2754,11 @@ function renderFactorLevels(payload) {
     state.tradePointStability.pending = { buy: null, sell: null };
   }
   const stableTradePoints = stabilizeTradePoints(payload?.trade_points, tradePointContext);
-  renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null, payload?.stop_loss || null, payload?.support || []);
-  renderPlan(payload?.plan, spot);
+  const hasCachedHistoryAnalysis = Number(payload?.history?.bars) > 0 && payload?.trend;
+  if (hasCachedHistoryAnalysis || !renderCurrentChanMarketAnalysis(spot)) {
+    renderTrend(payload?.trend || null, payload?.extremes || null, spot, payload?.history || null, payload?.recommendation || null, stableTradePoints, payload?.trade_points_horizon || null, payload?.trend_market || null, payload?.beta || null, payload?.stop_loss || null, payload?.support || []);
+  }
+  if (completeLevels || addViews.length || !keepCurrentLevels) renderPlan(payload?.plan, spot, !completeLevels);
   refreshQuoteWithTrendClose();
   rememberClientSnapshot();
 }
@@ -2952,7 +3168,8 @@ function hasFairValueSnapshot(quote) {
 
 function mergeFairValueSnapshot(quote) {
   const previous = state.lastQuote;
-  if (!previous || !hasFairValueSnapshot(previous) || hasFairValueSnapshot(quote)) return quote;
+  if (quote?.symbol && quote.symbol !== state.symbol) return null;
+  if (!previous || previous.symbol !== quote?.symbol || !hasFairValueSnapshot(previous) || hasFairValueSnapshot(quote)) return quote;
   const merged = { ...previous, ...(quote || {}) };
   const fields = [
     "fair_value", "fair_value_low", "fair_value_high", "fair_value_buy_low", "fair_value_buy_high",
@@ -3004,7 +3221,137 @@ function applyETFValuationDefaults() {
   clearFairValuePoll();
 }
 
-function renderQuote(quote) {
+// 缠论与趋势卡片共用 SQLite 日线。不要让趋势展示等待期权链的 renderChain 流程：
+// 没有可用期权链时，缠论图表已有历史而趋势卡片会一直停在初始占位值。
+function hydrateTrendFromChan(payload, preferredSpot = null, preserveOptionLevels = false) {
+  if (!payload || payload.symbol !== state.symbol || !payload.market_analysis) return;
+  const analysis = payload.market_analysis;
+  const quote = state.lastQuote?.symbol === state.symbol ? state.lastQuote : null;
+  const spot = finitePrice(preferredSpot)
+    ?? finitePrice(activeSessionQuote(quote)?.price ?? quote?.price)
+    ?? finitePrice(payload.spot);
+  state.trendHistorySymbol = state.symbol;
+  renderTrend(analysis.trend || null, analysis.extremes || null, spot, payload.history || null,
+    analysis.recommendation || null, analysis.trade_points || null, analysis.trade_points_horizon || null,
+    analysis.trend_market || null, analysis.beta || null, analysis.stop_loss || null, analysis.support || []);
+  if (!preserveOptionLevels) {
+    const resistance = analysis.resistance || [];
+    const support = analysis.support || [];
+    const addLevels = analysis.plan?.add || [];
+    const keepCurrentLevels = sameDisplayedLevelContext();
+    state.view.levels.placeholder = false;
+    commitLevelViews({
+      resistance: buildFactorViews(resistance, Number(spot), "resistance"),
+      support: buildFactorViews(support, Number(spot), "support"),
+      add: buildFactorViews(addLevels, Number(spot), "support", true),
+    }, true);
+    state.view.levels.resistanceEmpty = "现价上方暂无历史观察价位";
+    state.view.levels.supportEmpty = "现价下方暂无历史观察价位";
+    state.view.levels.addEmpty = addLevels.length ? "" : "暂无可用历史加仓价位";
+    const source = "SQLite 日线计算 · 期权链尚不可用";
+    state.view.levels.resistanceNote = source;
+    state.view.levels.supportNote = source;
+    if (resistance.length || support.length || !keepCurrentLevels) {
+      OptionScopeCharts.renderLevelsChart({ spot, resistance, support });
+    }
+  }
+}
+
+function renderCurrentChanMarketAnalysis(spot, preserveOptionLevels = false) {
+  const payload = state.chanPayload;
+  if (payload?.symbol !== state.symbol || !payload.market_analysis) return false;
+  hydrateTrendFromChan(payload, spot, preserveOptionLevels);
+  return true;
+}
+
+function resetChanAnalysis() {
+  clearTimeout(state.chanRetryTimer);
+  state.chanRetryTimer = null;
+  state.chanRequestId += 1;
+  state.chanInFlightSymbol = "";
+  state.chanLastRequestedAt = 0;
+  state.chanRetryAttempts = 0;
+  state.chanLoading = false;
+  state.chanPayload = null;
+  state.chanRefreshPending = false;
+  state.view.chan = OptionScopeChan.empty();
+}
+
+function refreshChanAnalysis(force = false) {
+  const symbol = state.symbol;
+  if (!symbol) return;
+  if (state.chanInFlightSymbol === symbol) {
+    if (force) state.chanRefreshPending = true;
+    return;
+  }
+  if (!force && Date.now() - state.chanLastRequestedAt < 60000) return;
+  const token = ++state.chanRequestId;
+  state.chanInFlightSymbol = symbol;
+  state.chanLastRequestedAt = Date.now();
+  state.chanLoading = true;
+  clearTimeout(state.chanRetryTimer);
+  state.chanRetryTimer = null;
+  const currentQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
+  const currentSpot = finitePrice(activeSessionQuote(currentQuote)?.price ?? currentQuote?.price);
+  const spotQuery = currentSpot != null ? `?spot=${encodeURIComponent(currentSpot)}` : "";
+  request(`/api/chan/${encodeURIComponent(symbol)}${spotQuery}`).then((payload) => {
+    if (state.symbol !== symbol || state.chanRequestId !== token || payload?.symbol !== symbol) return;
+    const liveQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
+    const liveSpot = finitePrice(activeSessionQuote(liveQuote)?.price ?? liveQuote?.price);
+    state.chanPayload = OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload);
+    state.view.chan = OptionScopeChan.view(state.chanPayload);
+    hydrateTrendFromChan({ ...payload, spot: liveSpot ?? payload.spot }, null,
+      displayedSnapshotContextMatches() || sameDisplayedLevelContext());
+    // SSE normally refreshes history completion immediately. Bounded retry
+    // also covers symbols without options and browsers without EventSource.
+    if (payload.history?.refreshing && state.chanRetryAttempts < 12) {
+      state.chanRetryAttempts += 1;
+      state.chanRetryTimer = setTimeout(() => {
+        state.chanRetryTimer = null;
+        if (state.symbol === symbol) refreshChanAnalysis(true);
+      }, Math.min(15000, 3000 + state.chanRetryAttempts * 1000));
+    } else if (!payload.history?.refreshing) { state.chanRetryAttempts = 0; }
+  }).catch((error) => {
+    if (state.symbol !== symbol || state.chanRequestId !== token) return;
+    if (!state.view.chan.available) state.view.chan = OptionScopeChan.empty("缠论分析暂不可用，等待历史行情或下次刷新");
+    state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), `结构更新失败：${error.message}`])];
+  }).finally(() => {
+    if (state.chanRequestId !== token) return;
+    state.chanLoading = false;
+    state.chanInFlightSymbol = "";
+    if (state.chanRefreshPending) {
+      state.chanRefreshPending = false;
+      refreshChanAnalysis(true);
+    }
+  });
+}
+
+function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket = false) {
+  if (!quote || (quote.symbol && quote.symbol !== state.symbol)) return;
+  const previous = state.lastQuote;
+  let incomingAt = quote?.fetched_at ? new Date(quote.fetched_at).getTime() : null;
+  const previousAt = previous?.fetched_at ? new Date(previous.fetched_at).getTime() : null;
+  if (!quoteIsFresh(quote)) {
+    // A saved SQLite quote is useful immediately on a cold page load even when
+    // the provider refresh has not completed. It must never roll back a newer
+    // quote already visible for the same symbol.
+    if (allowStaleSQLiteMarket && quoteIsUsableSQLiteSnapshot(quote)) {
+      // Continue through the normal render path below.
+    } else {
+      // Valuation events can carry the last market snapshot timestamp. Apply
+      // their valuation fields to the latest fresh quote without rolling its
+      // price, session label, or analysis back.
+      if (!allowStaleValuation || previous?.symbol !== state.symbol || !quoteIsFresh(previous) || !hasFairValueSnapshot(quote)) return;
+      const valuationFields = Object.fromEntries(Object.entries(quote).filter(([key]) =>
+        key === "fair_value" || key.startsWith("fair_value_") || key === "earnings"));
+      quote = { ...previous, ...valuationFields };
+      incomingAt = previousAt;
+    }
+  }
+  // Parallel REST reads can complete after a newer SSE quote. Never let an
+  // older market snapshot roll the visible price, session label, or analysis back.
+  if (previous?.symbol === state.symbol && Number.isFinite(incomingAt)
+    && Number.isFinite(previousAt) && incomingAt < previousAt) return;
   const mergedQuote = mergeFairValueSnapshot(quote);
   if (!mergedQuote) return;
   quote = mergedQuote;
@@ -3023,9 +3370,16 @@ function renderQuote(quote) {
   // 涨跌色统一走 --up / --down：当前全局口径是绿涨红跌，变量名不再写死颜色。
   state.view.quoteChangeColor = change == null ? "var(--muted)" : (change < 0 ? "var(--down)" : "var(--up)");
   state.view.quoteCurrency = quote?.currency || "USD";
-  state.view.quoteMarket = quoteMarketLabel(quote);
+  state.view.quoteMarket = quote?.source === "sqlite" && !quoteIsFresh(quote)
+    ? `缓存 · ${quoteMarketLabel(quote)}`
+    : quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
+  if (state.chanPayload?.symbol === state.symbol) {
+    state.chanPayload = OptionScopeChan.withSpot(state.chanPayload, finitePrice(price));
+    state.view.chan = OptionScopeChan.view(state.chanPayload);
+  }
+  refreshChanAnalysis();
   state.view.quoteReference = reference.text;
   state.view.quoteReferenceTitle = reference.title;
   if (quoteIsETF(quote)) {
@@ -3113,7 +3467,7 @@ async function pollFairValue(key) {
     if ((quote?.fair_value_source?.startsWith("valuation_") && quote?.fair_value != null)
       || ["retry", "unavailable", "failed"].includes(String(quote?.fair_value_status || ""))) {
       resolved = true;
-      renderQuote(quote);
+      renderQuote(quote, true);
       if (quote?.fair_value_status === "retry") {
         resolved = false;
         scheduleFairValuePoll(quote);
@@ -3395,9 +3749,36 @@ function renderChainTable() {
 }
 
 function renderChain(payload, quote, analysisPayload) {
+  if (payload?.symbol && payload.symbol !== state.symbol) return;
   // 晚到的旧期限不能把下拉框拽回去，也不能盖掉用户刚选的链。
   if (payload?.expiration && state.expiration && payload.expiration !== state.expiration) return;
-  const rows = payload.data || [];
+  const rows = Array.isArray(payload?.data) ? payload.data : [];
+  const incomingExpiration = payload?.expiration || state.expiration;
+  // SQLite/upstream may briefly return an empty chain while another refresh is
+  // replacing it. Do not let that transient response erase a visible snapshot;
+  // explicit no-options handling clears the page through loadQuoteOnly instead.
+  if (!rows.length
+    && state.displayedChainSymbol === state.symbol
+    && state.displayedChainExpiration === incomingExpiration) {
+    state.view.lastStatus = "期权链暂时返回空数据，保留上一份显示并等待更新";
+    return;
+  }
+  const incomingFetchedAt = Date.parse(payload?.fetched_at || "");
+  const displayedFetchedAt = Date.parse(state.displayedChainFetchedAt || "");
+  if (rows.length
+    && state.displayedChainSymbol === state.symbol
+    && state.displayedChainExpiration === incomingExpiration
+    && Number.isFinite(incomingFetchedAt)
+    && Number.isFinite(displayedFetchedAt)
+    && incomingFetchedAt < displayedFetchedAt) return;
+  // The price-sensitive analysis needs a recent quote and a chain snapshot
+  // from the same short refresh window. A stale response is refreshed by the
+  // caller instead of briefly painting values that will immediately move.
+  const cachedChain = payload?.source === "sqlite";
+  quote = cachedChain
+    ? latestRenderableQuote(state.symbol, quote, state.lastQuote)
+    : latestFreshQuote(state.symbol, quote, state.lastQuote);
+  if (!quoteAndChainAreAligned(quote, payload?.fetched_at, cachedChain)) return;
   const basis = activeBasis(quote);
   const signature = [
     payload?.symbol,
@@ -3443,6 +3824,9 @@ function renderChain(payload, quote, analysisPayload) {
   state.chainFetchedAt = payload.fetched_at || null;
   state.chainFetchedSymbol = payload.symbol || state.symbol;
   state.chainFetchedExpiration = payload.expiration || state.expiration;
+  state.displayedChainSymbol = payload.symbol || state.symbol;
+  state.displayedChainExpiration = payload.expiration || state.expiration;
+  state.displayedChainFetchedAt = payload.fetched_at || null;
   renderAnalysis(analysisRows, quote?.price, analysisPayload, rows, payload.iv_model || {}, activeBasis(quote));
   if (state.pendingAnalyticsRefresh && state.lastAnalysis?.points?.length) schedulePushedAnalyticsRefresh();
   state.chainRows = rows; state.chainSpot = quote?.price ?? null;
@@ -3462,6 +3846,42 @@ function applyExpirations(dates, preferred, emptyLabel = "正在获取到期日�
   const requested = preferred || parsePageQuery(location.search).expiration || state.expiration;
   state.expiration = unique.includes(requested) ? requested : unique[0];
   return true;
+}
+
+function preferredCachedExpiration(dates, preferred, cachedDates) {
+  const available = new Set((cachedDates || []).filter(Boolean));
+  if (!available.size) return preferred;
+  if (preferred && available.has(preferred)) return preferred;
+  return dates.find((date) => available.has(date)) || [...available].sort()[0] || preferred;
+}
+
+async function renderCachedHistoryOnly(loadId, quote = null) {
+  const symbol = state.symbol;
+  const [quotePayload, cachedLevels] = await Promise.all([
+    Promise.resolve(quote).then((value) => value || request(`/api/quote/${encodeURIComponent(symbol)}`).catch(() => null)),
+    request(`/api/levels/${encodeURIComponent(symbol)}?raw=true`).catch(() => null),
+  ]);
+  if (!isCurrentLoad(loadId)) return;
+  const usableQuote = latestRenderableQuote(symbol, quotePayload, state.lastQuote);
+  if (usableQuote) renderQuote(usableQuote, false, quoteIsUsableSQLiteSnapshot(usableQuote));
+  if (cachedLevels?.raw && cachedLevels?.fast_levels) {
+    const levelsPayload = { ...cachedLevels, ...cachedLevels.fast_levels, raw: true };
+    renderFactorLevels(levelsPayload);
+    if (Number(levelsPayload.history?.bars) > 0) state.trendHistorySymbol = symbol;
+  } else if (state.chanPayload?.symbol === symbol && state.chanPayload.market_analysis) {
+    hydrateTrendFromChan(state.chanPayload);
+  }
+  state.view.chainTitle = `期权链 · ${symbol}`;
+  state.view.dataSource = "SQLite 行情/日线 · 无期权链缓存";
+  state.view.fetchedAt = usableQuote?.fetched_at ? `行情 ${formatTime(usableQuote.fetched_at)}` : "SQLite 暂无行情缓存";
+  state.view.totalCount = "0";
+  state.view.callVolume = "0";
+  state.view.putVolume = "0";
+  state.view.callInterest = "未平仓 0";
+  state.view.putInterest = "未平仓 0";
+  state.view.chainRows = [];
+  state.view.chainEmpty = "SQLite 目前没有期权合约缓存";
+  state.view.lastStatus = "已读取 SQLite 行情与日线缓存；该标的暂无期权链缓存";
 }
 
 function isCurrentLoad(loadId, expiration) {
@@ -3484,7 +3904,9 @@ function hasValidOptionQuotes(rows) {
 // 快照仍在新鲜期内时不再请求上游接口，只把本地缓存的状态回显给用户。
 function isSnapshotFresh(snapshot) {
   const age = snapshotAgeSeconds(snapshot?.fetchedAt);
-  return Boolean(snapshot?.shown && snapshot?.quoteReady && snapshot?.optionsQuotesReady) && age !== null && age < SNAPSHOT_FRESH_SECONDS;
+  return Boolean(snapshot?.shown && snapshot?.quoteReady && snapshot?.optionsQuotesReady)
+    && age !== null && age <= SNAPSHOT_FRESH_SECONDS
+    && quoteAndChainAreAligned(snapshot?.quote, snapshot?.fetchedAt);
 }
 
 function showFreshStatus(snapshot) {
@@ -3515,6 +3937,13 @@ function showChartSkeletons() {
 
 function showPending(message, preserveCache = false) {
   if (preserveCache && markApiUnavailable(message)) return;
+  // 自动刷新会先清空 chainFetchedSymbol/chainFetchedAt 使 SSE 响应重新校验，
+  // 但这不代表屏幕上的旧快照无效。同标的同期限仍有显示时只更新状态，不回退成 0 值骨架。
+  if (state.displayedChainSymbol === state.symbol
+    && state.displayedChainExpiration === state.expiration) {
+    state.view.lastStatus = `${message} · 保留当前显示，等待更新`;
+    return;
+  }
   const keepFairValue = state.lastQuote
     && state.lastQuote.symbol === state.symbol
     && hasFairValueSnapshot(state.lastQuote);
@@ -3553,7 +3982,14 @@ function showPending(message, preserveCache = false) {
   state.serverLevelsInFlightContext = "";
   state.serverLevelsInFlightKey = "";
   state.serverLevelsCooldownUntil = 0;
+  state.displayedLevelsContext = "";
+  const cachedHistoryAdd = state.trendHistorySymbol === state.symbol
+    ? state.view.levels.add.filter((level) => !level.placeholder) : [];
   state.view.levels = placeholderLevels(message || "正在加载");
+  if (cachedHistoryAdd.length) {
+    state.view.levels.add = cachedHistoryAdd;
+    state.view.levels.addEmpty = "";
+  }
   state.view.buyer = {
     available: false,
     directionLabel: "",
@@ -3565,8 +4001,11 @@ function showPending(message, preserveCache = false) {
   };
   state.buyerContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
   // 压力位图已在 showChartSkeletons 里铺好 0 值坐标，这里不再改回一句加载提示。
-  state.view.trend = placeholderTrend(message || "正在加载");
+  if (state.trendHistorySymbol !== state.symbol) state.view.trend = placeholderTrend(message || "正在加载");
   state.view.chainRows = [];
+  state.displayedChainSymbol = "";
+  state.displayedChainExpiration = "";
+  state.displayedChainFetchedAt = null;
   state.view.chainEmpty = message;
   state.view.chainHeatNote = "等待数据";
   chainRenderSignature = "";
@@ -3575,6 +4014,12 @@ function showPending(message, preserveCache = false) {
   // 旧标的的分析不能在等待新快照时被窗口缩放画回来。
   state.lastAnalysis = null;
   cancelScopeCharts();
+  // Keep the SQLite daily-history analysis visible while an option snapshot is
+  // unavailable. It is independent of the selected expiry and can repopulate
+  // the trend, add, support and resistance panels after their pending reset.
+  if (state.chanPayload?.symbol === state.symbol && state.chanPayload.market_analysis) {
+    hydrateTrendFromChan(state.chanPayload);
+  }
 }
 
 function applyCachedQuote(quote) {
@@ -3601,7 +4046,7 @@ function applyCachedQuote(quote) {
     if (quoteIsETF(null)) applyETFValuationDefaults();
     return;
   }
-  renderQuote(quote);
+  renderQuote(quote, false, quoteIsUsableSQLiteSnapshot(quote));
 }
 
 async function renderSnapshot(loadId, fallbackQuote = null) {
@@ -3645,8 +4090,10 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
     return null;
   }).then((result) => {
     if (!isCurrentLoad(loadId, expiration)) return null;
-    quote = quoteIsReady(result) && (!result.symbol || result.symbol === symbol) ? result : null;
-    const resolvedQuote = quote || (state.lastQuote?.symbol === symbol && quoteIsReady(state.lastQuote) ? state.lastQuote : usableFallback);
+    const incomingQuote = (quoteIsFresh(result) || quoteIsUsableSQLiteSnapshot(result, symbol)) ? result : null;
+    quote = latestRenderableQuote(symbol, incomingQuote, state.lastQuote, usableFallback);
+    if (!quote && result?.warning) quoteError = new Error(result.warning);
+    const resolvedQuote = latestRenderableQuote(symbol, quote, state.lastQuote, usableFallback);
     if (resolvedQuote) {
       applyCachedQuote(resolvedQuote);
       // 链先返回时先用缓存行情显示；quote 随后到达，再用准确现价重算分析区。
@@ -3667,7 +4114,10 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
       if (result?.symbol && result.symbol !== symbol) return result;
       payload = result;
       if (!result?.data?.length) return result;
-      const resolvedQuote = quote || (state.lastQuote?.symbol === symbol && quoteIsReady(state.lastQuote) ? state.lastQuote : usableFallback);
+      const cachedChain = result.source === "sqlite";
+      if (!cachedChain && !snapshotTimestampIsFresh(result.fetched_at)) return result;
+      const resolvedQuote = latestRenderableQuote(symbol, quote, state.lastQuote, usableFallback);
+      if (!quoteAndChainAreAligned(resolvedQuote, result.fetched_at, cachedChain && resolvedQuote?.source === "sqlite")) return result;
       state.analysisReady = gammaProfileReady(analysis) || state.analysisReady;
       renderChain(payload, resolvedQuote, analysis);
       state.view.lastStatus = payload.source === "sqlite"
@@ -3687,7 +4137,17 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
 
   [quote, payload] = await Promise.all([quoteRead, chainRead]);
   if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null, discarded: true };
-  const resolvedQuote = quote || (state.lastQuote?.symbol === symbol && quoteIsReady(state.lastQuote) ? state.lastQuote : usableFallback);
+  const resolvedQuote = latestRenderableQuote(symbol, quote, state.lastQuote, usableFallback);
+  const cachedPair = payload?.source === "sqlite" && resolvedQuote?.source === "sqlite";
+  if (payload?.data?.length && !quoteAndChainAreAligned(resolvedQuote, payload.fetched_at, cachedPair)) {
+    if (quoteError && markApiUnavailable(quoteError.message)) {
+      return { shown: true, source: "client-cache", fetchedAt: state.chainFetchedAt, quote: state.lastQuote, payload: {
+        data: state.chainRows, expiration: state.expiration, fetched_at: state.chainFetchedAt,
+      }, analysisReady: state.analysisReady, quoteReady: true, optionsQuotesReady: hasValidOptionQuotes(state.chainRows), cached: true,
+      };
+    }
+    return { shown: false, source: payload.source || null, fetchedAt: payload.fetched_at || null, quote: resolvedQuote, stale: true };
+  }
   if (!payload?.data?.length) {
     if ((quoteError || chainError) && markApiUnavailable("API 暂不可用")) {
       return { shown: true, source: "client-cache", fetchedAt: state.chainFetchedAt, quote: state.lastQuote, payload: {
@@ -3947,6 +4407,14 @@ async function refreshInBackground(loadId) {
       applyExpirations([refreshResult.expiration], refreshResult.expiration);
     }
     if (refreshResult?.skipped) {
+      if (!state.expiration) {
+        await renderCachedHistoryOnly(loadId, refreshResult.quote || null);
+        if (!isCurrentLoad(loadId) || await restartIfExpirationChanged(expiration)) return;
+        if (refreshResult.deferred) {
+          state.view.lastStatus = "已读取 SQLite 行情/日线缓存；期权数据在后台检查";
+        }
+        return;
+      }
       // 页面上已经是这份快照时不再读 quote、chain、levels。只有本地缺了有效报价才补读一次。
       if (!displayedSnapshotIsCurrent(refreshResult.fetched_at)) {
         // 首次读取时某个并发请求可能暂时失败，但后端已经确认 SQLite 快照新鲜；
@@ -3974,8 +4442,8 @@ async function refreshInBackground(loadId) {
     }
     const currentExpiration = state.expiration || refreshResult?.expiration;
     if (!currentExpiration) {
-      const restarted = await loadQuoteOnly(loadId);
-      if (!restarted && await restartIfExpirationChanged(expiration)) return;
+      await renderCachedHistoryOnly(loadId, refreshResult?.quote || null);
+      if (await restartIfExpirationChanged(expiration)) return;
       return;
     }
     const encodedExpiration = encodeURIComponent(currentExpiration);
@@ -3983,7 +4451,7 @@ async function refreshInBackground(loadId) {
     const expirationRequest = Array.isArray(refreshResult?.expirations)
       ? Promise.resolve({ expirations: refreshResult.expirations })
       : request(`/api/expirations/${encodedSymbol}?refresh=true`).catch(() => null);
-    const quoteRequest = quoteIsReady(refreshResult?.quote)
+    const quoteRequest = quoteIsFresh(refreshResult?.quote)
       ? Promise.resolve(refreshResult.quote)
       : request(`/api/quote/${encodedSymbol}`);
     const chainRequest = refreshResult?.chain?.data?.length
@@ -4011,12 +4479,16 @@ async function refreshInBackground(loadId) {
       await refreshInBackground(loadId);
       return;
     }
-    let resolvedQuote = quoteIsReady(quote) ? quote : refreshResult?.quote;
-    if (!quoteIsReady(resolvedQuote)) {
+    let resolvedQuote = quoteIsFresh(quote) ? quote : refreshResult?.quote;
+    if (!quoteIsFresh(resolvedQuote)) {
       // 快照响应和 quote 查询都可能在低配服务器上错开；最后再主动读一次上游行情。
       const retryQuote = await request(`/api/quote/${encodedSymbol}?refresh=true`).catch(() => null);
       if (await restartIfExpirationChanged(currentExpiration)) return;
-      if (quoteIsReady(retryQuote)) resolvedQuote = retryQuote;
+      if (quoteIsFresh(retryQuote)) resolvedQuote = retryQuote;
+    }
+    if (!quoteAndChainAreAligned(resolvedQuote, payload?.fetched_at)) {
+      state.view.lastStatus = "行情或期权链仍在刷新，等待一份时间匹配的新快照";
+      return;
     }
     renderQuote(resolvedQuote);
     // Gamma 窗口继续后台刷新；选中期限的综合价位已在这里与窗口任务并行请求。
@@ -4069,13 +4541,21 @@ async function loadQuoteOnly(loadId) {
     await refreshInBackground(loadId);
     return true;
   }
-  applyCachedQuote(quote);
+  if (expirations?.cached_expirations?.length) {
+    applyExpirations(expirations.cached_expirations, state.expiration);
+    state.refreshInFlight = null;
+    await loadChain({ loadId });
+    return true;
+  }
   // 所选期限可能刚刚全部到期：清掉失效的到期日，避免它继续留在 state 和地址栏里。
   state.expiration = null;
-  showPending(symbol + " 没有挂牌期权（或可用期限已全部到期），仅显示现货行情");
-  applyExpirations([], null, "无期权到期日");
+  state.expirationOptions = [];
+  state.expirationPlaceholder = "无期权缓存";
+  syncPageQuery();
+  await renderCachedHistoryOnly(loadId, quote);
   state.view.dataSource = "上游无期权数据";
-  state.view.lastStatus = "该标的没有期权合约，仅显示现货行情";
+  state.view.chainEmpty = "SQLite 目前没有期权合约缓存";
+  state.view.lastStatus = "已读取 SQLite 行情与日线缓存；上游没有可用期权合约";
 }
 
 async function loadExpirations(loadId, fallbackSnapshot = null) {
@@ -4096,8 +4576,24 @@ async function loadExpirations(loadId, fallbackSnapshot = null) {
     }
   }
   // source=pending 表示本地还没缓存过（需要回源），与「该标的确实没有期权」是两回事。
-  applyExpirations(payload.expirations, undefined, payload.source === "pending" ? "正在获取到期日…" : "该标的没有期权到期日");
-  await loadChain({ loadId });
+  const dates = payload.expirations || [];
+  const cachedDates = payload.cached_expirations || [];
+  const allDates = [...new Set([...dates, ...cachedDates])].sort();
+  const cachedExpiration = preferredCachedExpiration(allDates, state.expiration, cachedDates);
+  if (cachedExpiration) {
+    applyExpirations(allDates, cachedExpiration, payload.source === "pending" ? "正在获取到期日…" : "该标的没有期权到期日");
+    await loadChain({ loadId });
+    return;
+  }
+  state.expiration = null;
+  state.expirationOptions = [];
+  state.expirationPlaceholder = "无期权缓存";
+  syncPageQuery();
+  // A cached quote/history remains useful even when this symbol has no
+  // cached option expirations. Render the durable daily-history analysis
+  // independently instead of waiting on an upstream option snapshot.
+  await renderCachedHistoryOnly(loadId);
+  if (isCurrentLoad(loadId)) void refreshInBackground(loadId);
 }
 
 function displayedSnapshotMatches() {
@@ -4110,18 +4606,29 @@ function displayedSnapshotMatches() {
   );
 }
 
+function displayedSnapshotContextMatches() {
+  return Boolean(
+    state.displayedChainSymbol === state.symbol
+    && state.displayedChainExpiration
+    && state.displayedChainExpiration === state.expiration
+    && state.chainRows.length
+  );
+}
+
 function displayedSnapshotIsFresh() {
-  if (!displayedSnapshotMatches() || !quoteIsReady(state.lastQuote)) return false;
+  if (!displayedSnapshotMatches()) return false;
   if (!hasValidOptionQuotes(state.chainRows)) return false;
   const age = snapshotAgeSeconds(state.chainFetchedAt);
-  return age != null && age < SNAPSHOT_FRESH_SECONDS;
+  return age != null && age < SNAPSHOT_FRESH_SECONDS
+    && quoteAndChainAreAligned(state.lastQuote, state.chainFetchedAt);
 }
 
 // 后端跳过回源时，页面已经展示同一份快照并且报价有效，就不必再读一遍。
 // 不看本地年龄：客户端时钟走得快时，服务端仍可能判定这份快照新鲜。
 function displayedSnapshotIsCurrent(fetchedAt) {
   return displayedSnapshotMatches()
-    && quoteIsReady(state.lastQuote)
+    && quoteAndChainAreAligned(state.lastQuote, state.chainFetchedAt)
+    && snapshotTimestampIsFresh(state.chainFetchedAt)
     && hasValidOptionQuotes(state.chainRows)
     && Boolean(fetchedAt)
     && state.chainFetchedAt === fetchedAt;
@@ -4157,9 +4664,11 @@ async function loadChain(options = {}) {
     if (snapshot.discarded) return;
     if (!snapshot.shown) {
       if (snapshot.apiError && restoreDisplayedClientSnapshot(previousSnapshot)) return;
-      if (snapshot.source === "pending"
-        && restoreDisplayedClientSnapshot(previousSnapshot, "正在后台获取上游快照…", false)) return;
-      showPending("正在后台获取上游快照…");
+      if (displayedSnapshotContextMatches()) {
+        state.view.lastStatus = "期权链暂不可用，保留当前已显示数据并在后台重试";
+      } else {
+        showPending("正在后台获取上游快照…");
+      }
     }
     if (options.refresh === false) return;
     // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求上游接口。
@@ -4189,8 +4698,10 @@ async function loadSymbol() {
   state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
+  resetChanAnalysis();
   state.trendMarket = null;
   state.trendMarketSymbol = "";
+  state.trendHistorySymbol = "";
   closePushStream();
   clearFairValuePoll();
   state.expiration = parsePageQuery(location.search).expiration || null;
@@ -4202,28 +4713,14 @@ async function loadSymbol() {
   state.analysisReady = false;
   const loadId = ++state.loadId;
   setError("");
-  const restored = restoreClientSnapshot(symbol, state.expiration);
-  if (!restored) applyCachedQuote(null);
-  if (restored && state.chainRows?.length) {
-    const cachedView = cloneClientSnapshot(state.view);
-    renderChain({
-      symbol: state.chainFetchedSymbol || symbol,
-      expiration: state.chainFetchedExpiration || state.expiration,
-      fetched_at: state.chainFetchedAt,
-      source: "client-cache",
-      data: state.chainRows,
-    }, state.lastQuote, null);
-    if (cachedView) Object.assign(state.view, cachedView);
-    // renderChain() intentionally records a snapshot too, but it only has
-    // raw rows during restore. Write the restored view back so a reload while
-    // the API is down does not replace the complete cached analysis with that
-    // intermediate raw rendering.
-    rememberClientSnapshot();
-  }
-  if (!restored || !state.view.flow?.available) resetOptionFlow("正在读取当前标的的相邻快照…");
-  if (!restored) resetEarningsChip();
-  state.view.lastStatus = restored ? "正在验证本地缓存…" : "正在读取本地缓存…";
+  // Do not paint an old full-page snapshot during normal navigation. A fresh
+  // quote is requested below; client snapshots remain an explicit API-outage
+  // fallback through markApiUnavailable/restoreDisplayedClientSnapshot.
+  state.lastQuote = null;
+  applyCachedQuote(null);
+  showPending("正在获取最新行情并核对期权链…");
   syncPageQuery();
+  refreshChanAnalysis();
   try {
     await loadExpirations(loadId, previousSnapshot);
   } catch (error) {
@@ -4295,6 +4792,7 @@ initTheme();
 if (window.Vue && window.ELEMENT) Vue.use(ELEMENT);
 // 期权链单独成组件：父页面刷新报价或状态时，行数组引用不变就不重绘这张表。
 if (window.Vue) {
+  Vue.directive("chan-chart-hover", OptionScopeCharts.chanChartHover);
   Vue.component("chain-table-body", {
     props: {
       rows: { type: Array, default: () => [] },
@@ -4308,9 +4806,61 @@ const optionScopeApp = new Vue({
   data: state,
   computed: {
     busy() { return this.loading; },
+    chanFrame() { return this.view.chan[this.chanPeriod] || this.view.chan.daily; },
+  },
+  watch: {
+    chanPeriod() { this.chanHoveredScenario = null; },
   },
   methods: {
     navigateToSymbol() { return navigateToSymbol(); },
+    isChanTouchInput() {
+      return Boolean(window.matchMedia && window.matchMedia("(hover: none), (pointer: coarse)").matches);
+    },
+    showChanScenario(key, event) {
+      if (this.isChanTouchInput() && ["mouseenter", "focusin"].includes(event?.type)) return;
+      if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
+      this.chanScenarioHideTimer = null;
+      this.chanHoveredScenario = key;
+      this.positionChanScenarioCard(key, event);
+    },
+    positionChanScenarioCard(key, event) {
+      if (!event || !Number.isFinite(event.clientX)) return;
+      this.$nextTick(() => {
+        if (this.chanHoveredScenario !== key) return;
+        const chart = document.querySelector(".chan-chart");
+        const card = document.getElementById(`chan-scenario-card-${key}`);
+        if (!chart || !card) return;
+        const chartRect = chart.getBoundingClientRect();
+        const maxLeft = Math.max(0, chart.clientWidth - card.offsetWidth);
+        this.chanScenarioCardX = Math.max(0, Math.min(maxLeft, event.clientX - chartRect.left - card.offsetWidth / 2));
+      });
+    },
+    hideChanScenario(event) {
+      if (this.isChanTouchInput() && ["mouseleave", "focusout"].includes(event?.type)) return;
+      if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
+      this.chanScenarioHideTimer = null;
+      this.chanHoveredScenario = null;
+    },
+    toggleChanScenario(key, event) {
+      if (!this.isChanTouchInput()) return;
+      event?.preventDefault();
+      this.chanHoveredScenario = this.chanHoveredScenario === key ? null : key;
+      if (this.chanHoveredScenario) this.positionChanScenarioCard(key, event);
+    },
+    dismissChanScenarioOnTouch(event) {
+      if (!this.isChanTouchInput() || event.target.closest(".chan-projection-up, .chan-projection-down, .chan-projection-range, .chan-projection-float-card")) return;
+      this.chanHoveredScenario = null;
+    },
+    toggleChanPanel() {
+      this.chanExpanded = !this.chanExpanded;
+      rememberFoldState(CHAN_FOLD_KEYS.panel, this.chanExpanded);
+    },
+    rememberChanFold(name, event) {
+      if (!Object.prototype.hasOwnProperty.call(this.chanFolds, name)) return;
+      const expanded = event.currentTarget.open;
+      this.chanFolds[name] = expanded;
+      rememberFoldState(CHAN_FOLD_KEYS[name], expanded);
+    },
     expirationChanged() { return switchExpiration(this.expiration); },
     expirationMenuChanged(open) { return setExpirationMenuOpen(open); },
     filterChanged() { return renderChainTable(); },

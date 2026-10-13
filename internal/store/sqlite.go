@@ -237,15 +237,28 @@ CREATE TABLE IF NOT EXISTS push_refresh_state (
 	if err := ensureCompatibilityColumns(conn); err != nil {
 		return err
 	}
-	var batchCount int
-	if err := conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM option_latest_batches`).Scan(&batchCount); err != nil {
+	// Older Python/Go writers can leave a subset of option_snapshots without a
+	// corresponding latest-batch marker. Repair each symbol/expiration pair,
+	// not only databases where the marker table is completely empty. This runs
+	// under the startup migration transaction, so readers never see a partial
+	// repair. Never move an existing marker backwards.
+	if _, err := conn.ExecContext(context.Background(), `INSERT OR IGNORE INTO option_latest_batches(symbol, expiration, fetched_at)
+SELECT symbol, expiration, MAX(fetched_at) FROM option_snapshots GROUP BY symbol, expiration`); err != nil {
 		return err
 	}
-	if batchCount == 0 {
-		if _, err := conn.ExecContext(context.Background(), `INSERT INTO option_latest_batches(symbol, expiration, fetched_at)
-SELECT symbol, expiration, MAX(fetched_at) FROM option_snapshots GROUP BY symbol, expiration`); err != nil {
-			return err
-		}
+	if _, err := conn.ExecContext(context.Background(), `UPDATE option_latest_batches
+SET fetched_at=(SELECT MAX(snapshot.fetched_at) FROM option_snapshots snapshot
+                WHERE snapshot.symbol=option_latest_batches.symbol
+                  AND snapshot.expiration=option_latest_batches.expiration)
+WHERE EXISTS (SELECT 1 FROM option_snapshots snapshot
+              WHERE snapshot.symbol=option_latest_batches.symbol
+                AND snapshot.expiration=option_latest_batches.expiration
+                AND (snapshot.fetched_at > option_latest_batches.fetched_at
+                     OR NOT EXISTS (SELECT 1 FROM option_snapshots current
+                                    WHERE current.symbol=option_latest_batches.symbol
+                                      AND current.expiration=option_latest_batches.expiration
+                                      AND current.fetched_at=option_latest_batches.fetched_at)))`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -574,7 +587,8 @@ func (s *SQLite) LatestQuote(symbol string) (model.Quote, bool, error) {
  fair_value_historical_valuation_percentiles_json, fair_value_shareholder_total_return_yield,
  fair_value_market_cap_data_quality, fair_value_data_quality_score,
  fair_value_owner_earnings_maintenance_ratio, fair_value_owner_earnings_ratio_source
-FROM quote_snapshots WHERE symbol=? ORDER BY fetched_at DESC LIMIT 1`, symbol).Scan(
+FROM quote_snapshots WHERE symbol=?
+ORDER BY CASE WHEN price IS NOT NULL AND price > 0 THEN 0 ELSE 1 END, fetched_at DESC LIMIT 1`, symbol).Scan(
 		&quoteID, &rawJSON, &fetched, &price, &change, &todayOpen, &previous, &currency, &marketState, &providerName, &sessions,
 		&fairValue, &fairLow, &fairHigh, &fairBuyLow, &fairBuyHigh, &fairSource, &fairModel, &methodsJSON,
 		&forwardEPS, &epsSource, &safetyMargin, &confidence, &confidenceScore, &interestCoverage,
@@ -662,6 +676,9 @@ func (s *SQLite) SaveQuotePreservingFairValue(quote model.Quote) (model.Quote, e
 // SaveQuotePreservingFairValue; valuation status transitions use this method
 // when a newly detected instrument type invalidates an older company estimate.
 func (s *SQLite) SaveQuoteReplacingFairValue(quote model.Quote) (model.Quote, error) {
+	if quote.Price == nil || math.IsNaN(*quote.Price) || math.IsInf(*quote.Price, 0) || *quote.Price <= 0 {
+		return model.Quote{}, errors.New("refusing to persist quote snapshot without a positive price")
+	}
 	return s.saveQuoteSnapshot(quote)
 }
 
@@ -713,6 +730,9 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 // preservation behavior. The option batch marker is committed with both rows so
 // readers never observe a quote without its corresponding chain (or vice versa).
 func (s *SQLite) SaveQuoteAndChainSnapshot(quote model.Quote, chain model.ChainResponse) (model.Quote, error) {
+	if quote.Price == nil || math.IsNaN(*quote.Price) || math.IsInf(*quote.Price, 0) || *quote.Price <= 0 {
+		return model.Quote{}, errors.New("refusing to persist quote snapshot without a positive price")
+	}
 	var err error
 	quote, err = s.PreserveCachedFairValue(quote)
 	if err != nil {
@@ -926,6 +946,31 @@ func (s *SQLite) LatestExpirations(symbol string) ([]string, bool, error) {
 		}
 	}
 	return s.latestExpirationsFromBatches(symbol)
+}
+
+// CachedExpirations lists expirations that have a readable persisted option
+// batch. The provider catalog can include many expirations never downloaded
+// locally, so it must not be used to infer cache availability.
+func (s *SQLite) CachedExpirations(symbol string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT latest.expiration FROM option_latest_batches latest
+WHERE latest.symbol=? AND EXISTS (
+  SELECT 1 FROM option_snapshots snapshot
+  WHERE snapshot.symbol=latest.symbol AND snapshot.expiration=latest.expiration
+    AND snapshot.fetched_at=latest.fetched_at
+) ORDER BY latest.expiration`, symbol)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := []string{}
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
 }
 
 func cleanExpirationCatalog(payload string) []string {
@@ -1281,7 +1326,33 @@ func (s *SQLite) WriteHistory(symbol string, bars []map[string]any, fetchedAt ti
 			}
 			values[valueIndex] = value
 		}
+		// A candle without a usable close is not safe to write. Yahoo can
+		// occasionally return a partially empty chart even when it reports
+		// success; dropping that row also keeps it from replacing a cached close.
+		closeValue, closeOK := values[3].(float64)
+		if !closeOK || closeValue <= 0 {
+			continue
+		}
+		openValue, openOK := optionalHistoryNumber(values[0])
+		highValue, highOK := optionalHistoryNumber(values[1])
+		lowValue, lowOK := optionalHistoryNumber(values[2])
+		volumeValue, volumeOK := optionalHistoryNumber(values[4])
+		if !openOK || !highOK || !lowOK || !volumeOK ||
+			openValue != nil && *openValue <= 0 ||
+			highValue != nil && *highValue <= 0 ||
+			lowValue != nil && *lowValue <= 0 ||
+			volumeValue != nil && *volumeValue < 0 ||
+			highValue != nil && lowValue != nil && *highValue < *lowValue ||
+			highValue != nil && *highValue < closeValue ||
+			lowValue != nil && *lowValue > closeValue ||
+			openValue != nil && highValue != nil && *highValue < *openValue ||
+			openValue != nil && lowValue != nil && *lowValue > *openValue {
+			continue
+		}
 		prepared = append(prepared, preparedBar{day: rawDate, open: values[0], high: values[1], low: values[2], close: values[3], volume: values[4]})
+	}
+	if len(prepared) == 0 {
+		return errors.New("history response contains no usable closing prices")
 	}
 
 	tx, err := s.db.Begin()
@@ -1291,8 +1362,13 @@ func (s *SQLite) WriteHistory(symbol string, bars []map[string]any, fetchedAt ti
 	defer tx.Rollback()
 	stmt, err := tx.Prepare(`INSERT INTO price_history(symbol, bar_date, open, high, low, close, volume, fetched_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(symbol, bar_date) DO UPDATE SET open=excluded.open, high=excluded.high,
-low=excluded.low, close=excluded.close, volume=excluded.volume, fetched_at=excluded.fetched_at`)
+ON CONFLICT(symbol, bar_date) DO UPDATE SET
+open=COALESCE(excluded.open, price_history.open),
+high=COALESCE(excluded.high, price_history.high),
+low=COALESCE(excluded.low, price_history.low),
+close=COALESCE(excluded.close, price_history.close),
+volume=COALESCE(excluded.volume, price_history.volume), fetched_at=excluded.fetched_at
+WHERE excluded.fetched_at >= price_history.fetched_at`)
 	if err != nil {
 		return err
 	}
@@ -1303,6 +1379,17 @@ low=excluded.low, close=excluded.close, volume=excluded.volume, fetched_at=exclu
 		}
 	}
 	return tx.Commit()
+}
+
+func optionalHistoryNumber(value any) (*float64, bool) {
+	if value == nil {
+		return nil, true
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return nil, false
+	}
+	return &number, true
 }
 
 // finiteSQLiteNumber preserves NULLs and normalizes supported numeric inputs
@@ -1353,12 +1440,22 @@ func finiteSQLiteNumber(value any) (any, error) {
 }
 
 func (s *SQLite) LatestHistory(symbol string, limit int) (map[string]any, error) {
+	return s.latestHistory(symbol, limit, false)
+}
+
+// LatestHistoryWithTimestamps preserves the fetch time of each individual
+// candle. The normal history API keeps its established OHLCV shape.
+func (s *SQLite) LatestHistoryWithTimestamps(symbol string, limit int) (map[string]any, error) {
+	return s.latestHistory(symbol, limit, true)
+}
+
+func (s *SQLite) latestHistory(symbol string, limit int, includeTimestamps bool) (map[string]any, error) {
 	if limit <= 0 || limit > 3000 {
 		limit = 1500
 	}
 	rows, err := s.db.Query(`SELECT bar_date, open, high, low, close, volume, fetched_at FROM (
  SELECT bar_date, open, high, low, close, volume, fetched_at
- FROM price_history WHERE symbol=? ORDER BY bar_date DESC LIMIT ?
+ FROM price_history WHERE symbol=? AND close IS NOT NULL AND close > 0 ORDER BY bar_date DESC LIMIT ?
 ) ORDER BY bar_date`, symbol, limit)
 	if err != nil {
 		return nil, err
@@ -1373,6 +1470,9 @@ func (s *SQLite) LatestHistory(symbol string, limit int) (map[string]any, error)
 			return nil, err
 		}
 		bars = append(bars, map[string]any{"date": day, "open": nullableFloat(open), "high": nullableFloat(high), "low": nullableFloat(low), "close": nullableFloat(close), "volume": nullableFloat(volume)})
+		if includeTimestamps {
+			bars[len(bars)-1]["captured_at"] = fetched
+		}
 		if fetched > latestFetched {
 			latestFetched = fetched
 		}

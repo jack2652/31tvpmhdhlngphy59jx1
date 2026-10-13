@@ -59,8 +59,189 @@ function scheduleChartPointerMove(chartSvg, onMove, hideTooltip) {
   const stop = () => { cancel(); hideTooltip(); };
   chartSvg.addEventListener("pointerleave", stop);
   chartSvg.addEventListener("pointercancel", stop);
+  cancel.dispose = () => {
+    cancel();
+    chartSvg.removeEventListener("pointermove", schedule);
+    chartSvg.removeEventListener("pointerleave", stop);
+    chartSvg.removeEventListener("pointercancel", stop);
+  };
   return cancel;
 }
+
+// Vue owns the candle geometry. This controller only updates the hover layer
+// and readout, so pointer movement never redraws the full page or candle list.
+function bindChanChartHover(target, initialModel) {
+  const svg = target.querySelector("svg");
+  const layer = target.querySelector(".chan-crosshair-layer");
+  const tooltip = target.querySelector(".chan-chart-tooltip");
+  if (!svg || !layer || !tooltip) return null;
+  const vertical = layer.querySelector(".chart-crosshair");
+  const horizontal = layer.querySelector(".chart-crosshair-h");
+  const tagX = layer.querySelector(".chart-tag-x");
+  const tagY = layer.querySelector(".chart-tag-y");
+  let model = initialModel;
+  let activeIndex = null;
+  let lastPointer = null;
+  let shownCandle = null;
+  const title = document.createElement("div");
+  title.className = "chart-tooltip-title";
+  const subtitle = document.createElement("div");
+  subtitle.className = "chart-tooltip-sub";
+  tooltip.replaceChildren(title, subtitle);
+  const values = {};
+  [["open", "开盘"], ["high", "最高"], ["low", "最低"], ["close", "收盘"]].forEach(([key, label]) => {
+    const row = document.createElement("div");
+    row.className = "chart-tooltip-row chan-ohlc-row";
+    const name = document.createElement("span");
+    name.textContent = label;
+    values[key] = document.createElement("strong");
+    row.append(name, values[key]);
+    tooltip.append(row);
+  });
+  const hide = () => {
+    layer.setAttribute("visibility", "hidden");
+    tooltip.hidden = true;
+    activeIndex = null;
+    lastPointer = null;
+  };
+  const localPoint = (clientX, clientY) => {
+    const matrix = svg.getScreenCTM();
+    if (!matrix) return null;
+    const point = svg.createSVGPoint();
+    point.x = clientX;
+    point.y = clientY;
+    return point.matrixTransform(matrix.inverse());
+  };
+  const setLine = (line, x1, y1, x2, y2) => {
+    line.setAttribute("x1", x1); line.setAttribute("y1", y1);
+    line.setAttribute("x2", x2); line.setAttribute("y2", y2);
+  };
+  const setTag = (tag, text, x, y, width) => {
+    const rect = tag.querySelector("rect"), label = tag.querySelector("text");
+    rect.setAttribute("x", x); rect.setAttribute("y", y); rect.setAttribute("width", width);
+    label.setAttribute("x", x + width / 2); label.setAttribute("y", y + 12.5);
+    label.setAttribute("text-anchor", "middle");
+    label.textContent = text;
+  };
+  const show = (index, localY) => {
+    const candle = model?.candles?.[index];
+    if (!candle || !target.offsetWidth || !target.offsetHeight) { hide(); return; }
+    activeIndex = index;
+    const plotHeight = model.plotBottom - model.plotTop;
+    const priceRange = model.maximum - model.minimum;
+    const cursorY = Math.max(model.plotTop, Math.min(model.plotBottom, localY));
+    const price = model.maximum - (cursorY - model.plotTop) / plotHeight * priceRange;
+    setLine(vertical, candle.x, model.plotTop, candle.x, model.plotBottom);
+    // The Chan chart reserves its right side for scenario cards; keep the
+    // historical crosshair inside the candle plot so it cannot strike text.
+    setLine(horizontal, model.plotLeft, cursorY, model.historyRight ?? model.plotRight, cursorY);
+    const dateWidth = 84;
+    setTag(tagX, candle.date, Math.max(2, Math.min(model.width - dateWidth - 2, candle.x - dateWidth / 2)), model.height - 22, dateWidth);
+    const priceLabel = formatMoney(price), priceWidth = Math.min(model.width - model.plotRight - 16, Math.max(52, priceLabel.length * 7 + 14));
+    // Preserve the current-price badge when the cursor reaches the same price.
+    const overlapsSpot = model.spot && Math.abs(cursorY - model.spot.y) < model.spot.height / 2 + 10;
+    const priceX = overlapsSpot ? model.plotLeft : model.plotRight + 8;
+    setTag(tagY, priceLabel, priceX, cursorY - 9, priceWidth);
+    if (shownCandle !== candle) {
+      title.textContent = candle.date;
+      subtitle.textContent = `${model.periodLabel} · 已收盘 K 线`;
+      const directionClass = candle.prices.close > candle.prices.open ? "chan-ohlc-up"
+        : candle.prices.close < candle.prices.open ? "chan-ohlc-down" : "chan-ohlc-flat";
+      Object.keys(values).forEach((key) => {
+        values[key].textContent = formatMoney(candle.prices[key]);
+        values[key].className = `chan-ohlc-value ${directionClass}`;
+      });
+      shownCandle = candle;
+    }
+    layer.setAttribute("visibility", "visible");
+    tooltip.hidden = false;
+    const matrix = svg.getScreenCTM();
+    if (!matrix) { hide(); return; }
+    const point = svg.createSVGPoint();
+    point.x = candle.x; point.y = cursorY;
+    const client = point.matrixTransform(matrix);
+    const bounds = target.getBoundingClientRect();
+    const tooltipWidth = tooltip.offsetWidth;
+    tooltip.style.left = `${Math.max(4, Math.min(bounds.width - tooltipWidth - 4, client.x - bounds.left - tooltipWidth / 2))}px`;
+    tooltip.style.top = "auto";
+    tooltip.style.bottom = `${bounds.height + 4}px`;
+  };
+  const onMove = (event) => {
+    if (!model?.candles?.length || (event.buttons & 2)) { hide(); return; }
+    const point = localPoint(event.clientX, event.clientY);
+    if (!point || point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > model.plotBottom) { hide(); return; }
+    lastPointer = event;
+    const slot = ((model.historyRight ?? model.plotRight) - model.plotLeft) / model.candles.length;
+    const index = Math.max(0, Math.min(model.candles.length - 1, Math.floor((point.x - model.plotLeft) / slot)));
+    show(index, point.y);
+  };
+  const cancelPointerMove = scheduleChartPointerMove(svg, onMove, hide);
+  const showClose = (index) => {
+    const close = model?.candles?.[index]?.prices.close;
+    if (close == null) return;
+    lastPointer = null;
+    show(index, model.plotTop + (model.maximum - close) / (model.maximum - model.minimum) * (model.plotBottom - model.plotTop));
+  };
+  const onBlur = () => { cancelPointerMove(); hide(); };
+  const onKey = (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End", "Escape"].includes(event.key)) return;
+    event.preventDefault();
+    cancelPointerMove();
+    if (event.key === "Escape") { hide(); return; }
+    const last = model.candles.length - 1;
+    const current = activeIndex ?? last;
+    const next = event.key === "Home" ? 0 : event.key === "End" ? last : current + (event.key === "ArrowLeft" ? -1 : 1);
+    showClose(Math.max(0, Math.min(last, next)));
+  };
+  const onDown = (event) => {
+    cancelPointerMove();
+    if (event.button === 2) { hide(); return; }
+    onMove(event);
+  };
+  svg.addEventListener("blur", onBlur);
+  svg.addEventListener("keydown", onKey);
+  svg.addEventListener("pointerdown", onDown);
+  return {
+    svg,
+    update(next) {
+      const sameCandles = model?.candles === next?.candles;
+      model = next;
+      if (!sameCandles) { cancelPointerMove(); hide(); shownCandle = null; }
+      else if (lastPointer) onMove(lastPointer);
+      else if (activeIndex != null) showClose(activeIndex);
+    },
+    destroy() {
+      cancelPointerMove.dispose();
+      hide();
+      svg.removeEventListener("blur", onBlur);
+      svg.removeEventListener("keydown", onKey);
+      svg.removeEventListener("pointerdown", onDown);
+    },
+  };
+}
+
+const chanHoverControllers = new WeakMap();
+function syncChanChartHover(element, binding) {
+  let controller = chanHoverControllers.get(element);
+  if (controller && controller.svg !== element.querySelector("svg")) {
+    controller.destroy();
+    chanHoverControllers.delete(element);
+    controller = null;
+  }
+  if (controller) controller.update(binding.value);
+  else {
+    controller = bindChanChartHover(element, binding.value);
+    if (controller) chanHoverControllers.set(element, controller);
+  }
+}
+const chanChartHover = {
+  inserted: syncChanChartHover,
+  componentUpdated: syncChanChartHover,
+  unbind(element) {
+    chanHoverControllers.get(element)?.destroy();
+    chanHoverControllers.delete(element);
+  },
+};
 
 function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emptyMessage, options = {}) {
   const target = document.getElementById(targetId);
@@ -80,7 +261,7 @@ function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emp
   const labelColumnRight = axisOnRight ? 0 : axisColumnWidth + 4;
   // 刻度文字按可用宽度决定数量：桌面宽屏约每 84px 一个，手机上自动减少避免重叠。
   const labelEvery = Math.max(1, Math.ceil(points.length / Math.max(2, Math.floor(innerWidth / 84))));
-  const bars = points.map((point, index) => { const x = pad.left + index * slot + (slot - barWidth) / 2; const positive = Number(point[positiveKey]) || 0; const negative = Number(point[negativeKey]) || 0; const positiveHeight = Math.abs(positive) / maxValue * maxBarHeight; const negativeHeight = Math.abs(negative) / maxValue * maxBarHeight; const label = index % labelEvery === 0 ? `<text class="chart-label" x="${x + barWidth / 2}" y="${height - 8}" text-anchor="middle">${formatMoney(point.strike)}</text>` : ""; return `<rect class="chart-call" x="${x}" y="${baseline - positiveHeight}" width="${barWidth}" height="${positiveHeight}" rx="1"><title>${formatMoney(point.strike)} 看涨 ${formatChartValue(positive, 2, unit)}</title></rect><rect class="chart-put" x="${x}" y="${baseline}" width="${barWidth}" height="${negativeHeight}" rx="1"><title>${formatMoney(point.strike)} 看跌 ${formatChartValue(Math.abs(negative), 2, unit)}</title></rect>${label}`; }).join("");
+  const bars = points.map((point, index) => { const x = pad.left + index * slot + (slot - barWidth) / 2; const positive = Number(point[positiveKey]) || 0; const negative = Number(point[negativeKey]) || 0; const positiveHeight = Math.abs(positive) / maxValue * maxBarHeight; const negativeHeight = Math.abs(negative) / maxValue * maxBarHeight; const label = index % labelEvery === 0 ? `<text class="chart-label" x="${x + barWidth / 2}" y="${height - 8}" text-anchor="middle">${formatMoney(point.strike)}</text>` : ""; return `<rect class="chart-call" x="${x}" y="${baseline - positiveHeight}" width="${barWidth}" height="${positiveHeight}" rx="1"></rect><rect class="chart-put" x="${x}" y="${baseline}" width="${barWidth}" height="${negativeHeight}" rx="1"></rect>${label}`; }).join("");
   // 柱端标记：Gamma 图标注看涨墙/看跌墙，成交量与持仓量图标注最高看涨柱/最高看跌柱。
   const markers = (options.markers || []).filter((marker) => marker.point).map((marker) => {
     const index = points.indexOf(marker.point);
@@ -307,11 +488,10 @@ function renderLevelsChart(payload) {
     const barHeight = item.score / maxScore * maxBarHeight;
     const y = item.side === "up" ? baseline - barHeight : baseline;
     const className = item.side === "up" ? "chart-call" : "chart-put";
-    const title = `${item.side === "up" ? "压力位" : "支撑位"} ${formatMoney(item.price)} · 强度 ${item.score.toFixed(2)}`;
     const showLabel = centerX - lastLabelX >= minLabelGap;
     if (showLabel) lastLabelX = centerX;
     const label = showLabel ? `<text class="chart-label" x="${centerX}" y="${height - 8}" text-anchor="middle">${formatMoney(item.price)}</text>` : "";
-    return `<rect class="${className}" x="${centerX - barWidth / 2}" y="${y}" width="${barWidth}" height="${barHeight}" rx="1"><title>${title}</title></rect>${label}`;
+    return `<rect class="${className}" x="${centerX - barWidth / 2}" y="${y}" width="${barWidth}" height="${barHeight}" rx="1"></rect>${label}`;
   }).join("");
   const gridLines = [baseline - maxBarHeight, baseline, baseline + maxBarHeight].map((line) => `<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${line}" y2="${line}"/>`).join("");
   const axisLabels = `<text class="chart-label" x="4" y="${baseline - maxBarHeight + 4}">${yLabel}</text><text class="chart-label" x="4" y="${baseline + 4}">0</text><text class="chart-label" x="4" y="${baseline + maxBarHeight + 4}">-${yLabel}</text>`;
@@ -481,6 +661,7 @@ function clearSummary(targetId) {
 
 /* 图表模块只暴露绘制入口，页面状态不进入这里。 */
 window.OptionScopeCharts = {
+  chanChartHover: chanChartHover,
   renderSignedChart: renderSignedChart,
   renderLevelsChart: renderLevelsChart,
   renderDistributionSummary: renderDistributionSummary,

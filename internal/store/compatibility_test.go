@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"testing"
@@ -287,9 +288,55 @@ INSERT INTO push_events(symbol,kind,created_at) VALUES ('QQQ','snapshot','2030-0
 	if err != nil || !found || len(chain.Data) != 1 || chain.Data[0].Gamma != nil || chain.Data[0].ContractSymbol != "QQQ-C-400" {
 		t.Fatalf("legacy option snapshot lost or malformed: chain=%#v found=%v err=%v", chain, found, err)
 	}
+	cachedExpirations, err := repository.CachedExpirations("QQQ")
+	if err != nil || !reflect.DeepEqual(cachedExpirations, []string{"2099-01-16"}) {
+		t.Fatalf("legacy option expiration not advertised as cached: values=%#v err=%v", cachedExpirations, err)
+	}
 	events, err := repository.EventsSince(0, "QQQ", "")
 	if err != nil || len(events) != 1 || events[0].Kind != "snapshot" {
 		t.Fatalf("legacy push event lost: events=%#v err=%v", events, err)
+	}
+}
+
+func TestOpenRepairsMissingBatchMarkersEvenWhenOtherSymbolsHaveMarkers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "partial-batch-markers.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+CREATE TABLE option_snapshots (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, expiration TEXT NOT NULL,
+ fetched_at TEXT NOT NULL, contract_symbol TEXT NOT NULL, contract_type TEXT NOT NULL,
+ strike REAL, last_price REAL, bid REAL, ask REAL, volume INTEGER, open_interest INTEGER,
+ implied_volatility REAL, gamma REAL, in_the_money INTEGER, change_percent REAL,
+ provider TEXT NOT NULL, raw_json TEXT, UNIQUE(symbol, expiration, fetched_at, contract_symbol)
+);
+CREATE TABLE option_latest_batches (symbol TEXT NOT NULL, expiration TEXT NOT NULL, fetched_at TEXT NOT NULL, PRIMARY KEY(symbol, expiration));
+INSERT INTO option_snapshots(symbol,expiration,fetched_at,contract_symbol,contract_type,strike,provider) VALUES
+ ('AAA','2099-01-16','2030-01-18T15:00:00Z','AAA-C-1','call',1,'legacy'),
+ ('BBB','2099-01-16','2030-01-18T15:01:00Z','BBB-C-1','call',1,'legacy');
+INSERT INTO option_latest_batches(symbol,expiration,fetched_at) VALUES ('AAA','2099-01-16','2030-01-18T15:00:00Z');`)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	repository, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	chain, found, err := repository.LatestChain("BBB", "2099-01-16")
+	if err != nil || !found || len(chain.Data) != 1 || chain.Data[0].ContractSymbol != "BBB-C-1" {
+		t.Fatalf("missing marker was not repaired for partially indexed DB: chain=%#v found=%v err=%v", chain, found, err)
+	}
+	values, err := repository.CachedExpirations("BBB")
+	if err != nil || !reflect.DeepEqual(values, []string{"2099-01-16"}) {
+		t.Fatalf("repaired batch not reported as cached: values=%#v err=%v", values, err)
 	}
 }
 

@@ -63,10 +63,11 @@ type Quote struct {
 }
 
 type ExpirationsResponse struct {
-	Symbol      string   `json:"symbol"`
-	Expirations []string `json:"expirations"`
-	Source      string   `json:"source"`
-	Warning     string   `json:"warning,omitempty"`
+	Symbol            string   `json:"symbol"`
+	Expirations       []string `json:"expirations"`
+	CachedExpirations []string `json:"cached_expirations"`
+	Source            string   `json:"source"`
+	Warning           string   `json:"warning,omitempty"`
 }
 
 type OptionRow struct {

@@ -597,14 +597,14 @@ func TestQueryValidationMatchesFastAPIErrorDetailFixtures(t *testing.T) {
 			want: `{"detail":[{"type":"int_parsing","loc":["query","horizon_days"],"msg":"Input should be a valid integer, unable to parse string as an integer","input":"x"},{"type":"bool_parsing","loc":["query","status_only"],"msg":"Input should be a valid boolean, unable to interpret input","input":""},{"type":"bool_parsing","loc":["query","include_rows"],"msg":"Input should be a valid boolean, unable to interpret input","input":"nope"}]}`,
 		},
 		{
-			name: "levels aggregates missing and constrained fields in signature order",
+			name: "levels aggregates constrained fields in signature order",
 			path: "/api/levels/QQQ?spot=0&raw=perhaps&raw_expirations=9",
-			want: `{"detail":[{"type":"missing","loc":["query","expiration"],"msg":"Field required","input":null},{"type":"greater_than","loc":["query","spot"],"msg":"Input should be greater than 0","input":"0","ctx":{"gt":0.0}},{"type":"bool_parsing","loc":["query","raw"],"msg":"Input should be a valid boolean, unable to interpret input","input":"perhaps"},{"type":"less_than_equal","loc":["query","raw_expirations"],"msg":"Input should be less than or equal to 8","input":"9","ctx":{"le":8}}]}`,
+			want: `{"detail":[{"type":"greater_than","loc":["query","spot"],"msg":"Input should be greater than 0","input":"0","ctx":{"gt":0.0}},{"type":"bool_parsing","loc":["query","raw"],"msg":"Input should be a valid boolean, unable to interpret input","input":"perhaps"},{"type":"less_than_equal","loc":["query","raw_expirations"],"msg":"Input should be less than or equal to 8","input":"9","ctx":{"le":8}}]}`,
 		},
 		{
 			name: "query validation aggregates before endpoint symbol normalization",
 			path: "/api/levels/INVALID!?spot=bad&raw=perhaps&raw_expirations=9",
-			want: `{"detail":[{"type":"missing","loc":["query","expiration"],"msg":"Field required","input":null},{"type":"float_parsing","loc":["query","spot"],"msg":"Input should be a valid number, unable to parse string as a number","input":"bad"},{"type":"bool_parsing","loc":["query","raw"],"msg":"Input should be a valid boolean, unable to interpret input","input":"perhaps"},{"type":"less_than_equal","loc":["query","raw_expirations"],"msg":"Input should be less than or equal to 8","input":"9","ctx":{"le":8}}]}`,
+			want: `{"detail":[{"type":"float_parsing","loc":["query","spot"],"msg":"Input should be a valid number, unable to parse string as a number","input":"bad"},{"type":"bool_parsing","loc":["query","raw"],"msg":"Input should be a valid boolean, unable to interpret input","input":"perhaps"},{"type":"less_than_equal","loc":["query","raw_expirations"],"msg":"Input should be less than or equal to 8","input":"9","ctx":{"le":8}}]}`,
 		},
 		{
 			name:   "refresh optional pattern and maximum",
@@ -2011,6 +2011,10 @@ func TestCachedChainReadCompletesWhileGammaJobOwnsHeavyGate(t *testing.T) {
 	if err := repository.SaveExpirations("QQQ", []string{jobExpiration, readExpiration}); err != nil {
 		t.Fatal(err)
 	}
+	spot := 100.0
+	if err := repository.SaveQuote(model.Quote{Symbol: "QQQ", Price: &spot, Provider: "sqlite-test", FetchedAt: &fetched, Sessions: map[string]any{}}); err != nil {
+		t.Fatal(err)
+	}
 	if _, claimed := service.claimGammaJob("QQQ", 45); !claimed {
 		t.Fatal("Gamma job was not claimed")
 	}
@@ -2173,6 +2177,59 @@ func TestExpirationsReadsSharedCatalogAndTreatsExpiredOnlyCacheAsPending(t *test
 	status, body = get("/api/expirations/QQQ?refresh=true")
 	if status != http.StatusBadGateway || body["detail"] != "upstream unavailable" {
 		t.Fatalf("expired-only catalog should not mask refresh failure: status=%d body=%#v", status, body)
+	}
+}
+
+func TestExpirationsDistinguishesCatalogFromReadableSQLiteBatches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "expiration-readable-batches.db")
+	cfg := config.Config{DatabasePath: path, UpstreamTimeout: time.Second}
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := time.Now().AddDate(0, 0, 7).Format("2006-01-02")
+	second := time.Now().AddDate(0, 0, 14).Format("2006-01-02")
+	if err := repository.SaveExpirations("QQQ", []string{first, second}); err != nil {
+		t.Fatal(err)
+	}
+	strike := 100.0
+	now := time.Now().UTC()
+	if err := repository.SaveChain(model.ChainResponse{Symbol: "QQQ", Expiration: second, FetchedAt: &now, Data: []model.OptionRow{{
+		ContractSymbol: "QQQ-C-100", ContractType: "call", Strike: &strike,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	service := NewWithProvider(cfg, repository, &testMarketProvider{expirationErr: fmt.Errorf("upstream unavailable")})
+	defer service.Close()
+	ts := httptest.NewServer(service.Router())
+	defer ts.Close()
+	response, err := http.Get(ts.URL + "/api/expirations/QQQ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var body model.ExpirationsResponse
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("expiration response status=%d decode=%v body=%#v", response.StatusCode, err, body)
+	}
+	if !reflect.DeepEqual(body.Expirations, []string{first, second}) {
+		t.Errorf("catalog dates=%v, want both provider dates", body.Expirations)
+	}
+	if !reflect.DeepEqual(body.CachedExpirations, []string{second}) {
+		t.Fatalf("readable cached dates=%v, want only %s", body.CachedExpirations, second)
+	}
+	chainResponse, err := http.Get(ts.URL + "/api/chain/QQQ?expiration=" + second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer chainResponse.Body.Close()
+	var chain map[string]any
+	if err := json.NewDecoder(chainResponse.Body).Decode(&chain); err != nil || chainResponse.StatusCode != http.StatusOK {
+		t.Fatalf("chain response status=%d decode=%v body=%#v", chainResponse.StatusCode, err, chain)
+	}
+	rows, _ := chain["data"].([]any)
+	if chain["source"] != "sqlite" || len(rows) != 1 {
+		t.Fatalf("cached chain not returned on cold service: %#v", chain)
 	}
 }
 
@@ -4329,13 +4386,14 @@ func TestFastAPIDocumentRoutesExposeOpenAPISchemaAndUIs(t *testing.T) {
 		t.Fatalf("OpenAPI metadata = %#v, want FastAPI title/version and 3.1.0", document)
 	}
 	paths, ok := document["paths"].(map[string]any)
-	if !ok || len(paths) != 10 {
-		t.Fatalf("OpenAPI paths = %#v, want all 10 FastAPI API routes", document["paths"])
+	if !ok || len(paths) != 11 {
+		t.Fatalf("OpenAPI paths = %#v, want all 10 original API routes plus Chan structure", document["paths"])
 	}
 	for _, path := range []string{
 		"/api/events/{stock_symbol}", "/api/quote/{stock_symbol}", "/api/expirations/{stock_symbol}",
 		"/api/chain/{stock_symbol}", "/api/flow/{stock_symbol}", "/api/gamma/{stock_symbol}",
 		"/api/refresh/{stock_symbol}", "/api/levels/{stock_symbol}", "/api/status/{stock_symbol}", "/api/cleanup",
+		"/api/chan/{stock_symbol}",
 	} {
 		if _, exists := paths[path]; !exists {
 			t.Errorf("OpenAPI path %q missing", path)

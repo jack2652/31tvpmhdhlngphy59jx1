@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
@@ -108,11 +109,74 @@ func (s *Service) historyLock(ctx context.Context, key string, wait time.Duratio
 }
 
 func (s *Service) loadHistory(ctx context.Context, symbol, period string) map[string]any {
+	return s.loadHistoryWithMaxAge(ctx, symbol, period, s.cfg.HistoryMaxAge)
+}
+
+func (s *Service) loadHistoryWithMaxAge(ctx context.Context, symbol, period string, maxAge time.Duration) map[string]any {
 	cached, err := s.store.LatestHistory(symbol, 3000)
 	if err != nil {
 		return historyResult(symbol, nil, nil, "none", err.Error())
 	}
-	if historyFresh(cached["fetched_at"], s.cfg.HistoryMaxAge) {
+	bars, _ := cached["bars"].([]map[string]any)
+	if len(bars) > 0 {
+		if historyFresh(cached["fetched_at"], maxAge) {
+			return historyResult(symbol, bars, cached["fetched_at"], "sqlite", nil)
+		}
+		if s.scheduleHistoryRefresh(symbol, period, maxAge) {
+			return historyResult(symbol, bars, cached["fetched_at"], "sqlite", "SQLite 历史行情已先显示，后台正在更新")
+		}
+		return historyResult(symbol, bars, cached["fetched_at"], "sqlite", nil)
+	}
+	return s.refreshHistory(ctx, symbol, period, maxAge, cached)
+}
+
+func (s *Service) scheduleHistoryRefresh(symbol, period string, maxAge time.Duration) bool {
+	key := strings.ToUpper(strings.TrimSpace(symbol))
+	s.mu.Lock()
+	if s.background.Err() != nil || s.historyRefreshJobs[key] || time.Now().Before(s.historyRefreshAfter[key]) {
+		s.mu.Unlock()
+		return false
+	}
+	s.historyRefreshJobs[key] = true
+	s.backgroundWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.backgroundWG.Done()
+		defer func() {
+			s.mu.Lock()
+			delete(s.historyRefreshJobs, key)
+			s.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(s.background, 3*time.Minute)
+		defer cancel()
+		result := s.refreshHistory(ctx, symbol, period, maxAge, nil)
+		if result["source"] == "upstream" {
+			s.mu.Lock()
+			delete(s.historyRefreshAfter, key)
+			s.mu.Unlock()
+			s.publishAnalyticsEvent(symbol)
+		} else {
+			s.mu.Lock()
+			s.historyRefreshAfter[key] = time.Now().Add(30 * time.Second)
+			s.mu.Unlock()
+		}
+		if warning, _ := result["warning"].(string); warning != "" && ctx.Err() == nil {
+			log.Printf("background history refresh failed symbol=%s: %s", symbol, warning)
+		}
+	}()
+	return true
+}
+
+func (s *Service) refreshHistory(ctx context.Context, symbol, period string, maxAge time.Duration, initial map[string]any) map[string]any {
+	cached := initial
+	var err error
+	if cached == nil {
+		cached, err = s.store.LatestHistory(symbol, 3000)
+		if err != nil {
+			return historyResult(symbol, nil, nil, "none", err.Error())
+		}
+	}
+	if bars, _ := cached["bars"].([]map[string]any); len(bars) > 0 && historyFresh(cached["fetched_at"], maxAge) {
 		return historyResult(symbol, cached["bars"], cached["fetched_at"], "sqlite", nil)
 	}
 	wait := time.Duration(0)
@@ -128,7 +192,7 @@ func (s *Service) loadHistory(ctx context.Context, symbol, period string) map[st
 	if err != nil {
 		return historyResult(symbol, nil, nil, "none", err.Error())
 	}
-	if historyFresh(cached["fetched_at"], s.cfg.HistoryMaxAge) {
+	if historyFresh(cached["fetched_at"], maxAge) {
 		return historyResult(symbol, cached["bars"], cached["fetched_at"], "sqlite", nil)
 	}
 	releaseLease, leaseErr := s.acquireHistoryLease(ctx, "history:bars:"+symbol)
@@ -140,7 +204,7 @@ func (s *Service) loadHistory(ctx context.Context, symbol, period string) map[st
 	if latestErr != nil {
 		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), latestErr.Error())
 	}
-	if historyFresh(latest["fetched_at"], s.cfg.HistoryMaxAge) {
+	if historyFresh(latest["fetched_at"], maxAge) {
 		return historyResult(symbol, latest["bars"], latest["fetched_at"], "sqlite", nil)
 	}
 	loader, ok := s.provider.(HistoryProvider)
@@ -153,10 +217,21 @@ func (s *Service) loadHistory(ctx context.Context, symbol, period string) map[st
 	if fetchErr != nil {
 		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), fetchErr.Error())
 	}
+	if len(result.Bars) == 0 || result.FetchedAt.IsZero() {
+		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), "上游返回空历史行情，继续使用 SQLite 缓存")
+	}
 	if err := s.store.WriteHistory(symbol, result.Bars, result.FetchedAt); err != nil {
 		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), err.Error())
 	}
-	return historyResult(symbol, result.Bars, result.FetchedAt, "upstream", nil)
+	updated, err := s.store.LatestHistory(symbol, 3000)
+	if err != nil {
+		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), err.Error())
+	}
+	updatedBars, _ := updated["bars"].([]map[string]any)
+	if len(updatedBars) == 0 {
+		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), "上游历史行情未包含有效收盘价，继续使用 SQLite 缓存")
+	}
+	return historyResult(symbol, updatedBars, updated["fetched_at"], "upstream", nil)
 }
 
 func (s *Service) acquireHistoryLease(ctx context.Context, name string) (func(), error) {

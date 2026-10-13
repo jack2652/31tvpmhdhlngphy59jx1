@@ -2,7 +2,9 @@ package config
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +17,9 @@ import (
 // Config contains the small set of runtime settings needed by the Go service.
 // It deliberately mirrors the deployable settings used by the Python service.
 type Config struct {
+	DotEnvPath           string
+	DotEnvStatus         string
+	PortSource           string
 	Host                 string
 	Port                 string
 	DatabasePath         string
@@ -32,7 +37,10 @@ type Config struct {
 	UpstreamWait         time.Duration
 	UpstreamConcurrency  int
 	MemoryLimitBytes     int64
+	MemoryAvailableBytes int64
 	UpstreamMemoryBytes  int64
+	GoMemoryLimitBytes   int64
+	GoMemoryLimitSource  string
 	InboundConcurrency   int
 	LowMemoryMode        string
 	LowMemory            bool
@@ -60,11 +68,39 @@ func Load() Config {
 // from this directory rather than from the process working directory.
 func LoadFromDir(baseDir string) Config {
 	baseDir = cleanRuntimeDirectory(baseDir)
-	loadDotEnv(filepath.Join(baseDir, ".env"))
+	_, portFromEnvironment := os.LookupEnv("PORT")
+	dotEnvPath := filepath.Join(baseDir, ".env")
+	dotEnvStatus := "loaded"
+	if err := loadDotEnv(dotEnvPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			panic(fmt.Sprintf("load configuration %q: %v", dotEnvPath, err))
+		}
+		dotEnvStatus = "missing"
+	}
+	portSource := "default"
+	if strings.TrimSpace(os.Getenv("PORT")) != "" {
+		portSource = ".env"
+		if portFromEnvironment {
+			portSource = "environment"
+		}
+	} else if portFromEnvironment {
+		portSource = "default (empty environment PORT)"
+	}
 	memoryLimit := effectiveMemoryLimitBytes()
-	upstreamMemory := effectiveMemoryAvailableBytes(memoryLimit)
+	memoryAvailable := effectiveMemoryAvailableBytes(memoryLimit)
+	upstreamMemory := memoryAvailable
+	goMemoryLimit, goMemorySource := goMemoryLimitSetting(memoryLimit, memoryAvailable)
+	resourceLimit := memoryLimit
+	if goMemoryLimit >= 0 && goMemoryLimit < math.MaxInt64 {
+		if resourceLimit <= 0 || goMemoryLimit < resourceLimit {
+			resourceLimit = goMemoryLimit
+		}
+		if upstreamMemory < 0 || goMemoryLimit < upstreamMemory {
+			upstreamMemory = goMemoryLimit
+		}
+	}
 	lowMemoryMode := lowMemoryModeValue()
-	lowMemory := lowMemoryEnabled(lowMemoryMode, memoryLimit, upstreamMemory)
+	lowMemory := lowMemoryEnabled(lowMemoryMode, resourceLimit, upstreamMemory)
 	defaultSymbols := parseSymbols(env("DEFAULT_SYMBOLS", "QQQ"))
 	defaultSymbol := "QQQ"
 	if len(defaultSymbols) > 0 {
@@ -77,6 +113,9 @@ func LoadFromDir(baseDir string) Config {
 		databasePath = filepath.Join(baseDir, databasePath)
 	}
 	return Config{
+		DotEnvPath:           dotEnvPath,
+		DotEnvStatus:         dotEnvStatus,
+		PortSource:           portSource,
 		Host:                 env("HOST", "0.0.0.0"),
 		Port:                 env("PORT", "8000"),
 		DatabasePath:         databasePath,
@@ -94,7 +133,10 @@ func LoadFromDir(baseDir string) Config {
 		UpstreamWait:         upstreamWaitDuration(lowMemory),
 		UpstreamConcurrency:  effectiveConcurrency(upstreamMemory, lowMemory),
 		MemoryLimitBytes:     memoryLimit,
+		MemoryAvailableBytes: memoryAvailable,
 		UpstreamMemoryBytes:  upstreamMemory,
+		GoMemoryLimitBytes:   goMemoryLimit,
+		GoMemoryLimitSource:  goMemorySource,
 		InboundConcurrency:   inboundConcurrency(lowMemory),
 		LowMemoryMode:        lowMemoryMode,
 		LowMemory:            lowMemory,
@@ -122,17 +164,21 @@ func runtimeDirectory() string {
 	return "."
 }
 
+var (
+	goRunTemporaryExecutable = regexp.MustCompile(`(?:^|/)go-build[0-9]+/b[0-9]+/exe/[^/]+$`)
+	goRunCachedExecutable    = regexp.MustCompile(`(?:^|/)([0-9a-f]{2})/([0-9a-f]{64})-d/[^/]+$`)
+)
+
 func isGoRunArtifact(executable string) bool {
-	relative, err := filepath.Rel(os.TempDir(), executable)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return false
+	path := filepath.ToSlash(filepath.Clean(executable))
+	if goRunTemporaryExecutable.MatchString(path) {
+		return true
 	}
-	for _, component := range strings.Split(relative, string(filepath.Separator)) {
-		if component == "exe" {
-			return true
-		}
-	}
-	return false
+	// Go can execute cache hits directly from <cache>/<hash[:2]>/<hash>-d/<name>.
+	// Match the artifact layout rather than its root so custom GOTMPDIR and
+	// GOCACHE paths work too. A cache directory is never a deployment directory.
+	match := goRunCachedExecutable.FindStringSubmatch(path)
+	return len(match) == 3 && strings.HasPrefix(match[2], match[1])
 }
 
 func cleanRuntimeDirectory(directory string) string {
@@ -160,10 +206,10 @@ func inboundConcurrency(lowMemory bool) int {
 
 var dotenvVariable = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
-func loadDotEnv(path string) {
+func loadDotEnv(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
-		return
+		return err
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
@@ -198,8 +244,11 @@ func loadDotEnv(path string) {
 				return os.Getenv(name)
 			})
 		}
-		_ = os.Setenv(name, value)
+		if err := os.Setenv(name, value); err != nil {
+			return fmt.Errorf("set environment variable %q: %w", name, err)
+		}
 	}
+	return scanner.Err()
 }
 
 func parseSymbols(raw string) []string {
@@ -260,7 +309,7 @@ func lowMemoryEnabled(mode string, memoryLimit, memoryAvailable int64) bool {
 	if memoryLimit > 0 && memoryLimit <= autoLowMemoryLimit {
 		return true
 	}
-	return memoryAvailable > 0 && memoryAvailable <= autoLowMemoryAvailable
+	return memoryAvailable >= 0 && memoryAvailable <= autoLowMemoryAvailable
 }
 
 // effectiveMemoryLimitBytes returns the smallest visible memory limit for the
@@ -287,7 +336,7 @@ func effectiveMemoryLimitBytes() int64 {
 		for _, line := range strings.Split(string(data), "\n") {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 && fields[0] == "MemTotal:" {
-				if kilobytes, err := strconv.ParseInt(fields[1], 10, 64); err == nil && kilobytes > 0 {
+				if kilobytes, err := strconv.ParseInt(fields[1], 10, 64); err == nil && kilobytes > 0 && kilobytes <= math.MaxInt64/1024 {
 					limits = append(limits, kilobytes*1024)
 				}
 				break
@@ -316,32 +365,67 @@ func memoryCgroupFiles() []cgroupMemoryFiles {
 		{limit: "/sys/fs/cgroup/memory.max", usage: "/sys/fs/cgroup/memory.current"},
 		{limit: "/sys/fs/cgroup/memory/memory.limit_in_bytes", usage: "/sys/fs/cgroup/memory/memory.usage_in_bytes"},
 	}
+	mounts := memoryCgroupMounts()
+	for _, mount := range mounts {
+		limitName, usageName := "memory.limit_in_bytes", "memory.usage_in_bytes"
+		if mount.v2 {
+			limitName, usageName = "memory.max", "memory.current"
+		}
+		paths = append(paths, cgroupMemoryFiles{limit: filepath.Join(mount.directory, limitName), usage: filepath.Join(mount.directory, usageName)})
+	}
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
 		return paths
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		parts := strings.SplitN(line, ":", 3)
-		if len(parts) != 3 || parts[2] == "" || parts[2] == "/" {
+		if len(parts) != 3 || parts[2] == "" {
 			continue
 		}
-		base := strings.TrimPrefix(parts[2], "/")
-		if parts[0] == "0" {
-			paths = append([]cgroupMemoryFiles{{limit: "/sys/fs/cgroup/" + base + "/memory.max", usage: "/sys/fs/cgroup/" + base + "/memory.current"}}, paths...)
-		} else if strings.Contains(","+parts[1]+",", ",memory,") {
-			paths = append([]cgroupMemoryFiles{{limit: "/sys/fs/cgroup/memory/" + base + "/memory.limit_in_bytes", usage: "/sys/fs/cgroup/memory/" + base + "/memory.usage_in_bytes"}}, paths...)
+		v2 := parts[0] == "0" && parts[1] == ""
+		if !v2 && !strings.Contains(","+parts[1]+",", ",memory,") {
+			continue
+		}
+		for _, mount := range mounts {
+			if mount.v2 != v2 {
+				continue
+			}
+			relative, err := filepath.Rel(mount.root, filepath.Clean(parts[2]))
+			if err == nil && (relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
+				// Cgroup namespaces can report a path relative to their own
+				// root while mountinfo retains the host mount root.
+				relative = strings.TrimPrefix(filepath.Clean(parts[2]), string(filepath.Separator))
+			}
+			if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				continue
+			}
+			limitName, usageName := "memory.limit_in_bytes", "memory.usage_in_bytes"
+			if v2 {
+				limitName, usageName = "memory.max", "memory.current"
+			}
+			// A parent's limit also constrains the process even when the leaf
+			// cgroup is unlimited; consider every visible ancestor.
+			for directory := filepath.Join(mount.directory, relative); ; directory = filepath.Dir(directory) {
+				paths = append(paths, cgroupMemoryFiles{limit: filepath.Join(directory, limitName), usage: filepath.Join(directory, usageName)})
+				if directory == mount.directory {
+					break
+				}
+			}
 		}
 	}
 	return paths
 }
 
 func effectiveMemoryAvailableBytes(fallbackLimit int64) int64 {
+	if fallbackLimit <= 0 {
+		fallbackLimit = -1
+	}
 	cgroupAvailable := effectiveMemoryAvailableFromPaths(memoryCgroupFiles(), fallbackLimit)
 	hostAvailable := hostMemoryAvailableBytes()
-	if hostAvailable <= 0 {
+	if hostAvailable < 0 {
 		return cgroupAvailable
 	}
-	if cgroupAvailable <= 0 || hostAvailable < cgroupAvailable {
+	if cgroupAvailable < 0 || hostAvailable < cgroupAvailable {
 		return hostAvailable
 	}
 	return cgroupAvailable
@@ -386,19 +470,25 @@ func effectiveMemoryAvailableFromPaths(paths []cgroupMemoryFiles, fallbackLimit 
 func hostMemoryAvailableBytes() int64 {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return 0
+		return -1
 	}
+	free := int64(-1)
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == "MemAvailable:" {
-			kilobytes, parseErr := strconv.ParseInt(fields[1], 10, 64)
-			if parseErr == nil && kilobytes > 0 {
-				return kilobytes * 1024
-			}
-			break
+		if len(fields) < 2 || fields[0] != "MemAvailable:" && fields[0] != "MemFree:" {
+			continue
 		}
+		kilobytes, parseErr := strconv.ParseInt(fields[1], 10, 64)
+		if parseErr != nil || kilobytes < 0 || kilobytes > math.MaxInt64/1024 {
+			continue
+		}
+		if fields[0] == "MemAvailable:" {
+			return kilobytes * 1024
+		}
+		free = kilobytes * 1024
 	}
-	return 0
+	// Older kernels and some container meminfo views omit MemAvailable.
+	return free
 }
 
 func upstreamWaitDuration(lowMemory bool) time.Duration {

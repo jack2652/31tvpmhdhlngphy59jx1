@@ -227,6 +227,7 @@ DATABASE_PATH=data/options.db
 DATABASE_MAX_MB=256M
 RAW_RETENTION_DAYS=30
 SCHEDULER_ENABLED=true
+GO_MEMORY_LIMIT=auto
 ENVEOF
       ok "已生成默认 $ENV_FILE"
     fi
@@ -814,7 +815,7 @@ cgroup_mem_limit_mb() {
   local value=""
   if [ -r /sys/fs/cgroup/memory.max ]; then
     value="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
-  elif [ -r /sys/fs/cgroup/memory.memory.limit_in_bytes ]; then
+  elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
     value="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)"
   fi
   case "$value" in
@@ -1491,6 +1492,7 @@ CONFIG_ROWS=(
   'UPSTREAM_CONCURRENCY|auto|plain|单进程上游并发上限（auto 或正整数）'
   'UPSTREAM_WAIT_SECONDS|20|plain|等待上游并发槽位的最长秒数'
   'LOW_MEMORY|auto|plain|低内存保护（auto:内存≤4GiB或可用≤2GiB时开启）'
+  'GO_MEMORY_LIMIT|auto|plain|Go GC 软内存上限（auto / 96MiB / 1GiB / off）'
   'ALPACA_API_KEY||secret|Alpaca API Key（夜盘股票行情）'
   'ALPACA_API_SECRET||secret|Alpaca API Secret（夜盘股票行情）'
 )
@@ -1510,7 +1512,7 @@ show_config_summary() {
 }
 
 validate_config_values() {
-  local port limit concurrency wait_seconds low_memory
+  local port limit concurrency wait_seconds low_memory go_memory_limit
   port="$(read_env_value PORT 8000)"
   case "$port" in
     '' | *[!0-9]*)
@@ -1540,6 +1542,16 @@ validate_config_values() {
   case "$(printf '%s' "$low_memory" | tr '[:upper:]' '[:lower:]')" in
     '' | auto | true | false | 1 | 0 | yes | no | on | off) ;;
     *) fail "LOW_MEMORY 只能是 auto、true 或 false"; return 1 ;;
+  esac
+  go_memory_limit="$(read_env_value GO_MEMORY_LIMIT auto)"
+  case "$go_memory_limit" in
+    '' | [Aa][Uu][Tt][Oo] | off) ;;
+    *)
+      if [[ ! "$go_memory_limit" =~ ^[0-9]+(B|KiB|MiB|GiB|TiB)?$ ]] || [[ ! "$go_memory_limit" =~ [1-9] ]]; then
+        fail "GO_MEMORY_LIMIT 必须是 auto、off 或正整数容量，例如 96MiB、1GiB（纯数字按字节）"
+        return 1
+      fi
+      ;;
   esac
   return 0
 }
