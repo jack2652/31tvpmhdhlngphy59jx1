@@ -44,7 +44,7 @@ function scheduleChartPointerMove(chartSvg, onMove, hideTooltip) {
     if (event) onMove(event);
   };
   const schedule = (event) => {
-    pending = { clientX: event.clientX, clientY: event.clientY, buttons: event.buttons || 0 };
+    pending = { clientX: event.clientX, clientY: event.clientY, buttons: event.buttons || 0, target: event.target };
     if (frameId !== null) return;
     frameId = useAnimationFrame ? window.requestAnimationFrame(run) : window.setTimeout(run, 16);
   };
@@ -167,6 +167,7 @@ function bindChanChartHover(target, initialModel) {
     tooltip.style.bottom = `${bounds.height + 4}px`;
   };
   const onMove = (event) => {
+    if (event.target?.closest?.(".chan-spot-guide-target")) { hide(); return; }
     if (!model?.candles?.length || (event.buttons & 2)) { hide(); return; }
     const point = localPoint(event.clientX, event.clientY);
     if (!point || point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > model.plotBottom) { hide(); return; }

@@ -459,6 +459,72 @@
     return guide;
   }
 
+  // Summarize how the live quote sits against the closed-bar structure. This
+  // describes price location only; it never promotes an intraday move into a
+  // confirmed pen or close-based condition.
+  function liveSpotGuide(frame, spot, guidance) {
+    const price = spot != null && Number.isFinite(Number(spot)) && Number(spot) > 0
+      ? Number(spot) : frame?.last_close;
+    if (price == null || !Number.isFinite(Number(price)) || Number(price) <= 0) return null;
+    const close = frame?.last_close != null && Number.isFinite(Number(frame.last_close)) ? Number(frame.last_close) : null;
+    const center = frame?.position?.center;
+    const endpoints = new Map();
+    (frame?.strokes || []).forEach((stroke) => {
+      [stroke.start, stroke.end].forEach((point) => {
+        const key = point.date + "-" + point.kind + "-" + point.price;
+        endpoints.set(key, { ...point, confirmed: point.confirmed || Boolean(endpoints.get(key)?.confirmed) });
+      });
+    });
+    const ordered = [...endpoints.values()].sort((a, b) => a.date.localeCompare(b.date));
+    const high = [...ordered].reverse().find((point) => point.kind === "top");
+    const low = [...ordered].reverse().find((point) => point.kind === "bottom");
+    let position = "历史结构不足，先观察现价与最近收盘价的变化。";
+    if (center) {
+      const location = price > center.upper ? "高于中枢上沿 " + money(center.upper)
+        : price < center.lower ? "低于中枢下沿 " + money(center.lower)
+          : "位于中枢 " + money(center.lower) + "–" + money(center.upper) + " 内";
+      position = "现价 " + money(price) + "，" + location + (close != null ? "；最近收盘 " + money(close) : "") + "。";
+    } else if (high && low) {
+      position = "现价 " + money(price) + "；近期笔端点区间为 " + money(low.price) + "–" + money(high.price)
+        + (close != null ? "，最近收盘 " + money(close) : "") + "。";
+    } else if (close != null) {
+      position = "现价 " + money(price) + "；最近收盘 " + money(close) + "。";
+    }
+    const scenarios = guidance?.scenarios || [];
+    const bullish = scenarios.find((item) => item.direction === "up")
+      || scenarios.find((item) => item.direction === "hold")
+      || scenarios.find((item) => item.direction === "range");
+    const bullishNext = center && price < center.lower
+      ? scenarios.find((item) => item.direction === "repair") : null;
+    const bearish = scenarios.find((item) => item.direction === "down");
+    const bullishCondition = bullish?.condition
+      || (high ? "等待" + frame.label + "收盘站上近期笔高点 " + money(high.price) + "，再核对随后回落结构。" : "等待可确认的笔高低点和后续结构。");
+    const bearishCondition = bearish?.condition
+      || (low ? (price <= low.price ? "现价已到近期笔低点 " + money(low.price) + " 下方；等待反抽能否收回，再核对收盘。"
+        : "观察" + frame.label + "收盘是否跌破近期笔低点 " + money(low.price) + "；跌破后等待反抽确认。") : "等待下方结构边界形成后再评估风险。");
+    const change = close != null && close > 0 ? (price / close - 1) * 100 : null;
+    const freshness = frame.label + " K 线截至 " + (frame.as_of || "未知日期")
+      + (change == null ? "" : " · 现价较最近收盘 " + (change > 0 ? "+" : "") + change.toFixed(2) + "%")
+      + "。现价越过观察位不等于收盘确认。";
+    return { position,
+      bullishLabel: bullish?.label || "向上观察", bullishStatus: bullish?.status || "等待结构确认",
+      bullish: bullishCondition, bullishExpectation: bullish?.expectation || "观察高点突破后的回落能否形成更高低点。",
+      bullishTilt: bullish?.tilt_score == null ? "" : "倾向 " + bullish.tilt_score + "/100",
+      bullishInvalidation: bullish?.invalidation || "条件未满足前，不把现价波动当作结构确认。",
+      bullishNextLabel: bullishNext?.label || "",
+      bullishNextStatus: bullishNext?.status || "",
+      bullishNextPrerequisite: bullishNext ? "前置：完成第一步后，再进入中枢修复观察。" : "",
+      bullishNextCondition: bullishNext?.condition || "",
+      bullishNextExpectation: bullishNext?.expectation || "",
+      bullishNextTilt: bullishNext?.tilt_score == null ? "" : "倾向 " + bullishNext.tilt_score + "/100",
+      bullishNextInvalidation: bullishNext?.invalidation || "",
+      bearishLabel: bearish?.label || "向下风险", bearishStatus: bearish?.status || "等待结构确认",
+      bearish: bearishCondition, bearishExpectation: bearish?.expectation || "观察失守后的反抽能否收回边界。",
+      bearishTilt: bearish?.tilt_score == null ? "" : "倾向 " + bearish.tilt_score + "/100",
+      bearishInvalidation: bearish?.invalidation || "条件未满足前，不把现价波动当作结构确认。",
+      freshness };
+  }
+
   function frameView(frame, spot, weekly = null, showScenarios = true) {
     if (!frame) return emptyFrame("--");
     const center = frame.position?.center;
@@ -491,6 +557,7 @@
       strokes: (frame.strokes || []).length, confirmed: fixed.length, warnings: frame.warnings || [], structure: frame.structure || "等待中枢形成",
       turning: turningView(frame, spot),
       plan,
+      spotGuide: liveSpotGuide(frame, spot, guidance),
       signals: (frame.signals || []).filter((signal) => !turningKinds.has(signal.kind)).map((signal, index) => ({ ...signal, key: `${signal.kind}-${index}`,
         dateLabel: `结构位置 ${signal.date} · 识别于 ${signal.confirmed_at}`,
         statusLabel: signal.status === "invalidated" ? "已失效" : (signal.status === "candidate" ? "候选，待次级别确认" : "力度观察"),

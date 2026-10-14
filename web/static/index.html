@@ -33,7 +33,7 @@
     </section>
 
     <section class="headline-grid">
-      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">昨收 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">财报日期未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
+      <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">昨收 --</span><span id="quote-earnings" class="quote-earnings" :class="view.earnings.status" :title="view.earnings.title" v-text="view.earnings.label">未知</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
       <article class="metric panel"><div class="eyebrow">合约总数</div><strong id="total-count" v-text="view.totalCount">--</strong><span>当前到期日</span></article>
       <article class="metric call-metric panel"><div class="eyebrow">看涨成交量</div><strong id="call-volume" v-text="view.callVolume">--</strong><span id="call-interest" v-text="view.callInterest">未平仓 --</span></article>
       <article class="metric put-metric panel"><div class="eyebrow">看跌成交量</div><strong id="put-volume" v-text="view.putVolume">--</strong><span id="put-interest" v-text="view.putInterest">未平仓 --</span></article>
@@ -175,7 +175,7 @@
             <div v-for="level in chanFrame.chart.keyLevels" :key="level.key" class="chan-key-level-chip" :class="'chan-key-level-chip-' + level.tone" role="listitem" :title="level.title"><span>{{ level.label }}</span><strong>{{ level.priceLabel }}</strong></div>
           </div>
         </div>
-        <div class="chan-chart" v-if="chanFrame.chart" v-chan-chart-hover="chanFrame.chart" @click="dismissChanScenarioOnTouch($event)">
+        <div class="chan-chart" v-if="chanFrame.chart" v-chan-chart-hover="chanFrame.chart" @click="dismissChanScenarioOnTouch($event)" @mouseleave="hideChanSpotGuide($event)">
           <svg :key="chanPeriod" viewBox="0 0 960 340" role="img" tabindex="0" :aria-label="chanFrame.chart.title" aria-describedby="chan-chart-description chan-chart-readout">
             <desc id="chan-chart-description">{{ chanFrame.chart.description }}</desc>
             <defs><marker id="chan-route-arrow" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" class="chan-projection-arrow"></path></marker></defs>
@@ -220,6 +220,10 @@
               <rect :x="chanFrame.chart.spot.x" :y="chanFrame.chart.spot.boxY" :width="chanFrame.chart.spot.width" :height="chanFrame.chart.spot.height" rx="2" class="chan-spot-badge"></rect>
               <text :x="chanFrame.chart.spot.textX" :y="chanFrame.chart.spot.textY" text-anchor="middle" class="chan-spot-label">现价 {{ chanFrame.chart.spot.label }}</text>
             </g>
+            <g key="chan-spot-guide" v-if="chanFrame.chart.spot && chanFrame.spotGuide" class="chan-spot-guide-target" role="button" tabindex="0" aria-label="现价实时结构指引，悬停或轻触查看上下方向条件" :aria-expanded="chanSpotGuideVisible ? 'true' : 'false'" :aria-describedby="chanSpotGuideVisible ? 'chan-spot-guide-card' : null" @mouseenter="showChanSpotGuide($event)" @mouseleave="hideChanSpotGuide($event)" @focusin="showChanSpotGuide($event)" @focusout="hideChanSpotGuide($event)" @pointerdown.stop @click.stop="toggleChanSpotGuide($event)" @keydown.esc.stop="chanSpotGuideVisible = false" @keydown.enter.stop.prevent="toggleChanSpotGuide($event)" @keydown.space.stop.prevent="toggleChanSpotGuide($event)">
+              <line x1="18" :x2="chanFrame.chart.historyRight" :y1="chanFrame.chart.spot.y" :y2="chanFrame.chart.spot.y" class="chan-spot-guide-hit-area"></line>
+              <rect :x="chanFrame.chart.spot.x - 3" :y="chanFrame.chart.spot.boxY - 4" :width="chanFrame.chart.spot.width + 6" :height="chanFrame.chart.spot.height + 8" rx="3" class="chan-spot-guide-badge-hit"></rect>
+            </g>
             <g key="chan-scenario-toggle" class="chan-scenario-toggle-svg" :transform="'translate(' + (chanFrame.chart.historyRight - 15) + ' ' + (chanFrame.chart.plotBottom - 15) + ')'" role="button" tabindex="0" :aria-pressed="chanScenariosVisible ? 'true' : 'false'" :aria-label="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" @click.stop="toggleChanScenarios" @keydown.enter.stop.prevent="toggleChanScenarios" @keydown.space.stop.prevent="toggleChanScenarios">
               <title>{{ chanScenariosVisible ? '隐藏条件情景' : '显示条件情景' }}</title>
               <rect width="15" height="15" class="chan-scenario-toggle-svg-box"></rect>
@@ -235,9 +239,35 @@
           </svg>
           <div v-pre class="chart-tooltip chan-chart-tooltip" id="chan-chart-readout" hidden></div>
           <template v-if="chanFrame.chart && chanFrame.chart.projections && chanScenariosVisible"><article v-for="route in chanFrame.chart.projections" v-if="chanHoveredScenario === route.key" :id="'chan-scenario-card-' + route.key" :key="route.key + '-card'" class="chan-projection-float-card" :class="'chan-projection-' + route.tone" :style="{ left: chanScenarioCardX + 'px' }" @mouseenter="showChanScenario(route.key, $event)" @mouseleave="hideChanScenario($event)" @click.stop><h4><span class="chan-scenario-title">{{ route.label }}</span><span class="chan-route-meta"><strong>倾向 {{ route.tiltScore }}/100</strong><span>{{ route.status }}</span></span></h4><p class="chan-tilt-note">综合日周位置、确认笔与有效信号的规则倾向分 · 非历史胜率</p><dl><div><dt>观察</dt><dd>{{ route.expectation }}</dd></div><div><dt>条件</dt><dd>{{ route.condition }}</dd></div><div><dt>失效</dt><dd>{{ route.invalidation }}</dd></div></dl></article></template>
+          <article v-if="chanSpotGuideVisible && chanFrame.spotGuide" id="chan-spot-guide-card" class="chan-spot-float-card" role="tooltip" :style="{ left: chanSpotGuideX + 'px', top: chanSpotGuideY + 'px' }">
+            <header><h4>现价结构观察</h4><span>实时行情 · 条件推演</span></header>
+            <p class="chan-spot-guide-position">{{ chanFrame.spotGuide.position }}</p>
+            <dl>
+              <div class="chan-spot-scenario-up">
+                <dt><span>{{ chanFrame.spotGuide.bullishLabel }}</span><small>{{ chanFrame.spotGuide.bullishStatus }}</small><strong>{{ chanFrame.spotGuide.bullishTilt }}</strong></dt>
+                <dd>{{ chanFrame.spotGuide.bullish }}</dd>
+                <dd class="chan-spot-guide-expectation"><b>后续观察</b>{{ chanFrame.spotGuide.bullishExpectation }}</dd>
+                <dd class="chan-spot-guide-invalidation"><b>失效条件</b>{{ chanFrame.spotGuide.bullishInvalidation }}</dd>
+                <section v-if="chanFrame.spotGuide.bullishNextLabel" class="chan-spot-scenario-next">
+                  <div><strong>{{ chanFrame.spotGuide.bullishNextLabel }}</strong><span>{{ chanFrame.spotGuide.bullishNextStatus }}</span><b>{{ chanFrame.spotGuide.bullishNextTilt }}</b></div>
+                  <small>{{ chanFrame.spotGuide.bullishNextPrerequisite }}</small>
+                  <p>{{ chanFrame.spotGuide.bullishNextCondition }}</p>
+                  <p><b>后续观察</b>{{ chanFrame.spotGuide.bullishNextExpectation }}</p>
+                  <p><b>失效条件</b>{{ chanFrame.spotGuide.bullishNextInvalidation }}</p>
+                </section>
+              </div>
+              <div class="chan-spot-scenario-down">
+                <dt><span>{{ chanFrame.spotGuide.bearishLabel }}</span><small>{{ chanFrame.spotGuide.bearishStatus }}</small><strong>{{ chanFrame.spotGuide.bearishTilt }}</strong></dt>
+                <dd>{{ chanFrame.spotGuide.bearish }}</dd>
+                <dd class="chan-spot-guide-expectation"><b>后续观察</b>{{ chanFrame.spotGuide.bearishExpectation }}</dd>
+                <dd class="chan-spot-guide-invalidation"><b>失效条件</b>{{ chanFrame.spotGuide.bearishInvalidation }}</dd>
+              </div>
+            </dl>
+            <p class="chan-spot-guide-note">{{ chanFrame.spotGuide.freshness }} 倾向分是规则估算，不代表胜率。</p>
+          </article>
         </div>
         <div v-else class="levels-empty">历史行情到达后展示 K 线、笔与中枢</div>
-        <div class="chan-legend"><span><i class="chan-legend-pen"></i>已确认笔</span><span><i class="chan-legend-pen chan-legend-pending"></i>形成中的笔</span><span><i class="chan-legend-center"></i>笔中枢</span><span><i class="chan-legend-level"></i>近期高低点／中枢边界</span><span><i class="chan-legend-projection"></i>右侧为条件情景推演</span><span>倾向分为规则估算，非统计概率</span><span>带 *：形成中的端点价格</span></div>
+        <div class="chan-legend"><span><i class="chan-legend-pen"></i>已确认笔</span><span><i class="chan-legend-pen chan-legend-pending"></i>形成中的笔</span><span><i class="chan-legend-center"></i>笔中枢</span><span><i class="chan-legend-level"></i>近期高低点／中枢边界</span><span><i class="chan-legend-projection"></i>右侧为条件情景推演</span><span>倾向分为规则估算，非统计概率</span><span>悬停或点按现价线查看实时结构指引</span><span>带 *：形成中的端点价格</span></div>
         <dl class="chan-facts"><div><dt>最近中枢</dt><dd>{{ chanFrame.boundary }}<small>{{ chanFrame.structure }}</small></dd></div><div><dt>最近一笔</dt><dd>{{ chanFrame.stroke }}<small>{{ chanFrame.observation }}</small></dd></div></dl>
         <div class="chan-turning">
           <details class="chan-fold chan-plan-fold" :open="chanFolds.plan" @toggle="rememberChanFold('plan', $event)">

@@ -45,6 +45,9 @@ const state = {
   chanHoveredScenario: null,
   chanScenarioCardX: 0,
   chanScenarioHideTimer: null,
+  chanSpotGuideVisible: false,
+  chanSpotGuideX: 0,
+  chanSpotGuideY: 0,
   chanExpanded: readFoldState(CHAN_FOLD_KEYS.panel, false),
   chanFolds: {
     plan: readFoldState(CHAN_FOLD_KEYS.plan, false),
@@ -144,7 +147,7 @@ const state = {
     fairOptimisticTitle: "模型 B：远期 EPS × PEG",
     earnings: {
       status: "unknown",
-      label: "财报日期未知",
+      label: "未知",
       title: "没有可用的未来财报日期，评分不因财报调整",
     },
   earningsFetchedAt: 0,
@@ -844,6 +847,22 @@ function applyPushedSnapshotPayload(message) {
   applyCachedQuote(quote);
   renderQuote(quote);
   renderChain(chain, quote, state.lastAnalysis?.analysisPayload || null);
+  if (chain.expiration && !state.expirationOptions.length) {
+    // The quote and first chain can arrive before /api/expirations returns.
+    // Show the selected expiry immediately, then fill the full menu from the
+    // catalogue the refresh worker just persisted.
+    applyExpirations([chain.expiration], chain.expiration);
+    request(`/api/expirations/${encodeURIComponent(state.symbol)}`).then((catalog) => {
+      if (loadId !== state.loadId || state.symbol !== message.symbol) return;
+      const dates = [...new Set([...(catalog?.expirations || []), ...(catalog?.cached_expirations || [])])].sort();
+      if (dates.length) applyExpirations(dates, state.expiration);
+    }).catch(() => {});
+  }
+  if (!state.analysisReady && chain.data?.length) {
+    // The first snapshot can arrive on SSE before expiry discovery completes.
+    // Start the slow Gamma window only after this selected chain is visible.
+    refreshAnalysisWindow(loadId, chain, quote);
+  }
   state.view.lastStatus = `最近更新 ${formatTime(chain.fetched_at)}`;
   syncPageQuery();
   // Flow requires two adjacent snapshots and is intentionally kept as the
@@ -869,7 +888,10 @@ async function applyPushedGammaUpdate() {
   ]);
   if (symbol !== state.symbol || pending.loadId !== state.loadId) return;
   const payload = chain?.data?.length ? chain : state.lastAnalysis?.payload;
-  if (payload?.data?.length) renderChain(payload, state.lastQuote, gammaProfileReady(analysis) ? analysis : null);
+  if (payload?.data?.length && gammaProfileReady(analysis)) {
+    state.analysisReady = true;
+    renderChain(payload, state.lastQuote, analysis);
+  }
 }
 
 function closePushStream() {
@@ -2961,10 +2983,14 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   state.view.chart.oiScope = scopeText;
   const modelIv = Number(ivModel?.[state.expiration]?.iv);
   const scopeSuffix = Number.isFinite(modelIv) && modelIv > 0 ? ` · 模型 IV ${(modelIv * 100).toFixed(1)}%` : "";
-  const serverFlip = Number(analysisPayload?.zero_gamma?.price);
-  // 零 Gamma 与柱状图同口径：先按所选到期日扫描，找不到穿越点再退回服务端结果。
-  const gammaFlip = findGammaFlip(expirationRows, spot, state.expiration)
-    || (Number.isFinite(serverFlip) ? { strike: serverFlip } : null);
+  const serverFlip = finitePrice(analysisPayload?.zero_gamma?.price);
+  // 零 Gamma 等跨期限 Gamma 窗口全部到齐后再估算，避免首个到期日的局部结果
+  // 被误认为完整窗口的零 Gamma。
+  const gammaReady = state.analysisReady && gammaProfileReady(analysisPayload);
+  const gammaFlip = gammaReady
+    ? (serverFlip != null ? { strike: serverFlip } : null)
+      || findGammaFlip(expirationRows, spot, state.expiration)
+    : null;
   const callWall = points.reduce((best, point) => point.callGex > (best?.callGex || 0) ? point : best, null);
   const putWall = points.reduce((best, point) => Math.abs(point.putGex) > Math.abs(best?.putGex || 0) ? point : best, null);
   const volumeCallPeak = maxPoint(points, "callVolume");
@@ -2972,7 +2998,9 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   const oiCallPeak = maxPoint(points, "callOi");
   const oiPutPeak = maxPoint(points, "putOi");
   state.view.chart.netGex = `净 Gamma ${formatGex(points.reduce((sum, point) => sum + point.callGex + point.putGex, 0), 2)} · 估算`;
-  state.view.chart.gammaFlip = `零 Gamma ${gammaFlip ? formatMoney(gammaFlip.strike) : "--"} · 估算`;
+  state.view.chart.gammaFlip = gammaReady
+    ? `零 Gamma ${gammaFlip ? formatMoney(gammaFlip.strike) : "--"} · 估算`
+    : "零 Gamma 等待窗口加载";
   state.view.chart.netGexTitle = GAMMA_ESTIMATE_TITLE;
   state.view.chart.gammaFlipTitle = GAMMA_ESTIMATE_TITLE;
   state.view.chart.gammaScopeDate = `柱状图 到期日 ${state.expiration || "--"}`;
@@ -3156,7 +3184,7 @@ function earningsMonthDay(value) {
 function resetEarningsChip() {
   state.view.earnings = {
     status: "unknown",
-    label: "财报日期未知",
+    label: "未知",
     title: "没有可用的未来财报日期，评分不因财报调整",
   };
 }
@@ -3340,6 +3368,7 @@ function resetChanAnalysis() {
   state.chanLastRequestedAt = 0;
   state.chanRetryAttempts = 0;
   state.chanLoading = false;
+  state.chanSpotGuideVisible = false;
   state.chanPayload = null;
   state.chanRefreshPending = false;
   state.view.chan = OptionScopeChan.empty();
@@ -3934,10 +3963,12 @@ function applyExpirations(dates, preferred, emptyLabel = "正在获取到期日�
 }
 
 function preferredCachedExpiration(dates, preferred, cachedDates) {
-  const available = new Set((cachedDates || []).filter(Boolean));
-  if (!available.size) return preferred;
-  if (preferred && available.has(preferred)) return preferred;
-  return dates.find((date) => available.has(date)) || [...available].sort()[0] || preferred;
+  const ordered = [...new Set((dates || []).filter(Boolean))].sort();
+  if (preferred && ordered.includes(preferred)) return preferred;
+  // On a new symbol, start with the nearest active expiry even if only a
+  // later expiry happens to be cached. The selected chain can then refresh
+  // independently while the remaining expiries load in the Gamma queue.
+  return ordered[0] || preferred || [...new Set((cachedDates || []).filter(Boolean))].sort()[0] || null;
 }
 
 async function renderCachedHistoryOnly(loadId, quote = null) {
@@ -3956,6 +3987,12 @@ async function renderCachedHistoryOnly(loadId, quote = null) {
   } else if (state.chanPayload?.symbol === symbol && state.chanPayload.market_analysis) {
     hydrateTrendFromChan(state.chanPayload);
   }
+  // The queued snapshot refresh can finish while the slower daily-level read
+  // is pending. Preserve both the rendered chain and history panels, and skip
+  // only the history-only chain placeholder below.
+  if (state.displayedChainSymbol === symbol
+    && state.displayedChainExpiration === state.expiration
+    && state.chainRows?.length) return;
   state.view.chainTitle = `期权链 · ${symbol}`;
   state.view.dataSource = "SQLite 行情/日线 · 无期权链缓存";
   state.view.fetchedAt = usableQuote?.fetched_at ? `行情 ${formatTime(usableQuote.fetched_at)}` : "SQLite 暂无行情缓存";
@@ -4670,15 +4707,25 @@ async function loadExpirations(loadId, fallbackSnapshot = null) {
     await loadChain({ loadId });
     return;
   }
+  // A live SSE refresh can deliver the nearest chain before this initial
+  // expiry-catalog read completes. Keep that selected expiry visible instead
+  // of interpreting an early `pending` catalog response as no options.
+  if (state.displayedChainSymbol === state.symbol
+    && state.displayedChainExpiration === state.expiration
+    && state.expiration && state.chainRows?.length) {
+    return;
+  }
   state.expiration = null;
   state.expirationOptions = [];
   state.expirationPlaceholder = "无期权缓存";
   syncPageQuery();
   // A cached quote/history remains useful even when this symbol has no
   // cached option expirations. Render the durable daily-history analysis
-  // independently instead of waiting on an upstream option snapshot.
-  await renderCachedHistoryOnly(loadId);
-  if (isCurrentLoad(loadId)) void refreshInBackground(loadId);
+  // independently, but do not make the quote or snapshot request wait for it.
+  if (isCurrentLoad(loadId)) {
+    void refreshInBackground(loadId);
+    void renderCachedHistoryOnly(loadId);
+  }
 }
 
 function displayedSnapshotMatches() {
@@ -4794,6 +4841,8 @@ async function loadSymbol() {
   closePushStream();
   clearFairValuePoll();
   state.expiration = parsePageQuery(location.search).expiration || null;
+  state.expirationOptions = [];
+  state.expirationPlaceholder = "正在获取到期日…";
   // 切换标的时取消旧页面的 Gamma 状态轮询；服务端任务可继续，但旧响应不能再驱动新页面。
   if (state.analysisRefreshTimer) clearTimeout(state.analysisRefreshTimer);
   state.analysisRefreshTimer = null;
@@ -4809,7 +4858,19 @@ async function loadSymbol() {
   applyCachedQuote(null);
   showPending("正在获取最新行情并核对期权链…");
   syncPageQuery();
+  // Quote delivery must not wait for expiry discovery or the historical-levels
+  // read. The cache read gives an immediate first paint when available; the
+  // SSE subscription and snapshot refresh then publish a live session quote.
+  connectPushStream(symbol);
+  request(`/api/quote/${encodeURIComponent(symbol)}`).then((quote) => {
+    if (isCurrentLoad(loadId) && quote?.symbol === symbol) {
+      const usableQuote = latestRenderableQuote(symbol, quote, state.lastQuote);
+      if (usableQuote) renderQuote(usableQuote, false, quoteIsUsableSQLiteSnapshot(usableQuote, symbol));
+    }
+  }).catch(() => {});
   refreshChanAnalysis();
+  // Opening the stream starts the server-side snapshot worker immediately;
+  // loadChain owns any follow-up read after expiry discovery.
   try {
     await loadExpirations(loadId, previousSnapshot);
   } catch (error) {
@@ -4908,6 +4969,7 @@ const optionScopeApp = new Vue({
   watch: {
     chanPeriod() {
       this.chanHoveredScenario = null;
+      this.chanSpotGuideVisible = false;
       this.ensureChanIntraday(this.chanPeriod);
     },
   },
@@ -4936,6 +4998,7 @@ const optionScopeApp = new Vue({
     },
     showChanScenario(key, event) {
       if (this.isChanTouchInput() && ["mouseenter", "focusin"].includes(event?.type)) return;
+      this.chanSpotGuideVisible = false;
       if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
       this.chanScenarioHideTimer = null;
       this.chanHoveredScenario = key;
@@ -4963,11 +5026,61 @@ const optionScopeApp = new Vue({
       if (!this.isChanTouchInput()) return;
       event?.preventDefault();
       this.chanHoveredScenario = this.chanHoveredScenario === key ? null : key;
+      if (this.chanHoveredScenario) this.chanSpotGuideVisible = false;
       if (this.chanHoveredScenario) this.positionChanScenarioCard(key, event);
     },
     dismissChanScenarioOnTouch(event) {
-      if (!this.isChanTouchInput() || event.target.closest(".chan-projection-up, .chan-projection-down, .chan-projection-range, .chan-projection-float-card")) return;
+      if (!this.isChanTouchInput() || event.target.closest(".chan-projection-up, .chan-projection-down, .chan-projection-range, .chan-projection-float-card, .chan-spot-guide-target, .chan-spot-float-card")) return;
       this.chanHoveredScenario = null;
+      this.chanSpotGuideVisible = false;
+    },
+    showChanSpotGuide(event) {
+      if (this.isChanTouchInput() && ["mouseenter", "focusin"].includes(event?.type)) return;
+      this.chanHoveredScenario = null;
+      if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
+      this.chanScenarioHideTimer = null;
+      this.chanSpotGuideVisible = true;
+      this.positionChanSpotGuide(event);
+    },
+    positionChanSpotGuide(event) {
+      this.$nextTick(() => {
+        if (!this.chanSpotGuideVisible) return;
+        const card = document.getElementById("chan-spot-guide-card");
+        if (!card) return;
+        const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+        const viewportHeight = window.innerHeight;
+        const margin = viewportWidth <= 600 ? 8 : 16;
+        const maxLeft = Math.max(margin, viewportWidth - card.offsetWidth - margin);
+        const spotBadge = document.querySelector(".chan-chart .chan-spot-badge");
+        const badgeRect = spotBadge?.getBoundingClientRect();
+        card.style.maxHeight = Math.max(120, viewportHeight - 32) + "px";
+        // Anchor the popup's right edge just left of the live-price badge;
+        // keep it fixed there instead of following the pointer along the line.
+        const preferredLeft = badgeRect
+          ? badgeRect.left - card.offsetWidth - 12
+          : (viewportWidth - card.offsetWidth) / 2;
+        this.chanSpotGuideX = Math.max(margin, Math.min(maxLeft, preferredLeft));
+        this.chanSpotGuideY = Math.max(16, Math.min(viewportHeight - card.offsetHeight - 16, (viewportHeight - card.offsetHeight) / 2));
+      });
+    },
+    hideChanSpotGuide(event) {
+      // Touch opens the guide by tap and keeps it available until the next
+      // chart action. On a pointer device, leaving the live-price target hides
+      // it immediately; the card itself has pointer-events:none below.
+      if (this.isChanTouchInput() && event?.type === "mouseleave") return;
+      this.chanSpotGuideVisible = false;
+    },
+    toggleChanSpotGuide(event) {
+      if (event?.type?.startsWith("key")) {
+        this.chanSpotGuideVisible = true;
+      } else if (this.isChanTouchInput()) {
+        this.chanSpotGuideVisible = !this.chanSpotGuideVisible;
+      } else {
+        return;
+      }
+      event?.preventDefault();
+      if (this.chanSpotGuideVisible) this.chanHoveredScenario = null;
+      if (this.chanSpotGuideVisible) this.positionChanSpotGuide(event);
     },
     toggleChanScenarios() {
       this.chanScenariosVisible = !this.chanScenariosVisible;

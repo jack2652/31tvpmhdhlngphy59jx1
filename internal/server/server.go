@@ -1737,25 +1737,26 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 			expirationsDuration = time.Since(started)
 		}()
 	} else {
-		if expirationsOverride == nil {
+		// In constrained mode, publish the live quote before asking the provider
+		// for the expiry catalogue. That request can be slow and is not needed to
+		// show the current premarket, regular, after-hours, or overnight price.
+		if quoteOverride != nil {
+			quote = s.decorateCachedQuote(*quoteOverride)
+		} else {
+			started := time.Now()
+			quote, err = s.fetchSnapshotQuoteForExpirationMode(ctx, symbol, requestedExpiration, false)
+			quoteDuration = time.Since(started)
+			if err == nil {
+				publishStarted := time.Now()
+				s.cacheQuote(symbol, quote)
+				s.publishQuoteEvent(symbol)
+				earlyQuotePublishDuration = time.Since(publishStarted)
+			}
+		}
+		if err == nil && expirationsOverride == nil {
 			started := time.Now()
 			expires, expireErr = s.provider.Expirations(ctx, symbol)
 			expirationsDuration = time.Since(started)
-		}
-		if expireErr == nil {
-			if quoteOverride != nil {
-				quote = s.decorateCachedQuote(*quoteOverride)
-			} else {
-				started := time.Now()
-				quote, err = s.fetchSnapshotQuoteForExpirationMode(ctx, symbol, requestedExpiration, false)
-				quoteDuration = time.Since(started)
-				if err == nil {
-					publishStarted := time.Now()
-					s.cacheQuote(symbol, quote)
-					s.publishQuoteEvent(symbol)
-					earlyQuotePublishDuration = time.Since(publishStarted)
-				}
-			}
 		}
 	}
 	if parallelQuoteAndCatalog {
@@ -3954,6 +3955,9 @@ func activeExpirations(values []string) []string {
 			active = append(active, value)
 		}
 	}
+	// ISO dates sort chronologically, so every consumer starts with the nearest
+	// active expiry even when an upstream catalog changes its response order.
+	sort.Strings(active)
 	return active
 }
 
