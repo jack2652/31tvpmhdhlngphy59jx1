@@ -21,8 +21,15 @@
 .chan-chart-controls h3{margin:0;color:var(--text);font-size:15px;font-weight:600}
 .chan-controls>span{grid-area:status;align-self:center;font-size:11px;line-height:1.5;text-align:right;font-variant-numeric:tabular-nums}
 .chan-chart{position:relative;touch-action:pan-y;overflow:visible}
-.chan-chart svg{display:block;width:100%;height:auto;min-height:270px}
-.chan-chart svg:focus,.chan-chart svg:focus-visible{outline:0!important;box-shadow:none}
+.chan-chart>svg{display:block;width:100%;height:auto;min-height:270px}
+.chan-chart>svg:focus,.chan-chart>svg:focus-visible{outline:0!important;box-shadow:none}
+.chan-scenario-toggle-svg{color:var(--muted);cursor:pointer}
+.chan-scenario-toggle-svg-box{fill:var(--panel);stroke:var(--field-line);stroke-width:.8}
+.chan-scenario-toggle-svg-icon{fill:none;stroke:currentColor;stroke-width:.9;stroke-linecap:round;stroke-linejoin:round}
+.chan-scenario-toggle-svg:hover{color:var(--blue)}
+.chan-scenario-toggle-svg:focus{outline:none}
+.chan-scenario-toggle-svg:focus-visible{color:var(--blue)}
+.chan-scenario-toggle-svg:hover .chan-scenario-toggle-svg-box,.chan-scenario-toggle-svg:focus-visible .chan-scenario-toggle-svg-box{stroke:var(--blue)}
 .chan-crosshair-layer{pointer-events:none}
 .chan-crosshair-layer line{vector-effect:non-scaling-stroke}
 .chan-crosshair-layer .chart-tag text{font-size:11px;font-weight:500}
@@ -243,6 +250,10 @@
   .chan-overview-item:first-child{padding-top:0;border-right:0;border-bottom:1px solid var(--line)}
   .chan-controls{grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto;grid-template-areas:"controls" "status" "levels";gap:10px}
   .chan-controls>span{text-align:left}
+  /* 四个周期按钮在窄屏独占一行并按等分收缩，避免被 detail-segmented 的 overflow:hidden 裁掉。 */
+  .chan-chart-controls{flex-wrap:wrap;gap:10px}
+  .chan-controls .detail-segmented{display:flex;flex:1 1 100%;flex-wrap:wrap}
+  .chan-controls .detail-seg{flex:1 1 25%;min-width:0;padding:5px 6px}
   .chan-projection-float-card{bottom:calc(100% + 6px);width:min(340px,100%);max-height:min(38vh,220px);padding:8px 10px}
   .chan-projection-hit-area{stroke-width:32px}
   .chan-evidence{display:block}
@@ -257,7 +268,7 @@
 }
 @media(max-width:500px){
   .chan-chart{overflow:visible}
-  .chan-chart svg{width:100%;min-width:0;min-height:0;height:auto}
+  .chan-chart>svg{width:100%;min-width:0;min-height:0;height:auto}
 }
 @media(hover:none),(pointer:coarse){
   .chan-projection-float-card{pointer-events:auto}
@@ -314,11 +325,11 @@
 .level-strong-support,.level-reinforced-support{--level-color:var(--up)}
 .level-strong-resistance,.level-reinforced-resistance{--level-color:var(--down)}
 .level-strong,.level-reinforced{background:color-mix(in srgb,var(--level-color) var(--level-fill),transparent);box-shadow:inset var(--level-edge) 0 0 color-mix(in srgb,var(--level-color) var(--level-edge-fill),transparent)}
-.level-strength-1{--level-fill:8%;--level-edge:2px;--level-edge-fill:42%}
-.level-strength-2{--level-fill:13%;--level-edge:2px;--level-edge-fill:58%}
-.level-strength-3{--level-fill:19%;--level-edge:3px;--level-edge-fill:72%}
-.level-strength-4{--level-fill:26%;--level-edge:3px;--level-edge-fill:86%}
-.level-strength-5{--level-fill:34%;--level-edge:4px;--level-edge-fill:100%}
+.level-strength-1{--level-fill:16%;--level-edge:2px;--level-edge-fill:58%}
+.level-strength-2{--level-fill:22%;--level-edge:2px;--level-edge-fill:72%}
+.level-strength-3{--level-fill:29%;--level-edge:3px;--level-edge-fill:84%}
+.level-strength-4{--level-fill:37%;--level-edge:3px;--level-edge-fill:100%}
+.level-strength-5{--level-fill:46%;--level-edge:4px;--level-edge-fill:100%}
 .level-reinforced .level-strike{font-weight:750}
 .level-strong .level-strike{font-weight:800}
 .level-strong-support .level-strike{color:var(--up)}

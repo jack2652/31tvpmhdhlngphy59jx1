@@ -174,107 +174,105 @@ func TestHybridOvernightQuoteFallsBackToAlpacaWithoutCboe(t *testing.T) {
 	}
 }
 
-func TestHybridOvernightQuoteMergesAlpacaAndFallsBack(t *testing.T) {
-	var price float64 = 100
-	base := model.Quote{Symbol: "QQQ", Price: &price, Provider: "yahoo-chart", Currency: "USD", PreviousClose: floatPtr(98.0), Sessions: map[string]any{"post": map[string]any{"reference_close": float64(99)}}}
-	overnightPrice, previous, open := 101.0, 99.5, 100.5
-	overnight := model.Quote{Symbol: "QQQ", Price: &overnightPrice, PreviousClose: &previous, TodayOpen: &open, Provider: "alpaca-overnight", Sessions: map[string]any{"overnight": map[string]any{"price": overnightPrice}}}
-	merged := mergeOvernightQuote(base, overnight)
-	if merged.Price == nil || *merged.Price != 101 || merged.PreviousClose == nil || *merged.PreviousClose != 99 || merged.TodayOpen == nil || *merged.TodayOpen != 100.5 || merged.MarketState != "OVERNIGHT" {
-		t.Fatalf("unexpected merged quote: %#v", merged)
+func TestOvernightOnlyQuoteKeepsAlpacaPriceAndDerivesChange(t *testing.T) {
+	overnightPrice, previous, open := 101.0, 100.0, 100.5
+	overnight := model.Quote{Symbol: "QQQ", Price: &overnightPrice, PreviousClose: &previous, TodayOpen: &open, Provider: "alpaca-overnight", MarketState: "OVERNIGHT", Sessions: map[string]any{"overnight": map[string]any{"price": overnightPrice}}}
+	quote := overnightOnlyQuote(overnight)
+	if quote.Price == nil || *quote.Price != 101 || quote.PreviousClose == nil || *quote.PreviousClose != 100 || quote.TodayOpen == nil || *quote.TodayOpen != 100.5 || quote.MarketState != "OVERNIGHT" || quote.Provider != "alpaca-overnight" {
+		t.Fatalf("unexpected overnight quote: %#v", quote)
 	}
-	if merged.ChangePercent == nil || *merged.ChangePercent < 2.02 || *merged.ChangePercent > 2.03 {
-		t.Fatalf("change percent=%v, want near 2.0202", merged.ChangePercent)
+	if quote.ChangePercent == nil || *quote.ChangePercent != 1 {
+		t.Fatalf("change percent=%v, want 1", quote.ChangePercent)
 	}
 }
 
-func TestHybridOvernightQuoteFetchesIndependentProvidersConcurrently(t *testing.T) {
-	entered := make(chan string, 2)
-	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		entered <- "alpaca"
-		<-release
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"QQQ":{"latestTrade":{"p":101},"prevDailyBar":{"c":100}}}`)
-	}))
-	defer server.Close()
-
-	hybrid, err := NewDefaultHybrid(2*time.Second, 2, "", "key", "secret", 2*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hybrid.Regular.tickerFactory = func(string) (yahooTicker, error) {
-		return &yahooSDKTestTicker{quoteFunc: func() (*models.Quote, error) {
-			entered <- "yahoo"
-			<-release
-			return &models.Quote{Symbol: "QQQ", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"}, nil
-		}}, nil
-	}
-	hybrid.Overnight.baseURL = server.URL
+func TestHybridOvernightQuoteFallsBackToYahooWithoutAlpaca(t *testing.T) {
+	yahoo := NewYahoo(time.Second, 2)
+	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
+		quote: &models.Quote{Symbol: "QQQ", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"},
+	})
+	hybrid := NewHybrid(yahoo, nil, nil)
 	newYork, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		t.Fatal(err)
 	}
 	hybrid.now = func() time.Time { return time.Date(2026, time.October, 7, 20, 0, 0, 0, newYork) }
 
-	result := make(chan error, 1)
-	go func() {
-		_, quoteErr := hybrid.Quote(context.Background(), "QQQ")
-		result <- quoteErr
-	}()
-
-	seen := map[string]bool{}
-	for len(seen) < 2 {
-		select {
-		case providerName := <-entered:
-			seen[providerName] = true
-		case <-time.After(time.Second):
-			close(release)
-			<-result
-			t.Fatalf("only these providers entered before release: %v", seen)
-		}
+	quote, err := hybrid.Quote(context.Background(), "QQQ")
+	if err != nil || quote.Price == nil || *quote.Price != 100 || quote.Provider != "yahoo-chart" {
+		t.Fatalf("overnight Quote() without Alpaca = %#v, %v; want the Yahoo regular quote", quote, err)
 	}
-	close(release)
-	if err := <-result; err != nil {
-		t.Fatalf("Hybrid.Quote() error = %v", err)
+}
+
+func TestHybridOvernightQuoteFallsBackToYahooWhenAlpacaFails(t *testing.T) {
+	alpacaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprint(w, "boom")
+	}))
+	defer alpacaServer.Close()
+
+	yahoo := NewYahoo(time.Second, 2)
+	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
+		quote: &models.Quote{Symbol: "QQQ", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"},
+	})
+	alpaca := NewAlpaca("key", "secret", alpacaServer.URL, alpacaServer.Client())
+	hybrid := NewHybrid(yahoo, nil, alpaca)
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hybrid.now = func() time.Time { return time.Date(2026, time.October, 7, 20, 0, 0, 0, newYork) }
+
+	quote, err := hybrid.Quote(context.Background(), "QQQ")
+	if err != nil || quote.Price == nil || *quote.Price != 100 {
+		t.Fatalf("overnight Quote() with a failing Alpaca = %#v, %v; want the Yahoo fallback", quote, err)
+	}
+}
+
+func TestHybridOvernightQuoteSkipsYahooDuringOvernightSession(t *testing.T) {
+	var yahooRequests atomic.Int64
+	alpacaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"QQQ":{"latestTrade":{"p":101},"prevDailyBar":{"c":100}}}`)
+	}))
+	defer alpacaServer.Close()
+
+	yahoo := NewYahoo(time.Second, 2)
+	yahoo.tickerFactory = func(string) (yahooTicker, error) {
+		yahooRequests.Add(1)
+		return &yahooSDKTestTicker{quoteFunc: func() (*models.Quote, error) {
+			return &models.Quote{Symbol: "QQQ", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"}, nil
+		}}, nil
+	}
+	alpaca := NewAlpaca("key", "secret", alpacaServer.URL, alpacaServer.Client())
+	hybrid := NewHybrid(yahoo, nil, alpaca)
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hybrid.now = func() time.Time { return time.Date(2026, time.October, 7, 20, 0, 0, 0, newYork) }
+
+	quote, err := hybrid.Quote(context.Background(), "QQQ")
+	if err != nil || quote.Price == nil || *quote.Price != 101 {
+		t.Fatalf("overnight Quote() = %#v, %v; want the Alpaca overnight price", quote, err)
+	}
+	if got := yahooRequests.Load(); got != 0 {
+		t.Fatalf("Yahoo requests = %d, want none during the overnight session", got)
 	}
 }
 
 func TestHybridOvernightQuoteDoesNotReturnFallbackAfterCancellation(t *testing.T) {
-	responseGate := make(chan struct{})
-	var responseGateOnce sync.Once
-	releaseResponse := func() { responseGateOnce.Do(func() { close(responseGate) }) }
 	requestStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requestStarted <- struct{}{}
-		<-responseGate
+		<-release
 		_, _ = fmt.Fprint(w, `{"QQQ":{"latestTrade":{"p":101},"prevDailyBar":{"c":100}}}`)
 	}))
 	defer server.Close()
-	defer releaseResponse()
+	defer close(release)
 
-	historyStarted := make(chan struct{})
-	historyRelease := make(chan struct{})
-	var historyReleaseOnce sync.Once
-	releaseHistory := func() { historyReleaseOnce.Do(func() { close(historyRelease) }) }
-	defer releaseHistory()
-	historyFinished := make(chan struct{})
 	yahoo := NewYahoo(time.Second, 2)
-	yahoo.tickerFactory = func(string) (yahooTicker, error) {
-		return &yahooSDKTestTicker{
-			quoteFunc: func() (*models.Quote, error) {
-				return &models.Quote{Symbol: "QQQ", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"}, nil
-			},
-			historyFunc: func(params models.HistoryParams) ([]models.Bar, error) {
-				if params.Interval == "1m" {
-					close(historyStarted)
-					<-historyRelease
-					close(historyFinished)
-				}
-				return nil, nil
-			},
-		}, nil
-	}
 	alpaca := NewAlpaca("key", "secret", server.URL, server.Client())
 	hybrid := NewHybrid(yahoo, nil, alpaca)
 	newYork, err := time.LoadLocation("America/New_York")
@@ -295,59 +293,20 @@ func TestHybridOvernightQuoteDoesNotReturnFallbackAfterCancellation(t *testing.T
 		result <- quoteResult{quote: quote, err: quoteErr}
 	}()
 
-	for name, signal := range map[string]<-chan struct{}{
-		"Alpaca request": requestStarted,
-		"Yahoo history":  historyStarted,
-	} {
-		select {
-		case <-signal:
-		case <-time.After(time.Second):
-			releaseResponse()
-			releaseHistory()
-			t.Fatalf("%s did not start", name)
-		}
-	}
-
-	// The request has passed CanRequest. A non-zero cooldown marker lets
-	// the test observe Alpaca's successful response parsing via markAuthSuccess.
-	alpaca.authMu.Lock()
-	alpaca.authRetryAt = time.Now().Add(time.Hour)
-	alpaca.authMu.Unlock()
-	releaseResponse()
-	deadline := time.NewTimer(time.Second)
-	ticker := time.NewTicker(time.Millisecond)
-	defer deadline.Stop()
-	defer ticker.Stop()
-	for {
-		alpaca.authMu.Lock()
-		responseParsed := alpaca.authRetryAt.IsZero()
-		alpaca.authMu.Unlock()
-		if responseParsed {
-			break
-		}
-		select {
-		case <-deadline.C:
-			releaseHistory()
-			t.Fatal("Alpaca did not finish parsing the successful response")
-		case <-ticker.C:
-		}
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Alpaca request did not start")
 	}
 	cancel()
 
 	select {
 	case got := <-result:
 		if !errors.Is(got.err, context.Canceled) {
-			t.Fatalf("Hybrid.Quote() = %#v, error %v; want context.Canceled after Alpaca succeeds", got.quote, got.err)
+			t.Fatalf("Hybrid.Quote() = %#v, error %v; want context.Canceled instead of a fallback", got.quote, got.err)
 		}
 	case <-time.After(time.Second):
-		releaseHistory()
 		t.Fatal("Hybrid.Quote() did not return after cancellation")
-	}
-	releaseHistory()
-	select {
-	case <-historyFinished:
-	case <-time.After(time.Second):
-		t.Fatal("Yahoo SDK operation did not finish after releasing its history call")
 	}
 }
 

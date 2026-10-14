@@ -167,6 +167,8 @@
           <div class="chan-chart-controls"><h3>价格结构</h3><div class="detail-segmented" role="group" aria-label="缠论图表周期">
             <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'daily' ? 'true' : 'false'" @click="chanPeriod = 'daily'">日线</button>
             <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'weekly' ? 'true' : 'false'" @click="chanPeriod = 'weekly'">周线</button>
+            <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '15m' ? 'true' : 'false'" @click="chanPeriod = '15m'">15分钟</button>
+            <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '4h' ? 'true' : 'false'" @click="chanPeriod = '4h'">4小时</button>
           </div></div>
           <span>{{ chanFrame.bars }} 根收盘 K 线 · {{ chanFrame.confirmed }} 根已确认笔 · 截至 {{ chanFrame.asOf }}</span>
           <div v-if="chanFrame.chart && chanFrame.chart.keyLevels.length" class="chan-key-level-summary" role="list" aria-label="关键观察价位">
@@ -199,11 +201,11 @@
             <g key="chan-key-levels">
               <g v-for="level in chanFrame.chart.keyLevels" :key="level.key" :class="'chan-key-level-' + level.tone"><title>{{ level.title }}</title><line :x1="level.x1" :x2="level.x2" :y1="level.y" :y2="level.y" class="chan-key-level-line"></line></g>
             </g>
-            <g key="chan-projection-lane" v-if="chanFrame.chart.projections.length">
+            <g key="chan-projection-lane" v-if="chanFrame.chart.projections.length" v-show="chanScenariosVisible">
               <rect :x="chanFrame.chart.historyRight" :y="chanFrame.chart.plotTop" :width="chanFrame.chart.plotRight - chanFrame.chart.historyRight" :height="chanFrame.chart.plotBottom - chanFrame.chart.plotTop" class="chan-projection-lane"></rect>
               <text :x="chanFrame.chart.historyRight + 8" y="31" class="chan-projection-caption">条件情景 · 非预测</text>
             </g>
-            <g key="chan-projections">
+            <g key="chan-projections" v-show="chanScenariosVisible">
               <g v-for="route in chanFrame.chart.projections" :key="route.key" :class="'chan-projection-' + route.tone" @mouseenter="showChanScenario(route.key, $event)" @mouseleave="hideChanScenario($event)" @click.stop="toggleChanScenario(route.key, $event)" role="group" :aria-label="route.label + '：' + route.condition + '。悬停或轻触查看完整说明'" :aria-describedby="chanHoveredScenario === route.key ? 'chan-scenario-card-' + route.key : null">
                 <path :d="route.path" class="chan-projection-hit-area" aria-hidden="true"></path>
                 <path :d="route.path" class="chan-projection-path" marker-end="url(#chan-route-arrow)"></path>
@@ -218,6 +220,12 @@
               <rect :x="chanFrame.chart.spot.x" :y="chanFrame.chart.spot.boxY" :width="chanFrame.chart.spot.width" :height="chanFrame.chart.spot.height" rx="2" class="chan-spot-badge"></rect>
               <text :x="chanFrame.chart.spot.textX" :y="chanFrame.chart.spot.textY" text-anchor="middle" class="chan-spot-label">现价 {{ chanFrame.chart.spot.label }}</text>
             </g>
+            <g key="chan-scenario-toggle" class="chan-scenario-toggle-svg" :transform="'translate(' + (chanFrame.chart.historyRight - 15) + ' ' + (chanFrame.chart.plotBottom - 15) + ')'" role="button" tabindex="0" :aria-pressed="chanScenariosVisible ? 'true' : 'false'" :aria-label="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" @click.stop="toggleChanScenarios" @keydown.enter.stop.prevent="toggleChanScenarios" @keydown.space.stop.prevent="toggleChanScenarios">
+              <title>{{ chanScenariosVisible ? '隐藏条件情景' : '显示条件情景' }}</title>
+              <rect width="15" height="15" class="chan-scenario-toggle-svg-box"></rect>
+              <path v-if="chanScenariosVisible" d="M4 4 L7.5 7.5 L4 11 M7 4 L10.5 7.5 L7 11" class="chan-scenario-toggle-svg-icon"></path>
+              <path v-else d="M11 4 L7.5 7.5 L11 11 M8 4 L4.5 7.5 L8 11" class="chan-scenario-toggle-svg-icon"></path>
+            </g>
             <!-- 悬停图层独立于 Vue 数据，移动鼠标时只更新光标，不重绘整张 K 线图。 -->
             <g v-pre class="chan-crosshair-layer" aria-hidden="true" visibility="hidden">
               <line class="chart-crosshair"></line><line class="chart-crosshair-h"></line>
@@ -226,7 +234,7 @@
             </g>
           </svg>
           <div v-pre class="chart-tooltip chan-chart-tooltip" id="chan-chart-readout" hidden></div>
-          <template v-if="chanFrame.chart && chanFrame.chart.projections"><article v-for="route in chanFrame.chart.projections" v-if="chanHoveredScenario === route.key" :id="'chan-scenario-card-' + route.key" :key="route.key + '-card'" class="chan-projection-float-card" :class="'chan-projection-' + route.tone" :style="{ left: chanScenarioCardX + 'px' }" @mouseenter="showChanScenario(route.key, $event)" @mouseleave="hideChanScenario($event)" @click.stop><h4><span class="chan-scenario-title">{{ route.label }}</span><span class="chan-route-meta"><strong>倾向 {{ route.tiltScore }}/100</strong><span>{{ route.status }}</span></span></h4><p class="chan-tilt-note">综合日周位置、确认笔与有效信号的规则倾向分 · 非历史胜率</p><dl><div><dt>观察</dt><dd>{{ route.expectation }}</dd></div><div><dt>条件</dt><dd>{{ route.condition }}</dd></div><div><dt>失效</dt><dd>{{ route.invalidation }}</dd></div></dl></article></template>
+          <template v-if="chanFrame.chart && chanFrame.chart.projections && chanScenariosVisible"><article v-for="route in chanFrame.chart.projections" v-if="chanHoveredScenario === route.key" :id="'chan-scenario-card-' + route.key" :key="route.key + '-card'" class="chan-projection-float-card" :class="'chan-projection-' + route.tone" :style="{ left: chanScenarioCardX + 'px' }" @mouseenter="showChanScenario(route.key, $event)" @mouseleave="hideChanScenario($event)" @click.stop><h4><span class="chan-scenario-title">{{ route.label }}</span><span class="chan-route-meta"><strong>倾向 {{ route.tiltScore }}/100</strong><span>{{ route.status }}</span></span></h4><p class="chan-tilt-note">综合日周位置、确认笔与有效信号的规则倾向分 · 非历史胜率</p><dl><div><dt>观察</dt><dd>{{ route.expectation }}</dd></div><div><dt>条件</dt><dd>{{ route.condition }}</dd></div><div><dt>失效</dt><dd>{{ route.invalidation }}</dd></div></dl></article></template>
         </div>
         <div v-else class="levels-empty">历史行情到达后展示 K 线、笔与中枢</div>
         <div class="chan-legend"><span><i class="chan-legend-pen"></i>已确认笔</span><span><i class="chan-legend-pen chan-legend-pending"></i>形成中的笔</span><span><i class="chan-legend-center"></i>笔中枢</span><span><i class="chan-legend-level"></i>近期高低点／中枢边界</span><span><i class="chan-legend-projection"></i>右侧为条件情景推演</span><span>倾向分为规则估算，非统计概率</span><span>带 *：形成中的端点价格</span></div>

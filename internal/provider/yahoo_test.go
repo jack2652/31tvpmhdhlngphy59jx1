@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,9 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"option-scope-go/internal/outboundhttp"
+
 	yahooauth "github.com/wnjoon/go-yfinance/pkg/client"
 	ymodels "github.com/wnjoon/go-yfinance/pkg/models"
-	"option-scope-go/internal/outboundhttp"
 )
 
 type yahooSDKTestTicker struct {
@@ -186,8 +186,8 @@ func TestYahooOptionsAuthenticationUsesGoYFinanceAuthManager(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("go-yfinance authenticated requests = %d, want 1", calls)
 	}
-	if sdkCalls != 1 {
-		t.Fatalf("go-yfinance OptionChain calls = %d, want 1", sdkCalls)
+	if sdkCalls != 0 {
+		t.Fatalf("go-yfinance OptionChain calls = %d, want 0 when the authenticated raw response supplies the full chain", sdkCalls)
 	}
 }
 
@@ -325,24 +325,18 @@ func TestYahooSDKExpirationLookupDateUsesSDKLocalCacheKey(t *testing.T) {
 	}
 }
 
-func TestYahooQuoteFallsBackToDailyBarsWhenIntradayRequestFails(t *testing.T) {
+func TestYahooQuoteFallsBackToDailyBarsWhenQuoteRequestFails(t *testing.T) {
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		t.Fatal(err)
 	}
 	frozen := time.Date(2026, time.September, 25, 10, 0, 0, 0, location)
-	var intradayRequested, dailyRequested atomic.Bool
+	var dailyRequested atomic.Bool
 	yahoo := NewYahoo(time.Second, 1)
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
 		quoteErr: errors.New("quote endpoint unavailable"),
 		historyFunc: func(params ymodels.HistoryParams) ([]ymodels.Bar, error) {
 			switch params.Interval {
-			case "1m":
-				intradayRequested.Store(true)
-				if !params.PrePost {
-					t.Error("intraday history omitted pre/post sessions")
-				}
-				return nil, errors.New("intraday unavailable")
 			case "1d":
 				dailyRequested.Store(true)
 				return []ymodels.Bar{
@@ -360,8 +354,8 @@ func TestYahooQuoteFallsBackToDailyBarsWhenIntradayRequestFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Quote() error = %v", err)
 	}
-	if !intradayRequested.Load() || !dailyRequested.Load() {
-		t.Fatalf("requests intraday=%v daily=%v, want both", intradayRequested.Load(), dailyRequested.Load())
+	if !dailyRequested.Load() {
+		t.Fatal("failed quote did not trigger daily-history fallback")
 	}
 	if quote.Price == nil || *quote.Price != 102.5 || quote.PreviousClose == nil || *quote.PreviousClose != 100 || quote.TodayOpen == nil || *quote.TodayOpen != 101 {
 		t.Fatalf("daily fallback quote = %#v, want price 102.5 previous 100 open 101", quote)
@@ -371,22 +365,19 @@ func TestYahooQuoteFallsBackToDailyBarsWhenIntradayRequestFails(t *testing.T) {
 	}
 }
 
-func TestYahooQuoteSkipsIntradayWhenExchangeCalendarIsClosed(t *testing.T) {
+func TestYahooQuoteSkipsHistoryWhenMetadataIsCompleteOnClosedDay(t *testing.T) {
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Sunday: Yahoo occasionally keeps the previous REGULAR state in its
-	// quote payload even though no current intraday bars can exist.
+	// Sunday: a complete quote should not need history data.
 	frozen := time.Date(2026, time.October, 11, 12, 0, 0, 0, location)
-	var intradayCalls atomic.Int32
+	var historyCalls atomic.Int32
 	yahoo := NewYahoo(time.Second, 2)
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
 		quote: &ymodels.Quote{Symbol: "TEST", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"},
 		historyFunc: func(params ymodels.HistoryParams) ([]ymodels.Bar, error) {
-			if params.Interval == "1m" {
-				intradayCalls.Add(1)
-			}
+			historyCalls.Add(1)
 			return nil, nil
 		},
 	})
@@ -394,35 +385,24 @@ func TestYahooQuoteSkipsIntradayWhenExchangeCalendarIsClosed(t *testing.T) {
 	if _, err := yahoo.Quote(context.Background(), "TEST"); err != nil {
 		t.Fatalf("Quote() error=%v", err)
 	}
-	if got := intradayCalls.Load(); got != 0 {
-		t.Fatalf("closed-market intraday calls=%d, want 0", got)
+	if got := historyCalls.Load(); got != 0 {
+		t.Fatalf("complete quote triggered %d history calls, want 0", got)
 	}
 }
 
-func TestYahooQuoteLoadsQuoteAndIntradayConcurrently(t *testing.T) {
+func TestYahooQuoteDoesNotWaitForIntradayHistory(t *testing.T) {
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		t.Fatal(err)
 	}
 	frozen := time.Date(2026, time.September, 25, 10, 0, 0, 0, location)
-	historyStarted := make(chan struct{})
-	var overlapped atomic.Bool
+	var historyCalls atomic.Int32
 	yahoo := NewYahoo(time.Second, 1)
 	yahoo.now = func() time.Time { return frozen }
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
-		quoteFunc: func() (*ymodels.Quote, error) {
-			select {
-			case <-historyStarted:
-				overlapped.Store(true)
-			case <-time.After(time.Second):
-			}
-			return &ymodels.Quote{Symbol: "TEST", RegularMarketPrice: 10, RegularMarketPreviousClose: 9, MarketState: "REGULAR"}, nil
-		},
+		quote: &ymodels.Quote{Symbol: "TEST", RegularMarketPrice: 10, RegularMarketPreviousClose: 9, MarketState: "REGULAR"},
 		historyFunc: func(params ymodels.HistoryParams) ([]ymodels.Bar, error) {
-			if params.Interval != "1m" {
-				t.Errorf("History interval = %q, want 1m", params.Interval)
-			}
-			close(historyStarted)
+			historyCalls.Add(1)
 			return nil, nil
 		},
 	})
@@ -430,8 +410,8 @@ func TestYahooQuoteLoadsQuoteAndIntradayConcurrently(t *testing.T) {
 	if _, err := yahoo.Quote(context.Background(), "TEST"); err != nil {
 		t.Fatalf("Quote() error = %v", err)
 	}
-	if !overlapped.Load() {
-		t.Fatal("quote and intraday history did not overlap")
+	if got := historyCalls.Load(); got != 0 {
+		t.Fatalf("complete quote triggered %d history requests, want 0", got)
 	}
 }
 
@@ -446,8 +426,9 @@ func TestYahooQuoteUsesDailyBarsToFillMissingPrimaryFields(t *testing.T) {
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
 		quote: &ymodels.Quote{Symbol: "TEST", Currency: "USD", RegularMarketPrice: 110, RegularMarketOpen: 108, MarketState: "REGULAR"},
 		historyFunc: func(params ymodels.HistoryParams) ([]ymodels.Bar, error) {
-			if params.Interval == "1m" {
-				return nil, nil
+			if params.Interval != "1d" {
+				t.Errorf("History interval = %q, want daily fallback", params.Interval)
+				return nil, errors.New("unexpected history interval")
 			}
 			dailyRequested.Store(true)
 			return []ymodels.Bar{
@@ -470,30 +451,25 @@ func TestYahooQuoteUsesDailyBarsToFillMissingPrimaryFields(t *testing.T) {
 }
 
 func TestYahooQuotePreservesPrimaryErrorWhenDailyFallbackAlsoFails(t *testing.T) {
-	var intradayRequested, dailyRequested atomic.Bool
+	var dailyRequested atomic.Bool
 	yahoo := NewYahoo(time.Second, 1)
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
-		quoteErr: errors.New("original intraday HTTP 502"),
+		quoteErr: errors.New("original quote HTTP 502"),
 		historyFunc: func(params ymodels.HistoryParams) ([]ymodels.Bar, error) {
-			switch params.Interval {
-			case "1m":
-				intradayRequested.Store(true)
-				return nil, errors.New("intraday unavailable")
-			case "1d":
-				dailyRequested.Store(true)
-				return nil, errors.New("daily unavailable")
-			default:
+			if params.Interval != "1d" {
 				t.Errorf("unexpected history interval %q", params.Interval)
 				return nil, errors.New("unexpected history interval")
 			}
+			dailyRequested.Store(true)
+			return nil, errors.New("daily unavailable")
 		},
 	})
 	_, err := yahoo.Quote(context.Background(), "TEST")
-	if err == nil || !strings.Contains(err.Error(), "original intraday HTTP 502") {
+	if err == nil || !strings.Contains(err.Error(), "original quote HTTP 502") {
 		t.Fatalf("Quote() error = %v, want primary SDK quote error", err)
 	}
-	if !intradayRequested.Load() || !dailyRequested.Load() {
-		t.Fatalf("requests intraday=%v daily=%v, want both", intradayRequested.Load(), dailyRequested.Load())
+	if !dailyRequested.Load() {
+		t.Fatal("failed quote did not trigger daily-history fallback")
 	}
 }
 
@@ -530,9 +506,6 @@ func TestYahooQuoteTreatsEarlyCloseAfternoonAsPostMarket(t *testing.T) {
 	yahoo := NewYahoo(time.Second, 1)
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
 		quote: &ymodels.Quote{Symbol: "TEST", Currency: "USD", RegularMarketPrice: 100, RegularMarketOpen: 99, RegularMarketPreviousClose: 98, MarketState: "REGULAR"},
-		bars: map[string][]ymodels.Bar{
-			"1m": {{Date: time.Date(2025, time.December, 24, 13, 0, 0, 0, newYork), Open: 99, Close: 100}},
-		},
 	})
 	yahoo.now = func() time.Time { return frozen }
 
@@ -550,30 +523,15 @@ func TestYahooQuoteMapsPreRegularPostAndOvernightSessions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stamps := []time.Time{
-		time.Date(2026, 9, 24, 15, 59, 0, 0, location),
-		time.Date(2026, 9, 25, 8, 10, 0, 0, location),
-		time.Date(2026, 9, 25, 9, 29, 0, 0, location),
-		time.Date(2026, 9, 25, 9, 30, 0, 0, location),
-		time.Date(2026, 9, 25, 10, 0, 0, 0, location),
-		time.Date(2026, 9, 25, 15, 59, 0, 0, location),
-		time.Date(2026, 9, 25, 18, 0, 0, 0, location),
-		time.Date(2026, 9, 28, 2, 0, 0, 0, location),
-	}
-	timestamps := make([]string, len(stamps))
-	for index, stamp := range stamps {
-		timestamps[index] = strconv.FormatInt(stamp.Unix(), 10)
-	}
-	openValues := []string{"137", "138", "138.2", "138.27", "139", "140", "140.11", "138"}
-	closeValues := []string{"139.54", "140", "138.26", "138.4", "140", "137.79", "138.91", "139.1"}
 	cases := []struct {
-		name, now, state                              string
-		wantPrice, wantPrevious, wantOpen, wantChange float64
+		name, now, state                   string
+		regular, previous, open, pre, post float64
+		wantPrice, wantPrevious            float64
 	}{
-		{name: "pre", now: "2026-09-25T09:20:00-04:00", state: "PRE", wantPrice: 140.11, wantPrevious: 139.54, wantOpen: 136, wantChange: (140.11 - 139.54) / 139.54 * 100},
-		{name: "regular", now: "2026-09-25T10:01:00-04:00", state: "REGULAR", wantPrice: 140.11, wantPrevious: 139.54, wantOpen: 138.27, wantChange: (140.11 - 139.54) / 139.54 * 100},
-		{name: "post", now: "2026-09-25T18:01:00-04:00", state: "POST", wantPrice: 140.11, wantPrevious: 139.54, wantOpen: 138.27, wantChange: (140.11 - 139.54) / 139.54 * 100},
-		{name: "overnight", now: "2026-09-28T02:01:00-04:00", state: "OVERNIGHT", wantPrice: 140.11, wantPrevious: 139.54, wantOpen: 138.27, wantChange: (140.11 - 139.54) / 139.54 * 100},
+		{name: "pre", now: "2026-09-25T09:20:00-04:00", state: "PRE", regular: 139.54, previous: 138.91, open: 136, pre: 140.11, wantPrice: 140.11, wantPrevious: 139.54},
+		{name: "regular", now: "2026-09-25T10:01:00-04:00", state: "REGULAR", regular: 140.11, previous: 139.54, open: 138.27, pre: 140, wantPrice: 140.11, wantPrevious: 139.54},
+		{name: "post", now: "2026-09-25T18:01:00-04:00", state: "POST", regular: 140.11, previous: 139.54, open: 138.27, pre: 140, post: 138.91, wantPrice: 138.91, wantPrevious: 139.54},
+		{name: "overnight", now: "2026-09-28T02:01:00-04:00", state: "OVERNIGHT", regular: 140.11, previous: 139.54, open: 138.27, pre: 140, post: 138.91, wantPrice: 140.11, wantPrevious: 139.54},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -581,69 +539,52 @@ func TestYahooQuoteMapsPreRegularPostAndOvernightSessions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			bars := make([]ymodels.Bar, 0, len(stamps))
-			for index, stamp := range stamps {
-				if stamp.After(frozen) {
-					continue
-				}
-				open, _ := strconv.ParseFloat(openValues[index], 64)
-				close, _ := strconv.ParseFloat(closeValues[index], 64)
-				bars = append(bars, ymodels.Bar{Date: stamp, Open: open, Close: close})
-			}
 			yahoo := NewYahoo(time.Second, 1)
 			setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
-				quote: &ymodels.Quote{Symbol: "TEST", Currency: "USD", RegularMarketPrice: 140.11, RegularMarketOpen: 136, RegularMarketPreviousClose: 138.91, MarketState: "REGULAR"},
-				bars:  map[string][]ymodels.Bar{"1m": bars},
+				quote: &ymodels.Quote{
+					Symbol: "TEST", Currency: "USD", RegularMarketPrice: test.regular, RegularMarketOpen: test.open,
+					RegularMarketPreviousClose: test.previous, RegularMarketTime: time.Date(2026, 9, 25, 16, 0, 0, 0, location),
+					PreMarketPrice: test.pre, PreMarketTime: time.Date(2026, 9, 25, 9, 19, 0, 0, location),
+					PostMarketPrice: test.post, PostMarketTime: time.Date(2026, 9, 25, 18, 0, 0, 0, location),
+				},
 			})
 			yahoo.now = func() time.Time { return frozen }
 			quote, err := yahoo.Quote(context.Background(), "TEST")
 			if err != nil {
 				t.Fatalf("Quote() error=%v", err)
 			}
-			if quote.MarketState != test.state || quote.Price == nil || *quote.Price != test.wantPrice || quote.PreviousClose == nil || *quote.PreviousClose != test.wantPrevious || quote.TodayOpen == nil || *quote.TodayOpen != test.wantOpen || quote.ChangePercent == nil || math.Abs(*quote.ChangePercent-test.wantChange) > 1e-9 {
+			if quote.MarketState != test.state || quote.Price == nil || *quote.Price != test.wantPrice || quote.PreviousClose == nil || *quote.PreviousClose != test.wantPrevious || quote.TodayOpen == nil || *quote.TodayOpen != test.open {
 				t.Fatalf("quote calibration differs: %#v", quote)
 			}
-			wantPrePrice := float64(140)
-			if test.name != "pre" {
-				wantPrePrice = 138.26
-			}
 			pre, preOK := quote.Sessions["pre"].(map[string]any)
-			if !preOK || pre["price"] != wantPrePrice {
-				t.Errorf("pre summary=%#v, want price=%v", quote.Sessions["pre"], wantPrePrice)
-			}
-			if test.name == "post" || test.name == "overnight" {
-				if value, ok := quote.Sessions["post"].(map[string]any); !ok || value["price"] != float64(138.91) || value["reference_close"] != float64(137.79) {
-					t.Errorf("post summary differs: %#v", quote.Sessions["post"])
+			if test.name == "pre" {
+				if !preOK || pre["price"] != test.pre || pre["reference_close"] != test.regular {
+					t.Errorf("pre summary differs: %#v", quote.Sessions["pre"])
 				}
+			} else if preOK {
+				t.Errorf("stale pre summary should be omitted: %#v", pre)
 			}
-			if test.name == "overnight" {
-				if value, ok := quote.Sessions["overnight"].(map[string]any); !ok || value["price"] != float64(139.1) || value["reference_close"] != float64(137.79) {
-					t.Errorf("overnight summary differs: %#v", quote.Sessions["overnight"])
+			post, postOK := quote.Sessions["post"].(map[string]any)
+			if !postOK || post["reference_close"] != test.regular {
+				t.Errorf("post reference differs: %#v", quote.Sessions["post"])
+			}
+			if test.name == "post" {
+				if post["price"] != test.post {
+					t.Errorf("post price=%v, want %v", post["price"], test.post)
 				}
-			}
-			if preOK && (pre["reference_close"] != float64(139.54) || math.Abs(pre["change_percent"].(float64)-(wantPrePrice-139.54)/139.54*100) > 1e-9) {
-				t.Errorf("pre session references wrong regular close: %#v", pre)
-			}
-			if test.name == "post" || test.name == "overnight" {
-				if post, ok := quote.Sessions["post"].(map[string]any); !ok || post["reference_close"] != float64(137.79) {
-					t.Errorf("post session reference=%#v, want 137.79", quote.Sessions["post"])
-				}
+			} else if _, exists := post["price"]; exists {
+				t.Errorf("stale post price should be omitted: %#v", post)
 			}
 		})
 	}
 }
 
-func TestYahooQuoteSkipsSparseAndNullIntradayValues(t *testing.T) {
+func TestYahooQuoteUsesQuoteMetadataForPreMarketSession(t *testing.T) {
 	location, _ := time.LoadLocation("America/New_York")
 	latest := time.Date(2026, 9, 25, 8, 10, 0, 0, location)
 	yahoo := NewYahoo(time.Second, 1)
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
-		quote: &ymodels.Quote{Symbol: "TEST", Currency: "USD", RegularMarketPrice: 101, RegularMarketPreviousClose: 100, MarketState: "PRE"},
-		bars: map[string][]ymodels.Bar{"1m": {
-			{Date: latest.Add(-2 * time.Minute), Open: 0, Close: 0},
-			{Date: latest.Add(-time.Minute), Open: 0, Close: 103},
-			{Date: latest, Open: 100, Close: 102},
-		}},
+		quote: &ymodels.Quote{Symbol: "TEST", Currency: "USD", RegularMarketPrice: 101, RegularMarketPreviousClose: 100, PreMarketPrice: 102, PreMarketTime: latest, MarketState: "PRE"},
 	})
 	yahoo.now = func() time.Time { return latest }
 	quote, err := yahoo.Quote(context.Background(), "TEST")
@@ -652,10 +593,10 @@ func TestYahooQuoteSkipsSparseAndNullIntradayValues(t *testing.T) {
 	}
 	pre, ok := quote.Sessions["pre"].(map[string]any)
 	if !ok || pre["price"] != float64(102) || pre["as_of"] != latest.Format(time.RFC3339) {
-		t.Fatalf("sparse/null bars not handled like Python: %#v", quote.Sessions)
+		t.Fatalf("quote metadata was not mapped to pre summary: %#v", quote.Sessions)
 	}
-	if quote.MarketState != "PRE" || quote.Price == nil || *quote.Price != 101 {
-		t.Fatalf("meta price/state fallback changed on sparse bars: %#v", quote)
+	if quote.MarketState != "PRE" || quote.Price == nil || *quote.Price != 102 {
+		t.Fatalf("quote metadata price/state mapping differs: %#v", quote)
 	}
 }
 
@@ -764,7 +705,7 @@ func TestYahooChainPreservesNullableOptionNumericFields(t *testing.T) {
 	}
 }
 
-func TestYahooChainMatchesRawExtensionsByContractSymbol(t *testing.T) {
+func TestYahooChainUsesSingleRawResponseContractOrder(t *testing.T) {
 	expiration := time.Date(2030, time.January, 18, 0, 0, 0, 0, time.UTC)
 	stamp := expiration.Unix()
 	body := fmt.Sprintf(`{"optionChain":{"result":[{"options":[{"expirationDate":%d,"calls":[{"contractSymbol":"B","bid":22,"gamma":0.02},{"contractSymbol":"A","bid":11,"gamma":0.01}],"puts":[]}]}],"error":null}}`, stamp)
@@ -784,11 +725,11 @@ func TestYahooChainMatchesRawExtensionsByContractSymbol(t *testing.T) {
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("Chain() = %#v, %v; want two calls", rows, err)
 	}
-	if rows[0].ContractSymbol != "A" || rows[0].Bid == nil || *rows[0].Bid != 11 || rows[0].Gamma == nil || *rows[0].Gamma != 0.01 {
-		t.Errorf("first SDK contract received mismatched raw fields: %#v", rows[0])
+	if rows[0].ContractSymbol != "B" || rows[0].Bid == nil || *rows[0].Bid != 22 || rows[0].Gamma == nil || *rows[0].Gamma != 0.02 {
+		t.Errorf("first raw contract fields were not preserved: %#v", rows[0])
 	}
-	if rows[1].ContractSymbol != "B" || rows[1].Bid == nil || *rows[1].Bid != 22 || rows[1].Gamma == nil || *rows[1].Gamma != 0.02 {
-		t.Errorf("second SDK contract received mismatched raw fields: %#v", rows[1])
+	if rows[1].ContractSymbol != "A" || rows[1].Bid == nil || *rows[1].Bid != 11 || rows[1].Gamma == nil || *rows[1].Gamma != 0.01 {
+		t.Errorf("second raw contract fields were not preserved: %#v", rows[1])
 	}
 }
 
@@ -859,13 +800,10 @@ func TestYahooSDKCancellationRetainsGateUntilRequestFinishes(t *testing.T) {
 	closed := make(chan struct{})
 	yahoo := NewYahoo(time.Minute, 1)
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
-		quote: &ymodels.Quote{Symbol: "TEST", RegularMarketPrice: 10, RegularMarketPreviousClose: 9, MarketState: "REGULAR"},
-		historyFunc: func(params ymodels.HistoryParams) ([]ymodels.Bar, error) {
-			if params.Interval == "1m" {
-				started <- struct{}{}
-				<-releaseSDK
-			}
-			return nil, nil
+		quoteFunc: func() (*ymodels.Quote, error) {
+			started <- struct{}{}
+			<-releaseSDK
+			return &ymodels.Quote{Symbol: "TEST", RegularMarketPrice: 10, RegularMarketPreviousClose: 9, MarketState: "REGULAR"}, nil
 		},
 		closed: func() { close(closed) },
 	})
@@ -916,14 +854,20 @@ func TestYahooPropagatesProviderErrors(t *testing.T) {
 			case "quote error":
 				setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
 					quoteErr:   errors.New("Quote not found"),
-					historyErr: map[string]error{"1m": errors.New("history unavailable"), "1d": errors.New("history unavailable")},
+					historyErr: map[string]error{"1d": errors.New("history unavailable")},
 				})
 				_, err = yahoo.Quote(context.Background(), "TEST")
 			case "expiration error is not empty catalog":
 				setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{optionsErr: errors.New("Invalid cookie")})
 				_, err = yahoo.Expirations(context.Background(), "TEST")
 			case "chain error":
-				setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{chainErr: errors.New("API error: Bad Request - Invalid expiration")})
+				yahoo.optionsURL = "https://query1.finance.yahoo.com/v7/finance/options/%s"
+				yahoo.optionsAuth = yahooCrumbGetterFunc(func(string, url.Values) (*yahooauth.Response, error) {
+					return &yahooauth.Response{
+						StatusCode: http.StatusOK,
+						Body:       `{"optionChain":{"result":null,"error":{"code":"Bad Request","description":"Invalid expiration"}}}`,
+					}, nil
+				})
 				_, _, err = yahoo.Chain(context.Background(), "TEST", "2030-01-18")
 			}
 			wantMessage := map[string]string{

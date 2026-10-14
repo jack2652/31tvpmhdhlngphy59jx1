@@ -108,11 +108,15 @@ type CboeOptionsClient struct {
 	CacheTTL   time.Duration
 	CacheLimit int
 	Gate       chan struct{}
-	GateWait   time.Duration
-	mu         sync.Mutex
-	cache      map[string]cboeCacheEntry
-	inFlight   map[string]*cboeFlight
-	clockNow   func() time.Time
+	// InteractiveGate reserves one upstream slot for the delayed price fallback
+	// (Quote) so a busy shared gate cannot starve the current-price path. Chain
+	// and Expirations keep using Gate.
+	InteractiveGate chan struct{}
+	GateWait        time.Duration
+	mu              sync.Mutex
+	cache           map[string]cboeCacheEntry
+	inFlight        map[string]*cboeFlight
+	clockNow        func() time.Time
 }
 
 type cboeCacheEntry struct {
@@ -138,6 +142,13 @@ func NewCboeOptionsClient(client *http.Client, endpoint string) *CboeOptionsClie
 }
 
 func (c *CboeOptionsClient) fetch(ctx context.Context, rawSymbol string) (string, CboeOptionsPayloadDTO, error) {
+	return c.fetchWithGate(ctx, rawSymbol, c.Gate)
+}
+
+// fetchWithGate runs the shared Cboe request under the provided upstream gate.
+// Quote passes the interactive gate so the delayed price fallback keeps a
+// reserved slot; Expirations and Chain keep the shared gate.
+func (c *CboeOptionsClient) fetchWithGate(ctx context.Context, rawSymbol string, gate chan struct{}) (string, CboeOptionsPayloadDTO, error) {
 	symbol, err := normalizeCboeSymbol(rawSymbol)
 	if err != nil {
 		return "", CboeOptionsPayloadDTO{}, err
@@ -148,7 +159,16 @@ func (c *CboeOptionsClient) fetch(ctx context.Context, rawSymbol string) (string
 	if payload, ok := c.cachedPayload(symbol); ok {
 		return symbol, payload, nil
 	}
-	return c.fetchSingleFlight(ctx, symbol)
+	return c.fetchSingleFlight(ctx, symbol, gate)
+}
+
+// priceGate returns the reserved upstream slot when configured, otherwise the
+// shared gate.
+func (c *CboeOptionsClient) priceGate() chan struct{} {
+	if c != nil && c.InteractiveGate != nil {
+		return c.InteractiveGate
+	}
+	return c.Gate
 }
 
 func (c *CboeOptionsClient) cachedPayload(symbol string) (CboeOptionsPayloadDTO, bool) {
@@ -162,7 +182,7 @@ func (c *CboeOptionsClient) cachedPayload(symbol string) (CboeOptionsPayloadDTO,
 	return entry.payload, true
 }
 
-func (c *CboeOptionsClient) fetchSingleFlight(ctx context.Context, symbol string) (string, CboeOptionsPayloadDTO, error) {
+func (c *CboeOptionsClient) fetchSingleFlight(ctx context.Context, symbol string, gate chan struct{}) (string, CboeOptionsPayloadDTO, error) {
 	retriedCanceledFlight := false
 	for {
 		c.mu.Lock()
@@ -190,7 +210,7 @@ func (c *CboeOptionsClient) fetchSingleFlight(ctx context.Context, symbol string
 		c.inFlight[symbol] = flight
 		c.mu.Unlock()
 
-		payload, err := c.fetchUncached(ctx, symbol)
+		payload, err := c.fetchUncached(ctx, symbol, gate)
 		leaderCanceled := ctx.Err() != nil && err != nil
 		c.mu.Lock()
 		flight.payload, flight.err, flight.leaderCanceled = payload, err, leaderCanceled
@@ -217,8 +237,8 @@ func (c *CboeOptionsClient) fetchSingleFlight(ctx context.Context, symbol string
 	}
 }
 
-func (c *CboeOptionsClient) fetchUncached(ctx context.Context, symbol string) (CboeOptionsPayloadDTO, error) {
-	release, err := acquireGateTimeout(ctx, c.Gate, c.GateWait)
+func (c *CboeOptionsClient) fetchUncached(ctx context.Context, symbol string, gate chan struct{}) (CboeOptionsPayloadDTO, error) {
+	release, err := acquireGateTimeout(ctx, gate, c.GateWait)
 	if err != nil {
 		return CboeOptionsPayloadDTO{}, err
 	}
@@ -279,7 +299,7 @@ func (c *CboeOptionsClient) fetchUncached(ctx context.Context, symbol string) (C
 
 // Quote returns the delayed underlying price embedded in Cboe's option snapshot.
 func (c *CboeOptionsClient) Quote(ctx context.Context, rawSymbol string) (model.Quote, error) {
-	symbol, payload, err := c.fetch(ctx, rawSymbol)
+	symbol, payload, err := c.fetchWithGate(ctx, rawSymbol, c.priceGate())
 	if err != nil {
 		return model.Quote{}, err
 	}

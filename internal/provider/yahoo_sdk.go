@@ -38,48 +38,6 @@ func newYahooTickerFactory(client *yfinanceclient.Client) yahooTickerFactory {
 	}
 }
 
-func yahooChartFromSDK(quote *models.Quote, bars []models.Bar) yahooChartResult {
-	result := yahooChartResult{}
-	if quote != nil {
-		result.Meta = yahooChartMeta{
-			Symbol: quote.Symbol, Currency: quote.Currency, RegularMarketPrice: quote.RegularMarketPrice,
-			RegularMarketOpen: quote.RegularMarketOpen, PreviousClose: quote.RegularMarketPreviousClose,
-			MarketState: quote.MarketState, RegularMarketTime: quote.RegularMarketTime.Unix(),
-		}
-	}
-	result.Timestamp = make([]*int64, 0, len(bars))
-	values := struct {
-		Open   []*float64 `json:"open"`
-		High   []*float64 `json:"high"`
-		Low    []*float64 `json:"low"`
-		Close  []*float64 `json:"close"`
-		Volume []*int64   `json:"volume"`
-	}{
-		Open: make([]*float64, 0, len(bars)), High: make([]*float64, 0, len(bars)),
-		Low: make([]*float64, 0, len(bars)), Close: make([]*float64, 0, len(bars)),
-		Volume: make([]*int64, 0, len(bars)),
-	}
-	for _, bar := range bars {
-		stamp := bar.Date.Unix()
-		result.Timestamp = append(result.Timestamp, &stamp)
-		values.Open = append(values.Open, sdkOptionalFloat(bar.Open))
-		values.High = append(values.High, sdkOptionalFloat(bar.High))
-		values.Low = append(values.Low, sdkOptionalFloat(bar.Low))
-		values.Close = append(values.Close, sdkOptionalFloat(bar.Close))
-		volume := bar.Volume
-		values.Volume = append(values.Volume, &volume)
-	}
-	result.Indicators.Quote = append(result.Indicators.Quote, values)
-	return result
-}
-
-func sdkOptionalFloat(value float64) *float64 {
-	if !validYahooPrice(value) {
-		return nil
-	}
-	return &value
-}
-
 func yahooHistoryParams(interval string, prePost bool) models.HistoryParams {
 	return models.HistoryParams{Period: "5d", Interval: interval, PrePost: prePost, AutoAdjust: false, Actions: false, KeepNA: false}
 }

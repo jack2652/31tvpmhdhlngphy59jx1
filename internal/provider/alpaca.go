@@ -28,12 +28,15 @@ const (
 // Alpaca fetches Basic stock snapshots from Alpaca's overnight feed. It is
 // intentionally limited to stock quotes; it does not request options data.
 type Alpaca struct {
-	apiKey   string
-	secret   string
-	baseURL  string
-	client   *http.Client
-	Gate     chan struct{}
-	GateWait time.Duration
+	apiKey  string
+	secret  string
+	baseURL string
+	client  *http.Client
+	Gate    chan struct{}
+	// InteractiveGate reserves one upstream slot for the overnight price quote so
+	// a busy shared gate cannot starve the current-price path.
+	InteractiveGate chan struct{}
+	GateWait        time.Duration
 
 	authMu      sync.Mutex
 	authRetryAt time.Time
@@ -224,7 +227,11 @@ func (a *Alpaca) fetchSnapshot(ctx context.Context, symbol string) (map[string]a
 	request.Header.Set("User-Agent", "option-scope/1.0")
 	request.Header.Set("APCA-API-KEY-ID", a.apiKey)
 	request.Header.Set("APCA-API-SECRET-KEY", a.secret)
-	release, err := acquireGateTimeout(ctx, a.Gate, a.GateWait)
+	gate := a.Gate
+	if a.InteractiveGate != nil {
+		gate = a.InteractiveGate
+	}
+	release, err := acquireGateTimeout(ctx, gate, a.GateWait)
 	if err != nil {
 		return nil, err
 	}

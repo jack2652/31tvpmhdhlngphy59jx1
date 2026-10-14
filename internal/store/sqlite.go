@@ -578,7 +578,24 @@ func (s *SQLite) LatestQuote(symbol string) (model.Quote, bool, error) {
 	var methodsJSON sql.NullString
 	var forwardEPS, safetyMargin, confidenceScore, interestCoverage, shareholderReturnYield sql.NullFloat64
 	var dataQualityScore, ownerEarningsMaintenanceRatio sql.NullFloat64
-	err := s.db.QueryRow(`SELECT id, raw_json, fetched_at, price, change_percent, today_open, previous_close, currency, market_state, provider, COALESCE(sessions_json, '{}'),
+	err := s.db.QueryRow(`WITH quote_rows AS (
+ SELECT quote_snapshots.*,
+  CASE WHEN provider='go-valuation' THEN COALESCE((
+   SELECT source.fetched_at FROM quote_snapshots AS source
+   WHERE source.symbol=quote_snapshots.symbol AND source.provider<>'go-valuation'
+    AND ((source.today_open IS NULL AND quote_snapshots.today_open IS NULL) OR
+     (source.today_open IS NOT NULL AND quote_snapshots.today_open IS NOT NULL AND
+      ABS(source.today_open-quote_snapshots.today_open)<=MAX(0.01,ABS(quote_snapshots.today_open)*0.0001)))
+    AND ((source.previous_close IS NULL AND quote_snapshots.previous_close IS NULL) OR
+     (source.previous_close IS NOT NULL AND quote_snapshots.previous_close IS NOT NULL AND
+      ABS(source.previous_close-quote_snapshots.previous_close)<=MAX(0.01,ABS(quote_snapshots.previous_close)*0.0001)))
+    AND source.market_state IS quote_snapshots.market_state
+    AND source.fetched_at<=quote_snapshots.fetched_at
+   ORDER BY source.fetched_at DESC LIMIT 1
+  ), fetched_at) ELSE fetched_at END AS market_fetched_at
+ FROM quote_snapshots WHERE symbol=?
+)
+SELECT id, raw_json, market_fetched_at, price, change_percent, today_open, previous_close, currency, market_state, provider, COALESCE(sessions_json, '{}'),
  fair_value, fair_value_low, fair_value_high, fair_value_buy_low, fair_value_buy_high, fair_value_source, fair_value_model, fair_value_methods_json,
  fair_value_forward_eps, fair_value_forward_eps_source, fair_value_safety_margin, fair_value_confidence,
  fair_value_confidence_score, fair_value_interest_coverage, fair_value_regime, fair_value_regime_signals_json,
@@ -587,8 +604,9 @@ func (s *SQLite) LatestQuote(symbol string) (model.Quote, bool, error) {
  fair_value_historical_valuation_percentiles_json, fair_value_shareholder_total_return_yield,
  fair_value_market_cap_data_quality, fair_value_data_quality_score,
  fair_value_owner_earnings_maintenance_ratio, fair_value_owner_earnings_ratio_source
-FROM quote_snapshots WHERE symbol=?
-ORDER BY CASE WHEN price IS NOT NULL AND price > 0 THEN 0 ELSE 1 END, fetched_at DESC LIMIT 1`, symbol).Scan(
+FROM quote_rows
+ORDER BY CASE WHEN price IS NOT NULL AND price > 0 THEN 0 ELSE 1 END,
+ market_fetched_at DESC, CASE WHEN provider='go-valuation' THEN 0 ELSE 1 END, fetched_at DESC LIMIT 1`, symbol).Scan(
 		&quoteID, &rawJSON, &fetched, &price, &change, &todayOpen, &previous, &currency, &marketState, &providerName, &sessions,
 		&fairValue, &fairLow, &fairHigh, &fairBuyLow, &fairBuyHigh, &fairSource, &fairModel, &methodsJSON,
 		&forwardEPS, &epsSource, &safetyMargin, &confidence, &confidenceScore, &interestCoverage,

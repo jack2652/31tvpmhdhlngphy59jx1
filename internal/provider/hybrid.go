@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
-	"sync"
 	"time"
 
 	"option-scope-go/internal/marketcalendar"
@@ -21,6 +20,10 @@ type HistoryClient interface {
 	FetchAdjusted(context.Context, string, string) (HistoryResult, error)
 }
 
+type IntradayHistoryClient interface {
+	FetchIntraday(context.Context, string, string) (HistoryResult, error)
+}
+
 type Hybrid struct {
 	Regular       *Yahoo
 	Delayed       *CboeOptionsClient
@@ -33,6 +36,17 @@ func NewHybrid(regular *Yahoo, delayed *CboeOptionsClient, overnight *Alpaca) *H
 	var history HistoryClient
 	if regular != nil {
 		history = NewYFinanceHistoryClient(regular.semaphore, regular.gateWait, regular.tickerFactory)
+		// Give each alternate price source its own reserved upstream slot so a
+		// saturated shared gate cannot starve the overnight/delayed quote, while
+		// still letting the sources be fetched in parallel.
+		if regular.interactiveGate != nil {
+			if delayed != nil && delayed.InteractiveGate == nil {
+				delayed.InteractiveGate = make(chan struct{}, 1)
+			}
+			if overnight != nil && overnight.InteractiveGate == nil {
+				overnight.InteractiveGate = make(chan struct{}, 1)
+			}
+		}
 	}
 	return &Hybrid{Regular: regular, Delayed: delayed, Overnight: overnight, HistoryClient: history, now: time.Now}
 }
@@ -133,46 +147,49 @@ func (h *Hybrid) Quote(ctx context.Context, rawSymbol string) (model.Quote, erro
 	if err != nil {
 		return model.Quote{}, err
 	}
-	now := h.marketNow()
-	overnightSession := isNYSEOvernightSession(now)
-	canOverlay := overnightSession && h.Overnight != nil && h.Overnight.CanRequest()
-	var base, overnight model.Quote
-	var baseErr, overnightErr error
-	if canOverlay && h.concurrentQuoteFetchAllowed() {
-		var requests sync.WaitGroup
-		requests.Add(2)
-		go func() {
-			defer requests.Done()
-			base, baseErr = h.Regular.Quote(ctx, symbol)
-		}()
-		go func() {
-			defer requests.Done()
-			overnight, overnightErr = h.Overnight.Quote(ctx, symbol)
-		}()
-		requests.Wait()
-	} else {
-		base, baseErr = h.Regular.Quote(ctx, symbol)
-		if canOverlay {
-			overnight, overnightErr = h.Overnight.Quote(ctx, symbol)
+	// During the overnight session Alpaca's overnight snapshot is the current
+	// price, so the Yahoo regular quote is not fetched. When Alpaca is not
+	// configured (or is in an authentication cooldown) Yahoo takes over.
+	if isNYSEOvernightSession(h.marketNow()) && h.Overnight != nil && h.Overnight.CanRequest() {
+		overnight, overnightErr := h.Overnight.Quote(ctx, symbol)
+		if err := ctx.Err(); err != nil {
+			return model.Quote{}, err
 		}
-	}
-	if err := ctx.Err(); err != nil {
-		return model.Quote{}, err
-	}
-	if !canOverlay {
-		return base, baseErr
-	}
-	if baseErr != nil {
-		if overnightErr == nil {
-			return overnight, nil
+		if overnightErr == nil && overnight.Price != nil {
+			return overnightOnlyQuote(overnight), nil
 		}
-		return model.Quote{}, baseErr
-	}
-	if overnightErr != nil {
-		// An unavailable/invalid optional overnight feed must not break the base quote.
+		base, baseErr := h.Regular.Quote(ctx, symbol)
+		if baseErr != nil {
+			if overnightErr != nil {
+				return model.Quote{}, overnightErr
+			}
+			return model.Quote{}, baseErr
+		}
 		return base, nil
 	}
-	return mergeOvernightQuote(base, overnight), nil
+	return h.Regular.Quote(ctx, symbol)
+}
+
+// overnightOnlyQuote presents the Alpaca overnight snapshot as the current
+// quote. The Yahoo regular quote is not fetched during the overnight session, so
+// there is no separate base to merge; the change percent is derived against the
+// previous close and the Alpaca provider label is kept.
+func overnightOnlyQuote(overnight model.Quote) model.Quote {
+	if overnight.Sessions == nil {
+		overnight.Sessions = map[string]any{}
+	}
+	previous := overnight.PreviousClose
+	if previous == nil || *previous <= 0 {
+		previous = sessionReferenceClose(overnight.Sessions, "overnight")
+	}
+	if price := overnight.Price; price != nil && previous != nil && *previous > 0 {
+		change := (*price - *previous) / *previous * 100
+		if !math.IsNaN(change) && !math.IsInf(change, 0) {
+			overnight.ChangePercent = &change
+		}
+	}
+	overnight.MarketState = "OVERNIGHT"
+	return overnight
 }
 
 // SnapshotQuote matches the Python snapshot fetch path: outside regular
@@ -209,57 +226,6 @@ func withSnapshotFallbackSessions(fallback, original model.Quote, originalSuccee
 		fallback.Sessions = original.Sessions
 	}
 	return fallback
-}
-
-func (h *Hybrid) concurrentQuoteFetchAllowed() bool {
-	if h == nil || h.Regular == nil {
-		return false
-	}
-	return h.Regular.semaphore == nil || cap(h.Regular.semaphore) > 1
-}
-
-func mergeOvernightQuote(base, overnight model.Quote) model.Quote {
-	if base.Sessions == nil {
-		base.Sessions = map[string]any{}
-	}
-	for key, value := range overnight.Sessions {
-		base.Sessions[key] = value
-	}
-	previous := sessionReferenceClose(base.Sessions, "post")
-	if previous == nil || *previous <= 0 {
-		previous = sessionReferenceClose(base.Sessions, "overnight")
-	}
-	if previous == nil || *previous <= 0 {
-		previous = base.PreviousClose
-	}
-	if previous == nil || *previous <= 0 {
-		previous = overnight.PreviousClose
-	}
-	price := overnight.Price
-	if price == nil || *price <= 0 {
-		price = base.Price
-	}
-	base.Price = price
-	base.PreviousClose = previous
-	base.TodayOpen = firstValidQuoteValue(overnight.TodayOpen, base.TodayOpen)
-	base.MarketState = "OVERNIGHT"
-	base.Provider = "hybrid"
-	if price != nil && previous != nil && *previous > 0 {
-		change := (*price - *previous) / *previous * 100
-		if !math.IsNaN(change) && !math.IsInf(change, 0) {
-			base.ChangePercent = &change
-		}
-	}
-	return base
-}
-
-func firstValidQuoteValue(values ...*float64) *float64 {
-	for _, value := range values {
-		if value != nil && *value > 0 && !math.IsNaN(*value) && !math.IsInf(*value, 0) {
-			return value
-		}
-	}
-	return nil
 }
 
 func (h *Hybrid) Expirations(ctx context.Context, symbol string) ([]string, error) {
@@ -367,6 +333,17 @@ func (h *Hybrid) BenchmarkHistory(ctx context.Context, symbol, period string) (H
 		return HistoryResult{}, errors.New("Yahoo benchmark history provider is unavailable")
 	}
 	return h.HistoryClient.FetchAdjusted(ctx, symbol, period)
+}
+
+func (h *Hybrid) IntradayHistory(ctx context.Context, symbol, interval string) (HistoryResult, error) {
+	if h == nil || h.HistoryClient == nil {
+		return HistoryResult{}, errors.New("Yahoo intraday history provider is unavailable")
+	}
+	client, ok := h.HistoryClient.(IntradayHistoryClient)
+	if !ok {
+		return HistoryResult{}, errors.New("Yahoo history client does not support intraday history")
+	}
+	return client.FetchIntraday(ctx, symbol, interval)
 }
 
 func (h *Hybrid) EarningsDates(ctx context.Context, symbol string) ([]string, error) {

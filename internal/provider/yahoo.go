@@ -12,17 +12,16 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	yahooauth "github.com/wnjoon/go-yfinance/pkg/client"
-	ymodels "github.com/wnjoon/go-yfinance/pkg/models"
 	"option-scope-go/internal/marketcalendar"
 	"option-scope-go/internal/model"
 	"option-scope-go/internal/outboundhttp"
+
+	yahooauth "github.com/wnjoon/go-yfinance/pkg/client"
 )
 
 const (
@@ -43,6 +42,18 @@ type Yahoo struct {
 	gateWait      time.Duration
 	semaphore     chan struct{}
 	now           func() time.Time
+	// quoteTickers reuses one SDK ticker per symbol for quote refreshes. The SDK
+	// caches the Yahoo cookie/crumb inside the ticker, so reuse pays the
+	// authentication handshake once per process instead of on every refresh.
+	// Only Quote uses these; option-chain and fundamentals keep short-lived
+	// tickers so their own caches cannot serve stale data.
+	quoteTickersMu sync.Mutex
+	quoteTickers   map[string]yahooTicker
+	// interactiveGate reserves one upstream slot for the interactive quote path
+	// (the current-price card). Option chains, Gamma batches, fundamentals, and
+	// history share semaphore and can saturate it; Quote takes this dedicated
+	// slot instead so a busy background batch cannot starve the price.
+	interactiveGate chan struct{}
 }
 
 type yahooCrumbGetter interface {
@@ -62,11 +73,15 @@ func NewYahoo(timeout time.Duration, concurrency int) *Yahoo {
 	}
 	client := outboundhttp.DefaultBrowserClient(timeout)
 	semaphore := make(chan struct{}, concurrency)
+	var interactiveGate chan struct{}
+	if concurrency > 1 {
+		interactiveGate = make(chan struct{}, 1)
+	}
 	fundamentals := NewFundamentalsClient(client)
 	fundamentals.Gate, fundamentals.GateWait = semaphore, timeout
 	earnings := NewYahooEarningsClient(client)
 	earnings.Gate, earnings.GateWait = semaphore, timeout
-	return &Yahoo{client: client, optionsURL: optionsURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now}
+	return &Yahoo{client: client, optionsURL: optionsURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTicker), interactiveGate: interactiveGate}
 }
 
 func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress string) (*Yahoo, error) {
@@ -93,6 +108,10 @@ func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress stri
 		return nil, fmt.Errorf("create go-yfinance Yahoo client: %w", err)
 	}
 	semaphore := make(chan struct{}, concurrency)
+	var interactiveGate chan struct{}
+	if concurrency > 1 {
+		interactiveGate = make(chan struct{}, 1)
+	}
 	fundamentals := NewFundamentalsClient(client)
 	fundamentals.Gate = semaphore
 	fundamentals.GateWait = timeout
@@ -105,17 +124,19 @@ func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress stri
 	fundamentals.tickerFactory = tickerFactory
 	earnings.tickerFactory = tickerFactory
 	return &Yahoo{
-		client:        client,
-		authClient:    authClient,
-		optionsAuth:   optionsAuth,
-		optionsURL:    optionsURL,
-		fundamentals:  fundamentals,
-		earnings:      earnings,
-		tickerFactory: tickerFactory,
-		timeout:       timeout,
-		gateWait:      timeout,
-		semaphore:     semaphore,
-		now:           time.Now,
+		client:          client,
+		authClient:      authClient,
+		optionsAuth:     optionsAuth,
+		optionsURL:      optionsURL,
+		fundamentals:    fundamentals,
+		earnings:        earnings,
+		tickerFactory:   tickerFactory,
+		timeout:         timeout,
+		gateWait:        timeout,
+		semaphore:       semaphore,
+		now:             time.Now,
+		quoteTickers:    make(map[string]yahooTicker),
+		interactiveGate: interactiveGate,
 	}, nil
 }
 
@@ -129,6 +150,27 @@ func (y *Yahoo) Close() error {
 		}
 	}
 	return nil
+}
+
+// quoteTicker returns a cached SDK ticker for the symbol so successive quote
+// refreshes reuse the Yahoo cookie/crumb held by that ticker. The SDK ticker is
+// created with a shared client (ownsClient=false), so runYahooSDK's deferred
+// Close is a no-op and the instance stays warm between refreshes.
+func (y *Yahoo) quoteTicker(symbol string) (yahooTicker, error) {
+	if y.tickerFactory == nil {
+		return nil, errors.New("go-yfinance ticker factory is unavailable")
+	}
+	y.quoteTickersMu.Lock()
+	defer y.quoteTickersMu.Unlock()
+	if ticker, ok := y.quoteTickers[symbol]; ok {
+		return ticker, nil
+	}
+	ticker, err := y.tickerFactory(symbol)
+	if err != nil {
+		return nil, err
+	}
+	y.quoteTickers[symbol] = ticker
+	return ticker, nil
 }
 
 // Fundamentals fetches optional Yahoo financial inputs used by valuation. It is
@@ -172,6 +214,11 @@ func (e *yahooHTTPStatusError) Error() string {
 	return fmt.Sprintf("Yahoo returned HTTP %d", e.status)
 }
 
+type yahooAPIError struct {
+	Code        string `json:"code"`
+	Description string `json:"description"`
+}
+
 type yahooChartResult struct {
 	Meta       yahooChartMeta `json:"meta"`
 	Timestamp  []*int64       `json:"timestamp"`
@@ -207,11 +254,6 @@ type yahooChartMeta struct {
 	RegularMarketTime  int64   `json:"regularMarketTime"`
 }
 
-type yahooAPIError struct {
-	Code        string `json:"code"`
-	Description string `json:"description"`
-}
-
 func (e *yahooAPIError) Error() string {
 	if e == nil {
 		return ""
@@ -223,12 +265,6 @@ func (e *yahooAPIError) Error() string {
 		return "Yahoo API error: " + e.Description
 	}
 	return fmt.Sprintf("Yahoo API error (%s): %s", e.Code, e.Description)
-}
-
-type yahooIntradayBar struct {
-	at    time.Time
-	open  *float64
-	close float64
 }
 
 func yahooSessionOf(at time.Time) string {
@@ -288,111 +324,78 @@ func yahooSessionState(now time.Time, latest *time.Time) string {
 	return map[string]string{"pre": "PRE", "regular": "REGULAR", "post": "POST", "overnight": "OVERNIGHT"}[yahooSessionOf(now)]
 }
 
-func summarizeYahooChart(result yahooChartResult, now time.Time) (map[string]any, string, *float64, *float64) {
+func yahooCurrentSessionTime(at, now time.Time) bool {
+	if at.IsZero() || at.Unix() <= 0 {
+		return false
+	}
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		location = time.FixedZone("EST", -5*60*60)
 	}
-	now = now.In(location)
-	bars := make([]yahooIntradayBar, 0, len(result.Timestamp))
-	var opens, closes []*float64
-	if len(result.Indicators.Quote) > 0 {
-		opens, closes = result.Indicators.Quote[0].Open, result.Indicators.Quote[0].Close
-	}
-	for index, rawTimestamp := range result.Timestamp {
-		if rawTimestamp == nil || index >= len(closes) || closes[index] == nil {
-			continue
-		}
-		close := *closes[index]
-		if close <= 0 || math.IsNaN(close) || math.IsInf(close, 0) {
-			continue
-		}
-		bar := yahooIntradayBar{at: time.Unix(*rawTimestamp, 0).In(location), close: close}
-		if bar.at.After(now) {
-			continue
-		}
-		if index < len(opens) && opens[index] != nil && *opens[index] > 0 && !math.IsNaN(*opens[index]) && !math.IsInf(*opens[index], 0) {
-			value := *opens[index]
-			bar.open = &value
-		}
-		bars = append(bars, bar)
-	}
-	sort.SliceStable(bars, func(i, j int) bool { return bars[i].at.Before(bars[j].at) })
-	sessions := make(map[string]any)
-	regularCloses := make(map[string]float64)
-	regularOpens := make(map[string]float64)
-	var latest *time.Time
-	for _, bar := range bars {
-		at := bar.at
-		latestAt := at
-		latest = &latestAt
-		kind, day := yahooSessionOf(at), at.Format("2006-01-02")
-		if kind == "regular" {
-			regularCloses[day] = bar.close
-			if bar.open != nil {
-				if _, seen := regularOpens[day]; !seen {
-					regularOpens[day] = *bar.open
-				}
-			}
-			continue
-		}
-		var reference *float64
-		for _, regularDay := range sortedKeys(regularCloses) {
-			if regularDay <= day {
-				value := regularCloses[regularDay]
-				reference = &value
-			}
-		}
-		summary := map[string]any{"price": bar.close, "change_percent": nil, "as_of": at.Format(time.RFC3339)}
-		if reference != nil && *reference > 0 {
-			summary["reference_close"] = *reference
-			summary["change_percent"] = (bar.close - *reference) / *reference * 100
-		}
-		sessions[kind] = summary
-	}
-	state := yahooSessionState(now, latest)
-	day := yahooTradingDay(now).Format("2006-01-02")
-	regularDays := sortedKeys(regularCloses)
-	if len(regularDays) > 0 && (state == "OVERNIGHT" || state == "POST" || (state == "REGULAR" && regularDays[len(regularDays)-1] == day)) {
-		regularDays = regularDays[:len(regularDays)-1]
-	}
-	var previousClose *float64
-	if len(regularDays) > 0 {
-		value := regularCloses[regularDays[len(regularDays)-1]]
-		previousClose = &value
-	}
-	var regularOpen *float64
-	openDays := sortedKeys(regularOpens)
-	for _, openDay := range openDays {
-		if openDay <= now.Format("2006-01-02") {
-			value := regularOpens[openDay]
-			regularOpen = &value
-		}
-	}
-	if state == "PRE" && previousClose != nil {
-		for _, session := range []string{"pre", "post"} {
-			if summary, ok := sessions[session].(map[string]any); ok {
-				summary["reference_close"] = *previousClose
-				if value, ok := summary["price"].(float64); ok {
-					summary["change_percent"] = (value - *previousClose) / *previousClose * 100
-				}
-			}
-		}
-	}
-	return sessions, state, regularOpen, previousClose
+	at, now = at.In(location), now.In(location)
+	return !at.After(now) && yahooTradingDay(at).Format("2006-01-02") == yahooTradingDay(now).Format("2006-01-02")
 }
 
-func sortedKeys(values map[string]float64) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
+func yahooQuoteSessions(quote *yahooQuoteModel, now time.Time) map[string]any {
+	sessions := make(map[string]any)
+	if quote == nil {
+		return sessions
 	}
-	sort.Strings(keys)
-	return keys
+	state := yahooSessionState(now, nil)
+	add := func(name string, price, reference float64, priceAt, referenceAt time.Time) {
+		if !validYahooPrice(price) && !validYahooPrice(reference) {
+			return
+		}
+		summary := make(map[string]any, 4)
+		if validYahooPrice(price) {
+			summary["price"] = price
+		}
+		if validYahooPrice(reference) {
+			summary["reference_close"] = reference
+			if validYahooPrice(price) {
+				summary["change_percent"] = (price - reference) / reference * 100
+			}
+		}
+		at := priceAt
+		if at.IsZero() || at.Unix() <= 0 {
+			at = referenceAt
+		}
+		if !at.IsZero() && at.Unix() > 0 {
+			summary["as_of"] = at.Format(time.RFC3339)
+		}
+		sessions[name] = summary
+	}
+	if state == "PRE" && yahooCurrentSessionTime(quote.PreMarketTime, now) {
+		// Before the open, RegularMarketPrice is the last completed session close;
+		// RegularMarketPreviousClose is one session older.
+		add("pre", quote.PreMarketPrice, quote.RegularMarketPrice, quote.PreMarketTime, quote.RegularMarketTime)
+	}
+	// Keep the formal close baseline even when Yahoo omits the post-market price.
+	postPrice := float64(0)
+	postTime := time.Time{}
+	if (state == "POST" || state == "OVERNIGHT") && yahooCurrentSessionTime(quote.PostMarketTime, now) {
+		postPrice, postTime = quote.PostMarketPrice, quote.PostMarketTime
+	}
+	add("post", postPrice, quote.RegularMarketPrice, postTime, quote.RegularMarketTime)
+	return sessions
 }
 
 func validYahooPrice(value float64) bool {
 	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func yahooQuoteHasCurrentPrice(quote *yahooQuoteModel, now time.Time) bool {
+	if quote == nil {
+		return false
+	}
+	switch yahooSessionState(now, nil) {
+	case "PRE":
+		return (validYahooPrice(quote.PreMarketPrice) && yahooCurrentSessionTime(quote.PreMarketTime, now)) || validYahooPrice(quote.RegularMarketPrice)
+	case "POST":
+		return (validYahooPrice(quote.PostMarketPrice) && yahooCurrentSessionTime(quote.PostMarketTime, now)) || validYahooPrice(quote.RegularMarketPrice)
+	default:
+		return validYahooPrice(quote.RegularMarketPrice)
+	}
 }
 
 func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
@@ -400,127 +403,69 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 	if err != nil {
 		return model.Quote{}, err
 	}
+	now := y.marketNow()
 	type quoteSnapshot struct {
-		quote       *yahooQuoteModel
-		quoteErr    error
-		intraday    []yahooBarModel
-		intradayErr error
-		daily       []yahooBarModel
-		dailyErr    error
+		quote    *yahooQuoteModel
+		quoteErr error
+		daily    []yahooBarModel
+		dailyErr error
 	}
 	type quotePhaseTimes struct {
-		quote, intraday, daily time.Duration
+		quote, daily time.Duration
 	}
 	var phases quotePhaseTimes
 	startedAt := time.Now()
-	snapshot, fetchErr := runYahooSDK(ctx, y.semaphore, y.gateWait, y.tickerFactory, symbol, func(ticker yahooTicker) (quoteSnapshot, error) {
-		type quoteResult struct {
-			quote *yahooQuoteModel
-			err   error
+	quoteTickerFactory := func(string) (yahooTicker, error) { return y.quoteTicker(symbol) }
+	quoteGate := y.semaphore
+	if y.interactiveGate != nil {
+		quoteGate = y.interactiveGate
+	}
+	snapshot, fetchErr := runYahooSDK(ctx, quoteGate, y.gateWait, quoteTickerFactory, symbol, func(ticker yahooTicker) (quoteSnapshot, error) {
+		started := time.Now()
+		quote, quoteErr := ticker.Quote()
+		phases.quote = time.Since(started)
+		snapshot := quoteSnapshot{quote: quote, quoteErr: quoteErr}
+		needsDaily := quoteErr != nil || !yahooQuoteHasCurrentPrice(quote, now) || quote == nil || !validYahooPrice(quote.RegularMarketPreviousClose)
+		if needsDaily {
+			started = time.Now()
+			snapshot.daily, snapshot.dailyErr = ticker.History(yahooHistoryParams("1d", false))
+			phases.daily = time.Since(started)
 		}
-		type historyResult struct {
-			bars []yahooBarModel
-			err  error
-		}
-		quoteResults := make(chan quoteResult, 1)
-		quoteForHistory := make(chan quoteResult, 1)
-		historyResults := make(chan historyResult, 1)
-		dailyResults := make(chan historyResult, 1)
-		var requests sync.WaitGroup
-		// Closed-market quote snapshots have no current pre/post/overnight bars
-		// to add. Yahoo's quote endpoint can report a stale REGULAR marketState
-		// after the close, so the exchange calendar is authoritative here.
-		marketClosed := yahooSessionState(y.marketNow(), nil) == "CLOSED"
-		requests.Add(2)
-		go func() {
-			defer requests.Done()
-			started := time.Now()
-			quote, quoteErr := ticker.Quote()
-			phases.quote = time.Since(started)
-			result := quoteResult{quote: quote, err: quoteErr}
-			quoteResults <- result
-			quoteForHistory <- result
-		}()
-		go func() {
-			defer requests.Done()
-			var quote quoteResult
-			needsIntraday := !marketClosed
-			if needsIntraday {
-				started := time.Now()
-				bars, historyErr := ticker.History(yahooHistoryParams("1m", true))
-				phases.intraday = time.Since(started)
-				historyResults <- historyResult{bars: bars, err: historyErr}
-			} else {
-				historyResults <- historyResult{}
-			}
-			if quote.quote == nil && quote.err == nil {
-				// The quote goroutine may still be in flight. Daily history is only
-				// a fallback for missing regular fields, so decide after receiving it.
-				quote = <-quoteForHistory
-			}
-			needsDaily := quote.err != nil || quote.quote == nil || !validYahooPrice(quote.quote.RegularMarketPrice) || !validYahooPrice(quote.quote.RegularMarketPreviousClose)
-			if needsDaily {
-				started := time.Now()
-				bars, historyErr := ticker.History(yahooHistoryParams("1d", false))
-				phases.daily = time.Since(started)
-				dailyResults <- historyResult{bars: bars, err: historyErr}
-			}
-		}()
-		requests.Wait()
-		quoteCall := <-quoteResults
-		intradayCall := <-historyResults
-		quote, quoteErr := quoteCall.quote, quoteCall.err
-		intraday, historyErr := intradayCall.bars, intradayCall.err
-		var daily []yahooBarModel
-		var dailyErr error
-		if quoteErr != nil || quote == nil || !validYahooPrice(quote.RegularMarketPrice) || !validYahooPrice(quote.RegularMarketPreviousClose) {
-			dailyCall := <-dailyResults
-			daily, dailyErr = dailyCall.bars, dailyCall.err
-		}
-		if quoteErr != nil && len(intraday) == 0 && len(daily) == 0 {
-			return quoteSnapshot{}, quoteErr
-		}
-		if historyErr != nil && quote == nil && len(daily) == 0 {
-			return quoteSnapshot{}, historyErr
-		}
-		return quoteSnapshot{quote: quote, quoteErr: quoteErr, intraday: intraday, intradayErr: historyErr, daily: daily, dailyErr: dailyErr}, nil
+		return snapshot, nil
 	})
 	if elapsed := time.Since(startedAt); elapsed >= time.Second {
-		log.Printf("slow Yahoo quote symbol=%s total=%s quote=%s intraday=%s daily=%s", symbol, elapsed.Round(time.Millisecond), phases.quote.Round(time.Millisecond), phases.intraday.Round(time.Millisecond), phases.daily.Round(time.Millisecond))
+		log.Printf("slow Yahoo quote symbol=%s total=%s quote=%s daily_fallback=%s", symbol, elapsed.Round(time.Millisecond), phases.quote.Round(time.Millisecond), phases.daily.Round(time.Millisecond))
 	}
 	if fetchErr != nil {
 		return model.Quote{}, fetchErr
 	}
-	now := y.marketNow()
 	metaQuote := snapshot.quote
-	chart := yahooChartFromSDK(metaQuote, snapshot.intraday)
-	sessions, state, regularOpen, mappedPrevious := summarizeYahooChart(chart, now)
-	meta := chart.Meta
+	sessions := yahooQuoteSessions(metaQuote, now)
+	// The exchange calendar determines the active session, avoiding stale
+	// marketState values returned by Yahoo after regular or early closes.
+	state := yahooSessionState(now, nil)
+	price := float64(0)
+	previous := float64(0)
+	regularOpen := (*float64)(nil)
+	currency := "USD"
 	if metaQuote != nil {
-		meta.MarketState = strings.ToUpper(metaQuote.MarketState)
-	}
-	if state == "" || (len(snapshot.intraday) == 0 && meta.MarketState != "") {
-		state = strings.ToUpper(meta.MarketState)
-	}
-	price := meta.RegularMarketPrice
-	if metaQuote != nil {
-		switch strings.ToUpper(metaQuote.MarketState) {
+		price = metaQuote.RegularMarketPrice
+		previous = metaQuote.RegularMarketPreviousClose
+		if state == "PRE" && validYahooPrice(metaQuote.RegularMarketPrice) {
+			previous = metaQuote.RegularMarketPrice
+		}
+		regularOpen = optionalFloat(metaQuote.RegularMarketOpen)
+		currency = metaQuote.Currency
+		switch state {
 		case "PRE":
-			if validYahooPrice(metaQuote.PreMarketPrice) {
+			if validYahooPrice(metaQuote.PreMarketPrice) && yahooCurrentSessionTime(metaQuote.PreMarketTime, now) {
 				price = metaQuote.PreMarketPrice
 			}
 		case "POST":
-			if validYahooPrice(metaQuote.PostMarketPrice) {
+			if validYahooPrice(metaQuote.PostMarketPrice) && yahooCurrentSessionTime(metaQuote.PostMarketTime, now) {
 				price = metaQuote.PostMarketPrice
 			}
 		}
-	}
-	if !validYahooPrice(price) && len(snapshot.intraday) > 0 {
-		price = snapshot.intraday[len(snapshot.intraday)-1].Close
-	}
-	previous := meta.PreviousClose
-	if mappedPrevious != nil && validYahooPrice(*mappedPrevious) {
-		previous = *mappedPrevious
 	}
 	dailyOpen := float64(0)
 	if len(snapshot.daily) > 0 {
@@ -533,23 +478,14 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 		}
 		dailyOpen = last.Open
 	}
+	if snapshot.quoteErr != nil && len(snapshot.daily) == 0 {
+		return model.Quote{}, snapshot.quoteErr
+	}
 	if snapshot.dailyErr != nil && (!validYahooPrice(price) || !validYahooPrice(previous)) {
-		if snapshot.intradayErr != nil {
-			return model.Quote{}, snapshot.intradayErr
-		}
 		if snapshot.quoteErr != nil {
 			return model.Quote{}, snapshot.quoteErr
 		}
 		return model.Quote{}, snapshot.dailyErr
-	}
-	if state == "PRE" && mappedPrevious != nil && validYahooPrice(*mappedPrevious) && validYahooPrice(price) && math.Abs(price-*mappedPrevious) / *mappedPrevious <= 0.001 {
-		previous = price
-	}
-	if state == "" {
-		state = yahooSessionState(now, nil)
-	}
-	if regularOpen == nil || (state != "REGULAR" && state != "POST" && state != "OVERNIGHT") {
-		regularOpen = optionalFloat(meta.RegularMarketOpen)
 	}
 	if regularOpen == nil {
 		regularOpen = optionalFloat(dailyOpen)
@@ -560,12 +496,9 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 		change = &value
 	}
 	fetched := now.UTC()
-	if sessions == nil {
-		sessions = map[string]any{}
-	}
 	return model.Quote{
 		Symbol: symbol, Price: optionalFloat(price), ChangePercent: change, TodayOpen: regularOpen, PreviousClose: optionalFloat(previous),
-		Currency: stringOr(meta.Currency, "USD"), MarketState: strings.ToUpper(state), Provider: "yahoo-chart", Source: "upstream", FetchedAt: &fetched,
+		Currency: stringOr(currency, "USD"), MarketState: strings.ToUpper(state), Provider: "yahoo-chart", Source: "upstream", FetchedAt: &fetched,
 		Sessions: sessions, FairValuePending: true,
 	}, nil
 }
@@ -573,11 +506,14 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 type yahooOptionExtensions struct {
 	OptionChain struct {
 		Result []struct {
-			Options []struct {
-				Calls []yahooOptionContractExtension `json:"calls"`
-				Puts  []yahooOptionContractExtension `json:"puts"`
+			ExpirationDates []int64 `json:"expirationDates"`
+			Options         []struct {
+				ExpirationDate int64                          `json:"expirationDate"`
+				Calls          []yahooOptionContractExtension `json:"calls"`
+				Puts           []yahooOptionContractExtension `json:"puts"`
 			} `json:"options"`
 		} `json:"result"`
+		Error *yahooAPIError `json:"error"`
 	} `json:"optionChain"`
 }
 
@@ -629,7 +565,21 @@ func (contract yahooOptionContractExtension) float(name string, value float64) *
 	if isJSONNull(raw) {
 		return nil
 	}
-	return &value
+	var parsed float64
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		var text string
+		if json.Unmarshal(raw, &text) != nil {
+			return nil
+		}
+		parsed, err = strconv.ParseFloat(strings.TrimSpace(text), 64)
+		if err != nil {
+			return nil
+		}
+	}
+	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+		return nil
+	}
+	return &parsed
 }
 
 func (contract yahooOptionContractExtension) integer(name string, value int64) *int64 {
@@ -643,7 +593,18 @@ func (contract yahooOptionContractExtension) integer(name string, value int64) *
 	if isJSONNull(raw) {
 		return nil
 	}
-	return &value
+	var parsed int64
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		var text string
+		if json.Unmarshal(raw, &text) != nil {
+			return nil
+		}
+		parsed, err = strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+		if err != nil {
+			return nil
+		}
+	}
+	return &parsed
 }
 
 func (contract yahooOptionContractExtension) boolKnown(name string, sdkValue bool) bool {
@@ -652,6 +613,18 @@ func (contract yahooOptionContractExtension) boolKnown(name string, sdkValue boo
 		return sdkValue
 	}
 	return !isJSONNull(raw)
+}
+
+func (contract yahooOptionContractExtension) boolValue(name string, fallback bool) bool {
+	raw, ok := contract.fields[name]
+	if !ok || isJSONNull(raw) {
+		return fallback
+	}
+	var value bool
+	if json.Unmarshal(raw, &value) != nil {
+		return fallback
+	}
+	return value
 }
 
 func isJSONNull(raw json.RawMessage) bool {
@@ -687,71 +660,47 @@ func (y *Yahoo) Chain(ctx context.Context, symbol, expiration string) ([]model.O
 		return nil, nil, err
 	}
 	when, _ := time.Parse("2006-01-02", normalized)
-	sdkExpiration := yahooSDKExpirationLookupDate(when, time.Local)
-	chain, err := runYahooSDK(ctx, y.semaphore, y.gateWait, y.tickerFactory, normalizedSymbol, func(ticker yahooTicker) (*ymodels.OptionChain, error) {
-		return ticker.OptionChain(sdkExpiration)
-	})
+	// One dated Yahoo options response contains the SDK chain fields plus Gamma
+	// and nullable-field presence. Fetching the SDK chain and then requesting
+	// this same endpoint again serialized two network round trips per expiry.
+	rawExtensions, err := y.options(ctx, normalizedSymbol, fmt.Sprint(when.Unix()))
 	if err != nil {
 		return nil, nil, err
 	}
-	if chain == nil {
-		return nil, nil, fmt.Errorf("%s %s 没有期权数据", strings.ToUpper(strings.TrimSpace(symbol)), normalized)
+	if rawExtensions.OptionChain.Error != nil {
+		return nil, nil, rawExtensions.OptionChain.Error
 	}
-	if !chain.Expiration.IsZero() {
-		returnedExpiration := chain.Expiration.UTC().Format("2006-01-02")
+	if len(rawExtensions.OptionChain.Result) == 0 || len(rawExtensions.OptionChain.Result[0].Options) == 0 {
+		return nil, nil, fmt.Errorf("%s %s 没有期权数据", normalizedSymbol, normalized)
+	}
+	selected := rawExtensions.OptionChain.Result[0].Options[0]
+	if selected.ExpirationDate != 0 {
+		returnedExpiration := time.Unix(selected.ExpirationDate, 0).UTC().Format("2006-01-02")
 		if returnedExpiration != normalized {
 			return nil, nil, fmt.Errorf("Yahoo returned expiration %s for requested expiration %s", returnedExpiration, normalized)
 		}
 	}
-	if len(chain.Calls) == 0 && len(chain.Puts) == 0 {
-		return nil, nil, fmt.Errorf("%s %s 没有期权数据", strings.ToUpper(strings.TrimSpace(symbol)), normalized)
+	if len(selected.Calls) == 0 && len(selected.Puts) == 0 {
+		return nil, nil, fmt.Errorf("%s %s 没有期权数据", normalizedSymbol, normalized)
 	}
-
-	// go-yfinance v1.7.0 models OptionChain but drops Gamma and null-vs-zero
-	// presence bits; its OptionsJSON only fetches the nearest expiry. Keep a
-	// dated raw response for these fields through the SDK auth manager.
-	rawExtensions, err := y.options(ctx, normalizedSymbol, strconv.FormatInt(when.Unix(), 10))
-	if err != nil {
-		return nil, nil, err
-	}
-	var chainExtensions struct {
-		Calls []yahooOptionContractExtension
-		Puts  []yahooOptionContractExtension
-	}
-	if len(rawExtensions.OptionChain.Result) > 0 && len(rawExtensions.OptionChain.Result[0].Options) > 0 {
-		chainExtensions.Calls = rawExtensions.OptionChain.Result[0].Options[0].Calls
-		chainExtensions.Puts = rawExtensions.OptionChain.Result[0].Options[0].Puts
-	}
-	rows := make([]model.OptionRow, 0, len(chain.Calls)+len(chain.Puts))
-	appendRows := func(contracts []ymodels.Option, contractExtensions []yahooOptionContractExtension, kind string) {
-		byContract := make(map[string]yahooOptionContractExtension, len(contractExtensions))
-		for _, extension := range contractExtensions {
-			if extension.contractSymbol != "" {
-				byContract[extension.contractSymbol] = extension
-			}
-		}
-		for index, contract := range contracts {
-			var extension yahooOptionContractExtension
-			if matched, ok := byContract[contract.ContractSymbol]; contract.ContractSymbol != "" && ok {
-				extension = matched
-			} else if contract.ContractSymbol == "" && index < len(contractExtensions) && contractExtensions[index].contractSymbol == "" {
-				extension = contractExtensions[index]
-			}
+	rows := make([]model.OptionRow, 0, len(selected.Calls)+len(selected.Puts))
+	appendRows := func(contracts []yahooOptionContractExtension, kind string) {
+		for _, extension := range contracts {
 			rows = append(rows, model.OptionRow{
-				ContractSymbol: contract.ContractSymbol, Provider: "yahoo-options", ContractType: kind,
-				Strike: extension.float("strike", contract.Strike), LastPrice: extension.float("lastPrice", contract.LastPrice),
-				Bid: extension.float("bid", contract.Bid), Ask: extension.float("ask", contract.Ask),
-				Volume: extension.integer("volume", contract.Volume), OpenInterest: extension.integer("openInterest", contract.OpenInterest),
-				ImpliedVolatility: extension.float("impliedVolatility", contract.ImpliedVolatility),
+				ContractSymbol: extension.contractSymbol, Provider: "yahoo-options", ContractType: kind,
+				Strike: extension.float("strike", 0), LastPrice: extension.float("lastPrice", 0),
+				Bid: extension.float("bid", 0), Ask: extension.float("ask", 0),
+				Volume: extension.integer("volume", 0), OpenInterest: extension.integer("openInterest", 0),
+				ImpliedVolatility: extension.float("impliedVolatility", 0),
 				Gamma:             extension.float("gamma", extension.gamma),
-				InTheMoney:        contract.InTheMoney,
-				InTheMoneyKnown:   extension.boolKnown("inTheMoney", contract.InTheMoney),
-				ChangePercent:     extension.float("percentChange", contract.PercentChange), Expiration: normalized,
+				InTheMoney:        extension.boolValue("inTheMoney", false),
+				InTheMoneyKnown:   extension.boolKnown("inTheMoney", false),
+				ChangePercent:     extension.float("percentChange", 0), Expiration: normalized,
 			})
 		}
 	}
-	appendRows(chain.Calls, chainExtensions.Calls, "call")
-	appendRows(chain.Puts, chainExtensions.Puts, "put")
+	appendRows(selected.Calls, "call")
+	appendRows(selected.Puts, "put")
 	fetched := time.Now().UTC()
 	return rows, &fetched, nil
 }

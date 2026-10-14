@@ -46,6 +46,11 @@ type cachedChain struct {
 	at    time.Time
 }
 
+type intradayCacheEntry struct {
+	frame     []map[string]any
+	fetchedAt time.Time
+}
+
 type cachedValuationRegime struct {
 	regime  string
 	signals map[string]any
@@ -176,6 +181,10 @@ type HistoryProvider interface {
 	History(context.Context, string, string) (provider.HistoryResult, error)
 }
 
+type IntradayHistoryProvider interface {
+	IntradayHistory(context.Context, string, string) (provider.HistoryResult, error)
+}
+
 type Service struct {
 	cfg                   config.Config
 	provider              MarketProvider
@@ -197,6 +206,8 @@ type Service struct {
 	levelsFlights         map[string]*levelsCacheFlight
 	analyticsPrefetch     map[string]bool
 	chanHistoryJobs       map[string]bool
+	intradayMu            sync.Mutex
+	intradayHistoryCache  map[string]intradayCacheEntry
 	snapshotRefreshJobs   map[string]bool
 	gammaHeavyGate        chan struct{}
 	background            context.Context
@@ -275,8 +286,9 @@ func NewWithProvider(cfg config.Config, repository *store.SQLite, marketProvider
 		chains: make(map[string]cachedChain), events: eventLog{nextID: 1, payloads: make(map[string]map[string]any)},
 		refreshGates: make(map[string]*refreshGate), subscriptions: make(map[string]eventSubscription),
 		gammaJobs: make(map[string]*gammaJob), valuationJobs: make(map[string]bool), valuationAttempts: make(map[string]time.Time), valuationRegimes: make(map[string]cachedValuationRegime), historyLocks: make(map[string]*historyLockEntry), historyRefreshJobs: make(map[string]bool), historyRefreshAfter: make(map[string]time.Time), levelsFlights: make(map[string]*levelsCacheFlight), analyticsPrefetch: make(map[string]bool), chanHistoryJobs: make(map[string]bool), snapshotRefreshJobs: make(map[string]bool),
-		gammaHeavyGate: make(chan struct{}, gateLimit),
-		background:     background, stopBackground: stop, leaseOwner: hex.EncodeToString(ownerBytes[:]),
+		intradayHistoryCache: make(map[string]intradayCacheEntry),
+		gammaHeavyGate:       make(chan struct{}, gateLimit),
+		background:           background, stopBackground: stop, leaseOwner: hex.EncodeToString(ownerBytes[:]),
 	}
 }
 
@@ -333,6 +345,7 @@ func (s *Service) Router() *gin.Engine {
 	api.GET("/gamma/:symbol", s.gamma)
 	api.GET("/levels/:symbol", s.levels)
 	api.GET("/chan/:symbol", s.chanAnalysis)
+	api.GET("/chan/:symbol/intraday", s.intradayChanAnalysis)
 	api.GET("/status/:symbol", s.status)
 	api.POST("/cleanup", s.cleanup)
 	return router
@@ -1704,13 +1717,11 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	parallelQuoteAndCatalog := quoteOverride == nil && expirationsOverride == nil && s.cfg.UpstreamConcurrency > 1
 	var upstreamRequests sync.WaitGroup
 	if parallelQuoteAndCatalog {
-		parallelCtx, cancelParallelRequests := context.WithCancel(ctx)
-		defer cancelParallelRequests()
 		upstreamRequests.Add(2)
 		go func() {
 			defer upstreamRequests.Done()
 			started := time.Now()
-			quote, err = s.fetchSnapshotQuoteForExpirationMode(parallelCtx, symbol, requestedExpiration, false)
+			quote, err = s.fetchSnapshotQuoteForExpirationMode(ctx, symbol, requestedExpiration, false)
 			quoteDuration = time.Since(started)
 			if err == nil {
 				publishStarted := time.Now()
@@ -1718,14 +1729,11 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 				s.publishQuoteEvent(symbol)
 				earlyQuotePublishDuration = time.Since(publishStarted)
 			}
-			if err != nil {
-				cancelParallelRequests()
-			}
 		}()
 		go func() {
 			defer upstreamRequests.Done()
 			started := time.Now()
-			expires, expireErr = s.provider.Expirations(parallelCtx, symbol)
+			expires, expireErr = s.provider.Expirations(ctx, symbol)
 			expirationsDuration = time.Since(started)
 		}()
 	} else {
@@ -1892,7 +1900,14 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 		return model.RefreshResponse{}, chainErr
 	}
 	if quoteOverride != nil && fetched != nil {
-		quote.FetchedAt = fetched
+		// The Gamma window reuses one cached quote for every expiry it refreshes.
+		// A market refresh can commit a newer quote while this batch fetches the
+		// chain; never let the cached copy re-publish an older market price as the
+		// newest snapshot, which would keep a stale price on screen until the next
+		// refresh.
+		if latest, latestFound, latestErr := s.store.LatestQuote(symbol); latestErr == nil && latestFound && latest.Price != nil && latest.FetchedAt != nil && quote.FetchedAt != nil && latest.FetchedAt.After(*quote.FetchedAt) {
+			quote = latest
+		}
 	}
 	if quote.Price != nil {
 		expiry, expiryErr := time.Parse("2006-01-02", selectedExpiration)
@@ -1919,7 +1934,7 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 		return model.RefreshResponse{}, saveErr
 	}
 	response.Quote = &persisted
-	response.FetchedAt = persisted.FetchedAt
+	response.FetchedAt = fetched
 	response.Chain = &chain
 	key := symbol + "|" + selectedExpiration
 	s.mu.Lock()
@@ -3530,26 +3545,6 @@ func levelsOptionsTimestamp(profile map[string]any, selected model.ChainResponse
 	return fetchedAt
 }
 
-func cachedEarningsSummary(payload map[string]any) map[string]any {
-	if payload == nil {
-		payload = map[string]any{}
-	}
-	summary := summarizeEarnings(payload["dates"])
-	fetchedAt := payload["fetched_at"]
-	_, listDates := payload["dates"].([]any)
-	_, stringDates := payload["dates"].([]string)
-	if (listDates || stringDates) && fetchedAt != nil && fetchedAt != "" {
-		summary["fetched_at"] = fetchedAt
-		summary["source"] = "sqlite"
-		summary["warning"] = nil
-		return summary
-	}
-	summary["fetched_at"] = nil
-	summary["source"] = "none"
-	summary["warning"] = "本地没有财报日期缓存"
-	return summary
-}
-
 func laterTimestamp(candidate *time.Time, other any) any {
 	var otherTime *time.Time
 	switch value := other.(type) {
@@ -3686,10 +3681,70 @@ func trendMarket(bars []map[string]any, quote model.Quote) map[string]any {
 	return trendMarketAt(bars, quote, time.Now().In(location).Format("2006-01-02"))
 }
 
+func marketSessionState(moment time.Time) string {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	local := moment.In(location)
+	minute := local.Hour()*60 + local.Minute()
+	day := localDate(local)
+	if marketcalendar.IsTradingDay(day) {
+		closeMinute := marketcalendar.RegularCloseMinute(day)
+		if minute >= 9*60+30 && minute < closeMinute {
+			return "REGULAR"
+		}
+		if minute >= 4*60 && minute < 9*60+30 {
+			return "PRE"
+		}
+		if minute >= closeMinute && minute < 20*60 {
+			return "POST"
+		}
+	}
+	if minute >= 20*60 && marketcalendar.IsTradingDay(day.AddDate(0, 0, 1)) {
+		return "OVERNIGHT"
+	}
+	if minute < 4*60 && marketcalendar.IsTradingDay(day) {
+		return "OVERNIGHT"
+	}
+	return "CLOSED"
+}
+
 func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[string]any {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	marketState := strings.ToUpper(strings.TrimSpace(quote.MarketState))
+	if quote.FetchedAt != nil {
+		capturedAt := quote.FetchedAt.In(location)
+		capturedDate := capturedAt.Format(time.DateOnly)
+		if quote.Source == "sqlite" {
+			// SQLite can hold an older quote beside newer daily bars. Align stale
+			// snapshots to the current exchange session so the previous-session
+			// fields come from the most recently completed daily bar.
+			current := time.Now().In(location)
+			currentDate := current.Format(time.DateOnly)
+			currentState := marketSessionState(current)
+			if marketState == "" {
+				marketState = marketSessionState(capturedAt)
+			}
+			staleMarketQuote := capturedDate != currentDate
+			if current.Sub(capturedAt) > 15*time.Minute && marketState != currentState {
+				staleMarketQuote = true
+			}
+			if staleMarketQuote {
+				today, marketState = currentDate, currentState
+			} else {
+				today = capturedDate
+			}
+		} else {
+			today = capturedDate
+		}
+	}
 	var marketStateValue any
-	if quote.MarketState != "" {
-		marketStateValue = quote.MarketState
+	if marketState != "" {
+		marketStateValue = marketState
 	}
 	result := map[string]any{"today_open": nil, "previous_open": nil, "previous_close": quote.PreviousClose,
 		"today_open_date": nil, "previous_open_date": nil, "previous_close_date": nil, "market_state": marketStateValue}
@@ -3708,6 +3763,22 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 	sort.SliceStable(ordered, func(i, j int) bool {
 		return trendBarDate(ordered[i]) < trendBarDate(ordered[j])
 	})
+	if len(ordered) > 0 && trendBarDate(ordered[len(ordered)-1]) > today {
+		aligned := ordered[:0]
+		for _, bar := range ordered {
+			if trendBarDate(bar) <= today {
+				aligned = append(aligned, bar)
+			}
+		}
+		ordered = aligned
+	}
+	// A daily bar for the current calendar date may already exist in SQLite
+	// from a later fetch even when this quote snapshot was captured premarket.
+	// It is not a completed session yet, so exclude it when finding the last
+	// completed day's open and close.
+	if marketState == "PRE" && len(ordered) > 0 && trendBarDate(ordered[len(ordered)-1]) == today {
+		ordered = ordered[:len(ordered)-1]
+	}
 	var latest, previous map[string]any
 	if len(ordered) > 0 {
 		latest = ordered[len(ordered)-1]
@@ -3719,7 +3790,6 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 		result["previous_open"], result["previous_open_date"] = latest["open"], latest["date"]
 	}
 
-	marketState := strings.ToUpper(strings.TrimSpace(quote.MarketState))
 	latestDate := trendBarDate(latest)
 	latestIsToday := latestDate == today && marketState == "REGULAR"
 	if latestIsToday {

@@ -25,6 +25,10 @@ const CHAN_FOLD_KEYS = {
   evidence: "option-scope-chan-evidence",
   rules: "option-scope-chan-rules",
 };
+const CHAN_SCENARIOS_STORAGE_KEY = "option-scope-chan-scenarios-visible";
+function readChanScenarioVisibility() {
+  try { return localStorage.getItem(CHAN_SCENARIOS_STORAGE_KEY) === "1"; } catch (error) { return false; }
+}
 const state = {
   symbol: defaultSymbol,
   symbolInput: defaultSymbol,
@@ -34,6 +38,10 @@ const state = {
   analysisReady: false,
   loadId: 0,
   chanPeriod: "daily",
+  chanScenariosVisible: readChanScenarioVisibility(),
+  chanIntradayPayload: { "15m": null, "4h": null },
+  chanIntradayLoading: { "15m": false, "4h": false },
+  chanIntradaySpot: null,
   chanHoveredScenario: null,
   chanScenarioCardX: 0,
   chanScenarioHideTimer: null,
@@ -139,6 +147,9 @@ const state = {
       label: "财报日期未知",
       title: "没有可用的未来财报日期，评分不因财报调整",
     },
+  earningsFetchedAt: 0,
+  earningsResolvedFor: "",
+  earningsData: null,
     totalCount: "--",
     callVolume: "--",
     putVolume: "--",
@@ -485,24 +496,32 @@ function initTheme() {
   applyTheme(stored === "dark" ? "dark" : "light");
 }
 
-// 手动选择优先于默认值；同一标签页内跨标的、刷新页面均保留。
+// 手动选择优先于默认值；跨标的、刷新页面及重新打开页面均保留。
 function readFoldState(storageKey, defaultExpanded) {
   if (!storageKey) return defaultExpanded;
   try {
-    const stored = sessionStorage.getItem(storageKey);
+    const stored = localStorage.getItem(storageKey);
     if (stored === "1") return true;
     if (stored === "0") return false;
   } catch (error) { /* 浏览器禁用存储时使用默认值。 */ }
+  // Migrate choices saved by earlier versions, which used tab-scoped storage.
+  try {
+    const stored = sessionStorage.getItem(storageKey);
+    if (stored === "1" || stored === "0") {
+      try { localStorage.setItem(storageKey, stored); } catch (error) { /* Keep the session value when persistent storage is unavailable. */ }
+      return stored === "1";
+    }
+  } catch (error) { /* Browser storage is unavailable; use the default. */ }
   return defaultExpanded;
 }
 
 function rememberFoldState(storageKey, expanded) {
   if (!storageKey) return;
-  try { sessionStorage.setItem(storageKey, expanded ? "1" : "0"); } catch (error) { /* 存储不可用时保留当前页面状态。 */ }
+  try { localStorage.setItem(storageKey, expanded ? "1" : "0"); } catch (error) { /* 存储不可用时保留当前页面状态。 */ }
 }
 
 // 折叠组通用逻辑：内容体用 hidden 控制显隐（[hidden] 在 flex/grid 上下文里会被覆盖，样式里补了 [hidden]{display:none}），
-// 按钮同步 aria-expanded 与「展开/收起」文案，并在 sessionStorage 中保存状态。
+// 按钮同步 aria-expanded 与「展开/收起」文案，并在 localStorage 中保存状态。
 function bindFoldGroup({ headerId, toggleId, bodyId, actionId, storageKey, defaultExpanded, onChange, shouldIgnore }) {
   const header = byId(headerId);
   const body = byId(bodyId);
@@ -739,6 +758,16 @@ function snapshotTimestampIsFresh(fetchedAt, maxAgeSeconds = SNAPSHOT_FRESH_SECO
 
 function quoteIsFresh(quote, maxAgeSeconds = SNAPSHOT_FRESH_SECONDS) {
   return quoteIsReady(quote) && snapshotTimestampIsFresh(quote?.fetched_at, maxAgeSeconds);
+}
+
+// The live snapshot cadence varies by session: regular hours refresh every
+// 20 seconds, extended hours every minute, and closed markets every 5 minutes.
+// Allow three expected refresh intervals before marking the displayed quote
+// as cached so the label does not flash between normal refreshes.
+function quoteCacheBadgeIsStale(quote) {
+  const maxAgeBySession = { REGULAR: 60, PRE: 180, POST: 180, OVERNIGHT: 180, CLOSED: 900 };
+  const maxAge = maxAgeBySession[quote?.market_state] || 900;
+  return !snapshotTimestampIsFresh(quote?.fetched_at, maxAge);
 }
 
 function quoteIsUsableSQLiteSnapshot(quote, symbol = state.symbol) {
@@ -3132,7 +3161,46 @@ function resetEarningsChip() {
   };
 }
 
+function earningsHasData(earnings) {
+  return Boolean(earnings && ["inside", "outside"].includes(earnings.status));
+}
+
+function mergeQuoteEarnings(quote) {
+  if (!quote || state.earningsResolvedFor !== state.symbol || quote.symbol && quote.symbol !== state.symbol) return quote;
+  const current = state.earningsData;
+  if (!current) return quote;
+  const incoming = quote.earnings;
+  if (!incoming) return { ...quote, earnings: current };
+  const fetchedAt = incoming.fetched_at ? new Date(incoming.fetched_at).getTime() : 0;
+  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0) return { ...quote, earnings: current };
+  if (!earningsHasData(incoming) && fetchedAt < state.earningsFetchedAt) {
+    return { ...quote, earnings: current };
+  }
+  if (earningsHasData(incoming) && fetchedAt < state.earningsFetchedAt) {
+    return { ...quote, earnings: current };
+  }
+  return quote;
+}
+
 function applyEarnings(earnings) {
+  if (!earnings || typeof earnings !== "object") return;
+  const symbol = state.symbol;
+  const fetchedAt = earnings.fetched_at ? new Date(earnings.fetched_at).getTime() : 0;
+  const hasFetchedAt = Number.isFinite(fetchedAt) && fetchedAt > 0;
+  const incomingHasData = earningsHasData(earnings);
+  // raw levels and lightweight quote/levels responses can finish out of order.
+  // Ignore summaries without their cache version; raw levels intentionally
+  // omit cache metadata and must not reset a dated quote/levels result.
+  if (!hasFetchedAt) return;
+  if (state.earningsResolvedFor === symbol && !incomingHasData
+    && fetchedAt < state.earningsFetchedAt) return;
+  if (incomingHasData && state.earningsResolvedFor === symbol
+    && hasFetchedAt && fetchedAt < state.earningsFetchedAt) return;
+  state.earningsData = earnings;
+  if (incomingHasData || hasFetchedAt) {
+    state.earningsResolvedFor = symbol;
+    if (hasFetchedAt) state.earningsFetchedAt = fetchedAt;
+  }
   const day = earningsMonthDay(earnings?.date);
   if (earnings?.status === "inside" && day) {
     state.view.earnings = {
@@ -3151,7 +3219,7 @@ function applyEarnings(earnings) {
     return;
   }
   resetEarningsChip();
-  if (earnings?.detail) state.view.earnings.title = earnings.detail;
+  if (earnings?.detail || earnings?.warning) state.view.earnings.title = earnings.detail || earnings.warning;
 }
 
 function withEarningsHorizon(label) {
@@ -3275,6 +3343,9 @@ function resetChanAnalysis() {
   state.chanPayload = null;
   state.chanRefreshPending = false;
   state.view.chan = OptionScopeChan.empty();
+  state.chanIntradayPayload = { "15m": null, "4h": null };
+  state.chanIntradayLoading = { "15m": false, "4h": false };
+  state.chanIntradaySpot = null;
 }
 
 function refreshChanAnalysis(force = false) {
@@ -3299,7 +3370,7 @@ function refreshChanAnalysis(force = false) {
     const liveQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
     const liveSpot = finitePrice(activeSessionQuote(liveQuote)?.price ?? liveQuote?.price);
     state.chanPayload = OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload);
-    state.view.chan = OptionScopeChan.view(state.chanPayload);
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible);
     hydrateTrendFromChan({ ...payload, spot: liveSpot ?? payload.spot }, null,
       displayedSnapshotContextMatches() || sameDisplayedLevelContext());
     // SSE normally refreshes history completion immediately. Bounded retry
@@ -3352,6 +3423,17 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   // older market snapshot roll the visible price, session label, or analysis back.
   if (previous?.symbol === state.symbol && Number.isFinite(incomingAt)
     && Number.isFinite(previousAt) && incomingAt < previousAt) return;
+  // The quote endpoint reads the persisted snapshot and marks it "sqlite",
+  // while its SSE event retains the original provider. Those are the same
+  // market data when their timestamps match, so do not flash the cache label
+  // just because a later 3-second poll took the SQLite read path.
+  if (previous?.symbol === state.symbol && Number.isFinite(incomingAt)
+    && Number.isFinite(previousAt) && incomingAt === previousAt
+    && previous.source !== "sqlite" && quote.source === "sqlite"
+    && !quoteCacheBadgeIsStale(quote)) {
+    quote = { ...quote, source: previous.source };
+  }
+  quote = mergeQuoteEarnings(quote);
   const mergedQuote = mergeFairValueSnapshot(quote);
   if (!mergedQuote) return;
   quote = mergedQuote;
@@ -3370,14 +3452,17 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   // 涨跌色统一走 --up / --down：当前全局口径是绿涨红跌，变量名不再写死颜色。
   state.view.quoteChangeColor = change == null ? "var(--muted)" : (change < 0 ? "var(--down)" : "var(--up)");
   state.view.quoteCurrency = quote?.currency || "USD";
-  state.view.quoteMarket = quote?.source === "sqlite" && !quoteIsFresh(quote)
+  state.view.quoteMarket = quote?.source === "sqlite" && quoteCacheBadgeIsStale(quote)
     ? `缓存 · ${quoteMarketLabel(quote)}`
     : quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
   if (state.chanPayload?.symbol === state.symbol) {
     state.chanPayload = OptionScopeChan.withSpot(state.chanPayload, finitePrice(price));
-    state.view.chan = OptionScopeChan.view(state.chanPayload);
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible);
+  }
+  if (state.chanIntradayPayload["15m"] || state.chanIntradayPayload["4h"]) {
+    state.chanIntradaySpot = finitePrice(price);
   }
   refreshChanAnalysis();
   state.view.quoteReference = reference.text;
@@ -3948,7 +4033,7 @@ function showPending(message, preserveCache = false) {
     && state.lastQuote.symbol === state.symbol
     && hasFairValueSnapshot(state.lastQuote);
   clearFairValuePoll();
-  resetEarningsChip();
+  if (state.earningsResolvedFor !== state.symbol) resetEarningsChip();
   resetOptionFlow(message || "需要两份相邻期权链快照才能估算流向");
   if (!keepFairValue) {
     state.view.fairValue = "--";
@@ -4698,7 +4783,11 @@ async function loadSymbol() {
   state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
+  state.earningsFetchedAt = 0;
+  state.earningsResolvedFor = "";
+  state.earningsData = null;
   resetChanAnalysis();
+  if (window.optionScopeApp) window.optionScopeApp.ensureChanIntraday(state.chanPeriod);
   state.trendMarket = null;
   state.trendMarketSymbol = "";
   state.trendHistorySymbol = "";
@@ -4806,13 +4895,42 @@ const optionScopeApp = new Vue({
   data: state,
   computed: {
     busy() { return this.loading; },
-    chanFrame() { return this.view.chan[this.chanPeriod] || this.view.chan.daily; },
+    chanFrame() {
+      if (this.chanPeriod === "15m" || this.chanPeriod === "4h") {
+        const payload = this.chanIntradayPayload[this.chanPeriod];
+        return payload
+          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot)
+          : OptionScopeChan.emptyFrame(this.chanPeriod === "4h" ? "4小时" : "15分钟");
+      }
+      return this.view.chan[this.chanPeriod] || this.view.chan.daily;
+    },
   },
   watch: {
-    chanPeriod() { this.chanHoveredScenario = null; },
+    chanPeriod() {
+      this.chanHoveredScenario = null;
+      this.ensureChanIntraday(this.chanPeriod);
+    },
   },
   methods: {
     navigateToSymbol() { return navigateToSymbol(); },
+    ensureChanIntraday(period) {
+      if (period !== "15m" && period !== "4h") return;
+      if (this.chanIntradayPayload[period] || this.chanIntradayLoading[period]) return;
+      const symbol = state.symbol;
+      if (!symbol) return;
+      const quote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
+      const spot = finitePrice(activeSessionQuote(quote)?.price ?? quote?.price);
+      const query = spot != null ? `?period=${period}&spot=${encodeURIComponent(spot)}` : `?period=${period}`;
+      this.chanIntradayLoading = { ...this.chanIntradayLoading, [period]: true };
+      request(`/api/chan/${encodeURIComponent(symbol)}/intraday${query}`).then((payload) => {
+        if (state.symbol !== symbol) return;
+        this.chanIntradayPayload = { ...this.chanIntradayPayload, [period]: payload };
+      }).catch((error) => {
+        if (state.symbol === symbol) setError(error.message || "盘中周期加载失败");
+      }).then(() => {
+        this.chanIntradayLoading = { ...this.chanIntradayLoading, [period]: false };
+      });
+    },
     isChanTouchInput() {
       return Boolean(window.matchMedia && window.matchMedia("(hover: none), (pointer: coarse)").matches);
     },
@@ -4850,6 +4968,14 @@ const optionScopeApp = new Vue({
     dismissChanScenarioOnTouch(event) {
       if (!this.isChanTouchInput() || event.target.closest(".chan-projection-up, .chan-projection-down, .chan-projection-range, .chan-projection-float-card")) return;
       this.chanHoveredScenario = null;
+    },
+    toggleChanScenarios() {
+      this.chanScenariosVisible = !this.chanScenariosVisible;
+      this.chanHoveredScenario = null;
+      if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
+      this.chanScenarioHideTimer = null;
+      try { localStorage.setItem(CHAN_SCENARIOS_STORAGE_KEY, this.chanScenariosVisible ? "1" : "0"); } catch (error) { /* 存储不可用时保留当前页面状态。 */ }
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible);
     },
     toggleChanPanel() {
       this.chanExpanded = !this.chanExpanded;

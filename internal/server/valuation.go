@@ -1281,7 +1281,11 @@ func (s *Service) runValuationWithQuote(parent context.Context, symbol string, i
 	// snapshot when SQLite still contains the preceding snapshot; otherwise the
 	// timestamp guard below would discard the result as soon as the new quote is
 	// written.
-	if initialQuote != nil && (!found || !sameQuoteTimestamp(quote.FetchedAt, initialQuote.FetchedAt)) {
+	// Callers may hand over a cached quote rather than the one a refresh just
+	// fetched. Adopting a strictly older snapshot here would re-persist the old
+	// market price with a fresh timestamp and hide the live quote from readers
+	// until the next refresh, so keep the stored row when it is newer.
+	if initialQuote != nil && (!found || !sameQuoteTimestamp(quote.FetchedAt, initialQuote.FetchedAt)) && !quoteSnapshotIsOlder(initialQuote, quote, found) {
 		if found && quote.FairValue != nil && quote.FairValueSource != "" && !isGoFairValueSource(quote.FairValueSource) {
 			return
 		}
@@ -1344,8 +1348,6 @@ func (s *Service) runValuationWithQuote(parent context.Context, symbol string, i
 			clearQuoteValuation(&latest, result)
 			latest.Source = "sqlite"
 			latest.Provider = "go-valuation"
-			valuationFetchedAt := time.Now().UTC()
-			latest.FetchedAt = &valuationFetchedAt
 			if saved, saveErr := s.store.SaveQuoteReplacingFairValue(latest); saveErr == nil {
 				s.recordValuationEvent(symbol, saved)
 			}
@@ -1363,7 +1365,7 @@ func (s *Service) runValuationWithQuote(parent context.Context, symbol string, i
 	if latestErr != nil {
 		return
 	}
-	if initialQuote != nil && (!latestFound || !sameQuoteTimestamp(latest.FetchedAt, initialQuote.FetchedAt)) {
+	if initialQuote != nil && (!latestFound || !sameQuoteTimestamp(latest.FetchedAt, initialQuote.FetchedAt)) && !quoteSnapshotIsOlder(initialQuote, latest, latestFound) {
 		// The chain transaction may still be in flight. Keep the fresh quote that
 		// triggered this worker instead of calculating valuation against the prior
 		// SQLite snapshot; the later quote save will preserve these fields.
@@ -1403,11 +1405,9 @@ func (s *Service) runValuationWithQuote(parent context.Context, symbol string, i
 	enrichQuoteResult(&latest, fundamentals, inputs, result)
 	latest.Source = "sqlite"
 	latest.Provider = "go-valuation"
-	// Write the valuation as a fresh snapshot. Python's latest_quote uses
-	// fetched_at-only ordering, so reusing the quote timestamp would leave the
-	// older unvalued row selected on an equal-timestamp tie.
-	valuationFetchedAt := time.Now().UTC()
-	latest.FetchedAt = &valuationFetchedAt
+	// Valuation is derived data for this market snapshot, not a new quote. Keep
+	// the provider's market timestamp so SQLite readers cannot mistake an old
+	// cached price for a fresh quote after valuation finishes.
 	// Store the shared result before the snapshot so another worker can serve a
 	// completed value even if this process is interrupted during SQLite writing.
 	s.persistValuationCache(symbol, payload)
@@ -1517,4 +1517,15 @@ func sameQuoteTimestamp(left, right *time.Time) bool {
 		return left == nil && right == nil
 	}
 	return left.Equal(*right)
+}
+
+// quoteSnapshotIsOlder reports whether candidate is a strictly older quote
+// snapshot than the stored current row. Valuation workers and the Gamma window
+// can be handed a cached quote; re-persisting that older price with a fresh
+// timestamp would hide the live quote from readers until the next refresh.
+func quoteSnapshotIsOlder(candidate *model.Quote, current model.Quote, currentFound bool) bool {
+	if candidate == nil || candidate.FetchedAt == nil || !currentFound || current.FetchedAt == nil {
+		return false
+	}
+	return candidate.FetchedAt.Before(*current.FetchedAt)
 }

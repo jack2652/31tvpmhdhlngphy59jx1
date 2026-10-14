@@ -62,6 +62,141 @@ func Analyze(symbol string, input []Bar, spot *float64, cutoff time.Time) Result
 	return result
 }
 
+// AnalyzeIntraday builds a closed-bar intraday structure from Yahoo's
+// 15-minute regular-session bars. The 4-hour view uses two complete session
+// blocks (09:30–13:30 and 13:30–16:00 ET); partial blocks are omitted.
+func AnalyzeIntraday(symbol string, input []Bar, period string, spot *float64, cutoff time.Time) (Result, error) {
+	interval, label := 15*time.Minute, "15分钟"
+	bars, rejected, unfinished := completedIntradayBars(input, cutoff, interval)
+	if period == "4h" {
+		label = "4小时"
+		bars, rejected, unfinished = aggregateFourHourBars(input, cutoff)
+	} else if period != "15m" {
+		return Result{}, fmt.Errorf("unsupported intraday period %q", period)
+	}
+	// A missing, zero, or non-finite quote falls back to the last closed bar so
+	// the position is never judged against an invalid price.
+	if spot == nil || !finitePositive(*spot) {
+		spot = nil
+		if len(bars) > 0 {
+			spot = ptr(bars[len(bars)-1].Close)
+		}
+	}
+	result := Result{Symbol: symbol, Spot: spot, GeneratedAt: cutoff.UTC(), RuleVersion: RuleVersion,
+		Rules: []string{
+			"只使用已收盘的美东常规交易时段 K 线；盘前、盘后和未完成 K 线不参与结构确认",
+			"严格旧笔、分型与笔中枢使用与日线相同的结构规则；盘中历史可能较短",
+		}, Warnings: []string{},
+	}
+	if rejected > 0 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("%d 根日期、时段或 OHLC 无效的盘中 K 线已排除", rejected))
+	}
+	if unfinished > 0 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("%d 根尚未收盘或所属时段未完整的 K 线已排除", unfinished))
+	}
+	if len(bars) == 0 {
+		result.Daily = analyzeFrame(nil, period, label, spot)
+		result.Daily.Warnings = append(result.Daily.Warnings, "上游尚无完整的已收盘盘中 K 线")
+	} else {
+		result.Daily = analyzeFrame(bars, period, label, spot)
+	}
+	result.Daily.Warnings = append(result.Daily.Warnings, result.Warnings...)
+	result.Weekly = analyzeFrame(nil, "", "周线", spot)
+	result.Summary = Summary{Alignment: "intraday", Label: label + "结构", Detail: "按已收盘盘中 K 线识别；日周结构另行参考"}
+	return result, nil
+}
+
+func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration) ([]Bar, int, int) {
+	location, _ := time.LoadLocation("America/New_York")
+	if location == nil {
+		location = time.UTC
+	}
+	byTime := make(map[string]Bar, len(input))
+	rejected, unfinished := 0, 0
+	for _, bar := range input {
+		stamp, err := time.ParseInLocation("2006-01-02 15:04", bar.Date, location)
+		if err != nil || !marketcalendar.IsTradingDay(stamp) || stamp.Hour() < 9 || stamp.Hour() > 15 ||
+			stamp.Hour() == 9 && stamp.Minute() < 30 || stamp.Hour() == 15 && stamp.Minute() > 45 || stamp.Minute()%15 != 0 ||
+			!finitePositive(bar.Open) || !finitePositive(bar.High) || !finitePositive(bar.Low) || !finitePositive(bar.Close) ||
+			bar.High < math.Max(bar.Open, bar.Close) || bar.Low > math.Min(bar.Open, bar.Close) || bar.High < bar.Low {
+			rejected++
+			continue
+		}
+		if cutoff.Before(stamp.Add(interval)) {
+			unfinished++
+			continue
+		}
+		if math.IsNaN(bar.Volume) || math.IsInf(bar.Volume, 0) || bar.Volume < 0 {
+			bar.Volume = 0
+		}
+		byTime[bar.Date] = bar
+	}
+	bars := make([]Bar, 0, len(byTime))
+	for _, bar := range byTime {
+		bars = append(bars, bar)
+	}
+	sort.Slice(bars, func(i, j int) bool { return bars[i].Date < bars[j].Date })
+	return bars, rejected, unfinished
+}
+
+func aggregateFourHourBars(input []Bar, cutoff time.Time) ([]Bar, int, int) {
+	const fifteenMinutes = 15 * time.Minute
+	bars, rejected, unfinished := completedIntradayBars(input, cutoff, fifteenMinutes)
+	location, _ := time.LoadLocation("America/New_York")
+	if location == nil {
+		location = time.UTC
+	}
+	sessions := make(map[string]map[int]Bar)
+	for _, bar := range bars {
+		stamp, _ := time.ParseInLocation("2006-01-02 15:04", bar.Date, location)
+		open := time.Date(stamp.Year(), stamp.Month(), stamp.Day(), 9, 30, 0, 0, location)
+		index := int(stamp.Sub(open) / fifteenMinutes)
+		if index < 0 || index >= 26 {
+			continue
+		}
+		day := stamp.Format(time.DateOnly)
+		if sessions[day] == nil {
+			sessions[day] = make(map[int]Bar)
+		}
+		sessions[day][index] = bar
+	}
+	result := make([]Bar, 0, len(sessions)*2)
+	for day, session := range sessions {
+		dayStart, err := time.ParseInLocation(time.DateOnly, day, location)
+		if err != nil {
+			continue
+		}
+		for _, block := range []struct{ start, count int }{{0, 16}, {16, 10}} {
+			complete := true
+			var combined Bar
+			for offset := 0; offset < block.count; offset++ {
+				bar, found := session[block.start+offset]
+				if !found {
+					complete = false
+					break
+				}
+				if offset == 0 {
+					combined = bar
+					continue
+				}
+				combined.High = math.Max(combined.High, bar.High)
+				combined.Low = math.Min(combined.Low, bar.Low)
+				combined.Close, combined.Volume = bar.Close, combined.Volume+bar.Volume
+			}
+			if !complete {
+				unfinished++
+				continue
+			}
+			start := dayStart.Add(time.Duration(block.start) * fifteenMinutes)
+			combined.Date = start.Format("2006-01-02 15:04")
+			combined.CapturedAt = start.Add(time.Duration(block.count) * fifteenMinutes)
+			result = append(result, combined)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Date < result[j].Date })
+	return result, rejected, unfinished
+}
+
 func finitePositive(value float64) bool {
 	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }

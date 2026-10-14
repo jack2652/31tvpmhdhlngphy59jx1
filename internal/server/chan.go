@@ -13,6 +13,91 @@ import (
 	"option-scope-go/internal/model"
 )
 
+// intradayChanAnalysis serves closed-bar 15-minute and 4-hour structures. The
+// short Yahoo intraday window is cached in memory and fetched on demand so the
+// default daily/weekly view never pays for it.
+func (s *Service) intradayChanAnalysis(c *gin.Context) {
+	if !s.validateQuery(c, positiveFloatQueryRule("spot")) {
+		return
+	}
+	symbol, err := normalizeAPISymbol(c.Param("symbol"))
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	period := strings.ToLower(strings.TrimSpace(c.Query("period")))
+	if period == "" {
+		period = "15m"
+	}
+	if period != "15m" && period != "4h" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "period 只支持 15m 或 4h"})
+		return
+	}
+	var spot *float64
+	if raw, present := queryValue(c, "spot"); present {
+		value, _ := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		spot = &value
+	} else if quote, found, quoteErr := s.latestQuoteSnapshot(symbol); quoteErr == nil && found && quote.value.Price != nil {
+		spot = quote.value.Price
+	}
+	frame, source, warning := s.intradayFrame(c.Request.Context(), symbol)
+	result, analyzeErr := chananalysis.AnalyzeIntraday(symbol, intradayBars(frame), period, spot, time.Now())
+	if analyzeErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": analyzeErr.Error()})
+		return
+	}
+	warnings := append([]string{}, result.Warnings...)
+	if warning != "" {
+		warnings = append(warnings, warning)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"symbol": symbol, "spot": result.Spot, "period": period, "frame": result.Daily,
+		"warnings": warnings, "source": source, "fetched_at": frame.fetchedAt,
+	})
+}
+
+func (s *Service) intradayFrame(ctx context.Context, symbol string) (intradayCacheEntry, string, string) {
+	provider, ok := s.provider.(IntradayHistoryProvider)
+	if !ok {
+		return intradayCacheEntry{}, "none", "当前行情提供方不支持盘中历史，15 分钟与 4 小时结构暂不可用"
+	}
+	// Both periods derive from the same 15-minute series, so one cache entry per
+	// symbol covers them and switching periods reuses the fetch.
+	s.intradayMu.Lock()
+	if cached, found := s.intradayHistoryCache[symbol]; found && time.Since(cached.fetchedAt) < 3*time.Minute {
+		s.intradayMu.Unlock()
+		return cached, "memory", ""
+	}
+	s.intradayMu.Unlock()
+	result, err := provider.IntradayHistory(ctx, symbol, "15m")
+	if err != nil {
+		return intradayCacheEntry{}, "none", "盘中历史获取失败：" + err.Error()
+	}
+	entry := intradayCacheEntry{frame: result.Bars, fetchedAt: result.FetchedAt}
+	s.intradayMu.Lock()
+	if s.intradayHistoryCache == nil {
+		s.intradayHistoryCache = make(map[string]intradayCacheEntry)
+	}
+	s.intradayHistoryCache[symbol] = entry
+	s.intradayMu.Unlock()
+	return entry, result.Source, ""
+}
+
+func intradayBars(entry intradayCacheEntry) []chananalysis.Bar {
+	bars := make([]chananalysis.Bar, 0, len(entry.frame))
+	for _, raw := range entry.frame {
+		bar := chananalysis.Bar{}
+		bar.Date, _ = raw["date"].(string)
+		for field, target := range map[string]*float64{"open": &bar.Open, "high": &bar.High, "low": &bar.Low, "close": &bar.Close, "volume": &bar.Volume} {
+			if value := numberValue(raw[field]); value != nil {
+				*target = *value
+			}
+		}
+		bars = append(bars, bar)
+	}
+	return bars
+}
+
 // chanAnalysis shares the existing daily history cache and asynchronous
 // prefetch. It never fetches upstream history on the foreground request.
 func (s *Service) chanAnalysis(c *gin.Context) {

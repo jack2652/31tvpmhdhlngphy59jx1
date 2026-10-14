@@ -507,11 +507,39 @@ func (s *Service) loadEarnings(ctx context.Context, symbol string) map[string]an
 	}
 	dates = normalizeHistoryDates(dates)
 	fetchedAt := time.Now().UTC()
+	// Yahoo's calendar sometimes omits the upcoming report or returns only
+	// past reports. Keep an already known future date until it passes instead
+	// of replacing it with an unknown state.
+	if !hasUpcomingEarningsDate(dates, fetchedAt) {
+		cachedDates, _ := cached["dates"].([]string)
+		if hasUpcomingEarningsDate(cachedDates, fetchedAt) {
+			retainedDates := normalizeHistoryDates(append(cachedDates, dates...))
+			if err := s.store.WritePayload("earnings_snapshots", symbol, map[string]any{"dates": retainedDates}, fetchedAt); err != nil {
+				return map[string]any{"dates": cachedDates, "fetched_at": cached["fetched_at"], "source": cacheSource(cachedDates, cached["fetched_at"]), "warning": err.Error()}
+			}
+			return map[string]any{"dates": retainedDates, "fetched_at": fetchedAt, "source": "sqlite", "warning": nil}
+		}
+	}
 	payload := map[string]any{"dates": dates}
 	if err := s.store.WritePayload("earnings_snapshots", symbol, payload, fetchedAt); err != nil {
 		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["dates"], cached["fetched_at"]), "warning": err.Error()}
 	}
 	return map[string]any{"dates": dates, "fetched_at": fetchedAt, "source": "upstream", "warning": nil}
+}
+
+func hasUpcomingEarningsDate(dates []string, now time.Time) bool {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	today := now.In(location).Format(time.DateOnly)
+	for _, value := range dates {
+		parsed, err := time.Parse(time.DateOnly, value)
+		if err == nil && parsed.Format(time.DateOnly) >= today {
+			return true
+		}
+	}
+	return false
 }
 
 func historyTimestamp(raw any) (time.Time, bool) {

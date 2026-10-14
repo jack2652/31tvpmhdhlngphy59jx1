@@ -5,6 +5,8 @@
   const money = (value) => value != null && Number.isFinite(Number(value))
     ? Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "--";
   const direction = (value) => ({ up: "向上", down: "向下", unknown: "尚未成笔" }[value] || "尚未成笔");
+  // 盘中周期的时间戳形如 2026-10-13 15:45；坐标轴只保留月-日与时间，避免三处标签相互挤压。
+  const axisDateLabel = (value) => { const text = String(value || ""); return text.includes(" ") ? text.slice(5) : text; };
   const chartCache = new WeakMap();
   const turningKinds = new Set(["bottom_reversal_candidate", "top_exit_candidate"]);
   const buyKinds = new Set(["third_buy_candidate", "bottom_reversal_candidate"]);
@@ -184,11 +186,12 @@
     })) };
   }
 
-  function chartModel(frame, spot, scenarios) {
-    const cached = chartCache.get(frame.candles);
+  function chartModel(frame, spot, scenarios, showScenarios) {
+    const cachedLayouts = chartCache.get(frame.candles);
+    const cached = cachedLayouts?.get(showScenarios);
     const currentSpot = Number(spot);
-    const scenarioLevels = (scenarios || []).flatMap((scenario) => scenario.projection_levels || [])
-      .map(Number).filter((price) => Number.isFinite(price) && price > 0);
+    const scenarioLevels = showScenarios ? (scenarios || []).flatMap((scenario) => scenario.projection_levels || [])
+      .map(Number).filter((price) => Number.isFinite(price) && price > 0) : [];
     const newLevelsOutsideCache = scenarioLevels.some((price) => price < (cached?.minimum ?? Infinity) || price > (cached?.maximum ?? -Infinity));
     const quoteOutsideCache = Number.isFinite(currentSpot) && currentSpot > 0
       && (currentSpot < (cached?.minimum ?? -Infinity) || currentSpot > (cached?.maximum ?? Infinity));
@@ -199,9 +202,9 @@
     if (!bars.length) return null;
     const width = 960, height = 340, left = 18, right = 104, top = 18, bottom = 38;
     const plotWidth = width - left - right, plotHeight = height - top - bottom;
-    // Reserve a right-side lane for conditional scenarios so they do not
-    // overlap the candles or masquerade as future time-scaled price data.
-    const historyRight = left + plotWidth * 0.88;
+    // Keep the scenario lane separate from historical bars when it is shown.
+    const scenarioBoundary = left + plotWidth * 0.88;
+    const historyRight = showScenarios ? scenarioBoundary : width - right;
     const historyWidth = historyRight - left;
     const firstDate = bars[0].date, lastDate = bars[bars.length - 1].date;
     const visibleStrokes = (frame.strokes || []).filter((stroke) => stroke.end.date >= firstDate && stroke.start.date <= lastDate);
@@ -257,7 +260,7 @@
     const chart = {
       width, height, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: height - bottom,
       minimum, maximum, periodLabel: frame.label,
-      historyRight, lastClose: frame.last_close,
+      historyRight, scenarioBoundary, lastClose: frame.last_close,
       title: `${frame.label} K 线、笔、中枢与条件情景推演，${firstDate} 至 ${lastDate}`,
       description: "实体 K 线表示收盘后的行情。实线为已确认笔，虚线为形成中的笔；阴影表示三根已确认笔的重叠区。笔端点标注价格；底、顶标记是候选观察。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测。移动鼠标或触摸图表可查看 K 线日期和 OHLC；图表获得键盘焦点后，左右键切换 K 线，Home、End 跳到首根、末根，Escape 关闭提示。",
       points,
@@ -284,7 +287,7 @@
       candles: bars.map((bar, index) => ({ key: bar.date, date: bar.date, x: x(index),
         prices: { open: bar.open, high: bar.high, low: bar.low, close: bar.close },
         high: y(bar.high), low: y(bar.low), body: Math.min(y(bar.open), y(bar.close)),
-        bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, plotWidth / bars.length * 0.56),
+        bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, historyWidth / bars.length * 0.56),
         direction: bar.close >= bar.open ? "up" : "down",
         title: `${bar.date} · 开 ${money(bar.open)} · 高 ${money(bar.high)} · 低 ${money(bar.low)} · 收 ${money(bar.close)}` })),
       strokes: visibleStrokes.map((stroke, index) => ({ key: `${stroke.start.date}-${index}`,
@@ -306,9 +309,11 @@
         return { key: index, y: y(price), label: money(price) };
       }),
       dates: [...new Set([0, Math.floor((bars.length - 1) / 2), bars.length - 1])]
-        .map((index) => ({ x: x(index), y: height - 12, label: bars[index].date })),
+        .map((index) => ({ x: x(index), y: height - 12, label: axisDateLabel(bars[index].date) })),
     };
-    chartCache.set(frame.candles, { chart, minimum, maximum, y });
+    const layouts = cachedLayouts || new Map();
+    layouts.set(showScenarios, { chart, minimum, maximum, y });
+    if (!cachedLayouts) chartCache.set(frame.candles, layouts);
     return chartWithSpot(chart, spot, minimum, maximum, y, scenarios);
   }
 
@@ -454,13 +459,13 @@
     return guide;
   }
 
-  function frameView(frame, spot, weekly = null) {
+  function frameView(frame, spot, weekly = null, showScenarios = true) {
     if (!frame) return emptyFrame("--");
     const center = frame.position?.center;
     const last = frame.strokes?.[frame.strokes.length - 1];
     const fixed = (frame.strokes || []).filter((stroke) => stroke.confirmed);
     const guidance = frameGuidance(frame, spot, weekly);
-    const chart = chartModel(frame, spot, guidance.scenarios);
+    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios);
     const markers = chart ? (frame.signals || []).filter((signal) => turningKinds.has(signal.kind) && signal.status !== "invalidated").map((signal) => {
       const point = chart.points.find((item) => item.date === (signal.origin_date || signal.date) && item.price === signal.price);
       if (!point) return null;
@@ -496,14 +501,14 @@
     };
   }
 
-  function view(payload) {
+  function view(payload, showScenarios = true) {
     if (!payload) return empty();
     let historyTime = "--";
     if (payload.history?.fetched_at) {
       const date = new Date(payload.history.fetched_at);
       if (!Number.isNaN(date.getTime())) historyTime = date.toLocaleString("zh-CN", { hour12: false });
     }
-    const daily = frameView(payload.daily, payload.spot, payload.weekly), weekly = frameView(payload.weekly, payload.spot, payload.daily);
+    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios);
     const weeklyReady = Boolean(payload.weekly?.position?.center);
     const weeklyContext = weeklyReady ? `周线：${weekly.position}。` : `周线已有 ${weekly.bars} 根收盘 K 线、${weekly.confirmed} 根已确认笔，尚未形成中枢，不能给日线方向增加确认。`;
     return {
@@ -515,6 +520,16 @@
       warnings: payload.warnings || [], rules: payload.rules || [],
       spot: money(payload.spot), historyTime, refreshing: Boolean(payload.history?.refreshing),
     };
+  }
+
+  // Closed-bar intraday view. The server sends one frame for the requested
+  // 15-minute or 4-hour period; reuse the same frame renderer as daily/weekly.
+  function intradayView(payload, showScenarios = true, spotOverride = null) {
+    const label = payload?.period === "4h" ? "4小时" : "15分钟";
+    if (!payload || !payload.frame) return emptyFrame(label);
+    const spot = spotOverride != null && Number.isFinite(Number(spotOverride)) && Number(spotOverride) > 0
+      ? Number(spotOverride) : payload.spot;
+    return frameView(payload.frame, spot, null, showScenarios);
   }
 
   // Refresh the current price position without rebuilding historical pens.
@@ -579,5 +594,5 @@
     return { ...payload, spot, daily, weekly, summary };
   }
 
-  window.OptionScopeChan = { empty, view, withSpot };
+  window.OptionScopeChan = { empty, view, withSpot, intradayView, emptyFrame };
 }(window));
