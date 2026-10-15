@@ -59,7 +59,7 @@ type Quote struct {
 	FairValueWarnings                 []string       `json:"fair_value_warnings,omitempty"`
 	FairValueErrors                   []string       `json:"fair_value_errors,omitempty"`
 	Warning                           string         `json:"warning,omitempty"`
-	Earnings                          any            `json:"earnings"`
+	Earnings                          any            `json:"-"`
 }
 
 type ExpirationsResponse struct {

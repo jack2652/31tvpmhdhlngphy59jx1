@@ -17,7 +17,7 @@ const FAIR_VALUE_POLL_INTERVAL_MS = 3000;
 const FAIR_VALUE_POLL_LIMIT = 50;
 const FAIR_VALUE_RETRY_INTERVAL_MS = 2500;
 
-const TREND_SIGNAL_TITLE = "规则估算，不是下单指令，也不包含财报跳空";
+const TREND_SIGNAL_TITLE = "规则估算，不是下单指令";
 const CHAN_FOLD_KEYS = {
   panel: "option-scope-chan",
   plan: "option-scope-chan-plan",
@@ -38,6 +38,8 @@ const state = {
   analysisReady: false,
   loadId: 0,
   chanPeriod: "daily",
+  chanMobileChart: window.matchMedia ? window.matchMedia("(max-width: 600px)").matches : false,
+  chanMobileBars: 30,
   chanScenariosVisible: readChanScenarioVisibility(),
   chanIntradayPayload: { "15m": null, "4h": null },
   chanIntradayLoading: { "15m": false, "4h": false },
@@ -48,6 +50,7 @@ const state = {
   chanSpotGuideVisible: false,
   chanSpotGuideX: 0,
   chanSpotGuideY: 0,
+  chanSpotGuideSide: "up",
   chanExpanded: readFoldState(CHAN_FOLD_KEYS.panel, false),
   chanFolds: {
     plan: readFoldState(CHAN_FOLD_KEYS.plan, false),
@@ -137,22 +140,14 @@ const state = {
     quoteReference: "昨收 --",
     quoteReferenceTitle: "涨跌幅以昨收为基准",
     fairValue: "--",
-    fairValueSource: "保守模型 -- · 乐观模型 --",
-    fairValueTitle: "保守估值按公开财务数据估算；区间比单点更能反映模型不确定性",
+    fairValueSource: "保守情景 -- · 乐观情景 --",
+    fairValueTitle: "估值区间来自不同假设的情景模型，具体方法见估值卡片说明",
     fairDefensive: "--",
-    fairDefensiveSource: "等待估值计算",
-    fairDefensiveTitle: "模型 A：深度价值 / 保守现金流",
+    fairDefensiveSource: "等待估值数据",
+    fairDefensiveTitle: "保守情景估值",
     fairOptimistic: "--",
-    fairOptimisticSource: "等待远期盈利数据",
-    fairOptimisticTitle: "模型 B：远期 EPS × PEG",
-    earnings: {
-      status: "unknown",
-      label: "未知",
-      title: "没有可用的未来财报日期，评分不因财报调整",
-    },
-  earningsFetchedAt: 0,
-  earningsResolvedFor: "",
-  earningsData: null,
+    fairOptimisticSource: "等待估值数据",
+    fairOptimisticTitle: "乐观情景估值",
     totalCount: "--",
     callVolume: "--",
     putVolume: "--",
@@ -1797,7 +1792,6 @@ function serverLevelsNeedsRetry(payload) {
     payload?.history?.warning,
     payload?.history?.extremes_warning,
     payload?.beta_meta?.warning,
-    payload?.earnings?.warning,
   ].filter(Boolean).map(String);
   const temporarilyBlocked = warnings.some((warning) => /内存保护|刷新正在进行|租约忙|等待超时|稍后重试/.test(warning));
   if (!temporarilyBlocked) return false;
@@ -1868,7 +1862,6 @@ function renderClientRaw(payload, points, spot) {
     : resistance.metric;
   const renderSide = (items, side, isAdd = false) => buildFactorViews(items, Number(spot), side, isAdd);
   state.levelsPayload = payload;
-  applyEarnings(payload?.earnings);
   state.view.chart.levelsBasis = Number.isFinite(Number(spot)) && Number(spot) > 0 ? `基准 ${formatMoney(Number(spot))}` : "基准 --";
   state.view.levels.placeholder = false;
   const addLevels = hasServerLevels && Array.isArray(serverPayload.plan?.add)
@@ -2601,7 +2594,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const action = ["buy", "sell", "hold"].includes(recommendation?.action) ? recommendation.action : null;
   const actionLabel = action ? (recommendation.label || "继续持有") : "";
   const actionReason = action ? (recommendation.reason || "结合当前趋势与价位综合判断") : "";
-  const horizonLabel = withEarningsHorizon(tradePointsHorizon?.label || "未来 5 个交易日");
+  const horizonLabel = tradePointsHorizon?.label || "未来 5 个交易日";
   const opportunityRows = [
     ["buy", "近期最佳买入点"],
     ["sell", "近期最佳卖出点"],
@@ -2763,7 +2756,6 @@ function renderClientBuyerFallback(rows, spot, support = [], resistance = [], di
 function renderFactorLevels(payload) {
   if (payload?.symbol && payload.symbol !== state.symbol) return;
   if (payload?.expiration && state.expiration && payload.expiration !== state.expiration) return;
-  applyEarnings(payload?.earnings);
   const spot = Number(payload?.spot);
   state.view.chart.levelsBasis = Number.isFinite(spot) && spot > 0 ? `基准 ${formatMoney(spot)}` : "基准 --";
   const expiration = payload?.expiration || state.expiration || "--";
@@ -2882,7 +2874,7 @@ function renderBuyerStructures(payload, fetchedAt = null) {
   const empty = {
     available: false,
     directionLabel: "",
-    horizonLabel: withEarningsHorizon(payload?.horizon_label || "未来 5 个交易日"),
+    horizonLabel: payload?.horizon_label || "未来 5 个交易日",
     target: "",
     items: [],
     reason: payload?.reason || "等待数据",
@@ -2913,7 +2905,7 @@ function renderBuyerStructures(payload, fetchedAt = null) {
   state.view.buyer = {
     available: true,
     directionLabel: payload.direction_label || (payload.direction === "call" ? "买入看涨" : "买入看跌"),
-    horizonLabel: withEarningsHorizon(payload.horizon_label || "未来 5 个交易日"),
+    horizonLabel: payload.horizon_label || "未来 5 个交易日",
     target: targetText || "--",
     reason: "",
     note: `${buyerMethod} · ${sourceLabel} · ${buyerQuoteMethod} · ${ivLabel} · ${fetchedAt ? `数据 ${formatTime(fetchedAt)}` : "数据时间未知"} · 预计盈利/亏损以当前买卖价中间价为成本基准；负数表示目标价虽达到，扣除时间价值后仍未覆盖成本。${payload.disclaimer || "综合评分不是历史胜率"}`,
@@ -2941,7 +2933,7 @@ function renderBuyerStructures(payload, fetchedAt = null) {
         : `${notation}：${item.label || "买方期权"}，到期日 ${item.expiration}，执行价 ${strikes}。`;
       return {
         ...item,
-        horizon: withEarningsHorizon(item.horizon || payload.horizon_label || "未来 5 个交易日"),
+        horizon: item.horizon || payload.horizon_label || "未来 5 个交易日",
         // 同一期限可能同时出现多个相同执行价的候选方案，方向与序号一起纳入 key，避免 Vue 2 列表重排时出现重复 key。
         key: `${item.kind || "structure"}-${item.direction || "unknown"}-${item.expiration || "unknown"}-${strikes || "unknown"}-${index}`,
         structure: notation,
@@ -3176,86 +3168,6 @@ function refreshQuoteWithTrendClose() {
   }
 }
 
-function earningsMonthDay(value) {
-  const match = String(value || "").match(/^\d{4}-(\d{2})-(\d{2})/);
-  return match ? `${match[1]}-${match[2]}` : "";
-}
-
-function resetEarningsChip() {
-  state.view.earnings = {
-    status: "unknown",
-    label: "未知",
-    title: "没有可用的未来财报日期，评分不因财报调整",
-  };
-}
-
-function earningsHasData(earnings) {
-  return Boolean(earnings && ["inside", "outside"].includes(earnings.status));
-}
-
-function mergeQuoteEarnings(quote) {
-  if (!quote || state.earningsResolvedFor !== state.symbol || quote.symbol && quote.symbol !== state.symbol) return quote;
-  const current = state.earningsData;
-  if (!current) return quote;
-  const incoming = quote.earnings;
-  if (!incoming) return { ...quote, earnings: current };
-  const fetchedAt = incoming.fetched_at ? new Date(incoming.fetched_at).getTime() : 0;
-  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0) return { ...quote, earnings: current };
-  if (!earningsHasData(incoming) && fetchedAt < state.earningsFetchedAt) {
-    return { ...quote, earnings: current };
-  }
-  if (earningsHasData(incoming) && fetchedAt < state.earningsFetchedAt) {
-    return { ...quote, earnings: current };
-  }
-  return quote;
-}
-
-function applyEarnings(earnings) {
-  if (!earnings || typeof earnings !== "object") return;
-  const symbol = state.symbol;
-  const fetchedAt = earnings.fetched_at ? new Date(earnings.fetched_at).getTime() : 0;
-  const hasFetchedAt = Number.isFinite(fetchedAt) && fetchedAt > 0;
-  const incomingHasData = earningsHasData(earnings);
-  // raw levels and lightweight quote/levels responses can finish out of order.
-  // Ignore summaries without their cache version; raw levels intentionally
-  // omit cache metadata and must not reset a dated quote/levels result.
-  if (!hasFetchedAt) return;
-  if (state.earningsResolvedFor === symbol && !incomingHasData
-    && fetchedAt < state.earningsFetchedAt) return;
-  if (incomingHasData && state.earningsResolvedFor === symbol
-    && hasFetchedAt && fetchedAt < state.earningsFetchedAt) return;
-  state.earningsData = earnings;
-  if (incomingHasData || hasFetchedAt) {
-    state.earningsResolvedFor = symbol;
-    if (hasFetchedAt) state.earningsFetchedAt = fetchedAt;
-  }
-  const day = earningsMonthDay(earnings?.date);
-  if (earnings?.status === "inside" && day) {
-    state.view.earnings = {
-      status: "inside",
-      label: `财报 ${day} · 5日内`,
-      title: earnings.detail || `下一财报 ${earnings.date} 落在未来 5 个交易日内。只作提示，不改变评分。`,
-    };
-    return;
-  }
-  if (earnings?.status === "outside") {
-    state.view.earnings = {
-      status: "outside",
-      label: "窗口外",
-      title: earnings.detail || (earnings?.date ? `下一财报 ${earnings.date} 不在未来 5 个交易日内。` : "下一财报不在未来 5 个交易日内。"),
-    };
-    return;
-  }
-  resetEarningsChip();
-  if (earnings?.detail || earnings?.warning) state.view.earnings.title = earnings.detail || earnings.warning;
-}
-
-function withEarningsHorizon(label) {
-  const base = label || "未来 5 个交易日";
-  if (state.view.earnings?.status === "inside" && !String(base).includes("含财报")) return `${base} · 含财报`;
-  return base;
-}
-
 function hasFairValueSnapshot(quote) {
   return Boolean(quote
     && quote.fair_value != null
@@ -3399,7 +3311,7 @@ function refreshChanAnalysis(force = false) {
     const liveQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
     const liveSpot = finitePrice(activeSessionQuote(liveQuote)?.price ?? liveQuote?.price);
     state.chanPayload = OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload);
-    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible);
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, state.chanMobileBars);
     hydrateTrendFromChan({ ...payload, spot: liveSpot ?? payload.spot }, null,
       displayedSnapshotContextMatches() || sameDisplayedLevelContext());
     // SSE normally refreshes history completion immediately. Bounded retry
@@ -3443,7 +3355,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
       // price, session label, or analysis back.
       if (!allowStaleValuation || previous?.symbol !== state.symbol || !quoteIsFresh(previous) || !hasFairValueSnapshot(quote)) return;
       const valuationFields = Object.fromEntries(Object.entries(quote).filter(([key]) =>
-        key === "fair_value" || key.startsWith("fair_value_") || key === "earnings"));
+        key === "fair_value" || key.startsWith("fair_value_")));
       quote = { ...previous, ...valuationFields };
       incomingAt = previousAt;
     }
@@ -3462,13 +3374,10 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     && !quoteCacheBadgeIsStale(quote)) {
     quote = { ...quote, source: previous.source };
   }
-  quote = mergeQuoteEarnings(quote);
   const mergedQuote = mergeFairValueSnapshot(quote);
   if (!mergedQuote) return;
   quote = mergedQuote;
   const active = activeSessionQuote(quote);
-  // 财报日期随轻量 quote 返回，先于 levels/raw 请求更新现货卡片，避免首屏长期显示“未知”。
-  applyEarnings(quote?.earnings);
   const price = active?.price ?? quote?.price;
   const reference = quoteReference(quote);
   const referencePrice = finitePrice(reference.price);
@@ -3488,7 +3397,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.lastQuote = quote || null;
   if (state.chanPayload?.symbol === state.symbol) {
     state.chanPayload = OptionScopeChan.withSpot(state.chanPayload, finitePrice(price));
-    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible);
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, state.chanMobileBars);
   }
   if (state.chanIntradayPayload["15m"] || state.chanIntradayPayload["4h"]) {
     state.chanIntradaySpot = finitePrice(price);
@@ -3514,10 +3423,33 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   const fairValueUnavailable = ["unavailable", "failed"].includes(fairValueStatus);
   const fairValueRetrying = fairValueStatus === "retry";
   const fairValueWarning = quote?.fair_value_warning || "公开财务数据不足，暂不输出估值";
-  const defensiveModel = defensive?.model || "深度价值 / 保守现金流";
-  const optimisticModel = optimistic?.model || "远期 EPS × PEG";
+  const defensiveModel = defensive?.model || "保守情景估值";
+  const optimisticModel = optimistic?.model || "乐观情景估值";
   const formatRange = (item) => item && Number.isFinite(Number(item.low)) && Number.isFinite(Number(item.high))
     ? `${formatMoney(item.low)}-${formatMoney(item.high)}` : "--";
+  const formatRevenue = (value) => {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return null;
+    if (amount >= 1e12) return `$${(amount / 1e12).toFixed(2)}T`;
+    if (amount >= 1e9) return `$${(amount / 1e9).toFixed(2)}B`;
+    if (amount >= 1e6) return `$${(amount / 1e6).toFixed(1)}M`;
+    return `$${formatMoney(amount)}`;
+  };
+  const scenarioInputs = (item) => {
+    if (!item) return "";
+    const parts = [];
+    if (item.forward_eps != null) parts.push(`远期 EPS ${formatMoney(item.forward_eps)}`);
+    if (item.growth_rate != null) parts.push(`增长率 ${(Number(item.growth_rate) * 100).toFixed(1)}%`);
+    for (const [key, label] of [
+      ["revenue", "已实现收入"],
+      ["current_year_revenue_estimate", "本年收入预测"],
+      ["next_year_revenue_estimate", "下一年收入预测"],
+    ]) {
+      const formatted = item[key] == null ? null : formatRevenue(item[key]);
+      if (formatted) parts.push(`${label} ${formatted}`);
+    }
+    return parts.length ? `${parts.join("；")}。` : "";
+  };
   state.view.fairValue = hasConservativeValue
     ? `保守 ${formatRange(defensive || { low, high })} · 乐观 ${formatRange(optimistic)}`
     : "--";
@@ -3534,15 +3466,15 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     ? `买入 ${defensiveBuy} · 安全边际 ${(Number(defensive.safety_margin || 0) * 100).toFixed(0)}%`
      : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "模型 A 数据不足" : "等待估值计算")));
   state.view.fairDefensiveTitle = hasConservativeValue
-    ? `保守估值：${defensiveModel}。估值 ${state.view.fairDefensive}，${state.view.fairDefensiveSource}。确定性 ${quote?.fair_value_confidence_score != null ? `${quote.fair_value_confidence_score}%` : (quote?.fair_value_confidence || "暂无")}。${quote?.fair_value_regime === "WINTER" ? "AI 寒冬：禁止仅凭远期 EPS 抄底" : ""}`
-    : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : "模型 A：深度价值 / 保守现金流，等待计算完成"));
+    ? `保守估值：${defensiveModel}。${scenarioInputs(defensive)}估值 ${state.view.fairDefensive}，${state.view.fairDefensiveSource}。确定性 ${quote?.fair_value_confidence_score != null ? `${quote.fair_value_confidence_score}%` : (quote?.fair_value_confidence || "暂无")}。${quote?.fair_value_regime === "WINTER" ? "AI 寒冬：禁止仅凭远期 EPS 抄底" : ""}`
+    : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : "等待保守情景估值"));
   state.view.fairOptimistic = optimistic ? formatRange(optimistic) : "--";
   state.view.fairOptimisticSource = optimistic
     ? `买入 ${optimisticBuy} · 安全边际 ${(Number(optimistic.safety_margin || 0) * 100).toFixed(0)}%`
      : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "暂无可靠远期盈利依据" : "等待估值计算")));
   state.view.fairOptimisticTitle = optimistic
-    ? `模型 B：${optimisticModel}。远期 EPS ${optimistic.forward_eps ?? "--"}，增长率 ${optimistic.growth_rate != null ? `${(Number(optimistic.growth_rate) * 100).toFixed(1)}%` : "--"}。${state.view.fairOptimisticSource}`
-    : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : "模型 B：远期 EPS × PEG，当前没有可靠远期盈利依据");
+    ? `乐观估值：${optimisticModel}。${scenarioInputs(optimistic)}${state.view.fairOptimisticSource}`
+    : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : "当前没有足够数据生成乐观情景估值");
   scheduleFairValuePoll(quote);
 }
 
@@ -4070,16 +4002,15 @@ function showPending(message, preserveCache = false) {
     && state.lastQuote.symbol === state.symbol
     && hasFairValueSnapshot(state.lastQuote);
   clearFairValuePoll();
-  if (state.earningsResolvedFor !== state.symbol) resetEarningsChip();
   resetOptionFlow(message || "需要两份相邻期权链快照才能估算流向");
   if (!keepFairValue) {
     state.view.fairValue = "--";
-    state.view.fairValueSource = "保守模型 -- · 乐观模型 --";
+    state.view.fairValueSource = "保守情景 -- · 乐观情景 --";
     state.view.fairValueTitle = "公开财务数据不足，暂不输出保守估值";
     state.view.fairDefensive = "--";
     state.view.fairDefensiveSource = "等待估值计算";
     state.view.fairOptimistic = "--";
-    state.view.fairOptimisticSource = "等待远期盈利数据";
+    state.view.fairOptimisticSource = "等待估值数据";
     if (quoteIsETF(null)) applyETFValuationDefaults();
   }
   state.view.chainTitle = `期权链 · ${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
@@ -4159,12 +4090,12 @@ function applyCachedQuote(quote) {
     state.view.quoteReference = reference.text;
     state.view.quoteReferenceTitle = reference.title;
     state.view.fairValue = "--";
-    state.view.fairValueSource = "保守模型 -- · 乐观模型 --";
+    state.view.fairValueSource = "保守情景 -- · 乐观情景 --";
     state.view.fairValueTitle = "公开财务数据不足，暂不输出保守估值";
     state.view.fairDefensive = "--";
     state.view.fairDefensiveSource = "等待估值计算";
     state.view.fairOptimistic = "--";
-    state.view.fairOptimisticSource = "等待远期盈利数据";
+    state.view.fairOptimisticSource = "等待估值数据";
     if (quoteIsETF(null)) applyETFValuationDefaults();
     return;
   }
@@ -4830,9 +4761,6 @@ async function loadSymbol() {
   state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
-  state.earningsFetchedAt = 0;
-  state.earningsResolvedFor = "";
-  state.earningsData = null;
   resetChanAnalysis();
   if (window.optionScopeApp) window.optionScopeApp.ensureChanIntraday(state.chanPeriod);
   state.trendMarket = null;
@@ -4960,7 +4888,7 @@ const optionScopeApp = new Vue({
       if (this.chanPeriod === "15m" || this.chanPeriod === "4h") {
         const payload = this.chanIntradayPayload[this.chanPeriod];
         return payload
-          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot)
+          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, this.chanMobileBars)
           : OptionScopeChan.emptyFrame(this.chanPeriod === "4h" ? "4小时" : "15分钟");
       }
       return this.view.chan[this.chanPeriod] || this.view.chan.daily;
@@ -4994,7 +4922,10 @@ const optionScopeApp = new Vue({
       });
     },
     isChanTouchInput() {
-      return Boolean(window.matchMedia && window.matchMedia("(hover: none), (pointer: coarse)").matches);
+      const coarsePointer = window.matchMedia && window.matchMedia("(hover: none), (pointer: coarse)").matches;
+      const compactTouchScreen = Number(navigator.maxTouchPoints) > 0
+        && window.matchMedia && window.matchMedia("(max-width: 600px)").matches;
+      return Boolean(coarsePointer || compactTouchScreen);
     },
     showChanScenario(key, event) {
       if (this.isChanTouchInput() && ["mouseenter", "focusin"].includes(event?.type)) return;
@@ -5030,57 +4961,55 @@ const optionScopeApp = new Vue({
       if (this.chanHoveredScenario) this.positionChanScenarioCard(key, event);
     },
     dismissChanScenarioOnTouch(event) {
-      if (!this.isChanTouchInput() || event.target.closest(".chan-projection-up, .chan-projection-down, .chan-projection-range, .chan-projection-float-card, .chan-spot-guide-target, .chan-spot-float-card")) return;
+      if (!this.isChanTouchInput() || event.target.closest(".chan-projection-up, .chan-projection-down, .chan-projection-range, .chan-projection-float-card, .chan-spot-mobile-badge, .chan-spot-float-card")) return;
       this.chanHoveredScenario = null;
       this.chanSpotGuideVisible = false;
     },
-    showChanSpotGuide(event) {
-      if (this.isChanTouchInput() && ["mouseenter", "focusin"].includes(event?.type)) return;
-      this.chanHoveredScenario = null;
-      if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
-      this.chanScenarioHideTimer = null;
-      this.chanSpotGuideVisible = true;
-      this.positionChanSpotGuide(event);
+    preferredChanSpotGuideSide() {
+      const score = (value) => Number(String(value || "").match(/\d+(?:\.\d+)?/)?.[0] || 0);
+      return score(this.chanFrame?.spotGuide?.bearishTilt) > score(this.chanFrame?.spotGuide?.bullishTilt) ? "down" : "up";
     },
-    positionChanSpotGuide(event) {
+    setChanSpotGuideSide(side) {
+      if (side === "up" || side === "down") this.chanSpotGuideSide = side;
+    },
+    dismissChanSpotGuide() {
+      this.chanSpotGuideVisible = false;
+    },
+    positionChanSpotGuide() {
       this.$nextTick(() => {
         if (!this.chanSpotGuideVisible) return;
         const card = document.getElementById("chan-spot-guide-card");
         if (!card) return;
         const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
-        const viewportHeight = window.innerHeight;
+        const viewportHeight = window.visualViewport?.height || document.documentElement.clientHeight || window.innerHeight;
         const margin = viewportWidth <= 600 ? 8 : 16;
         const maxLeft = Math.max(margin, viewportWidth - card.offsetWidth - margin);
-        const spotBadge = document.querySelector(".chan-chart .chan-spot-badge");
+        const spotBadge = document.querySelector(".chan-chart .chan-spot-mobile-badge");
         const badgeRect = spotBadge?.getBoundingClientRect();
+        const mobileViewport = viewportWidth <= 600;
+        if (mobileViewport) {
+          this.chanSpotGuideX = viewportWidth / 2;
+          this.chanSpotGuideY = null;
+          return;
+        }
         card.style.maxHeight = Math.max(120, viewportHeight - 32) + "px";
-        // Anchor the popup's right edge just left of the live-price badge;
+        // Anchor the popup just to the right of the left-side live-price badge;
         // keep it fixed there instead of following the pointer along the line.
         const preferredLeft = badgeRect
-          ? badgeRect.left - card.offsetWidth - 12
+          ? badgeRect.right + 12
           : (viewportWidth - card.offsetWidth) / 2;
         this.chanSpotGuideX = Math.max(margin, Math.min(maxLeft, preferredLeft));
         this.chanSpotGuideY = Math.max(16, Math.min(viewportHeight - card.offsetHeight - 16, (viewportHeight - card.offsetHeight) / 2));
       });
     },
-    hideChanSpotGuide(event) {
-      // Touch opens the guide by tap and keeps it available until the next
-      // chart action. On a pointer device, leaving the live-price target hides
-      // it immediately; the card itself has pointer-events:none below.
-      if (this.isChanTouchInput() && event?.type === "mouseleave") return;
-      this.chanSpotGuideVisible = false;
-    },
     toggleChanSpotGuide(event) {
-      if (event?.type?.startsWith("key")) {
-        this.chanSpotGuideVisible = true;
-      } else if (this.isChanTouchInput()) {
-        this.chanSpotGuideVisible = !this.chanSpotGuideVisible;
-      } else {
-        return;
-      }
+      this.chanSpotGuideVisible = !this.chanSpotGuideVisible;
       event?.preventDefault();
       if (this.chanSpotGuideVisible) this.chanHoveredScenario = null;
-      if (this.chanSpotGuideVisible) this.positionChanSpotGuide(event);
+      if (this.chanSpotGuideVisible) {
+        this.chanSpotGuideSide = this.preferredChanSpotGuideSide();
+        this.positionChanSpotGuide();
+      }
     },
     toggleChanScenarios() {
       this.chanScenariosVisible = !this.chanScenariosVisible;
@@ -5088,7 +5017,12 @@ const optionScopeApp = new Vue({
       if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
       this.chanScenarioHideTimer = null;
       try { localStorage.setItem(CHAN_SCENARIOS_STORAGE_KEY, this.chanScenariosVisible ? "1" : "0"); } catch (error) { /* 存储不可用时保留当前页面状态。 */ }
-      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible);
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, this.chanMobileBars);
+    },
+    setChanMobileBars(count) {
+      if (![30, 60, 160].includes(count) || this.chanMobileBars === count) return;
+      this.chanMobileBars = count;
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, count);
     },
     toggleChanPanel() {
       this.chanExpanded = !this.chanExpanded;
@@ -5148,6 +5082,18 @@ let chartResizeTimer = null;
 window.addEventListener("resize", () => {
   clearTimeout(chartResizeTimer);
   chartResizeTimer = setTimeout(redrawChartsIfResized, 200);
+});
+// The Chan chart uses a taller coordinate system on phones so the candles
+// remain legible without clipping history or shrinking the scenario lane.
+let chanViewportTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(chanViewportTimer);
+  chanViewportTimer = setTimeout(() => {
+    const mobileChart = Boolean(window.matchMedia && window.matchMedia("(max-width: 600px)").matches);
+    if (state.chanMobileChart === mobileChart) return;
+    state.chanMobileChart = mobileChart;
+    if (state.chanPayload) state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, mobileChart, state.chanMobileBars);
+  }, 120);
 });
 const initialQuery = parsePageQuery(location.search);
 const initialAccessKey = initializeAccessKey();

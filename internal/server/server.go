@@ -747,9 +747,8 @@ func (s *Service) quote(c *gin.Context) {
 				s.scheduleValuation(symbol)
 			}
 			quote.Source = "sqlite"
-			// Cache reads must stay on the critical path for a new symbol. History or
-			// earnings may be stale and trigger a provider request; use only durable
-			// SQLite inputs here and refresh those inputs in the background.
+			// Cache reads stay on the critical path for a new symbol. Use only durable
+			// SQLite inputs here and refresh stale history in the background.
 			quote = s.decorateCachedQuote(quote)
 			s.prefetchSymbolAnalytics(symbol)
 			c.JSON(http.StatusOK, quoteAPIValue(quote))
@@ -802,7 +801,7 @@ func (s *Service) pendingQuoteWithCachedValuation(symbol string) map[string]any 
 		(quote.FairValueSource == goFairValueSource && s.goValuationCacheExpired(symbol)) {
 		s.scheduleValuation(symbol)
 	}
-	// A first-time quote request must not start history, benchmark, and earnings
+	// A first-time quote request must not start history or benchmark
 	// lookups before the snapshot refresh has fetched expirations and the option
 	// chain. That background analytics pass is started after the snapshot commit.
 	if mapped, ok := quoteAPIValue(quote).(map[string]any); ok {
@@ -1079,7 +1078,6 @@ func pendingQuoteResponse(symbol string) map[string]any {
 		"fair_value_market_cap_data_quality": nil, "fair_value_data_quality_score": nil,
 		"fair_value_owner_earnings_maintenance_ratio": nil, "fair_value_owner_earnings_ratio_source": nil,
 		"fair_value_status": "pending", "fair_value_warning": nil, "fair_value_pending": true,
-		"earnings": summarizeEarnings(nil),
 	}
 }
 
@@ -2147,16 +2145,15 @@ func (s *Service) prefetchSymbolAnalytics(symbol string) {
 		}
 		analyticsChanged := history["source"] == "upstream"
 		var jobs sync.WaitGroup
-		jobs.Add(3)
-		var extremes, beta, earnings map[string]any
+		jobs.Add(2)
+		var extremes, beta map[string]any
 		go func() { defer jobs.Done(); extremes = s.loadExtremes(ctx, symbol, history) }()
 		go func() { defer jobs.Done(); beta = s.loadBeta(ctx, symbol, bars) }()
-		go func() { defer jobs.Done(); earnings = s.loadEarnings(ctx, symbol) }()
 		jobs.Wait()
 		if ctx.Err() != nil {
 			return
 		}
-		for _, result := range []map[string]any{extremes, beta, earnings} {
+		for _, result := range []map[string]any{extremes, beta} {
 			if result["source"] == "upstream" {
 				analyticsChanged = true
 			}
@@ -2633,8 +2630,8 @@ func (s *Service) status(c *gin.Context) {
 	s.mu.RUnlock()
 	var quote any
 	if ok {
-		// Python routes status quotes through quote_response, so stale history and
-		// earnings caches are refreshed and attached just as they are on /quote.
+		// Python routes status quotes through quote_response, so stale history is
+		// refreshed and attached just as it is on /quote.
 		decorated := s.decorateStatusQuote(c.Request.Context(), cached.value)
 		decorated.Source = "sqlite"
 		quote = quoteAPIValue(decorated)
@@ -3086,8 +3083,8 @@ func (s *Service) levels(c *gin.Context) {
 		var quoteErr error
 		var history map[string]any
 		var historyErr error
-		var extremes, beta, earnings map[string]any
-		var extremesErr, betaErr, earningsErr error
+		var extremes, beta map[string]any
+		var extremesErr, betaErr error
 		if s.cfg.LowMemory || s.cfg.UpstreamConcurrency <= 1 {
 			profile, profileErr = s.store.LatestChains(symbol, 45)
 			chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration)
@@ -3095,20 +3092,15 @@ func (s *Service) levels(c *gin.Context) {
 			history, historyErr = s.store.LatestHistory(symbol, 3000)
 			extremes, extremesErr = s.store.LatestPayload("price_extremes", symbol)
 			beta, betaErr = s.store.LatestPayload("beta_snapshots", symbol)
-			earnings, earningsErr = s.store.LatestPayload("earnings_snapshots", symbol)
 		} else {
 			var reads sync.WaitGroup
-			reads.Add(7)
+			reads.Add(6)
 			go func() { defer reads.Done(); profile, profileErr = s.store.LatestChains(symbol, 45) }()
 			go func() { defer reads.Done(); chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration) }()
 			go func() { defer reads.Done(); quote, quoteFound, quoteErr = s.store.LatestQuote(symbol) }()
 			go func() { defer reads.Done(); history, historyErr = s.store.LatestHistory(symbol, 3000) }()
 			go func() { defer reads.Done(); extremes, extremesErr = s.store.LatestPayload("price_extremes", symbol) }()
 			go func() { defer reads.Done(); beta, betaErr = s.store.LatestPayload("beta_snapshots", symbol) }()
-			go func() {
-				defer reads.Done()
-				earnings, earningsErr = s.store.LatestPayload("earnings_snapshots", symbol)
-			}()
 			reads.Wait()
 		}
 		if profileErr != nil {
@@ -3140,7 +3132,7 @@ func (s *Service) levels(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"detail": historyErr.Error()})
 			return
 		}
-		for _, readErr := range []error{extremesErr, betaErr, earningsErr} {
+		for _, readErr := range []error{extremesErr, betaErr} {
 			if readErr != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"detail": readErr.Error()})
 				return
@@ -3248,7 +3240,7 @@ func (s *Service) levels(c *gin.Context) {
 		// by the Go levels pipeline are already loaded above, so calculate the
 		// lightweight decision payload here instead of making the browser recreate
 		// trend, support/resistance, trade points, and buyer structures in JavaScript.
-		fastLevels := buildCachedLevelsAt(symbol, expiration, bars, allRows, quote, spotValue, candidateSpot, history["fetched_at"], extremes, beta, earnings, time.Now(), ivModel)
+		fastLevels := buildCachedLevelsAt(symbol, expiration, bars, allRows, quote, spotValue, candidateSpot, history["fetched_at"], extremes, beta, nil, time.Now(), ivModel)
 		if fastLevels != nil {
 			fastLevels = fastLevelsPayload(fastLevels)
 		}
@@ -3258,7 +3250,7 @@ func (s *Service) levels(c *gin.Context) {
 			"options_horizon_days": 45, "options": rawOptions, "iv_model": ivModel, "generated_at": time.Now().UTC(),
 			"bars": bars, "history": historyMeta,
 			"extremes": extremesValue, "beta": betaValue, "beta_meta": gin.H{"fetched_at": beta["fetched_at"], "source": betaSource, "warning": betaWarning},
-			"trend_market": trendMarket(bars, quote), "earnings": summarizeEarnings(earnings["dates"]), "fast_levels": fastLevels,
+			"trend_market": trendMarket(bars, quote), "fast_levels": fastLevels,
 		})
 		return
 	}
@@ -3272,26 +3264,20 @@ func (s *Service) levels(c *gin.Context) {
 	var quoteErr error
 	var history map[string]any
 	var historyErr error
-	var earnings map[string]any
 	// The full levels endpoint is requested after the raw endpoint has already
-	// rendered the cached option data. Never put fresh Yahoo history, benchmark,
-	// or earnings calls on this request path: stale caches used to hold the page
+	// rendered the cached option data. Never put fresh Yahoo history or benchmark
+	// calls on this request path: stale caches used to hold the page
 	// for 13–20 seconds while the first snapshot was already visible. Read only
 	// SQLite here and let the symbol analytics prefetch refresh missing inputs.
 	var readStarted = time.Now()
 	var inputs sync.WaitGroup
-	inputs.Add(5)
+	inputs.Add(4)
 	go func() { defer inputs.Done(); profile, profileErr = s.store.LatestChains(symbol, 45) }()
 	go func() { defer inputs.Done(); chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration) }()
 	go func() { defer inputs.Done(); quote, quoteFound, quoteErr = s.store.LatestQuote(symbol) }()
 	go func() {
 		defer inputs.Done()
 		history, historyErr = s.store.LatestHistory(symbol, 3000)
-	}()
-	go func() {
-		defer inputs.Done()
-		earnings, _ = s.store.LatestPayload("earnings_snapshots", symbol)
-		earnings = normalizeEarningsCache(earnings)
 	}()
 	inputs.Wait()
 	inputReadDuration := time.Since(readStarted)
@@ -3369,28 +3355,16 @@ func (s *Service) levels(c *gin.Context) {
 		beta["source"] = "none"
 		beta["warning"] = "本地没有 Beta 缓存"
 	}
-	if cachedPayloadAvailable(earnings["dates"]) {
-		earnings["source"], earnings["warning"] = "sqlite", nil
-	} else {
-		earnings["source"] = "none"
-		earnings["warning"] = "本地没有财报日期缓存"
-	}
 	if !cachedPayloadAvailable(extremes["extremes"]) && len(bars) > 0 {
 		if calculated := calculatePriceExtremes(bars); calculated != nil {
 			extremes = map[string]any{"extremes": calculated, "fetched_at": history["fetched_at"]}
 		}
-	}
-	if earnings == nil {
-		earnings = map[string]any{}
 	}
 	if !cachedPayloadAvailable(beta["beta"]) {
 		beta["warning"] = "历史刷新正在进行，Beta 后台计算中"
 	}
 	if !cachedPayloadAvailable(extremes["extremes"]) {
 		extremes["warning"] = "历史刷新正在进行，历史极值后台计算中"
-	}
-	if !cachedPayloadAvailable(earnings["dates"]) {
-		earnings["warning"] = "历史刷新正在进行，财报日期后台获取中"
 	}
 	s.prefetchSymbolAnalytics(symbol)
 	var spotValue, candidateSpot *float64
@@ -3417,14 +3391,14 @@ func (s *Service) levels(c *gin.Context) {
 			}
 		}
 	}
-	cacheKey := levelsAnalysisCacheKey(symbol, expiration, bars, rows, quote, spotValue, candidateSpot, history["fetched_at"], profile["fetched_at"], extremes, beta, earnings)
+	cacheKey := levelsAnalysisCacheKey(symbol, expiration, bars, rows, quote, spotValue, candidateSpot, history["fetched_at"], profile["fetched_at"], extremes, beta, nil)
 	cacheEntries := s.cfg.AnalysisCacheEntries
 	if cacheEntries <= 0 {
 		cacheEntries = 128
 	}
 	cacheTimings := &levelsCacheTimings{}
 	computed, cacheErr := s.getOrBuildLevelsTimed(c.Request.Context(), cacheKey, cacheEntries, func() map[string]any {
-		return buildCachedLevels(symbol, expiration, bars, rows, quote, spotValue, candidateSpot, history["fetched_at"], extremes, beta, earnings)
+		return buildCachedLevels(symbol, expiration, bars, rows, quote, spotValue, candidateSpot, history["fetched_at"], extremes, beta, nil)
 	}, cacheTimings)
 	if elapsed := time.Since(requestStartedAt); elapsed >= time.Second {
 		log.Printf("slow levels stages symbol=%s input_reads=%s analysis_cache_read=%s cache_write=%s flight_wait=%s compute=%s bars=%d rows=%d history=%s profile=%s",
@@ -3443,11 +3417,6 @@ func (s *Service) levels(c *gin.Context) {
 		}
 		computed["beta"], computed["beta_meta"] = beta["beta"], map[string]any{"fetched_at": beta["fetched_at"], "source": beta["source"], "warning": beta["warning"]}
 		computed["extremes"] = extremes["extremes"]
-		if earningsSummary, ok := computed["earnings"].(map[string]any); ok {
-			for _, key := range []string{"fetched_at", "source", "warning"} {
-				earningsSummary[key] = earnings[key]
-			}
-		}
 		latestFetchedAt := levelsOptionsTimestamp(profile, chain, expiration)
 		computed["chain_fetched_at"] = latestFetchedAt
 		computed["options_fetched_at"] = latestFetchedAt
@@ -3461,18 +3430,14 @@ func (s *Service) levels(c *gin.Context) {
 		"extremes_fetched_at": extremes["fetched_at"], "extremes_source": extremes["source"], "extremes_warning": extremes["warning"],
 	}
 	betaValue := beta["beta"]
-	earningsSummary := summarizeEarnings(earnings["dates"])
-	for _, key := range []string{"fetched_at", "source", "warning"} {
-		earningsSummary[key] = earnings[key]
-	}
 	latestFetchedAt := levelsOptionsTimestamp(profile, chain, expiration)
 	c.JSON(http.StatusOK, gin.H{
 		"symbol": symbol, "expiration": expiration, "spot": nil,
 		"generated_at": time.Now().UTC(), "chain_fetched_at": latestFetchedAt, "options_fetched_at": latestFetchedAt,
 		"options_expirations": cachedExpirations(rows), "options_horizon_days": 45, "history_bars": len(bars),
 		"history": historyMeta, "trend_market": trendMarket(bars, quote), "beta": betaValue,
-		"beta_meta": gin.H{"fetched_at": beta["fetched_at"], "source": beta["source"], "warning": beta["warning"]},
-		"earnings":  earningsSummary, "extremes": extremes["extremes"],
+		"beta_meta":      gin.H{"fetched_at": beta["fetched_at"], "source": beta["source"], "warning": beta["warning"]},
+		"extremes":       extremes["extremes"],
 		"options_metric": "none", "resistance": []any{}, "support": []any{},
 		"trend": nil, "recommendation": gin.H{"action": "hold", "label": "继续持有", "reason": "缺少有效价格数据"},
 		"trade_points": gin.H{"buy": nil, "sell": nil}, "stop_loss": nil,
@@ -3506,9 +3471,9 @@ func gammaAnalysisCacheKey(symbol string, horizon int, includeRows bool, fetched
 
 // Bump when level classification changes so durable SQLite analysis results
 // are rebuilt instead of serving tiers produced by the previous rule set.
-const levelsAnalysisCacheVersion = "levels-v24"
+const levelsAnalysisCacheVersion = "levels-v25"
 
-func levelsAnalysisCacheKey(symbol, expiration string, bars []map[string]any, rows []model.OptionRow, quote model.Quote, spot, candidateSpot *float64, historyFetchedAt, profileFetchedAt any, extremes, beta, earnings map[string]any) string {
+func levelsAnalysisCacheKey(symbol, expiration string, bars []map[string]any, rows []model.OptionRow, quote model.Quote, spot, candidateSpot *float64, historyFetchedAt, profileFetchedAt any, extremes, beta, _ map[string]any) string {
 	input := struct {
 		Version          string            `json:"version"`
 		Symbol           string            `json:"symbol"`
@@ -3522,11 +3487,10 @@ func levelsAnalysisCacheKey(symbol, expiration string, bars []map[string]any, ro
 		ProfileFetchedAt any               `json:"profile_fetched_at"`
 		Extremes         map[string]any    `json:"extremes"`
 		Beta             map[string]any    `json:"beta"`
-		Earnings         map[string]any    `json:"earnings"`
 	}{
 		Version: levelsAnalysisCacheVersion, Symbol: symbol, Expiration: expiration, Bars: bars, Rows: rows,
 		Quote: quote, Spot: spot, CandidateSpot: candidateSpot, HistoryFetchedAt: historyFetchedAt,
-		ProfileFetchedAt: profileFetchedAt, Extremes: extremes, Beta: beta, Earnings: earnings,
+		ProfileFetchedAt: profileFetchedAt, Extremes: extremes, Beta: beta,
 	}
 	encoded, err := json.Marshal(input)
 	if err != nil {
@@ -3618,60 +3582,6 @@ func barDate(bars []map[string]any, index int) any {
 		return nil
 	}
 	return bars[index]["date"]
-}
-
-func (s *Service) earningsSummary(symbol string) map[string]any {
-	payload, err := s.store.LatestPayload("earnings_snapshots", symbol)
-	if err != nil {
-		return summarizeEarnings(nil)
-	}
-	return summarizeEarnings(payload["dates"])
-}
-
-func summarizeEarnings(raw any) map[string]any {
-	dates, _ := raw.([]any)
-	if values, ok := raw.([]string); ok {
-		dates = make([]any, len(values))
-		for i, value := range values {
-			dates[i] = value
-		}
-	}
-	location, err := time.LoadLocation("America/New_York")
-	if err != nil {
-		location = time.UTC
-	}
-	today := time.Now().In(location)
-	var next time.Time
-	for _, value := range dates {
-		text, ok := value.(string)
-		if !ok {
-			continue
-		}
-		candidate, parseErr := time.Parse("2006-01-02", strings.TrimSpace(text)[:minIntValue(len(strings.TrimSpace(text)), 10)])
-		if parseErr == nil && !candidate.Before(time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)) && (next.IsZero() || candidate.Before(next)) {
-			next = candidate
-		}
-	}
-	todayDate := localDate(today)
-	window := upcomingNYSETradingSessions(todayDate, 5)
-	windowStart, windowEnd := todayDate, todayDate.AddDate(0, 0, 7)
-	if len(window) > 0 {
-		windowStart, windowEnd = window[0], window[len(window)-1]
-	}
-	result := map[string]any{"status": "unknown", "date": nil, "window_start": windowStart.Format("2006-01-02"), "window_end": windowEnd.Format("2006-01-02"), "sessions": 5, "detail": "没有可用的未来财报日期，评分不因财报调整"}
-	if !next.IsZero() {
-		status := "outside"
-		if !next.Before(windowStart) && !next.After(windowEnd) {
-			status = "inside"
-		}
-		result["status"], result["date"] = status, next.Format("2006-01-02")
-		relation := "不在未来交易日窗口内"
-		if status == "inside" {
-			relation = "落在未来交易日窗口内"
-		}
-		result["detail"] = fmt.Sprintf("下一财报 %s %s（%s 至 %s，共 5 个交易日）。只作提示，不改变评分。", next.Format("2006-01-02"), relation, windowStart.Format("2006-01-02"), windowEnd.Format("2006-01-02"))
-	}
-	return result
 }
 
 func trendMarket(bars []map[string]any, quote model.Quote) map[string]any {
@@ -3983,6 +3893,8 @@ func parseCursor(raw string) int64 {
 	return value
 }
 
+// upcomingNYSETradingSessions is kept for calendar utility tests and market
+// date calculations; earnings dates no longer consume this window.
 func upcomingNYSETradingSessions(day time.Time, count int) []time.Time {
 	if count <= 0 {
 		return nil

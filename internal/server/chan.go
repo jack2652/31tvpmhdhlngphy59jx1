@@ -163,7 +163,7 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 	if analysisSpot == nil || *analysisSpot <= 0 {
 		analysisSpot = result.Spot
 	}
-	marketAnalysis := buildCachedLevelsAt(symbol, "", rawBars, nil, quote, analysisSpot, analysisSpot, history["fetched_at"], extremes, beta, map[string]any{}, now, map[string]any{})
+	marketAnalysis := buildCachedLevelsAt(symbol, "", rawBars, nil, quote, analysisSpot, analysisSpot, history["fetched_at"], extremes, beta, nil, now, map[string]any{})
 	var stopLoss any
 	if spot != nil && *spot > 0 && trend != nil {
 		stopLoss = cachedStopLoss(trend, nil, nil, *spot, cachedATR(rawBars, cachedATRPeriod))

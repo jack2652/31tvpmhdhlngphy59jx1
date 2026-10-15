@@ -40,7 +40,7 @@ func TestFastAPIOpenAPIBusinessRouteContracts(t *testing.T) {
 
 	levelsDescription := "压力位/支撑位：技术面与近 45 天多期限期权持仓综合。\n\n" +
 		"``raw=true`` 是轻量客户端计算模式。它只读取已经落库的日线和分析快照，\n" +
-		"不触发历史、Beta、财报回源，也不执行 ``build_levels``；浏览器可以用这些\n" +
+		"不触发历史或 Beta 回源，也不执行 ``build_levels``；浏览器可以用这些\n" +
 		"原始数据计算趋势、极值和基础价位。原始数据不足时，前端显示期权分布回退，\n" +
 		"不在倒计时刷新链路里启动默认综合模式。\n\n" +
 		"`expiration` 可省略；省略时仅按已缓存的日线与分析快照计算，不筛选选中期限的期权链。\n" +

@@ -270,15 +270,13 @@ func TestLoadHistoryCoalescesConcurrentRequestsForSameSymbol(t *testing.T) {
 	}
 }
 
-func TestLoadEarningsCoalescesConcurrentRequestsForSameSymbol(t *testing.T) {
+func TestLoadEarningsUsesOnlyCachedData(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "earnings-singleflight.db")
 	repository, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	providerStub := &historyBarrierProvider{
-		earningsEntered: make(chan string, 2), releaseEarnings: make(chan struct{}, 2),
-	}
+	providerStub := &historyBarrierProvider{}
 	service := NewWithProvider(config.Config{DatabasePath: path}, repository, providerStub)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	var workers sync.WaitGroup
@@ -288,46 +286,21 @@ func TestLoadEarningsCoalescesConcurrentRequestsForSameSymbol(t *testing.T) {
 		_ = service.Close()
 	}()
 
-	results := make(chan map[string]any, 2)
-	workers.Add(2)
-	go func() { defer workers.Done(); results <- service.loadEarnings(ctx, "QQQ") }()
-	waitForProviderEntry(t, providerStub.earningsEntered, "QQQ")
-	go func() { defer workers.Done(); results <- service.loadEarnings(ctx, "QQQ") }()
-	waitForHistoryLockRefs(t, service, "earnings:QQQ", 2)
-	if got := providerStub.earningsCalls.Load(); got != 1 {
-		t.Fatalf("duplicate earnings request reached provider before first refresh completed: calls=%d", got)
-	}
-	providerStub.releaseEarnings <- struct{}{}
-
-	first, second := <-results, <-results
-	if providerStub.earningsCalls.Load() != 1 {
-		t.Fatalf("same-symbol earnings requests should share one refresh, calls=%d", providerStub.earningsCalls.Load())
-	}
-	upstream, sqlite := 0, 0
-	for _, result := range []map[string]any{first, second} {
-		switch result["source"] {
-		case "upstream":
-			upstream++
-		case "sqlite":
-			sqlite++
-		default:
-			t.Fatalf("unexpected earnings result: %#v", result)
-		}
-	}
-	if upstream != 1 || sqlite != 1 {
-		t.Fatalf("expected one upstream and one cached result, upstream=%d sqlite=%d; results=%#v %#v", upstream, sqlite, first, second)
+	got := service.loadEarnings(ctx, "QQQ")
+	if got["source"] != "none" || providerStub.earningsCalls.Load() != 0 {
+		t.Fatalf("earnings lookup should not reach upstream: result=%#v calls=%d", got, providerStub.earningsCalls.Load())
 	}
 }
 
-func TestDecorateQuoteLoadsHistoryAndEarningsInParallel(t *testing.T) {
+func TestDecorateQuoteLoadsHistoryWithoutEarnings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "decorate-quote-parallel.db")
 	repository, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	providerStub := &historyBarrierProvider{
-		historyEntered: make(chan string, 1), earningsEntered: make(chan string, 1),
-		releaseHistory: make(chan struct{}, 1), releaseEarnings: make(chan struct{}, 1),
+		historyEntered: make(chan string, 1),
+		releaseHistory: make(chan struct{}, 1),
 	}
 	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamConcurrency: 2}, repository, providerStub)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -346,9 +319,7 @@ func TestDecorateQuoteLoadsHistoryAndEarningsInParallel(t *testing.T) {
 		result <- service.decorateQuote(ctx, model.Quote{Symbol: "QQQ", Price: &price})
 	}()
 	waitForProviderEntry(t, providerStub.historyEntered, "QQQ")
-	waitForProviderEntry(t, providerStub.earningsEntered, "QQQ")
 	providerStub.releaseHistory <- struct{}{}
-	providerStub.releaseEarnings <- struct{}{}
 
 	var got model.Quote
 	select {
@@ -362,16 +333,12 @@ func TestDecorateQuoteLoadsHistoryAndEarningsInParallel(t *testing.T) {
 	if got.ChangePercent == nil || math.Abs(*got.ChangePercent-(100.0/11.0)) > 0.0001 {
 		t.Fatalf("history change decoration mismatch: change_percent=%v", got.ChangePercent)
 	}
-	earnings, ok := got.Earnings.(map[string]any)
-	if !ok || earnings["source"] != "upstream" || earnings["warning"] != nil {
-		t.Fatalf("earnings decoration mismatch: %#v", got.Earnings)
-	}
-	if earnings["date"] != time.Now().UTC().AddDate(0, 0, 30).Format("2006-01-02") {
-		t.Fatalf("unexpected earnings date: %#v", earnings["date"])
+	if got.Earnings != nil || providerStub.earningsCalls.Load() != 0 {
+		t.Fatalf("quote decoration unexpectedly loaded earnings: field=%#v calls=%d", got.Earnings, providerStub.earningsCalls.Load())
 	}
 }
 
-func TestDecorateQuoteKeepsHistoryAndEarningsSerialWhenLimited(t *testing.T) {
+func TestDecorateQuoteDoesNotLoadEarningsWhenLimited(t *testing.T) {
 	tests := []struct {
 		name string
 		cfg  config.Config
@@ -387,8 +354,8 @@ func TestDecorateQuoteKeepsHistoryAndEarningsSerialWhenLimited(t *testing.T) {
 				t.Fatal(err)
 			}
 			providerStub := &historyBarrierProvider{
-				historyEntered: make(chan string, 1), earningsEntered: make(chan string, 1),
-				releaseHistory: make(chan struct{}, 1), releaseEarnings: make(chan struct{}, 1),
+				historyEntered: make(chan string, 1),
+				releaseHistory: make(chan struct{}, 1),
 			}
 			test.cfg.DatabasePath = path
 			service := NewWithProvider(test.cfg, repository, providerStub)
@@ -407,16 +374,12 @@ func TestDecorateQuoteKeepsHistoryAndEarningsSerialWhenLimited(t *testing.T) {
 				result <- service.decorateQuote(ctx, model.Quote{Symbol: "QQQ"})
 			}()
 			waitForProviderEntry(t, providerStub.historyEntered, "QQQ")
-			select {
-			case symbol := <-providerStub.earningsEntered:
-				t.Fatalf("earnings provider started before history completed: %s", symbol)
-			case <-time.After(50 * time.Millisecond):
-			}
 			providerStub.releaseHistory <- struct{}{}
-			waitForProviderEntry(t, providerStub.earningsEntered, "QQQ")
-			providerStub.releaseEarnings <- struct{}{}
 			select {
-			case <-result:
+			case quote := <-result:
+				if quote.Earnings != nil || providerStub.earningsCalls.Load() != 0 {
+					t.Fatalf("earnings loaded under %s mode: field=%#v calls=%d", test.name, quote.Earnings, providerStub.earningsCalls.Load())
+				}
 			case <-ctx.Done():
 				t.Fatalf("decorateQuote did not complete: %v", ctx.Err())
 			}

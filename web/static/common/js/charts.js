@@ -31,8 +31,10 @@ function markerLabelWidth(text, weight = 700) {
   return markerLabelContext.measureText(text).width;
 }
 
-// 鼠标移动事件可能远高于屏幕刷新率；每帧只处理最后一次坐标，避免连续重排 SVG 和提示框。
-function scheduleChartPointerMove(chartSvg, onMove, hideTooltip) {
+// Track the chart container, not just the SVG: the HTML spot-price badge sits
+// above it and leaving the plot for that badge must also clear the readout.
+// Mouse movement can exceed the display refresh rate, so process one point per frame.
+function scheduleChartPointerMove(chartTarget, onMove, hideTooltip) {
   let frameId = null;
   let pending = null;
   const useAnimationFrame = typeof window.requestAnimationFrame === "function"
@@ -55,15 +57,15 @@ function scheduleChartPointerMove(chartSvg, onMove, hideTooltip) {
     else window.clearTimeout(frameId);
     frameId = null;
   };
-  chartSvg.addEventListener("pointermove", schedule);
+  chartTarget.addEventListener("pointermove", schedule);
   const stop = () => { cancel(); hideTooltip(); };
-  chartSvg.addEventListener("pointerleave", stop);
-  chartSvg.addEventListener("pointercancel", stop);
+  chartTarget.addEventListener("pointerleave", stop);
+  chartTarget.addEventListener("pointercancel", stop);
   cancel.dispose = () => {
     cancel();
-    chartSvg.removeEventListener("pointermove", schedule);
-    chartSvg.removeEventListener("pointerleave", stop);
-    chartSvg.removeEventListener("pointercancel", stop);
+    chartTarget.removeEventListener("pointermove", schedule);
+    chartTarget.removeEventListener("pointerleave", stop);
+    chartTarget.removeEventListener("pointercancel", stop);
   };
   return cancel;
 }
@@ -137,11 +139,13 @@ function bindChanChartHover(target, initialModel) {
     setLine(horizontal, model.plotLeft, cursorY, model.historyRight ?? model.plotRight, cursorY);
     const dateWidth = 84;
     setTag(tagX, candle.date, Math.max(2, Math.min(model.width - dateWidth - 2, candle.x - dateWidth / 2)), model.height - 22, dateWidth);
-    const priceLabel = formatMoney(price), priceWidth = Math.min(model.width - model.plotRight - 16, Math.max(52, priceLabel.length * 7 + 14));
+    const priceLabel = formatMoney(price), priceWidth = Math.min(model.plotLeft - 16, Math.max(52, priceLabel.length * 7 + 14));
     // Preserve the current-price badge when the cursor reaches the same price.
     const overlapsSpot = model.spot && Math.abs(cursorY - model.spot.y) < model.spot.height / 2 + 10;
-    const priceX = overlapsSpot ? model.plotLeft : model.plotRight + 8;
+    const priceX = Math.max(2, model.plotLeft - priceWidth - 8);
     setTag(tagY, priceLabel, priceX, cursorY - 9, priceWidth);
+    if (overlapsSpot) tagY.setAttribute("visibility", "hidden");
+    else tagY.removeAttribute("visibility");
     if (shownCandle !== candle) {
       title.textContent = candle.date;
       subtitle.textContent = `${model.periodLabel} · 已收盘 K 线`;
@@ -167,7 +171,7 @@ function bindChanChartHover(target, initialModel) {
     tooltip.style.bottom = `${bounds.height + 4}px`;
   };
   const onMove = (event) => {
-    if (event.target?.closest?.(".chan-spot-guide-target")) { hide(); return; }
+    if (event.target?.closest?.(".chan-spot-mobile-badge")) { hide(); return; }
     if (!model?.candles?.length || (event.buttons & 2)) { hide(); return; }
     const point = localPoint(event.clientX, event.clientY);
     if (!point || point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > model.plotBottom) { hide(); return; }
@@ -176,7 +180,7 @@ function bindChanChartHover(target, initialModel) {
     const index = Math.max(0, Math.min(model.candles.length - 1, Math.floor((point.x - model.plotLeft) / slot)));
     show(index, point.y);
   };
-  const cancelPointerMove = scheduleChartPointerMove(svg, onMove, hide);
+  const cancelPointerMove = scheduleChartPointerMove(target, onMove, hide);
   const showClose = (index) => {
     const close = model?.candles?.[index]?.prices.close;
     if (close == null) return;

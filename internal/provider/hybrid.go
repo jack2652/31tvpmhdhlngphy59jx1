@@ -104,7 +104,6 @@ func newDefaultHybrid(timeout, cboeTimeout time.Duration, concurrency int, proxy
 	}
 	regular.gateWait = gateWait
 	regular.fundamentals.GateWait = gateWait
-	regular.earnings.GateWait = gateWait
 	delayedClient := outboundhttp.UsingTransport(httpClient.Transport, cboeTimeout)
 	delayed := NewCboeOptionsClient(delayedClient, "")
 	delayed.Gate, delayed.GateWait = gate, gateWait
@@ -346,6 +345,7 @@ func (h *Hybrid) IntradayHistory(ctx context.Context, symbol, interval string) (
 	return client.FetchIntraday(ctx, symbol, interval)
 }
 
+// EarningsDates remains available for explicit callers; the service no longer invokes it.
 func (h *Hybrid) EarningsDates(ctx context.Context, symbol string) ([]string, error) {
 	if h == nil || h.Regular == nil || h.Regular.earnings == nil {
 		return nil, errors.New("Yahoo earnings provider is unavailable")

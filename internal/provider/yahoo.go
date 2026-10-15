@@ -115,11 +115,11 @@ func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress stri
 	fundamentals := NewFundamentalsClient(client)
 	fundamentals.Gate = semaphore
 	fundamentals.GateWait = timeout
-	optionsAuth := yahooauth.NewAuthManager(authClient)
-	fundamentals.crumbAuth = optionsAuth
 	earnings := NewYahooEarningsClient(client)
 	earnings.Gate = semaphore
 	earnings.GateWait = timeout
+	optionsAuth := yahooauth.NewAuthManager(authClient)
+	fundamentals.crumbAuth = optionsAuth
 	tickerFactory := newYahooTickerFactory(authClient)
 	fundamentals.tickerFactory = tickerFactory
 	earnings.tickerFactory = tickerFactory
@@ -182,7 +182,7 @@ func (y *Yahoo) Fundamentals(ctx context.Context, symbol string) (YahooFundament
 	return y.fundamentals.Fetch(ctx, symbol)
 }
 
-// Earnings fetches the dates Yahoo currently exposes for the symbol.
+// Earnings remains available for explicit callers; the application no longer invokes it.
 func (y *Yahoo) Earnings(ctx context.Context, symbol string) ([]string, error) {
 	if y == nil || y.earnings == nil {
 		return nil, errors.New("Yahoo earnings client is unavailable")

@@ -7,7 +7,6 @@ import (
 	"math"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"option-scope-go/internal/model"
@@ -20,10 +19,6 @@ const lowMemoryHistoryLockWait = 3 * time.Second
 
 type benchmarkHistoryProvider interface {
 	BenchmarkHistory(context.Context, string, string) (provider.HistoryResult, error)
-}
-
-type earningsDateProvider interface {
-	EarningsDates(context.Context, string) ([]string, error)
 }
 
 func (s *Service) acquireHistoryHeavyGate(ctx context.Context) (func(), error) {
@@ -455,93 +450,6 @@ func (s *Service) loadBeta(ctx context.Context, symbol string, stockBars []map[s
 	return map[string]any{"beta": beta, "fetched_at": fetchedAt, "source": "upstream", "warning": nil}
 }
 
-func (s *Service) loadEarnings(ctx context.Context, symbol string) map[string]any {
-	cached, err := s.store.LatestPayload("earnings_snapshots", symbol)
-	if err != nil {
-		return map[string]any{"dates": []string{}, "source": "none", "warning": err.Error()}
-	}
-	cached = normalizeEarningsCache(cached)
-	if historyFresh(cached["fetched_at"], 6*time.Hour) {
-		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": "sqlite", "warning": nil}
-	}
-	unlock, lockErr := s.historyLock(ctx, "earnings:"+symbol, 0)
-	if lockErr != nil {
-		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["dates"], cached["fetched_at"]), "warning": lockErr.Error()}
-	}
-	defer unlock()
-	cached, err = s.store.LatestPayload("earnings_snapshots", symbol)
-	if err != nil {
-		return map[string]any{"dates": []string{}, "source": "none", "warning": err.Error()}
-	}
-	cached = normalizeEarningsCache(cached)
-	if historyFresh(cached["fetched_at"], 6*time.Hour) {
-		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": "sqlite", "warning": nil}
-	}
-	loader, ok := s.provider.(earningsDateProvider)
-	if !ok {
-		warning := any(nil)
-		if cacheSource(cached["dates"], cached["fetched_at"]) == "none" {
-			warning = "行情源不提供财报日期"
-		}
-		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["dates"], cached["fetched_at"]), "warning": warning}
-	}
-	releaseLease, leaseErr := s.acquireHistoryLease(ctx, "history:earnings:"+symbol)
-	if leaseErr != nil {
-		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["dates"], cached["fetched_at"]), "warning": leaseErr.Error()}
-	}
-	defer releaseLease()
-	latest, latestErr := s.store.LatestPayload("earnings_snapshots", symbol)
-	if latestErr != nil {
-		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["dates"], cached["fetched_at"]), "warning": latestErr.Error()}
-	}
-	latest = normalizeEarningsCache(latest)
-	if historyFresh(latest["fetched_at"], 6*time.Hour) {
-		return map[string]any{"dates": latest["dates"], "fetched_at": latest["fetched_at"], "source": "sqlite", "warning": nil}
-	}
-	cached = latest
-	dates, err := guardedHistoryCall(s, ctx, func() ([]string, error) {
-		return loader.EarningsDates(ctx, symbol)
-	})
-	if err != nil {
-		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["dates"], cached["fetched_at"]), "warning": err.Error()}
-	}
-	dates = normalizeHistoryDates(dates)
-	fetchedAt := time.Now().UTC()
-	// Yahoo's calendar sometimes omits the upcoming report or returns only
-	// past reports. Keep an already known future date until it passes instead
-	// of replacing it with an unknown state.
-	if !hasUpcomingEarningsDate(dates, fetchedAt) {
-		cachedDates, _ := cached["dates"].([]string)
-		if hasUpcomingEarningsDate(cachedDates, fetchedAt) {
-			retainedDates := normalizeHistoryDates(append(cachedDates, dates...))
-			if err := s.store.WritePayload("earnings_snapshots", symbol, map[string]any{"dates": retainedDates}, fetchedAt); err != nil {
-				return map[string]any{"dates": cachedDates, "fetched_at": cached["fetched_at"], "source": cacheSource(cachedDates, cached["fetched_at"]), "warning": err.Error()}
-			}
-			return map[string]any{"dates": retainedDates, "fetched_at": fetchedAt, "source": "sqlite", "warning": nil}
-		}
-	}
-	payload := map[string]any{"dates": dates}
-	if err := s.store.WritePayload("earnings_snapshots", symbol, payload, fetchedAt); err != nil {
-		return map[string]any{"dates": cached["dates"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["dates"], cached["fetched_at"]), "warning": err.Error()}
-	}
-	return map[string]any{"dates": dates, "fetched_at": fetchedAt, "source": "upstream", "warning": nil}
-}
-
-func hasUpcomingEarningsDate(dates []string, now time.Time) bool {
-	location, err := time.LoadLocation("America/New_York")
-	if err != nil {
-		location = time.UTC
-	}
-	today := now.In(location).Format(time.DateOnly)
-	for _, value := range dates {
-		parsed, err := time.Parse(time.DateOnly, value)
-		if err == nil && parsed.Format(time.DateOnly) >= today {
-			return true
-		}
-	}
-	return false
-}
-
 func historyTimestamp(raw any) (time.Time, bool) {
 	switch value := raw.(type) {
 	case time.Time:
@@ -569,6 +477,38 @@ func historyFresh(raw any, maxAge time.Duration) bool {
 		age = 0
 	}
 	return age < maxAge
+}
+
+// loadEarnings reads a legacy local snapshot only. Runtime quote and levels
+// requests do not call this helper or refresh earnings data.
+func (s *Service) loadEarnings(_ context.Context, symbol string) map[string]any {
+	cached, err := s.store.LatestPayload("earnings_snapshots", symbol)
+	if err != nil {
+		return map[string]any{"dates": []string{}, "source": "none", "warning": err.Error()}
+	}
+	cached = normalizeEarningsCache(cached)
+	cached["source"] = cacheSource(cached["dates"], cached["fetched_at"])
+	return cached
+}
+
+func normalizeEarningsCache(cached map[string]any) map[string]any {
+	raw, exists := cached["dates"]
+	if !exists {
+		return map[string]any{}
+	}
+	var dates []string
+	switch values := raw.(type) {
+	case []string:
+		dates = append([]string(nil), values...)
+	case []any:
+		dates = make([]string, 0, len(values))
+		for _, value := range values {
+			dates = append(dates, fmt.Sprint(value))
+		}
+	default:
+		return map[string]any{}
+	}
+	return map[string]any{"dates": dates, "fetched_at": cached["fetched_at"]}
 }
 
 func historyResult(symbol string, rawBars any, fetchedAt any, source string, warning any) map[string]any {
@@ -680,46 +620,6 @@ func numericHistoryValue(raw any) (float64, bool) {
 	return *value, true
 }
 
-func normalizeHistoryDates(raw []string) []string {
-	unique := map[string]bool{}
-	for _, value := range raw {
-		text := strings.TrimSpace(value)
-		if len(text) < 10 {
-			continue
-		}
-		text = text[:10]
-		if _, err := time.Parse("2006-01-02", text); err == nil {
-			unique[text] = true
-		}
-	}
-	result := make([]string, 0, len(unique))
-	for value := range unique {
-		result = append(result, value)
-	}
-	sort.Strings(result)
-	return result
-}
-
-func normalizeEarningsCache(cached map[string]any) map[string]any {
-	raw, exists := cached["dates"]
-	if !exists {
-		return map[string]any{}
-	}
-	var dates []string
-	switch values := raw.(type) {
-	case []string:
-		dates = append([]string(nil), values...)
-	case []any:
-		dates = make([]string, 0, len(values))
-		for _, value := range values {
-			dates = append(dates, fmt.Sprint(value))
-		}
-	default:
-		return map[string]any{}
-	}
-	return map[string]any{"dates": dates, "fetched_at": cached["fetched_at"]}
-}
-
 func calculateBeta(stock, benchmark []map[string]any) map[string]any {
 	toMap := func(bars []map[string]any) map[string]float64 {
 		result := map[string]float64{}
@@ -782,23 +682,7 @@ func (s *Service) decorateQuote(ctx context.Context, quote model.Quote) model.Qu
 	// snapshot. Reattach that durable result on every lightweight quote read.
 	s.mergeCachedValuation(quote.Symbol, &quote)
 	var history map[string]any
-	var earnings map[string]any
-	if !s.cfg.LowMemory && s.cfg.UpstreamConcurrency > 1 {
-		var workers sync.WaitGroup
-		workers.Add(2)
-		go func() {
-			defer workers.Done()
-			history = s.loadHistory(ctx, quote.Symbol, "2y")
-		}()
-		go func() {
-			defer workers.Done()
-			earnings = s.loadEarnings(ctx, quote.Symbol)
-		}()
-		workers.Wait()
-	} else {
-		history = s.loadHistory(ctx, quote.Symbol, "2y")
-		earnings = s.loadEarnings(ctx, quote.Symbol)
-	}
+	history = s.loadHistory(ctx, quote.Symbol, "2y")
 	bars, _ := history["bars"].([]map[string]any)
 	if latestDay := historyLatestDate(bars); len(bars) > 0 && historyFresh(history["fetched_at"], s.cfg.HistoryMaxAge) && historyWithinQuoteAlignmentWindow(latestDay, time.Now()) {
 		market := trendMarket(bars, quote)
@@ -812,18 +696,13 @@ func (s *Service) decorateQuote(ctx context.Context, quote model.Quote) model.Qu
 			}
 		}
 	}
-	earningsSummary := summarizeEarnings(earnings["dates"])
-	for _, key := range []string{"fetched_at", "source", "warning"} {
-		earningsSummary[key] = earnings[key]
-	}
-	quote.Earnings = earningsSummary
 	return quote
 }
 
 // decorateCachedQuote enriches a SQLite quote without touching an upstream
 // provider. It is used by the lightweight quote endpoint so a symbol with a
-// persisted snapshot renders immediately; stale history and earnings are
-// refreshed by prefetchSymbolAnalytics in the background.
+// persisted snapshot renders immediately; stale history is refreshed in the
+// background.
 func (s *Service) decorateCachedQuote(quote model.Quote) model.Quote {
 	if quote.Symbol == "" {
 		return quote
@@ -843,13 +722,6 @@ func (s *Service) decorateCachedQuote(quote model.Quote) model.Quote {
 				}
 			}
 		}
-	}
-	if earnings, err := s.store.LatestPayload("earnings_snapshots", quote.Symbol); err == nil {
-		summary := summarizeEarnings(earnings["dates"])
-		summary["fetched_at"] = earnings["fetched_at"]
-		summary["source"] = cacheSource(earnings["dates"], earnings["fetched_at"])
-		summary["warning"] = nil
-		quote.Earnings = summary
 	}
 	return quote
 }

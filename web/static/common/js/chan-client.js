@@ -141,18 +141,12 @@
       spot: "--", historyTime: "--", refreshing: false };
   }
 
-  // The current-price badge lives in the axis gutter, clear of candles and
-  // pen endpoints. Recompute it on quote updates even when geometry is cached.
+  // Recompute the left-axis current-price marker on quote updates even when
+  // chart geometry is cached.
   function chartWithSpot(chart, value, minimum, maximum, y, scenarios = []) {
     const badgePrice = Number(value);
     const spot = value != null && Number.isFinite(badgePrice) && badgePrice >= minimum && badgePrice <= maximum
-      ? { y: y(badgePrice), label: money(badgePrice), x: chart.plotRight + 8,
-        width: chart.width - chart.plotRight - 16, height: 22 } : null;
-    if (spot) {
-      spot.boxY = spot.y - spot.height / 2;
-      spot.textX = spot.x + spot.width / 2;
-      spot.textY = spot.y + 3.5;
-    }
+      ? { y: y(badgePrice), label: money(badgePrice), height: 22 } : null;
     const quotePrice = value != null && Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : chart.lastClose;
     const startX = chart.historyRight + 8;
     const endX = chart.plotRight - 8;
@@ -182,13 +176,16 @@
       };
     }).filter(Boolean);
     return { ...chart, spot, projections, grid: chart.grid.map((row) => ({ ...row,
-      labelVisible: !spot || Math.abs(row.y - spot.y) > spot.height / 2 + 8,
+      // Keep the nearest tick clear of the HTML current-price marker on the
+      // left axis. The mobile layout needs extra clearance for its larger scale.
+      labelVisible: !spot || Math.abs(row.y - spot.y) > spot.height / 2 + (chart.mobileChart ? 28 : 8),
     })) };
   }
 
-  function chartModel(frame, spot, scenarios, showScenarios) {
+  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30) {
     const cachedLayouts = chartCache.get(frame.candles);
-    const cached = cachedLayouts?.get(showScenarios);
+    const cacheKey = `${showScenarios ? "scenarios" : "history"}-${mobile ? `mobile-${mobileBars}` : "desktop"}`;
+    const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const scenarioLevels = showScenarios ? (scenarios || []).flatMap((scenario) => scenario.projection_levels || [])
       .map(Number).filter((price) => Number.isFinite(price) && price > 0) : [];
@@ -198,12 +195,17 @@
     if (cached && !newLevelsOutsideCache && !quoteOutsideCache) {
       return chartWithSpot(cached.chart, spot, cached.minimum, cached.maximum, cached.y, scenarios);
     }
-    const bars = (frame.candles || []).slice(frame.period === "1wk" ? -120 : -160);
+    const maxBars = frame.period === "1wk" ? 120 : 160;
+    const visibleBars = mobile ? Math.min(maxBars, Math.max(30, Number(mobileBars) || 60)) : maxBars;
+    const bars = (frame.candles || []).slice(-visibleBars);
     if (!bars.length) return null;
-    const width = 960, height = 340, left = 18, right = 104, top = 18, bottom = 38;
+    const width = mobile ? 420 : 960, height = mobile ? 520 : 340;
+    // Desktop retains room for the left price labels and current-price badge
+    // without carrying the oversized axis gutter from the former right axis.
+    const left = mobile ? 94 : 72, right = 20, top = mobile ? 24 : 18, bottom = 38;
     const plotWidth = width - left - right, plotHeight = height - top - bottom;
     // Keep the scenario lane separate from historical bars when it is shown.
-    const scenarioBoundary = left + plotWidth * 0.88;
+    const scenarioBoundary = left + plotWidth * (mobile ? 0.78 : 0.88);
     const historyRight = showScenarios ? scenarioBoundary : width - right;
     const historyWidth = historyRight - left;
     const firstDate = bars[0].date, lastDate = bars[bars.length - 1].date;
@@ -250,7 +252,7 @@
       const pointX = x(dateIndex(point.date)), pointY = y(point.price);
       const label = `${money(point.price)}${point.confirmed ? "" : " *"}`;
       // Keep labels inside the plot near the first or last candle.
-      const halfWidth = label.length * 3.5 + 3;
+      const halfWidth = label.length * (mobile ? 4.2 : 3.5) + 3;
       return { key: point.key, date: point.date, kind: point.kind, price: point.price, x: pointX, y: pointY, confirmed: point.confirmed, label,
         labelX: Math.max(left + halfWidth, Math.min(width - right - halfWidth, pointX)),
         labelY: point.kind === "top" ? Math.max(13, pointY - 12) : Math.min(height - bottom + 14, pointY + 18),
@@ -258,11 +260,11 @@
       };
     });
     const chart = {
-      width, height, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: height - bottom,
+      width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: height - bottom,
       minimum, maximum, periodLabel: frame.label,
       historyRight, scenarioBoundary, lastClose: frame.last_close,
       title: `${frame.label} K 线、笔、中枢与条件情景推演，${firstDate} 至 ${lastDate}`,
-      description: "实体 K 线表示收盘后的行情。实线为已确认笔，虚线为形成中的笔；阴影表示三根已确认笔的重叠区。笔端点标注价格；底、顶标记是候选观察。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测。移动鼠标或触摸图表可查看 K 线日期和 OHLC；图表获得键盘焦点后，左右键切换 K 线，Home、End 跳到首根、末根，Escape 关闭提示。",
+      description: "实体 K 线表示收盘后的行情。左侧显示价格刻度与现价；点击现价可查看结构观察。实线为已确认笔，虚线为形成中的笔；阴影表示三根已确认笔的重叠区。笔端点标注价格；底、顶标记是候选观察。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测。移动鼠标或触摸图表可查看 K 线日期和 OHLC；图表获得键盘焦点后，左右键切换 K 线，Home、End 跳到首根、末根，Escape 关闭提示。",
       points,
       keyLevels: (() => {
         const ordered = [...endpointList].sort((a, b) => b.date.localeCompare(a.date));
@@ -309,10 +311,10 @@
         return { key: index, y: y(price), label: money(price) };
       }),
       dates: [...new Set([0, Math.floor((bars.length - 1) / 2), bars.length - 1])]
-        .map((index) => ({ x: x(index), y: height - 12, label: axisDateLabel(bars[index].date) })),
+        .map((index) => ({ x: x(index), y: height - 12, label: mobile ? axisDateLabel(bars[index].date).slice(-5) : axisDateLabel(bars[index].date) })),
     };
     const layouts = cachedLayouts || new Map();
-    layouts.set(showScenarios, { chart, minimum, maximum, y });
+    layouts.set(cacheKey, { chart, minimum, maximum, y });
     if (!cachedLayouts) chartCache.set(frame.candles, layouts);
     return chartWithSpot(chart, spot, minimum, maximum, y, scenarios);
   }
@@ -456,6 +458,10 @@
         projection_labels: ["回到中枢", "区间内摆动·示意", "另一侧边界"],
         projection_hide_prices: [1, 2] });
     guide.scenarios = scenarioTiltScores(frame, weekly, guide.scenarios);
+    // A downside path may be intentionally omitted when price is already
+    // below the recent low and no lower confirmed endpoint exists. Keep its
+    // rule-based tilt available for the live risk summary even without a path.
+    guide.downsideTilt = scenarioTiltScores(frame, weekly, [{ direction: "down" }])[0]?.tilt_score;
     return guide;
   }
 
@@ -520,25 +526,25 @@
       bullishNextInvalidation: bullishNext?.invalidation || "",
       bearishLabel: bearish?.label || "向下风险", bearishStatus: bearish?.status || "等待结构确认",
       bearish: bearishCondition, bearishExpectation: bearish?.expectation || "观察失守后的反抽能否收回边界。",
-      bearishTilt: bearish?.tilt_score == null ? "" : "倾向 " + bearish.tilt_score + "/100",
+      bearishTilt: (bearish?.tilt_score ?? guidance?.downsideTilt) == null ? "" : "倾向 " + (bearish?.tilt_score ?? guidance.downsideTilt) + "/100",
       bearishInvalidation: bearish?.invalidation || "条件未满足前，不把现价波动当作结构确认。",
       freshness };
   }
 
-  function frameView(frame, spot, weekly = null, showScenarios = true) {
+  function frameView(frame, spot, weekly = null, showScenarios = true, mobileChart = false, mobileBars = 30) {
     if (!frame) return emptyFrame("--");
     const center = frame.position?.center;
     const last = frame.strokes?.[frame.strokes.length - 1];
     const fixed = (frame.strokes || []).filter((stroke) => stroke.confirmed);
     const guidance = frameGuidance(frame, spot, weekly);
-    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios);
+    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars);
     const markers = chart ? (frame.signals || []).filter((signal) => turningKinds.has(signal.kind) && signal.status !== "invalidated").map((signal) => {
       const point = chart.points.find((item) => item.date === (signal.origin_date || signal.date) && item.price === signal.price);
       if (!point) return null;
       const buy = signal.side === "buy", watch = signal.status === "watch";
       return { key: `${signal.kind}-${signal.origin_date || signal.date}`, x: point.x, y: point.y,
-        labelX: Math.max(48, Math.min(chart.plotRight - 35, point.x)),
-        labelY: buy ? Math.min(313, point.labelY + 13) : Math.max(10, point.labelY - 13),
+          labelX: Math.max(48, Math.min(chart.plotRight - 35, point.x)),
+        labelY: buy ? Math.min(chart.plotBottom - 4, point.labelY + 13) : Math.max(10, point.labelY - 13),
         label: `${buy ? "底" : "顶"}${watch ? "观察" : "候选"}`, watch,
         title: `${signal.label} · 极值 ${signal.origin_date || signal.date} ${money(signal.price)} · 首次识别 ${signal.observed_at || signal.confirmed_at} · 当前阶段 ${signal.phase_at || signal.confirmed_at}` };
     }).filter(Boolean) : [];
@@ -568,14 +574,14 @@
     };
   }
 
-  function view(payload, showScenarios = true) {
+  function view(payload, showScenarios = true, mobileChart = false, mobileBars = 30) {
     if (!payload) return empty();
     let historyTime = "--";
     if (payload.history?.fetched_at) {
       const date = new Date(payload.history.fetched_at);
       if (!Number.isNaN(date.getTime())) historyTime = date.toLocaleString("zh-CN", { hour12: false });
     }
-    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios);
+    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars);
     const weeklyReady = Boolean(payload.weekly?.position?.center);
     const weeklyContext = weeklyReady ? `周线：${weekly.position}。` : `周线已有 ${weekly.bars} 根收盘 K 线、${weekly.confirmed} 根已确认笔，尚未形成中枢，不能给日线方向增加确认。`;
     return {
@@ -591,12 +597,12 @@
 
   // Closed-bar intraday view. The server sends one frame for the requested
   // 15-minute or 4-hour period; reuse the same frame renderer as daily/weekly.
-  function intradayView(payload, showScenarios = true, spotOverride = null) {
+  function intradayView(payload, showScenarios = true, spotOverride = null, mobileChart = false, mobileBars = 30) {
     const label = payload?.period === "4h" ? "4小时" : "15分钟";
     if (!payload || !payload.frame) return emptyFrame(label);
     const spot = spotOverride != null && Number.isFinite(Number(spotOverride)) && Number(spotOverride) > 0
       ? Number(spotOverride) : payload.spot;
-    return frameView(payload.frame, spot, null, showScenarios);
+    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars);
   }
 
   // Refresh the current price position without rebuilding historical pens.

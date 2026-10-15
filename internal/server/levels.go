@@ -1787,8 +1787,8 @@ func cachedBuyerStructuresWithIVAt(rows []model.OptionRow, spot float64, recomme
 
 // buildCachedLevels computes the Go levels response from normalized history and
 // option snapshots. Provider reads and cache coordination stay in the service.
-func buildCachedLevels(symbol, expiration string, bars []map[string]any, rows []model.OptionRow, quote model.Quote, spot, candidateSpot *float64, historyFetchedAt any, extremes, beta, earnings map[string]any) map[string]any {
-	return buildCachedLevelsAt(symbol, expiration, bars, rows, quote, spot, candidateSpot, historyFetchedAt, extremes, beta, earnings, time.Now(), nil)
+func buildCachedLevels(symbol, expiration string, bars []map[string]any, rows []model.OptionRow, quote model.Quote, spot, candidateSpot *float64, historyFetchedAt any, extremes, beta, _ map[string]any) map[string]any {
+	return buildCachedLevelsAt(symbol, expiration, bars, rows, quote, spot, candidateSpot, historyFetchedAt, extremes, beta, nil, time.Now(), nil)
 }
 
 // fastLevelsPayload keeps the raw response focused on the fields needed to
@@ -1803,7 +1803,7 @@ func fastLevelsPayload(levels map[string]any) map[string]any {
 	for _, key := range []string{
 		"symbol", "expiration", "spot", "candidate_spot", "generated_at",
 		"chain_fetched_at", "options_fetched_at", "options_expirations", "options_horizon_days", "options_metric",
-		"history", "history_bars", "trend_market", "beta", "beta_meta", "earnings", "extremes",
+		"history", "history_bars", "trend_market", "beta", "beta_meta", "extremes",
 		"resistance", "support", "trend", "recommendation", "trade_points", "stop_loss", "trade_points_horizon",
 		"buyer_structures", "plan", "history_validation",
 	} {
@@ -1814,7 +1814,7 @@ func fastLevelsPayload(levels map[string]any) map[string]any {
 	return result
 }
 
-func buildCachedLevelsAt(symbol, expiration string, bars []map[string]any, rows []model.OptionRow, quote model.Quote, spot, candidateSpot *float64, historyFetchedAt any, extremes, beta, earnings map[string]any, now time.Time, modelByExpiry map[string]any) map[string]any {
+func buildCachedLevelsAt(symbol, expiration string, bars []map[string]any, rows []model.OptionRow, quote model.Quote, spot, candidateSpot *float64, historyFetchedAt any, extremes, beta, _ map[string]any, now time.Time, modelByExpiry map[string]any) map[string]any {
 	price := numberPointer(spot)
 	if price == nil || *price <= 0 {
 		if len(bars) > 0 {
@@ -1890,8 +1890,6 @@ func buildCachedLevelsAt(symbol, expiration string, bars []map[string]any, rows 
 	historyFrom, historyTo := cachedBarDates(bars)
 	extremesValue := extremes["extremes"]
 	betaValue := beta["beta"]
-	earningsDates := earnings["dates"]
-	earningsAvailable := cachedPayloadAvailable(earningsDates)
 	historyMeta := map[string]any{
 		"bars": len(bars), "from": historyFrom, "to": historyTo,
 		"fetched_at": historyFetchedAt, "source": cachedSource(len(bars)), "warning": cachedWarning(len(bars), historyFetchedAt),
@@ -1899,19 +1897,12 @@ func buildCachedLevelsAt(symbol, expiration string, bars []map[string]any, rows 
 		"extremes_source":     cachedSourceValue(extremesValue),
 		"extremes_warning":    cachedWarningValue(extremesValue, "本地没有极值缓存"),
 	}
-	earningsSummary := summarizeEarnings(earningsDates)
-	earningsSummary["fetched_at"] = earnings["fetched_at"]
-	earningsSummary["source"] = cachedSourceValue(earningsDates)
-	earningsSummary["warning"] = cachedWarningValue(earningsDates, "本地没有财报日期缓存")
-	if !earningsAvailable {
-		earningsSummary["fetched_at"] = nil
-	}
 	return map[string]any{
 		"symbol": symbol, "expiration": expiration, "spot": *price, "candidate_spot": *anchor,
 		"chain_fetched_at": nil, "options_fetched_at": nil, "options_expirations": cachedExpirations(rows),
 		"options_horizon_days": 45, "generated_at": now.UTC(), "history": historyMeta,
 		"trend_market": trendMarket(bars, quote), "beta": betaValue, "beta_meta": map[string]any{"fetched_at": beta["fetched_at"], "source": cachedSourceValue(betaValue), "warning": cachedWarningValue(betaValue, "本地没有 Beta 缓存")},
-		"earnings": earningsSummary, "extremes": extremesValue,
+		"extremes":            extremesValue,
 		"extremes_fetched_at": extremes["fetched_at"], "options_metric": metric, "history_bars": len(bars),
 		"resistance": resistance, "support": support,
 		"trend": trend, "recommendation": cachedRecommendation(trend, support, resistance, *price),

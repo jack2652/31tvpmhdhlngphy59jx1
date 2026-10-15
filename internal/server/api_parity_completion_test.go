@@ -13,7 +13,6 @@ func TestRawLevelsPropagatesSQLiteCacheReadErrors(t *testing.T) {
 		"quote_snapshots",
 		"price_extremes",
 		"beta_snapshots",
-		"earnings_snapshots",
 	} {
 		t.Run(table, func(t *testing.T) {
 			service, ts := testService(t, "")

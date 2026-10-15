@@ -2825,7 +2825,7 @@ func TestStatusReportsRefreshQueuedBeforeSemaphoreAcquire(t *testing.T) {
 	}
 }
 
-func TestStatusRefreshesMissingHistoryAndEarningsButKeepsErrorsNonfatal(t *testing.T) {
+func TestStatusRefreshesMissingHistoryWithoutFetchingEarnings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "status-no-upstream.db")
 	cfg := config.Config{DatabasePath: path, UpstreamTimeout: time.Second, HistoryMaxAge: time.Hour}
 	repository, err := store.Open(path)
@@ -2840,7 +2840,6 @@ func TestStatusRefreshesMissingHistoryAndEarningsButKeepsErrorsNonfatal(t *testi
 	provider := &statusTrackingProvider{
 		testMarketProvider: &testMarketProvider{},
 		historyErr:         fmt.Errorf("history unavailable"),
-		earningsErr:        fmt.Errorf("earnings unavailable"),
 	}
 	service := NewWithProvider(cfg, repository, provider)
 	defer service.Close()
@@ -2862,21 +2861,18 @@ func TestStatusRefreshesMissingHistoryAndEarningsButKeepsErrorsNonfatal(t *testi
 	if sessions, ok := quote["sessions"].(map[string]any); !ok || sessions == nil {
 		t.Fatalf("status did not normalize empty sessions: %#v", quote["sessions"])
 	}
-	if earnings, ok := quote["earnings"].(map[string]any); !ok || earnings["source"] != "none" {
-		t.Fatalf("status did not expose empty cached earnings state: %#v", quote["earnings"])
+	if _, exists := quote["earnings"]; exists {
+		t.Fatalf("status exposed the removed earnings field: %#v", quote["earnings"])
 	}
 	if got := provider.historyCalls.Load(); got != 1 {
 		t.Fatalf("status history upstream calls=%d, want one attempt", got)
 	}
-	if got := provider.earningsCalls.Load(); got != 1 {
-		t.Fatalf("status earnings upstream calls=%d, want one attempt", got)
-	}
-	if earnings := quote["earnings"].(map[string]any); earnings["warning"] != "earnings unavailable" {
-		t.Fatalf("status dropped nonfatal earnings warning: %#v", earnings)
+	if got := provider.earningsCalls.Load(); got != 0 {
+		t.Fatalf("status made earnings upstream calls=%d, want zero", got)
 	}
 }
 
-func TestStatusUsesQuoteEnrichmentForFreshHistoryAndEarnings(t *testing.T) {
+func TestStatusUsesQuoteEnrichmentForFreshHistoryWithoutEarnings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "status-upstream-enrichment.db")
 	cfg := config.Config{DatabasePath: path, UpstreamTimeout: time.Second, HistoryMaxAge: 24 * time.Hour, UpstreamConcurrency: 2}
 	repository, err := store.Open(path)
@@ -2903,7 +2899,6 @@ func TestStatusUsesQuoteEnrichmentForFreshHistoryAndEarnings(t *testing.T) {
 				{"date": latestDay, "open": 103.0, "high": 108.0, "low": 101.0, "close": 105.0, "volume": 1500},
 			},
 		},
-		earningsDates: []string{"2099-01-18"},
 	}
 	service := NewWithProvider(cfg, repository, provider)
 	defer service.Close()
@@ -2925,12 +2920,11 @@ func TestStatusUsesQuoteEnrichmentForFreshHistoryAndEarnings(t *testing.T) {
 	if quote["previous_close"] != float64(105) || quote["change_percent"] != (float64(110-105)/105*100) {
 		t.Fatalf("status did not align quote with refreshed history: %#v", quote)
 	}
-	earnings, ok := quote["earnings"].(map[string]any)
-	if !ok || earnings["source"] != "upstream" || earnings["date"] != "2099-01-18" || earnings["fetched_at"] == nil {
-		t.Fatalf("status did not attach refreshed earnings: %#v", quote["earnings"])
+	if _, exists := quote["earnings"]; exists {
+		t.Fatalf("status exposed the removed earnings field: %#v", quote["earnings"])
 	}
-	if provider.historyCalls.Load() != 1 || provider.earningsCalls.Load() != 1 {
-		t.Fatalf("status enrichment calls: history=%d earnings=%d, want one each", provider.historyCalls.Load(), provider.earningsCalls.Load())
+	if provider.historyCalls.Load() != 1 || provider.earningsCalls.Load() != 0 {
+		t.Fatalf("status enrichment calls: history=%d earnings=%d, want history only", provider.historyCalls.Load(), provider.earningsCalls.Load())
 	}
 }
 
@@ -3013,9 +3007,8 @@ func TestStatusDecoratesPersistedQuoteWithoutUpstreamAfterRestart(t *testing.T) 
 	if sessions, ok := statusQuote["sessions"].(map[string]any); !ok || sessions == nil {
 		t.Fatalf("status did not normalize empty sessions: %#v", statusQuote["sessions"])
 	}
-	earnings, ok := statusQuote["earnings"].(map[string]any)
-	if !ok || earnings["source"] != "sqlite" || earnings["fetched_at"] == nil || earnings["date"] != "2099-01-18" {
-		t.Fatalf("status did not attach cached earnings: %#v", statusQuote["earnings"])
+	if _, exists := statusQuote["earnings"]; exists {
+		t.Fatalf("status exposed the removed earnings field: %#v", statusQuote["earnings"])
 	}
 	if secondProvider.quoteCalls.Load() != 0 || secondProvider.fundamentalsCalls.Load() != 0 {
 		t.Fatalf("status triggered upstream calls: quote=%d fundamentals=%d", secondProvider.quoteCalls.Load(), secondProvider.fundamentalsCalls.Load())
@@ -3030,10 +3023,13 @@ func TestStatusDecoratesPersistedQuoteWithoutUpstreamAfterRestart(t *testing.T) 
 	if err := json.NewDecoder(quoteAgain.Body).Decode(&quoteAgainBody); err != nil || quoteAgain.StatusCode != http.StatusOK {
 		t.Fatalf("quote-after-restart response status=%d decode=%v body=%#v", quoteAgain.StatusCode, err, quoteAgainBody)
 	}
-	for _, field := range []string{"price", "previous_close", "change_percent", "fair_value_status", "fair_value_pending", "earnings", "sessions"} {
+	for _, field := range []string{"price", "previous_close", "change_percent", "fair_value_status", "fair_value_pending", "sessions"} {
 		if !reflect.DeepEqual(statusQuote[field], quoteAgainBody[field]) {
 			t.Fatalf("status and quote field %s differ: status=%#v quote=%#v", field, statusQuote[field], quoteAgainBody[field])
 		}
+	}
+	if _, exists := quoteAgainBody["earnings"]; exists {
+		t.Fatalf("quote endpoint exposed the removed earnings field: %#v", quoteAgainBody["earnings"])
 	}
 }
 
@@ -3491,7 +3487,7 @@ func TestLevelsUsesCachedSnapshotsForNonRawResponse(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := fixtureDB.Exec(`INSERT INTO price_extremes(symbol, payload, fetched_at) VALUES ('QQQ', '{"52_week_high": 110, "52_week_low": 80}', ?); INSERT INTO beta_snapshots(symbol, payload, fetched_at) VALUES ('QQQ', '{"value": 1.2}', ?); INSERT INTO earnings_snapshots(symbol, payload, fetched_at) VALUES ('QQQ', '{"dates":["2099-01-18"]}', ?)`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
+	if _, err := fixtureDB.Exec(`INSERT INTO price_extremes(symbol, payload, fetched_at) VALUES ('QQQ', '{"52_week_high": 110, "52_week_low": 80}', ?); INSERT INTO beta_snapshots(symbol, payload, fetched_at) VALUES ('QQQ', '{"value": 1.2}', ?)`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
 		fixtureDB.Close()
 		t.Fatal(err)
 	}
@@ -3522,9 +3518,8 @@ func TestLevelsUsesCachedSnapshotsForNonRawResponse(t *testing.T) {
 	if !betaMetaOK || betaMeta["source"] != "sqlite" || betaMeta["warning"] != nil {
 		t.Fatalf("cached levels lost beta metadata wrapper: %#v", body["beta_meta"])
 	}
-	earnings, earningsOK := body["earnings"].(map[string]any)
-	if !earningsOK || earnings["source"] != "sqlite" || earnings["warning"] != nil || earnings["fetched_at"] == nil {
-		t.Fatalf("cached levels lost earnings metadata wrapper: %#v", body["earnings"])
+	if _, exists := body["earnings"]; exists {
+		t.Fatalf("cached levels exposed removed earnings metadata: %#v", body["earnings"])
 	}
 	resistance, resistanceOK := body["resistance"].([]any)
 	support, supportOK := body["support"].([]any)
@@ -3575,7 +3570,7 @@ func TestUnavailableLevelsResponseMatchesPythonBuildLevelsShape(t *testing.T) {
 	}
 	for _, field := range []string{
 		"symbol", "expiration", "spot", "chain_fetched_at", "options_fetched_at", "options_expirations",
-		"options_horizon_days", "history", "trend_market", "beta", "beta_meta", "earnings", "extremes",
+		"options_horizon_days", "history", "trend_market", "beta", "beta_meta", "extremes",
 		"history_bars", "options_metric", "resistance", "support", "trend", "recommendation", "trade_points",
 		"stop_loss", "trade_points_horizon", "buyer_structures", "plan",
 	} {
@@ -3838,14 +3833,8 @@ func TestRawLevelsMatchesPythonOptionAndEarningsFields(t *testing.T) {
 	if value, exists := farOption["model_gamma"]; !exists || value != nil {
 		t.Errorf("far raw option model_gamma=%#v (exists=%v), want explicit null", value, exists)
 	}
-	earnings, ok := body["earnings"].(map[string]any)
-	if !ok {
-		t.Fatalf("raw earnings has type %T, want object", body["earnings"])
-	}
-	for _, key := range []string{"fetched_at", "source", "warning"} {
-		if _, exists := earnings[key]; exists {
-			t.Errorf("raw earnings unexpectedly exposes cache metadata %q", key)
-		}
+	if _, exists := body["earnings"]; exists {
+		t.Errorf("raw levels exposed removed earnings field: %#v", body["earnings"])
 	}
 	history, ok := body["history"].(map[string]any)
 	if !ok {
