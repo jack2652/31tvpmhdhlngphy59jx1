@@ -396,8 +396,9 @@ func TestDefaultHybridUsesPythonProviderTimeouts(t *testing.T) {
 }
 
 type hybridHistorySpy struct {
-	calls  []string
-	result HistoryResult
+	calls      []string
+	result     HistoryResult
+	chanResult ChanAdjustedHistoryResult
 }
 
 func (s *hybridHistorySpy) Fetch(_ context.Context, symbol, period string) (HistoryResult, error) {
@@ -408,6 +409,11 @@ func (s *hybridHistorySpy) Fetch(_ context.Context, symbol, period string) (Hist
 func (s *hybridHistorySpy) FetchAdjusted(_ context.Context, symbol, period string) (HistoryResult, error) {
 	s.calls = append(s.calls, "adjusted:"+symbol+":"+period)
 	return s.result, nil
+}
+
+func (s *hybridHistorySpy) FetchChanAdjusted(_ context.Context, symbol, period string) (ChanAdjustedHistoryResult, error) {
+	s.calls = append(s.calls, "chan-adjusted:"+symbol+":"+period)
+	return s.chanResult, nil
 }
 
 func TestNewHybridConfiguresDefaultYFinanceHistoryClient(t *testing.T) {
@@ -452,6 +458,20 @@ func TestHybridForwardsHistoryBenchmarkAndEarnings(t *testing.T) {
 	}
 	if gotSymbol != "TEST" {
 		t.Fatalf("earnings ticker symbol = %q, want TEST", gotSymbol)
+	}
+}
+
+func TestHybridForwardsIndependentChanAdjustedHistory(t *testing.T) {
+	regular := NewYahoo(time.Second, 2)
+	hybrid := NewHybrid(regular, nil, nil)
+	spy := &hybridHistorySpy{chanResult: ChanAdjustedHistoryResult{Symbol: "QQQ", Timeframe: "1d", AdjustmentType: "split_dividend_auto"}}
+	hybrid.HistoryClient = spy
+	result, err := hybrid.ChanAdjustedHistory(context.Background(), "QQQ", "2y")
+	if err != nil || result.Symbol != "QQQ" || result.Timeframe != "1d" {
+		t.Fatalf("ChanAdjustedHistory result=%+v err=%v", result, err)
+	}
+	if got := strings.Join(spy.calls, ","); got != "chan-adjusted:QQQ:2y" {
+		t.Fatalf("Chan adjusted provider calls=%q, want independent history route", got)
 	}
 }
 

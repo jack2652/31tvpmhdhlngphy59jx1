@@ -70,8 +70,23 @@ function scheduleChartPointerMove(chartTarget, onMove, hideTooltip) {
   return cancel;
 }
 
-// Vue owns the candle geometry. This controller only updates the hover layer
-// and readout, so pointer movement never redraws the full page or candle list.
+function chanStructureTooltipDetails(structure, fallbackRuleVersion = "未知") {
+  if (!structure) return null;
+  const displayPrice = (value) => value != null && value !== "" && Number.isFinite(Number(value)) ? formatMoney(Number(value)) : "未知";
+  const startPrice = displayPrice(structure.startPrice);
+  const endPrice = displayPrice(structure.endPrice);
+  const start = structure.start || "未知";
+  const end = structure.end || "未知";
+  const formed = structure.formedAt ? `形成 ${structure.formedAt}` : "形成时间未知";
+  const confirmation = structure.confirmedAt ? ` · 确认 ${structure.confirmedAt}` : " · 尚未确认";
+  return {
+    title: `${structure.type}${structure.level == null ? "" : ` · L${structure.level}`} · ${structure.confirmed ? "已确认" : "形成中"}`,
+    body: `${start} ${startPrice} → ${end} ${endPrice} · ${formed}${confirmation} · ${structure.composition || "组成范围未知"} · 规则 ${structure.ruleVersion || fallbackRuleVersion || "未知"}`,
+  };
+}
+
+// Canvas owns the candle geometry. This controller only updates the SVG hover
+// layer and readout, so pointer movement never redraws the full chart.
 function bindChanChartHover(target, initialModel) {
   const svg = target.querySelector("svg");
   const layer = target.querySelector(".chan-crosshair-layer");
@@ -89,6 +104,18 @@ function bindChanChartHover(target, initialModel) {
   title.className = "chart-tooltip-title";
   const subtitle = document.createElement("div");
   subtitle.className = "chart-tooltip-sub";
+  const changeRow = document.createElement("div");
+  changeRow.className = "chart-tooltip-row chan-ohlc-change-row";
+  const changeLabel = document.createElement("span");
+  changeLabel.textContent = "涨幅";
+  const changeValue = document.createElement("strong");
+  changeRow.append(changeLabel, changeValue);
+  const structureDetail = document.createElement("section");
+  structureDetail.className = "chan-structure-tooltip";
+  structureDetail.hidden = true;
+  const structureTitle = document.createElement("strong");
+  const structureBody = document.createElement("span");
+  structureDetail.append(structureTitle, structureBody);
   tooltip.replaceChildren(title, subtitle);
   const values = {};
   [["open", "开盘"], ["high", "最高"], ["low", "最低"], ["close", "收盘"]].forEach(([key, label]) => {
@@ -100,6 +127,8 @@ function bindChanChartHover(target, initialModel) {
     row.append(name, values[key]);
     tooltip.append(row);
   });
+  tooltip.append(changeRow);
+  tooltip.append(structureDetail);
   const hide = () => {
     layer.setAttribute("visibility", "hidden");
     tooltip.hidden = true;
@@ -125,10 +154,11 @@ function bindChanChartHover(target, initialModel) {
     label.setAttribute("text-anchor", "middle");
     label.textContent = text;
   };
-  const show = (index, localY) => {
+  const show = (index, localY, localXOverride = null) => {
     const candle = model?.candles?.[index];
     if (!candle || !target.offsetWidth || !target.offsetHeight) { hide(); return; }
     activeIndex = index;
+    const localX = Number.isFinite(localXOverride) ? localXOverride : candle.x;
     const plotHeight = model.plotBottom - model.plotTop;
     const priceRange = model.maximum - model.minimum;
     const cursorY = Math.max(model.plotTop, Math.min(model.plotBottom, localY));
@@ -137,17 +167,19 @@ function bindChanChartHover(target, initialModel) {
     // The Chan chart reserves its right side for scenario cards; keep the
     // historical crosshair inside the candle plot so it cannot strike text.
     setLine(horizontal, model.plotLeft, cursorY, model.historyRight ?? model.plotRight, cursorY);
-    const dateWidth = 84;
-    setTag(tagX, candle.date, Math.max(2, Math.min(model.width - dateWidth - 2, candle.x - dateWidth / 2)), model.height - 22, dateWidth);
-    const priceLabel = formatMoney(price), priceWidth = Math.min(model.plotLeft - 16, Math.max(52, priceLabel.length * 7 + 14));
+    const displayDate = candle.displayDate || candle.date;
+    const axisDate = displayDate.includes(" ") ? displayDate.slice(5) : displayDate;
+    const dateWidth = Math.max(84, axisDate.length * 7 + 12);
+    setTag(tagX, axisDate, Math.max(2, Math.min(model.width - dateWidth - 2, candle.x - dateWidth / 2)), model.height - 22, dateWidth);
+    const priceLabel = formatMoney(price), priceWidth = Math.min(model.plotLeft - 4, Math.max(42, priceLabel.length * 6 + 10));
     // Preserve the current-price badge when the cursor reaches the same price.
     const overlapsSpot = model.spot && Math.abs(cursorY - model.spot.y) < model.spot.height / 2 + 10;
-    const priceX = Math.max(2, model.plotLeft - priceWidth - 8);
+    const priceX = Math.max(2, model.plotLeft - priceWidth - 4);
     setTag(tagY, priceLabel, priceX, cursorY - 9, priceWidth);
     if (overlapsSpot) tagY.setAttribute("visibility", "hidden");
     else tagY.removeAttribute("visibility");
     if (shownCandle !== candle) {
-      title.textContent = candle.date;
+      title.textContent = displayDate;
       subtitle.textContent = `${model.periodLabel} · 已收盘 K 线`;
       const directionClass = candle.prices.close > candle.prices.open ? "chan-ohlc-up"
         : candle.prices.close < candle.prices.open ? "chan-ohlc-down" : "chan-ohlc-flat";
@@ -155,7 +187,33 @@ function bindChanChartHover(target, initialModel) {
         values[key].textContent = formatMoney(candle.prices[key]);
         values[key].className = `chan-ohlc-value ${directionClass}`;
       });
+      const change = candle.closeChangePercent;
+      changeValue.textContent = Number.isFinite(change)
+        ? `${change > 0 ? "+" : ""}${change.toFixed(2)}%` : "未知";
+      changeValue.className = `chan-ohlc-value ${!Number.isFinite(change) ? "chan-ohlc-flat" : change > 0 ? "chan-ohlc-up" : change < 0 ? "chan-ohlc-down" : "chan-ohlc-flat"}`;
       shownCandle = candle;
+    }
+    const distanceToSegment = (item) => {
+      const dx = item.x2 - item.x1, dy = item.y2 - item.y1;
+      const lengthSquared = dx * dx + dy * dy;
+      const ratio = lengthSquared ? Math.max(0, Math.min(1, ((localX - item.x1) * dx + (localY - item.y1) * dy) / lengthSquared)) : 0;
+      return Math.hypot(localX - (item.x1 + ratio * dx), localY - (item.y1 + ratio * dy));
+    };
+    const structure = (model.structures || []).map((item) => {
+      const inArea = item.area && localX >= Math.min(item.x1, item.x2) && localX <= Math.max(item.x1, item.x2)
+        && localY >= Math.min(item.y1, item.y2) && localY <= Math.max(item.y1, item.y2);
+      return { item, distance: item.area ? (inArea ? 5 : Infinity) : distanceToSegment(item) };
+    })
+      .filter(({ item, distance }) => distance <= (item.area ? 0 : 8))
+      .sort((left, right) => left.distance - right.distance)[0]?.item;
+    if (structure) {
+      const detail = chanStructureTooltipDetails(structure, model.ruleVersion);
+      structureTitle.textContent = detail.title;
+      structureBody.textContent = detail.body;
+      structureDetail.hidden = false;
+    } else {
+      structureDetail.hidden = true;
+      structureTitle.textContent = ""; structureBody.textContent = "";
     }
     layer.setAttribute("visibility", "visible");
     tooltip.hidden = false;
@@ -178,7 +236,7 @@ function bindChanChartHover(target, initialModel) {
     lastPointer = event;
     const slot = ((model.historyRight ?? model.plotRight) - model.plotLeft) / model.candles.length;
     const index = Math.max(0, Math.min(model.candles.length - 1, Math.floor((point.x - model.plotLeft) / slot)));
-    show(index, point.y);
+    show(index, point.y, point.x);
   };
   const cancelPointerMove = scheduleChartPointerMove(target, onMove, hide);
   const showClose = (index) => {
@@ -209,11 +267,14 @@ function bindChanChartHover(target, initialModel) {
   return {
     svg,
     update(next) {
-      const sameCandles = model?.candles === next?.candles;
+      const activeDate = activeIndex == null ? null : model?.candles?.[activeIndex]?.date;
       model = next;
-      if (!sameCandles) { cancelPointerMove(); hide(); shownCandle = null; }
-      else if (lastPointer) onMove(lastPointer);
-      else if (activeIndex != null) showClose(activeIndex);
+      if (lastPointer) onMove(lastPointer);
+      else if (activeDate) {
+        const nextIndex = model?.candles?.findIndex((candle) => candle.date === activeDate) ?? -1;
+        if (nextIndex >= 0) showClose(nextIndex);
+        else hide();
+      }
     },
     destroy() {
       cancelPointerMove.dispose();
@@ -226,7 +287,8 @@ function bindChanChartHover(target, initialModel) {
 }
 
 const chanHoverControllers = new WeakMap();
-function syncChanChartHover(element, binding) {
+const chanHoverBindRetries = new WeakMap();
+function syncChanChartHover(element, binding, attempt = 0) {
   let controller = chanHoverControllers.get(element);
   if (controller && controller.svg !== element.querySelector("svg")) {
     controller.destroy();
@@ -237,14 +299,379 @@ function syncChanChartHover(element, binding) {
   else {
     controller = bindChanChartHover(element, binding.value);
     if (controller) chanHoverControllers.set(element, controller);
+    else if (attempt < 4 && !chanHoverBindRetries.has(element)) {
+      const retry = window.requestAnimationFrame(() => {
+        chanHoverBindRetries.delete(element);
+        if (element.isConnected) syncChanChartHover(element, binding, attempt + 1);
+      });
+      chanHoverBindRetries.set(element, retry);
+    }
   }
 }
 const chanChartHover = {
   inserted: syncChanChartHover,
   componentUpdated: syncChanChartHover,
   unbind(element) {
+    const retry = chanHoverBindRetries.get(element);
+    if (retry != null) window.cancelAnimationFrame(retry);
+    chanHoverBindRetries.delete(element);
     chanHoverControllers.get(element)?.destroy();
     chanHoverControllers.delete(element);
+  },
+};
+
+// The Chan history layer can contain hundreds or thousands of individual
+// chart marks. Paint those marks into one canvas instead of making each a DOM
+// node; keep only the small, interactive scenario overlay in SVG.
+function chanThemeColor(target, token, fallback) {
+  const value = getComputedStyle(target).getPropertyValue(token).trim();
+  return value || fallback;
+}
+
+function chanPaleCandleColor(color, amount = 0.54) {
+  const hex = /^#([0-9a-f]{6})$/i.exec(color || "");
+  if (!hex) return color;
+  const value = Number.parseInt(hex[1], 16);
+  const channel = (shift) => Math.round(((value >> shift) & 0xff) * (1 - amount) + 255 * amount);
+  return "rgb(" + channel(16) + ", " + channel(8) + ", " + channel(0) + ")";
+}
+
+function drawChanCanvas(target, binding) {
+  // The chart model has already filtered segments by the global switch and
+  // per-level overrides; testing the global switch again would hide a level
+  // that was explicitly enabled on its own.
+  const chartLayers = binding?.chart?.layers;
+  const segmentPaintEnabled = chartLayers && Object.prototype.hasOwnProperty.call(chartLayers, "segments")
+    ? chartLayers.segments === true : binding?.layers?.segments === true;
+  const model = binding?.chart ? { ...binding.chart, layers: { ...(chartLayers || {}), ...(binding.layers || {}), segments: segmentPaintEnabled } } : binding;
+  const canvas = target.querySelector("canvas.chan-chart-canvas");
+  const svg = target.querySelector("svg");
+  if (!canvas || !svg || !model) return;
+  const bounds = svg.getBoundingClientRect();
+  const width = bounds.width, height = bounds.height;
+  if (!width || !height || !model.width || !model.height) return;
+  const ratio = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+  const pixelWidth = Math.round(width * ratio), pixelHeight = Math.round(height * ratio);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth; canvas.height = pixelHeight;
+  }
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+  context.setTransform(pixelWidth / model.width, 0, 0, pixelHeight / model.height, 0, 0);
+  context.clearRect(0, 0, model.width, model.height);
+  const colors = {
+    grid: chanThemeColor(target, "--grid", "#344654"), axis: chanThemeColor(target, "--axis", "#81909c"),
+    text: chanThemeColor(target, "--muted", "#81909c"), textPrimary: chanThemeColor(target, "--text", "#e8eef3"), panel: chanThemeColor(target, "--panel", "#101923"),
+    up: chanThemeColor(target, "--up", "#19bd83"), down: chanThemeColor(target, "--down", "#f04d68"),
+    blue: chanThemeColor(target, "--blue", "#69b7ff"), spot: chanThemeColor(target, "--muted", "#81909c"),
+    amber: chanThemeColor(target, "--amber", "#e7b45c"), net: chanThemeColor(target, "--net", "#5478ff"), gex: chanThemeColor(target, "--gex", "#ff7c45"),
+  };
+  const levelColors = [colors.blue, colors.amber, colors.net, colors.gex, colors.up, colors.down, colors.text, colors.textPrimary];
+  const levelColor = (level) => levelColors[Math.max(0, Number(level) || 0) % levelColors.length];
+  const levelDash = (level) => [[], [7, 3], [3, 2], [9, 3, 2, 3], [1, 2], [6, 2, 1, 2], [10, 4], [4, 4]][Math.max(0, Number(level) || 0) % 8];
+  const line = (x1, y1, x2, y2, color, dash = [], lineWidth = 1) => {
+    context.beginPath(); context.setLineDash(dash); context.lineWidth = lineWidth; context.strokeStyle = color;
+    context.moveTo(x1, y1); context.lineTo(x2, y2); context.stroke(); context.setLineDash([]);
+  };
+  const label = (text, x, y, options = {}) => {
+    context.font = options.font || `${model.mobileChart ? 14 : 11}px Inter, ui-sans-serif, system-ui, sans-serif`;
+    context.textAlign = options.align || "left"; context.textBaseline = options.baseline || "alphabetic";
+    context.fillStyle = options.color || colors.text; context.fillText(text, x, y);
+  };
+  // Plot grid and price labels.
+  for (const row of model.grid || []) {
+    line(model.plotLeft, row.y, model.plotRight, row.y, colors.grid, [2, 4], 1);
+    if (row.labelVisible) label(row.label, model.plotLeft - 8, row.y + 4, { align: "right" });
+  }
+  // Center zones sit behind candles. Legacy pen centers and recursive level
+  // centers have independent switches so the hierarchy can be inspected.
+  if (model.layers?.penCenters !== false) for (const zone of model.centers || []) {
+    context.fillStyle = colors.blue; context.globalAlpha = zone.latest ? 0.14 : 0.08;
+    context.fillRect(zone.x, zone.y, zone.width, zone.height);
+    context.strokeStyle = colors.blue; context.globalAlpha = zone.latest ? 0.6 : 0.3;
+    context.lineWidth = zone.latest ? 1.25 : 1;
+    context.strokeRect(zone.x, zone.y, zone.width, zone.height);
+    context.globalAlpha = 1;
+  }
+  for (const zone of model.recursiveCenters || []) {
+    if (model.layers?.recursiveCenters?.[zone.level] !== true) continue;
+    const color = levelColor(zone.level);
+    context.fillStyle = color; context.globalAlpha = zone.forming ? 0.045 : 0.085;
+    context.fillRect(zone.x, zone.y, zone.width, zone.height);
+    context.strokeStyle = color; context.globalAlpha = zone.forming ? 0.72 : 0.46;
+    context.lineWidth = Math.min(2.6, 1 + (zone.extensionCount || 0) * 0.18);
+    context.setLineDash(zone.forming ? [5, 3] : levelDash(zone.level)); context.strokeRect(zone.x, zone.y, zone.width, zone.height); context.setLineDash([]);
+    if (zone.width > 22 && zone.height > 12) label("L" + zone.level, zone.x + 4, zone.y + 10, { font: "9px Inter, ui-sans-serif, system-ui, sans-serif", color });
+    context.globalAlpha = 1;
+  }
+  // Each original candle keeps its normal-colored body. The Chan layer paints
+  // the merged high-low range back onto every source slot it covers, with an
+  // identically sized pale column behind that body.
+  const chanCandles = new Map((model.layers?.chanCandles === false ? [] : model.chanCandles || [])
+    .map((candle) => [candle.candleIndex, candle]));
+  for (const candle of model.candles || []) {
+    const color = candle.direction === "up" ? colors.up : colors.down;
+    const chan = chanCandles.get(candle.index);
+    if (chan) {
+      const pale = chanPaleCandleColor(chan.direction === "up" ? colors.up : colors.down);
+      // Keep each source candle's real high/low visible even when inclusion
+      // merging moves the merged range inward. Include its body bounds too so
+      // the pale column joins the unchanged body without leaving a white gap.
+      const bodyTop = candle.body;
+      const bodyBottom = candle.body + candle.bodyHeight;
+      const wickTop = Math.min(chan.high, chan.low, candle.high, candle.low, bodyTop);
+      const wickBottom = Math.max(chan.high, chan.low, candle.high, candle.low, bodyBottom);
+      context.fillStyle = pale;
+      context.fillRect(candle.x - candle.bodyWidth / 2, wickTop, candle.bodyWidth, Math.max(1, wickBottom - wickTop));
+    } else {
+      line(candle.x, candle.high, candle.x, candle.low, color, [], 1);
+    }
+    context.fillStyle = color; context.strokeStyle = color; context.lineWidth = 1;
+    context.fillRect(candle.x - candle.bodyWidth / 2, candle.body, candle.bodyWidth, candle.bodyHeight);
+  }
+  // Recursive segments are drawn as their own layer. Confirmed segments are
+  // solid; the current forming endpoint is dashed. Hue identifies the level.
+  if (model.layers?.segments === true) for (const segment of model.segments || []) {
+    line(segment.x1, segment.y1, segment.x2, segment.y2, levelColor(segment.level), segment.confirmed ? levelDash(segment.level) : [6, 4], segment.level === 0 ? 2.6 : 2.1);
+  }
+  // Chan pens and endpoints can be hidden independently of segments.
+  if (model.layers?.pens !== false) for (const pen of model.strokes || []) line(pen.x1, pen.y1, pen.x2, pen.y2, colors.blue, pen.confirmed ? [] : [6, 4], 2.2);
+  if (model.layers?.pens !== false) for (const point of model.points || []) {
+    context.beginPath(); context.arc(point.x, point.y, 2.6, 0, Math.PI * 2);
+    context.fillStyle = point.confirmed ? colors.blue : colors.panel; context.fill();
+    context.strokeStyle = colors.blue; context.lineWidth = point.confirmed ? 1 : 1.5; context.stroke();
+    context.font = model.mobileChart ? "550 12px Inter, ui-sans-serif, system-ui, sans-serif" : "9px Inter, ui-sans-serif, system-ui, sans-serif";
+    context.textAlign = "center"; context.textBaseline = "alphabetic";
+    context.lineWidth = 3; context.strokeStyle = colors.panel; context.lineJoin = "round";
+    context.strokeText(point.label, point.labelX, point.labelY); context.fillStyle = colors.textPrimary; context.fillText(point.label, point.labelX, point.labelY);
+  }
+  if (model.layers?.signals !== false) for (const marker of model.markers || []) {
+    context.beginPath(); context.arc(marker.x, marker.y, 5, 0, Math.PI * 2);
+    context.fillStyle = colors.panel; context.strokeStyle = colors.blue; context.lineWidth = 1.5; context.setLineDash(marker.watch ? [2, 2] : []); context.fill(); context.stroke(); context.setLineDash([]);
+    context.font = "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center";
+    context.lineWidth = 3; context.strokeStyle = colors.panel; context.strokeText(marker.label, marker.labelX, marker.labelY);
+    context.fillStyle = colors.blue; context.fillText(marker.label, marker.labelX, marker.labelY);
+  }
+  // Chan structural reference levels: recent swing highs/lows and the latest center boundaries.
+  for (const level of model.keyLevels || []) {
+    const color = level.tone === "support" ? colors.up : level.tone === "resistance" ? colors.down : colors.blue;
+    line(level.x1, level.y, level.x2, level.y, color, [3, 4], 1);
+  }
+  if (model.layers?.signals === true) for (const signal of model.signals || []) {
+    const color = signal.side === "buy" ? colors.up : colors.down;
+    context.beginPath();
+    context.moveTo(signal.x, signal.y + (signal.side === "buy" ? 6 : -6));
+    context.lineTo(signal.x - 5, signal.y + (signal.side === "buy" ? -2 : 2));
+    context.lineTo(signal.x + 5, signal.y + (signal.side === "buy" ? -2 : 2));
+    context.closePath(); context.fillStyle = color; context.globalAlpha = signal.status === "confirmed" ? 0.95 : 0.64; context.fill(); context.globalAlpha = 1;
+    const status = signal.status === "confirmed" ? "✓" : "?";
+    label(signal.label + status, signal.x, signal.y + (signal.side === "buy" ? 16 : -10), { align: "center", font: "9px Inter, ui-sans-serif, system-ui, sans-serif", color });
+  }
+  if (model.spot) line(model.plotLeft, model.spot.y, model.historyRight, model.spot.y, colors.spot, [3, 4], 1);
+  // Bottom axis and the three visible date anchors.
+  line(model.plotLeft, model.plotBottom, model.plotRight, model.plotBottom, colors.axis, [], 1);
+  for (const date of model.dates || []) {
+    const align = date.x < model.width * .1 ? "left" : date.x > model.width * .9 ? "right" : "center";
+    label(date.label, date.x, date.y, { align });
+  }
+}
+
+const chanCanvasControllers = new WeakMap();
+function syncChanCanvas(element, binding) {
+  let controller = chanCanvasControllers.get(element);
+  if (!controller) {
+    const render = () => drawChanCanvas(element, controller?.model);
+    controller = { model: binding.value, render, observer: null, themeObserver: null };
+    if (typeof ResizeObserver !== "undefined") { controller.observer = new ResizeObserver(render); controller.observer.observe(element); }
+    if (typeof MutationObserver !== "undefined") {
+      controller.themeObserver = new MutationObserver(render);
+      controller.themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    }
+    window.addEventListener("resize", render);
+    chanCanvasControllers.set(element, controller);
+  }
+  controller.model = binding.value;
+  window.requestAnimationFrame(controller.render);
+}
+const chanChartCanvas = {
+  inserted: syncChanCanvas,
+  componentUpdated: syncChanCanvas,
+  unbind(element) {
+    const controller = chanCanvasControllers.get(element);
+    if (!controller) return;
+    controller.observer?.disconnect(); controller.themeObserver?.disconnect(); window.removeEventListener("resize", controller.render);
+    chanCanvasControllers.delete(element);
+  },
+};
+
+// Drag to pan the visible candle range. Modified wheel and two-finger pinch
+// zoom around the pointer midpoint so the price action under it stays anchored.
+const chanInteractionControllers = new WeakMap();
+const chanInteractionBindRetries = new WeakMap();
+function bindChanChartInteraction(element, binding) {
+  const svg = element.querySelector("svg");
+  if (!svg) return null;
+  const state = { model: binding.value?.chart, onPan: binding.value?.onPan, onZoom: binding.value?.onZoom, pointers: new Map(), drag: null, pinch: null, lastPinchBars: null, suppressClick: false, clickTimer: null };
+  const localPoint = (event) => {
+    const matrix = svg.getScreenCTM();
+    if (!matrix) return null;
+    const point = svg.createSVGPoint(); point.x = event.clientX; point.y = event.clientY;
+    return point.matrixTransform(matrix.inverse());
+  };
+  const plotRatio = (clientX) => {
+    const point = localPoint({ clientX, clientY: 0 });
+    const model = state.model;
+    if (!point || !model) return 0.5;
+    return Math.max(0, Math.min(1, (point.x - model.plotLeft) / Math.max(1, model.historyRight - model.plotLeft)));
+  };
+  const anchorIndex = (model, ratio) => model.windowStart + ratio * Math.max(0, model.visibleBars - 1);
+  const touchPointers = () => [...state.pointers.values()].filter((pointer) => pointer.pointerType === "touch");
+  const suppressNextClick = () => {
+    state.suppressClick = true; window.clearTimeout(state.clickTimer);
+    state.clickTimer = window.setTimeout(() => { state.suppressClick = false; }, 500);
+  };
+  const startPinch = () => {
+    const points = touchPointers();
+    if (points.length < 2 || !state.model?.candles?.length) return;
+    state.drag = null;
+    const first = localPoint(points[0]), second = localPoint(points[1]);
+    if (!first || !second) return;
+    const distance = Math.hypot(second.x - first.x, second.y - first.y);
+    const midpoint = (points[0].clientX + points[1].clientX) / 2;
+    const ratio = plotRatio(midpoint);
+    state.pinch = { distance: Math.max(1, distance), visibleBars: state.model.visibleBars, anchorRatio: ratio, anchorIndex: anchorIndex(state.model, ratio) };
+    state.lastPinchBars = state.model.visibleBars;
+    element.classList.add("chan-chart-dragging");
+  };
+  const onPointerDown = (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    if (event.pointerType !== "touch" && event.pointerType !== "mouse" && event.pointerType !== "pen") return;
+    // SVG controls and projection paths own their click/touch gestures. Taking
+    // pointer capture here retargets their click to the chart container.
+    if (event.target.closest?.(".chan-scenario-toggle-svg, .chan-projection-up, .chan-projection-down, .chan-projection-range")) return;
+    const point = localPoint(event);
+    const model = state.model;
+    if (!point || !model || point.x < model.plotLeft || point.x > model.historyRight || point.y < model.plotTop || point.y > model.plotBottom) return;
+    state.pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY, pointerType: event.pointerType });
+    try { element.setPointerCapture(event.pointerId); } catch (_) { /* Capture is not available in older browsers. */ }
+    if (event.pointerType === "touch" && touchPointers().length >= 2) {
+      startPinch();
+      return;
+    }
+    state.drag = { pointerId: event.pointerId, clientX: point.x, clientY: point.y, startX: point.x, startY: point.y, moved: false, fractionalBars: 0, emittedBars: 0 };
+  };
+  const onPointerMove = (event) => {
+    if (!state.pointers.has(event.pointerId)) return;
+    state.pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY, pointerType: event.pointerType });
+    const model = state.model;
+    const points = touchPointers();
+    if (state.pinch && points.length >= 2 && model?.candles?.length) {
+      const first = localPoint(points[0]), second = localPoint(points[1]);
+      if (!first || !second) return;
+      const distance = Math.max(1, Math.hypot(second.x - first.x, second.y - first.y));
+      const scale = state.pinch.distance / distance;
+      const nextVisibleBars = Math.max(Math.min(12, model.totalBars), Math.min(model.totalBars, Math.round(state.pinch.visibleBars * scale)));
+      if (nextVisibleBars === state.lastPinchBars) return;
+      state.lastPinchBars = nextVisibleBars;
+      suppressNextClick();
+      state.onZoom?.(scale, state.pinch.anchorIndex, state.pinch.anchorRatio, state.pinch.visibleBars);
+      return;
+    }
+    if (!state.drag || state.drag.pointerId !== event.pointerId || !model?.candles?.length) return;
+    const point = localPoint(event);
+    if (!point) return;
+    const dx = point.x - state.drag.clientX, dy = point.y - state.drag.clientY;
+    const totalX = point.x - state.drag.startX, totalY = point.y - state.drag.startY;
+    if (!state.drag.moved && Math.abs(totalX) > 5 && Math.abs(totalX) > Math.abs(totalY)) {
+      state.drag.moved = true;
+      element.classList.add("chan-chart-dragging");
+    }
+    const slot = (model.historyRight - model.plotLeft) / model.candles.length;
+    if (Math.abs(dx) > 0.25 && state.drag.moved) {
+      state.drag.fractionalBars += dx / Math.max(1, slot);
+      const wholeBars = Math.trunc(state.drag.fractionalBars);
+      const deltaBars = wholeBars - state.drag.emittedBars;
+      if (deltaBars) { state.onPan?.(deltaBars); state.drag.emittedBars = wholeBars; }
+      state.drag.clientX = point.x; state.drag.clientY = point.y;
+    }
+  };
+  const onPointerUp = (event) => {
+    const pointer = state.pointers.get(event.pointerId);
+    state.pointers.delete(event.pointerId);
+    if (state.pinch && touchPointers().length < 2) suppressNextClick();
+    if (state.drag?.pointerId === event.pointerId) {
+      if (state.drag.moved) {
+        suppressNextClick();
+      }
+      state.drag = null;
+    }
+    if (state.pinch && touchPointers().length < 2) {
+      state.pinch = null;
+      const remaining = touchPointers()[0];
+      const remainingPointerId = remaining ? [...state.pointers.entries()].find(([, value]) => value === remaining)?.[0] : null;
+      const remainingPoint = remaining ? localPoint(remaining) : null;
+      state.drag = remaining && remainingPoint ? { pointerId: remainingPointerId, clientX: remainingPoint.x, clientY: remainingPoint.y, startX: remainingPoint.x, startY: remainingPoint.y, moved: true, fractionalBars: 0, emittedBars: 0 } : null;
+    }
+    if (!state.pointers.size) element.classList.remove("chan-chart-dragging");
+    if (pointer) { try { element.releasePointerCapture(event.pointerId); } catch (_) { /* Pointer capture may already be released. */ } }
+  };
+  const onClickCapture = (event) => {
+    if (!state.suppressClick) return;
+    window.clearTimeout(state.clickTimer);
+    state.clickTimer = window.setTimeout(() => { state.suppressClick = false; }, 500);
+    event.preventDefault(); event.stopPropagation();
+  };
+  const onWheel = (event) => {
+    if (!(event.ctrlKey || event.metaKey) || !state.model?.candles?.length) return;
+    event.preventDefault();
+    const ratio = plotRatio(event.clientX);
+    state.onZoom?.(event.deltaY < 0 ? 0.82 : 1.22, null, ratio);
+  };
+  element.addEventListener("pointerdown", onPointerDown);
+  element.addEventListener("pointermove", onPointerMove);
+  element.addEventListener("pointerup", onPointerUp);
+  element.addEventListener("pointercancel", onPointerUp);
+  element.addEventListener("lostpointercapture", onPointerUp);
+  element.addEventListener("click", onClickCapture, true);
+  // Run before SVG overlay targets so a chart layer cannot swallow the
+  // modified wheel gesture after switching between Chan and technical modes.
+  element.addEventListener("wheel", onWheel, { passive: false, capture: true });
+  return {
+    update(value) { state.model = value?.chart; state.onPan = value?.onPan; state.onZoom = value?.onZoom; },
+    destroy() {
+      window.clearTimeout(state.clickTimer); element.classList.remove("chan-chart-dragging");
+      element.removeEventListener("pointerdown", onPointerDown); element.removeEventListener("pointermove", onPointerMove);
+      element.removeEventListener("pointerup", onPointerUp); element.removeEventListener("pointercancel", onPointerUp);
+      element.removeEventListener("lostpointercapture", onPointerUp); element.removeEventListener("click", onClickCapture, true);
+      element.removeEventListener("wheel", onWheel, true);
+    },
+  };
+}
+function syncChanChartInteraction(element, binding, attempt = 0) {
+  let controller = chanInteractionControllers.get(element);
+  if (controller && controller.svg !== element.querySelector("svg")) { controller.destroy(); chanInteractionControllers.delete(element); controller = null; }
+  if (controller) controller.update(binding.value);
+  else {
+    const interaction = bindChanChartInteraction(element, binding);
+    if (interaction) { controller = { ...interaction, svg: element.querySelector("svg") }; chanInteractionControllers.set(element, controller); }
+    else if (attempt < 4 && !chanInteractionBindRetries.has(element)) {
+      const retry = window.requestAnimationFrame(() => {
+        chanInteractionBindRetries.delete(element);
+        if (element.isConnected) syncChanChartInteraction(element, binding, attempt + 1);
+      });
+      chanInteractionBindRetries.set(element, retry);
+    }
+  }
+}
+const chanChartInteraction = {
+  inserted: syncChanChartInteraction,
+  componentUpdated: syncChanChartInteraction,
+  unbind(element) {
+    const retry = chanInteractionBindRetries.get(element);
+    if (retry != null) window.cancelAnimationFrame(retry);
+    chanInteractionBindRetries.delete(element);
+    chanInteractionControllers.get(element)?.destroy(); chanInteractionControllers.delete(element);
   },
 };
 
@@ -666,7 +1093,11 @@ function clearSummary(targetId) {
 
 /* 图表模块只暴露绘制入口，页面状态不进入这里。 */
 window.OptionScopeCharts = {
+  chanChartCanvas: chanChartCanvas,
+  renderChanCanvas: drawChanCanvas,
+  chanChartInteraction: chanChartInteraction,
   chanChartHover: chanChartHover,
+  chanStructureTooltipDetails: chanStructureTooltipDetails,
   renderSignedChart: renderSignedChart,
   renderLevelsChart: renderLevelsChart,
   renderDistributionSummary: renderDistributionSummary,

@@ -49,6 +49,101 @@ func (c *YFinanceHistoryClient) FetchAdjusted(ctx context.Context, symbol, perio
 	return c.fetch(ctx, symbol, period, true)
 }
 
+// FetchChanAdjusted fetches adjusted and raw OHLC independently and joins them
+// by session date. Chan analysis must never silently fall back to raw prices.
+func (c *YFinanceHistoryClient) FetchChanAdjusted(ctx context.Context, symbol, period string) (ChanAdjustedHistoryResult, error) {
+	adjusted, err := c.fetch(ctx, symbol, period, true)
+	if err != nil {
+		return ChanAdjustedHistoryResult{}, err
+	}
+	raw, err := c.fetch(ctx, symbol, period, false)
+	if err != nil {
+		return ChanAdjustedHistoryResult{}, fmt.Errorf("fetch raw bars for adjusted Chan history: %w", err)
+	}
+	return pairChanAdjustedBars(adjusted, raw)
+}
+
+func pairChanAdjustedBars(adjusted, raw HistoryResult) (ChanAdjustedHistoryResult, error) {
+	rawByDate := make(map[string]map[string]any, len(raw.Bars))
+	for _, bar := range raw.Bars {
+		if date, ok := bar["date"].(string); ok {
+			rawByDate[date] = bar
+		}
+	}
+	joined := make([]map[string]any, 0, len(adjusted.Bars))
+	for _, bar := range adjusted.Bars {
+		date, ok := bar["date"].(string)
+		if !ok {
+			continue
+		}
+		if parsed, err := time.Parse(time.DateOnly, date); err != nil || parsed.Format(time.DateOnly) != date {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("invalid adjusted Chan bar date %q", date)
+		}
+		rawBar, found := rawByDate[date]
+		if !found {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("raw OHLC missing for adjusted Chan bar %s", date)
+		}
+		adjustedClose, adjOK := historyNumber(bar["close"])
+		rawClose, rawOK := historyNumber(rawBar["close"])
+		if !adjOK || !rawOK || adjustedClose <= 0 || rawClose <= 0 {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("invalid raw or adjusted close for Chan bar %s", date)
+		}
+		item := make(map[string]any, len(bar)+6)
+		for key, value := range bar {
+			item[key] = value
+		}
+		factor := adjustedClose / rawClose
+		for _, field := range []string{"open", "high", "low", "close", "volume"} {
+			value, valid := historyNumber(rawBar[field])
+			if !valid || field != "volume" && value <= 0 || field == "volume" && value < 0 {
+				return ChanAdjustedHistoryResult{}, fmt.Errorf("raw %s is invalid for Chan bar %s", field, date)
+			}
+			item["raw_"+field] = value
+			if field == "volume" {
+				continue
+			}
+			adjustedValue, valid := historyNumber(bar[field])
+			if !valid || adjustedValue <= 0 || math.Abs(adjustedValue-value*factor) > 1e-6*math.Max(1, adjustedValue) {
+				return ChanAdjustedHistoryResult{}, fmt.Errorf("adjusted %s is invalid for Chan bar %s", field, date)
+			}
+		}
+		if rawBarHigh, ok := historyNumber(rawBar["high"]); !ok {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("raw high is invalid for Chan bar %s", date)
+		} else if rawBarLow, ok := historyNumber(rawBar["low"]); !ok || rawBarLow > rawBarHigh {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("raw OHLC is inconsistent for Chan bar %s", date)
+		}
+		if adjustedHigh, ok := historyNumber(bar["high"]); !ok {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("adjusted high is invalid for Chan bar %s", date)
+		} else if adjustedLow, ok := historyNumber(bar["low"]); !ok || adjustedLow > adjustedHigh {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("adjusted OHLC is inconsistent for Chan bar %s", date)
+		}
+		item["adjustment_factor"] = factor
+		joined = append(joined, item)
+	}
+	if len(joined) == 0 {
+		return ChanAdjustedHistoryResult{}, errors.New("no paired raw and adjusted Chan bars")
+	}
+	fetchedAt := adjusted.FetchedAt
+	if raw.FetchedAt.After(fetchedAt) {
+		fetchedAt = raw.FetchedAt
+	}
+	return ChanAdjustedHistoryResult{Symbol: adjusted.Symbol, Bars: joined, FetchedAt: fetchedAt, Source: adjusted.Source,
+		AdjustmentType: "split_dividend_auto", Timeframe: "1d"}, nil
+}
+
+func historyNumber(value any) (float64, bool) {
+	switch number := value.(type) {
+	case float64:
+		return number, !math.IsNaN(number) && !math.IsInf(number, 0)
+	case int64:
+		return float64(number), true
+	case int:
+		return float64(number), true
+	default:
+		return 0, false
+	}
+}
+
 // FetchIntraday returns completed-session 15-minute Yahoo bars. Yahoo only
 // retains this interval for a limited recent window, so refresh it briefly in
 // memory and let callers aggregate larger intraday periods locally.
@@ -192,7 +287,7 @@ func ptrTime(value time.Time) *time.Time { return &value }
 
 func supportedHistoryPeriod(period string) bool {
 	switch period {
-	case "1mo", "6mo", "1y", "2y", "5y", "max":
+	case "1mo", "6mo", "1y", "2y", "5y", "10y", "20y", "max":
 		return true
 	default:
 		return false

@@ -1,0 +1,40 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+
+const template = fs.readFileSync("web/static/index.html", "utf8");
+const client = fs.readFileSync("web/static/common/js/chan-client.js", "utf8");
+const readme = fs.readFileSync("README.md", "utf8");
+const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
+
+assert.match(template, /class="chan-meta"[^>]*>[\s\S]*?chanFrame.dataSummary/, "Chan summary must be rendered in the quote metadata row");
+assert.match(template, /chanChartLayers\.recursiveCenters && chanChartLayers\.recursiveCenters\[level\] === true/, "recursive layer controls must tolerate missing persisted layer state");
+assert.match(template, /aria-label="显示或隐藏全部级别的线段"[^>]*@click="toggleChanChartLayer\('segments'\)"/, "the all-segments master switch must remain available and connected regardless of the currently available levels");
+assert.match(template, /v-for="level in chanSegmentLevels"[^>]*toggleChanSegmentLevel\(level\)/, "each available segment level must retain its independent visibility control");
+assert.match(template, /\{\{ chanTurningStatus\(0\) \}\} \/ \{\{ chanTurningStatus\(1\) \}\}/, "turning status summary must use its guarded accessor instead of indexing the frame array in the template");
+assert.doesNotMatch(template, /chanFrame\.turning\[[01]\]/, "template must not directly index turning data that can be absent during initial render");
+assert.match(app, /chanTurningStatus\(index\) \{[\s\S]*?Array\.isArray\(turning\) \? turning\[index\] : null[\s\S]*?item\?\.status \|\| "等待信号"/, "turning status accessor must tolerate an absent frame array and return a fallback");
+assert.match(app, /const recursiveCenters = this\.chanChartLayers\?\.recursiveCenters \|\| \{\};[\s\S]*?recursiveCenters\[level\] !== true/, "recursive center toggles must tolerate a missing layer map");
+assert.match(template, /class="chart-tooltip chan-chart-tooltip"/, "Canvas chart must retain a dedicated structure and OHLC tooltip");
+assert.match(template, /signal.evidenceLabel \|\| signal.detail/, "signal cards must show the structured rule evidence when available");
+assert.ok(client.includes("规则证据："), "signal evidence must list satisfied conditions");
+assert.ok(client.includes("待满足："), "signal evidence must list pending conditions");
+assert.ok(client.includes("失效边界 "), "signal evidence must expose its invalidation price");
+assert.match(client, /市场环境：/, "signal evidence must expose market filter state");
+assert.match(client, /跨级别确认：/, "signal evidence must expose lower-level confirmation state");
+assert.match(template, /条件情景 · 非预测/, "Chan chart scenarios must be identified as conditional, not predictive");
+assert.match(template, /倾向分为规则估算，非统计概率/, "Chan chart tilt scores must not be presented as win probabilities");
+assert.match(template, /倾向分是规则估算，不代表胜率/, "Chan spot guidance must state tilt scores are not win rates");
+assert.match(template, /本项目尚无对应胜率统计/, "Chan candidates must disclose when win-rate evidence is unavailable");
+assert.match(template, /倾向分为规则估算，非统计概率/, "chart legend must describe the tilt score as a rule estimate, not a probability");
+assert.match(template, /倾向分是规则估算，不代表胜率/, "spot guidance must not present its rule score as a win rate");
+assert.match(template, /综合日周位置、确认笔与有效信号的规则倾向分 · 非历史胜率/, "scenario tilt must be labeled as a rule estimate, not historical win rate");
+assert.match(template, /不等同于完整一类、二类买卖点[\s\S]*?本项目尚无对应胜率统计/, "legacy structure observations must not imply complete signals or a measured win rate");
+assert.match(readme, /项目尚无经过成本和样本外验证的 v4 收益报告，不报告未经验证的胜率/, "documentation must not claim unvalidated backtest returns or win rates");
+assert.match(template, /key="chan-projections" v-if="chanScenariosVisible"/, "scenario projection lines must follow the scenario visibility state");
+assert.match(template, /@click.stop="toggleChanScenarios"/, "scenario visibility control must remain connected to its toggle");
+const scenarioToggle = app.indexOf("toggleChanScenarios() {");
+assert.ok(scenarioToggle >= 0, "scenario toggle method must exist");
+assert.ok(app.indexOf("this.chanScenariosVisible = !this.chanScenariosVisible;", scenarioToggle) > scenarioToggle, "scenario toggle must invert visibility");
+assert.ok(app.indexOf("OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible", scenarioToggle) > scenarioToggle, "scenario toggle must rebuild the Canvas model");
+
+console.log("Chan rendered UI contract checks passed");

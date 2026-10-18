@@ -51,6 +51,12 @@ type intradayCacheEntry struct {
 	fetchedAt time.Time
 }
 
+type chanAdjustedHistoryCacheEntry struct {
+	bars      []map[string]any
+	fetchedAt time.Time
+	source    string
+}
+
 type cachedValuationRegime struct {
 	regime  string
 	signals map[string]any
@@ -185,39 +191,49 @@ type IntradayHistoryProvider interface {
 	IntradayHistory(context.Context, string, string) (provider.HistoryResult, error)
 }
 
+type ChanAdjustedHistoryProvider interface {
+	ChanAdjustedHistory(context.Context, string, string) (provider.ChanAdjustedHistoryResult, error)
+}
+
 type Service struct {
-	cfg                   config.Config
-	provider              MarketProvider
-	store                 *store.SQLite
-	mu                    sync.RWMutex
-	quotes                map[string]cachedQuote
-	expires               map[string][]string
-	chains                map[string]cachedChain
-	events                eventLog
-	refreshGates          map[string]*refreshGate
-	subscriptions         map[string]eventSubscription
-	gammaJobs             map[string]*gammaJob
-	valuationJobs         map[string]bool
-	valuationAttempts     map[string]time.Time
-	valuationRegimes      map[string]cachedValuationRegime
-	historyLocks          map[string]*historyLockEntry
-	historyRefreshJobs    map[string]bool
-	historyRefreshAfter   map[string]time.Time
-	levelsFlights         map[string]*levelsCacheFlight
-	analyticsPrefetch     map[string]bool
-	chanHistoryJobs       map[string]bool
-	intradayMu            sync.Mutex
-	intradayHistoryCache  map[string]intradayCacheEntry
-	snapshotRefreshJobs   map[string]bool
-	gammaHeavyGate        chan struct{}
-	background            context.Context
-	stopBackground        context.CancelFunc
-	backgroundWG          sync.WaitGroup
-	leaseOwner            string
-	cleanupOnce           sync.Once
-	cleanupMu             sync.Mutex
-	housekeepingLeaseHeld bool // guarded by cleanupMu
-	cleanupActive         bool // guarded by cleanupMu
+	cfg                    config.Config
+	provider               MarketProvider
+	store                  *store.SQLite
+	mu                     sync.RWMutex
+	quotes                 map[string]cachedQuote
+	expires                map[string][]string
+	chains                 map[string]cachedChain
+	events                 eventLog
+	refreshGates           map[string]*refreshGate
+	subscriptions          map[string]eventSubscription
+	gammaJobs              map[string]*gammaJob
+	valuationJobs          map[string]bool
+	valuationAttempts      map[string]time.Time
+	valuationRegimes       map[string]cachedValuationRegime
+	historyLocks           map[string]*historyLockEntry
+	historyRefreshJobs     map[string]bool
+	historyRefreshAfter    map[string]time.Time
+	levelsFlights          map[string]*levelsCacheFlight
+	analyticsPrefetch      map[string]bool
+	chanHistoryJobs        map[string]bool
+	chanAdjustedMu         sync.Mutex
+	chanAdjustedCache      map[string]chanAdjustedHistoryCacheEntry
+	chanAdjustedJobs       map[string]bool
+	chanAdjustedRetryAfter map[string]time.Time
+	intradayMu             sync.Mutex
+	intradayHistoryCache   map[string]intradayCacheEntry
+	intradayRefreshJobs    map[string]bool
+	intradayRefreshAfter   map[string]time.Time
+	snapshotRefreshJobs    map[string]bool
+	gammaHeavyGate         chan struct{}
+	background             context.Context
+	stopBackground         context.CancelFunc
+	backgroundWG           sync.WaitGroup
+	leaseOwner             string
+	cleanupOnce            sync.Once
+	cleanupMu              sync.Mutex
+	housekeepingLeaseHeld  bool // guarded by cleanupMu
+	cleanupActive          bool // guarded by cleanupMu
 }
 
 func New(cfg config.Config) (*Service, error) {
@@ -286,9 +302,14 @@ func NewWithProvider(cfg config.Config, repository *store.SQLite, marketProvider
 		chains: make(map[string]cachedChain), events: eventLog{nextID: 1, payloads: make(map[string]map[string]any)},
 		refreshGates: make(map[string]*refreshGate), subscriptions: make(map[string]eventSubscription),
 		gammaJobs: make(map[string]*gammaJob), valuationJobs: make(map[string]bool), valuationAttempts: make(map[string]time.Time), valuationRegimes: make(map[string]cachedValuationRegime), historyLocks: make(map[string]*historyLockEntry), historyRefreshJobs: make(map[string]bool), historyRefreshAfter: make(map[string]time.Time), levelsFlights: make(map[string]*levelsCacheFlight), analyticsPrefetch: make(map[string]bool), chanHistoryJobs: make(map[string]bool), snapshotRefreshJobs: make(map[string]bool),
-		intradayHistoryCache: make(map[string]intradayCacheEntry),
-		gammaHeavyGate:       make(chan struct{}, gateLimit),
-		background:           background, stopBackground: stop, leaseOwner: hex.EncodeToString(ownerBytes[:]),
+		intradayHistoryCache:   make(map[string]intradayCacheEntry),
+		intradayRefreshJobs:    make(map[string]bool),
+		intradayRefreshAfter:   make(map[string]time.Time),
+		chanAdjustedCache:      make(map[string]chanAdjustedHistoryCacheEntry),
+		chanAdjustedJobs:       make(map[string]bool),
+		chanAdjustedRetryAfter: make(map[string]time.Time),
+		gammaHeavyGate:         make(chan struct{}, gateLimit),
+		background:             background, stopBackground: stop, leaseOwner: hex.EncodeToString(ownerBytes[:]),
 	}
 }
 
@@ -346,6 +367,7 @@ func (s *Service) Router() *gin.Engine {
 	api.GET("/levels/:symbol", s.levels)
 	api.GET("/chan/:symbol", s.chanAnalysis)
 	api.GET("/chan/:symbol/intraday", s.intradayChanAnalysis)
+	api.GET("/chan/:symbol/adjusted", s.chanAdjustedAnalysis)
 	api.GET("/status/:symbol", s.status)
 	api.POST("/cleanup", s.cleanup)
 	return router
@@ -3702,7 +3724,7 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 	}
 
 	latestDate := trendBarDate(latest)
-	latestIsToday := latestDate == today && marketState == "REGULAR"
+	latestIsToday := latestDate == today && (marketState == "REGULAR" || marketState == "CLOSED")
 	if latestIsToday {
 		if previous != nil {
 			result["previous_close"], result["previous_close_date"] = previous["close"], previous["date"]
@@ -3712,10 +3734,25 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 			result["previous_open"], result["previous_open_date"] = nil, nil
 		}
 	}
-
+	// When the exchange is closed for a weekend or holiday, show the session
+	// before the most recent completed session in the "previous session" fields.
+	// If history is already missing that latest session, keep its actual latest
+	// bar instead of skipping a second bar.
+	if marketState == "CLOSED" && previous != nil {
+		if currentDate, err := time.ParseInLocation(time.DateOnly, today, location); err == nil {
+			latestCompletedSession := currentDate
+			for searched := 0; searched < 14 && !marketcalendar.IsTradingDay(latestCompletedSession); searched++ {
+				latestCompletedSession = latestCompletedSession.AddDate(0, 0, -1)
+			}
+			if marketcalendar.IsTradingDay(latestCompletedSession) && latestDate == latestCompletedSession.Format(time.DateOnly) {
+				result["previous_close"], result["previous_close_date"] = previous["close"], previous["date"]
+				result["previous_open"], result["previous_open_date"] = previous["open"], previous["date"]
+			}
+		}
+	}
 	// Extended-session summaries can be newer than daily bars and provide the
 	// authoritative regular-session close when the cached daily history lags.
-	if marketState != "REGULAR" {
+	if marketState != "REGULAR" && marketState != "CLOSED" {
 		var summary map[string]any
 		if marketState == "PRE" {
 			summary = nestedMap(quote.Sessions, "pre")

@@ -21,6 +21,7 @@ func turningSignals(strokes []Stroke, centers []Center, bars []Bar) []Signal {
 			side = "buy"
 		}
 		if seen[side] || !previous.Confirmed || previous.Direction != current.Direction ||
+			previous.Chain != current.Chain ||
 			previous.Start.RawIndex < 35 || previous.MACDArea <= 1e-9 || current.MACDArea <= 1e-9 {
 			continue
 		}
@@ -68,7 +69,7 @@ func turningSignals(strokes []Stroke, centers []Center, bars []Bar) []Signal {
 			signal.Confirmation = "这段上涨还在形成，等待随后出现符合识别规则的一段回落来确认高点；在此之前，高点和 MACD 柱面积还会更新"
 			signal.NextStep = fmt.Sprintf("高点确认后，观察下跌后的第一次反弹能否涨回 %.2f，再看收盘是否跌破回落低点", current.End.Price)
 		}
-		if current.Confirmed && index+1 < len(strokes) {
+		if current.Confirmed && index+1 < len(strokes) && strokes[index+1].Chain == current.Chain {
 			reversal := strokes[index+1]
 			signal.Status, signal.Phase = "candidate", "reversal"
 			signal.ConfirmedAt, signal.PhaseAt = current.ConfirmedAt, current.ConfirmedAt
@@ -88,7 +89,7 @@ func turningSignals(strokes []Stroke, centers []Center, bars []Bar) []Signal {
 			} else {
 				signal.PhaseAt = reversal.ConfirmedAt
 			}
-			if reversal.Confirmed && index+2 < len(strokes) {
+			if reversal.Confirmed && index+2 < len(strokes) && strokes[index+2].Chain == current.Chain {
 				retest := strokes[index+2]
 				held := side == "buy" && retest.Low > current.End.Price || side == "sell" && retest.High < current.End.Price
 				if retest.Confirmed && retest.Direction == current.Direction && held {

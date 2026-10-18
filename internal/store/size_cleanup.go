@@ -63,15 +63,18 @@ func (s *SQLite) CleanupBySize(maxBytes int64, batchSize int, budget time.Durati
 		return nil, err
 	}
 	result := map[string]any{
-		"limit_bytes":        maxBytes,
-		"before_bytes":       before,
-		"after_bytes":        before,
-		"live_bytes":         before,
-		"raw_json_cleared":   int64(0),
-		"superseded_options": int64(0),
-		"superseded_quotes":  int64(0),
-		"stale_runs":         int64(0),
-		"vacuumed":           false,
+		"limit_bytes":                     maxBytes,
+		"before_bytes":                    before,
+		"after_bytes":                     before,
+		"live_bytes":                      before,
+		"raw_json_cleared":                int64(0),
+		"superseded_options":              int64(0),
+		"superseded_quotes":               int64(0),
+		"stale_runs":                      int64(0),
+		"intraday_bars_pruned":            int64(0),
+		"chan_adjusted_bars_pruned":       int64(0),
+		"chan_structure_revisions_pruned": int64(0),
+		"vacuumed":                        false,
 	}
 	if maxBytes <= 0 || before <= maxBytes {
 		return result, nil
@@ -130,9 +133,63 @@ func (s *SQLite) CleanupBySize(maxBytes int64, batchSize int, budget time.Durati
 			result["superseded_options"] = result["superseded_options"].(int64) + options
 			result["superseded_quotes"] = result["superseded_quotes"].(int64) + quotes
 		}
+		// Intraday bars are all distinct observations, so they cannot be thinned
+		// like superseded snapshots. If snapshots are still too large, discard
+		// progressively older 15-minute history while retaining recent candles.
+		for _, keepDays := range []int{30, 7, 1} {
+			live, err = s.databaseLiveBytesContext(cleanupCtx)
+			if err != nil && cleanupCtx.Err() == nil {
+				return nil, err
+			}
+			if cleanupCtx.Err() != nil || live <= target || time.Now().After(deadline) {
+				break
+			}
+			cutoff := intradayRetentionFloor(time.Now(), keepDays)
+			pruned, pruneErr := s.pruneIntradayBefore(cutoff, batchSize, deadline)
+			if pruneErr != nil {
+				return nil, pruneErr
+			}
+			result["intraday_bars_pruned"] = result["intraday_bars_pruned"].(int64) + pruned
+		}
+		// Adjusted Chan bars duplicate raw OHLC plus adjustment metadata. Keep a
+		// recent minimum window, then prune older rows if the size limit still
+		// requires space. This table is isolated from all raw-price consumers.
+		for _, keepDays := range []int{730, 365, 180, 30, 1} {
+			live, err = s.databaseLiveBytesContext(cleanupCtx)
+			if err != nil && cleanupCtx.Err() == nil {
+				return nil, err
+			}
+			if cleanupCtx.Err() != nil || live <= target || time.Now().After(deadline) {
+				break
+			}
+			cutoff := time.Now().UTC().AddDate(0, 0, -keepDays).Format(time.DateOnly)
+			pruned, pruneErr := s.pruneChanAdjustedBefore(cutoff, batchSize, deadline)
+			if pruneErr != nil {
+				return nil, pruneErr
+			}
+			result["chan_adjusted_bars_pruned"] = result["chan_adjusted_bars_pruned"].(int64) + pruned
+		}
+		// Keep the latest structure snapshot for each symbol/timeframe because
+		// it is needed to detect future revisions. Old revision audit records
+		// are historical and can be pruned under the same database-size limit.
+		for _, keepDays := range []int{1825, 1095, 730, 365, 180, 30, 1} {
+			live, err = s.databaseLiveBytesContext(cleanupCtx)
+			if err != nil && cleanupCtx.Err() == nil {
+				return nil, err
+			}
+			if cleanupCtx.Err() != nil || live <= target || time.Now().After(deadline) {
+				break
+			}
+			cutoff := time.Now().UTC().AddDate(0, 0, -keepDays).Format(time.RFC3339Nano)
+			pruned, pruneErr := s.pruneChanStructureRevisionsBefore(cutoff, batchSize, deadline)
+			if pruneErr != nil {
+				return nil, pruneErr
+			}
+			result["chan_structure_revisions_pruned"] = result["chan_structure_revisions_pruned"].(int64) + pruned
+		}
 	}
 
-	changed := result["raw_json_cleared"].(int64) + result["superseded_options"].(int64) + result["superseded_quotes"].(int64) + result["stale_runs"].(int64)
+	changed := result["raw_json_cleared"].(int64) + result["superseded_options"].(int64) + result["superseded_quotes"].(int64) + result["stale_runs"].(int64) + result["intraday_bars_pruned"].(int64) + result["chan_adjusted_bars_pruned"].(int64) + result["chan_structure_revisions_pruned"].(int64)
 	if changed > 0 || before > maxBytes {
 		vacuumed, vacuumErr := s.checkpointAndVacuum()
 		if vacuumErr != nil {
@@ -151,10 +208,11 @@ func (s *SQLite) CleanupBySize(maxBytes int64, batchSize int, budget time.Durati
 	result["after_bytes"] = after
 	result["live_bytes"] = live
 	if after > maxBytes {
-		log.Printf("database size remains above limit: %.1f MB / %.1f MB; removed %d superseded snapshot rows",
+		log.Printf("database size remains above limit: %.1f MB / %.1f MB; removed %d superseded snapshot rows and %d intraday bars",
 			float64(after)/1048576,
 			float64(maxBytes)/1048576,
 			result["superseded_options"].(int64)+result["superseded_quotes"].(int64),
+			result["intraday_bars_pruned"].(int64)+result["chan_adjusted_bars_pruned"].(int64)+result["chan_structure_revisions_pruned"].(int64),
 		)
 	} else {
 		log.Printf("database size cleanup complete: %.1f MB -> %.1f MB (limit %.1f MB, VACUUM=%t)",
@@ -165,6 +223,133 @@ func (s *SQLite) CleanupBySize(maxBytes int64, batchSize int, budget time.Durati
 		)
 	}
 	return result, nil
+}
+
+func (s *SQLite) pruneChanStructureRevisionsBefore(cutoff string, batchSize int, deadline time.Time) (int64, error) {
+	var deleted int64
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer conn.Close()
+	defer restoreCleanupBusyTimeout(conn)
+	for ctx.Err() == nil {
+		if err := limitCleanupBusyTimeout(conn, deadline); err != nil {
+			if ctx.Err() != nil {
+				return deleted, nil
+			}
+			return deleted, err
+		}
+		result, err := conn.ExecContext(ctx, `DELETE FROM chan_structure_revisions WHERE id IN (
+SELECT id FROM chan_structure_revisions WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?)`, cutoff, batchSize)
+		if err != nil {
+			if cleanupBudgetExpired(ctx, deadline, err) {
+				return deleted, nil
+			}
+			return deleted, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return deleted, err
+		}
+		deleted += count
+		if count < int64(batchSize) {
+			break
+		}
+	}
+	return deleted, nil
+}
+
+func (s *SQLite) pruneChanAdjustedBefore(cutoff string, batchSize int, deadline time.Time) (int64, error) {
+	var deleted int64
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer conn.Close()
+	defer restoreCleanupBusyTimeout(conn)
+	for ctx.Err() == nil {
+		if err := limitCleanupBusyTimeout(conn, deadline); err != nil {
+			if ctx.Err() != nil {
+				return deleted, nil
+			}
+			return deleted, err
+		}
+		result, err := conn.ExecContext(ctx, `DELETE FROM chan_adjusted_history WHERE rowid IN (SELECT rowid FROM chan_adjusted_history WHERE bar_date < ? ORDER BY bar_date ASC LIMIT ?)`, cutoff, batchSize)
+		if err != nil {
+			if cleanupBudgetExpired(ctx, deadline, err) {
+				return deleted, nil
+			}
+			return deleted, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return deleted, err
+		}
+		deleted += count
+		if count < int64(batchSize) {
+			break
+		}
+	}
+	return deleted, nil
+}
+
+func intradayRetentionFloor(now time.Time, keepDays int) string {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	return now.In(location).AddDate(0, 0, -keepDays).Format("2006-01-02 15:04")
+}
+
+func (s *SQLite) pruneIntradayBefore(cutoff string, batchSize int, deadline time.Time) (int64, error) {
+	var deleted int64
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer conn.Close()
+	defer restoreCleanupBusyTimeout(conn)
+	for ctx.Err() == nil {
+		if err := limitCleanupBusyTimeout(conn, deadline); err != nil {
+			if ctx.Err() != nil {
+				return deleted, nil
+			}
+			return deleted, err
+		}
+		result, err := conn.ExecContext(ctx, `DELETE FROM intraday_history WHERE rowid IN (
+SELECT rowid FROM intraday_history WHERE bar_time < ? ORDER BY bar_time ASC LIMIT ?)`, cutoff, batchSize)
+		if err != nil {
+			if cleanupBudgetExpired(ctx, deadline, err) {
+				return deleted, nil
+			}
+			return deleted, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return deleted, err
+		}
+		deleted += count
+		if count < int64(batchSize) {
+			break
+		}
+	}
+	return deleted, nil
 }
 
 func (s *SQLite) clearRawJSON(batchSize int, deadline time.Time) (int64, error) {

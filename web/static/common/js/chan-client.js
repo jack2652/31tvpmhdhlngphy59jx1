@@ -1,4 +1,4 @@
-/* 缠论展示适配：Go 识别结构，浏览器按现价解读已识别的笔端点并绘制 SVG。 */
+/* 缠论展示适配：Go 识别结构，浏览器按现价解读已识别的笔端点并生成 Canvas 图表模型。 */
 (function (window) {
   "use strict";
 
@@ -7,8 +7,83 @@
   const direction = (value) => ({ up: "向上", down: "向下", unknown: "尚未成笔" }[value] || "尚未成笔");
   // 盘中周期的时间戳形如 2026-10-13 15:45；坐标轴只保留月-日与时间，避免三处标签相互挤压。
   const axisDateLabel = (value) => { const text = String(value || ""); return text.includes(" ") ? text.slice(5) : text; };
+  // Yahoo timestamps 15-minute bars by their opening time. Shift only the
+  // display value so labels show the end of the interval, preserving the
+  // original timestamp for ordering and Chan analysis.
+  function displayBarTime(value, period) {
+    const text = String(value || "");
+    if (period !== "15m") return text;
+    const match = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})$/.exec(text);
+    if (!match) return text;
+    const [, year, month, day, hour, minute] = match;
+    const end = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute) + 15));
+    return `${end.getUTCFullYear()}-${String(end.getUTCMonth() + 1).padStart(2, "0")}-${String(end.getUTCDate()).padStart(2, "0")} ${String(end.getUTCHours()).padStart(2, "0")}:${String(end.getUTCMinutes()).padStart(2, "0")}`;
+  }
   const chartCache = new WeakMap();
   const turningKinds = new Set(["bottom_reversal_candidate", "top_exit_candidate"]);
+  const v4ClassLabels = {
+    class1_buy: "一买", class1_sell: "一卖",
+    class2_buy: "二买", class2_sell: "二卖",
+    class3_buy: "三买", class3_sell: "三卖",
+  };
+  const v4PhaseLabels = {
+    observation: "观察中", divergence_confirmed: "背驰已确认", reversal_confirmed: "反向结构已确认",
+    first_retest: "首次回试", awaiting_first_retest: "等待首次回试", class2_confirmed: "二类点已确认",
+    class3_confirmed: "三类点已确认", awaiting_lower_level: "等待下级别确认", invalidated: "已失效",
+  };
+  const v4StatusLabels = {
+    awaiting_lower_level: "等待下级别确认", observing: "观察中", candidate: "候选",
+    confirmed: "已确认", invalidated: "已失效", unfiltered: "未过滤", unconfirmed: "未确认",
+  };
+  const v4MarketFilterLabels = {
+    classified: "环境已分类",
+    unfiltered: "未应用市场环境过滤", aligned: "与市场环境一致", passed: "通过市场环境过滤",
+    blocked: "市场环境暂不支持", rejected: "市场环境不匹配", unavailable: "市场环境数据不可用",
+    unknown: "市场环境未知",
+  };
+  const marketRegimeLabels = { bull: "牛市环境", bear: "熊市环境", range: "震荡环境", unfiltered: "未过滤" };
+  function marketEnvironmentLabel(environment) {
+    if (!environment) return "S&P 500 环境：未过滤（数据不可用）";
+    const regime = marketRegimeLabels[environment.regime] || "未过滤";
+    const reason = environment.reason ? ` · ${environment.reason}` : "";
+    return `S&P 500 ${regime} · ${environment.date || "日期未知"}${reason}`;
+  }
+  const v4LowerLevelLabels = {
+    awaiting_lower_level: "等待下级别确认", unconfirmed: "尚未确认", confirmed: "已确认",
+    ready: "下级别结构已具备", unavailable: "下级别数据不可用",
+    awaiting_lower_timeframe: "等待下级周期数据", awaiting_confirmation: "等待下级周期走势确认",
+    incompatible_price_basis: "上下级价格基准不一致", not_applicable: "没有更低周期",
+  };
+  function timeframeConfirmationLabel(confirmation) {
+    if (!confirmation) return "跨周期确认：未提供";
+    const state = v4LowerLevelLabels[confirmation.status] || confirmation.status || "状态未知";
+    const path = confirmation.lower_timeframe ? `${confirmation.higher_timeframe || "当前周期"} → ${confirmation.lower_timeframe}` : confirmation.higher_timeframe || "当前周期";
+    return `跨周期确认 ${path}：${state}${confirmation.confirmed_at ? ` · ${confirmation.confirmed_at}` : ""}${confirmation.reason ? ` · ${confirmation.reason}` : ""}`;
+  }
+  function timeframeMappingLabel(mapping) {
+    if (!mapping) return "周期映射：未提供";
+    const state = v4LowerLevelLabels[mapping.lower_timeframe_status] || mapping.lower_timeframe_status || "状态未知";
+    const path = [mapping.lower_timeframe, mapping.higher_timeframe].filter(Boolean).join(" ← ") || "无相邻周期";
+    return `周期映射 ${path} · ${state}`;
+  }
+  function v4SignalLabel(kind) { return v4ClassLabels[kind] || kind || "结构信号"; }
+  function v4SignalEvidence(signal) {
+    const parts = [
+      `${v4SignalLabel(signal.kind)} · L${signal.level ?? "?"} · ${v4StatusLabels[signal.status] || signal.status || "状态未知"} · ${v4PhaseLabels[signal.phase] || signal.phase || "阶段未知"}`,
+      `规则 ${signal.rule_version || "版本未知"} · 标的 ${signal.symbol || "未知"}`,
+      `结构日期 ${signal.date || "未知"} · 可观察 ${signal.observed_at || "未知"} · 确认 ${signal.confirmed_at || "未确认"}`,
+      (signal.conditions || []).length ? `规则证据：${signal.conditions.join("；")}` : "规则证据：暂无",
+      (signal.missing_conditions || []).length ? `待满足：${signal.missing_conditions.join("；")}` : "待满足：无",
+      `市场环境：${marketEnvironmentLabel(signal.market_environment)}（${v4MarketFilterLabels[signal.market_filter] || signal.market_filter || "未过滤"}）`,
+      `跨级别确认：${v4LowerLevelLabels[signal.lower_level_status] || signal.lower_level_status || "未提供"}`,
+      timeframeConfirmationLabel(signal.timeframe_confirmation),
+      signal.invalidation_price == null ? "失效边界：未知" : `失效边界 ${money(signal.invalidation_price)}`,
+      signal.related_signal_id ? `关联信号 ${signal.related_signal_id}` : "",
+      signal.related_center_id ? `关联中枢 ${signal.related_center_id}` : "",
+      (signal.structure_ids || []).length ? `关联结构 ${(signal.structure_ids || []).join(", ")}` : "",
+    ];
+    return parts.filter(Boolean).join("；");
+  }
   const buyKinds = new Set(["third_buy_candidate", "bottom_reversal_candidate"]);
   const sellKinds = new Set(["third_sell_candidate", "top_exit_candidate"]);
 
@@ -18,12 +93,14 @@
   // restart discards the old chain rather than joining unrelated structures.
   function withHoldingRisk(frame, spot, observed = null) {
     if (!frame?.strokes?.length) return frame;
-    const lows = frame.strokes.filter((stroke, index) => stroke.start.kind === "bottom" && (index > 0 || stroke.confirmed));
+    const latestChain = frame.strokes[frame.strokes.length - 1].chain || 0;
+    const chainStrokes = frame.strokes.filter((stroke) => (stroke.chain || 0) === latestChain);
+    const lows = chainStrokes.filter((stroke, index) => stroke.start.kind === "bottom" && (index > 0 || stroke.confirmed));
     const latest = lows[lows.length - 1];
     if (!latest) return frame;
     const previous = lows[lows.length - 2];
     const reference = previous && latest.start.price < previous.start.price ? previous : latest;
-    const chain = frame.strokes[0].start.date;
+    const chain = chainStrokes[0]?.start.date || frame.strokes[0].start.date;
     const prior = observed?.holding_risk || frame.holding_risk;
     let state = { chain, boundary: reference.start.price, boundary_date: reference.start.date,
       fixed_at: reference.end.confirmed_at, touched: false, touched_at: "" };
@@ -182,9 +259,22 @@
     })) };
   }
 
-  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30) {
+  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null) {
     const cachedLayouts = chartCache.get(frame.candles);
-    const cacheKey = `${showScenarios ? "scenarios" : "history"}-${mobile ? `mobile-${mobileBars}` : "desktop"}`;
+    const totalBars = frame.candles?.length || 0;
+    // Keep daily and 15-minute candles readable on first render while making
+    // the rest of their loaded history reachable through zoom and pan.
+    const defaultBars = ["1d", "15m"].includes(frame.period) ? Math.min(160, totalBars) : totalBars;
+    const requestedBars = Number(viewport?.visibleBars);
+    const visibleCount = Math.max(1, Math.min(totalBars, Number.isFinite(requestedBars) && requestedBars > 0 ? Math.floor(requestedBars) : (defaultBars || mobileBars || 30)));
+    const maxOffset = Math.max(0, totalBars - visibleCount);
+    const endOffset = Math.max(0, Math.min(maxOffset, Math.floor(Number(viewport?.endOffset) || 0)));
+    const endIndex = totalBars - endOffset;
+    const startIndex = Math.max(0, endIndex - visibleCount);
+    const selectedRecursiveLevels = Object.keys(layers?.recursiveCenters || {}).filter((level) => layers.recursiveCenters[level] === true).sort();
+    const segmentLevelOverrides = Object.keys(layers?.segmentLevels || {}).sort().map((level) => `${level}=${layers.segmentLevels[level] === true ? 1 : 0}`).join(",");
+    const layerCacheKey = [layers?.pens === false ? 0 : 1, layers?.penCenters === false ? 0 : 1, layers?.chanCandles === false ? 0 : 1, layers?.segments === true ? 1 : 0, segmentLevelOverrides, layers?.signals === false ? 0 : 1, selectedRecursiveLevels.join(",")].join(":");
+    const cacheKey = `${showScenarios ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${ruleVersion || ""}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const scenarioLevels = showScenarios ? (scenarios || []).flatMap((scenario) => scenario.projection_levels || [])
@@ -195,26 +285,53 @@
     if (cached && !newLevelsOutsideCache && !quoteOutsideCache) {
       return chartWithSpot(cached.chart, spot, cached.minimum, cached.maximum, cached.y, scenarios);
     }
-    const maxBars = frame.period === "1wk" ? 120 : 160;
-    const visibleBars = mobile ? Math.min(maxBars, Math.max(30, Number(mobileBars) || 60)) : maxBars;
-    const bars = (frame.candles || []).slice(-visibleBars);
+    const bars = (frame.candles || []).slice(startIndex, endIndex);
     if (!bars.length) return null;
     const width = mobile ? 420 : 960, height = mobile ? 520 : 340;
     // Desktop retains room for the left price labels and current-price badge
     // without carrying the oversized axis gutter from the former right axis.
-    const left = mobile ? 94 : 72, right = 20, top = mobile ? 24 : 18, bottom = 38;
+    const left = mobile ? 94 : 52, right = 20, top = mobile ? 24 : 18, bottom = 38;
     const plotWidth = width - left - right, plotHeight = height - top - bottom;
     // Keep the scenario lane separate from historical bars when it is shown.
     const scenarioBoundary = left + plotWidth * (mobile ? 0.78 : 0.88);
     const historyRight = showScenarios ? scenarioBoundary : width - right;
     const historyWidth = historyRight - left;
     const firstDate = bars[0].date, lastDate = bars[bars.length - 1].date;
+    const firstDisplayDate = displayBarTime(firstDate, frame.period), lastDisplayDate = displayBarTime(lastDate, frame.period);
     const visibleStrokes = (frame.strokes || []).filter((stroke) => stroke.end.date >= firstDate && stroke.start.date <= lastDate);
-    let minimum = Math.min(...bars.map((bar) => bar.low));
-    let maximum = Math.max(...bars.map((bar) => bar.high));
-    visibleStrokes.forEach((stroke) => {
+    const recursiveLevels = frame.recursive_levels || [];
+    const visibleRecursiveCenters = (frame.recursive_centers || []).filter((center) => center.end >= firstDate && center.start <= lastDate);
+    const allSegments = recursiveLevels.length ? recursiveLevels.flatMap((level) => level.segments || []) : (frame.segments || []);
+    const visibleSegments = allSegments
+      .filter((segment) => segment.end >= firstDate && segment.start <= lastDate);
+    const visibleV4Signals = (frame.signals_v4 || []).filter((signal) => signal.status !== "invalidated" && signal.date >= firstDate && signal.date <= lastDate);
+    const selectedStrokes = layers?.pens === false ? [] : visibleStrokes;
+    const selectedSegments = visibleSegments.filter((segment) => {
+      const level = String(segment.level || 0);
+      return Object.prototype.hasOwnProperty.call(layers?.segmentLevels || {}, level) ? layers.segmentLevels[level] === true : layers?.segments === true;
+    });
+    const selectedRecursiveCenters = visibleRecursiveCenters.filter((center) => layers?.recursiveCenters?.[center.level] === true);
+    const selectedV4Signals = layers?.signals === false ? [] : visibleV4Signals;
+    const legacyRule = "strict-old-bi-v3";
+    const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.2";
+    let minimum = Infinity, maximum = -Infinity;
+    bars.forEach((bar) => { minimum = Math.min(minimum, bar.low); maximum = Math.max(maximum, bar.high); });
+    selectedStrokes.forEach((stroke) => {
       minimum = Math.min(minimum, stroke.low);
       maximum = Math.max(maximum, stroke.high);
+    });
+    selectedSegments.forEach((segment) => {
+      minimum = Math.min(minimum, segment.low);
+      maximum = Math.max(maximum, segment.high);
+    });
+    selectedRecursiveCenters.forEach((center) => {
+      const lower = Number(center.zd ?? center.lower ?? center.lower_price);
+      const upper = Number(center.zg ?? center.upper ?? center.upper_price);
+      if (Number.isFinite(lower) && Number.isFinite(upper)) { minimum = Math.min(minimum, lower); maximum = Math.max(maximum, upper); }
+    });
+    selectedV4Signals.forEach((signal) => {
+      const price = Number(signal.price);
+      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
     });
     if (Number.isFinite(currentSpot) && currentSpot > 0) scenarioLevels.push(currentSpot);
     if (scenarioLevels.length) {
@@ -226,11 +343,41 @@
     maximum += padding;
     const y = (price) => top + (maximum - price) / (maximum - minimum) * plotHeight;
     const x = (index) => left + (index + 0.5) / bars.length * historyWidth;
+    const chanCandles = bars.map((bar, index) => ({
+      candleIndex: index, high: y(bar.high), low: y(bar.low),
+      direction: bar.close >= bar.open ? "up" : "down",
+    }));
+    const mergedBars = frame.merged_candles || [];
+    for (let mergedIndex = 0; mergedIndex < mergedBars.length; mergedIndex += 1) {
+      const merged = mergedBars[mergedIndex];
+      const rawStart = Number(merged.raw_start), rawEnd = Number(merged.raw_end);
+      const high = Number(merged.high), low = Number(merged.low);
+      if (!Number.isInteger(rawStart) || !Number.isInteger(rawEnd) || rawStart > rawEnd
+        || !Number.isFinite(high) || !Number.isFinite(low) || high < low) continue;
+      const previous = mergedBars[mergedIndex - 1];
+      const sameChain = previous && Number(previous.chain_id) === Number(merged.chain_id);
+      const rising = sameChain && high >= Number(previous.high) && low >= Number(previous.low)
+        && (high > Number(previous.high) || low > Number(previous.low));
+      const falling = sameChain && high <= Number(previous.high) && low <= Number(previous.low)
+        && (high < Number(previous.high) || low < Number(previous.low));
+      const source = frame.candles?.[rawEnd];
+      const direction = rising ? "up" : falling ? "down" : source?.close >= source?.open ? "up" : "down";
+      const firstVisible = Math.max(rawStart, startIndex), lastVisible = Math.min(rawEnd, endIndex - 1);
+      for (let rawIndex = firstVisible; rawIndex <= lastVisible; rawIndex += 1) {
+        chanCandles[rawIndex - startIndex] = { candleIndex: rawIndex - startIndex, high: y(high), low: y(low), direction };
+      }
+    }
     const dateIndex = (date) => {
       if (date <= firstDate) return 0;
-      const index = bars.findIndex((bar) => bar.date >= date);
-      return index < 0 ? bars.length - 1 : index;
+      let low = 0, high = bars.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (bars[middle].date < date) low = middle + 1;
+        else high = middle;
+      }
+      return low >= bars.length ? bars.length - 1 : low;
     };
+    const latestRecursiveCenter = selectedRecursiveCenters[selectedRecursiveCenters.length - 1];
     const zones = (frame.centers || []).filter((center) => center.end >= firstDate && center.start <= lastDate);
     const latest = frame.centers?.[frame.centers.length - 1];
     if (latest && latest.end < firstDate && latest.lower < maximum && latest.upper > minimum) zones.push(latest);
@@ -256,16 +403,79 @@
       return { key: point.key, date: point.date, kind: point.kind, price: point.price, x: pointX, y: pointY, confirmed: point.confirmed, label,
         labelX: Math.max(left + halfWidth, Math.min(width - right - halfWidth, pointX)),
         labelY: point.kind === "top" ? Math.max(13, pointY - 12) : Math.min(height - bottom + 14, pointY + 18),
-        title: `${point.date} · ${point.kind === "top" ? "高点" : "低点"} ${money(point.price)} · ${point.confirmed ? "已确认端点" : "形成中，端点可延伸"}`,
+        title: `${displayBarTime(point.date, frame.period)} · ${point.kind === "top" ? "高点" : "低点"} ${money(point.price)} · ${point.confirmed ? "已确认端点" : "形成中，端点可延伸"}`,
       };
     });
     const chart = {
       width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: height - bottom,
+      totalBars, visibleBars: bars.length, windowStart: startIndex, windowEnd: endIndex, endOffset,
+      canZoomIn: bars.length > Math.min(12, totalBars), canZoomOut: bars.length < totalBars,
+      canPanLeft: endOffset < maxOffset, canPanRight: endOffset > 0,
+      canResetViewport: endOffset > 0 || bars.length !== defaultBars,
       minimum, maximum, periodLabel: frame.label,
       historyRight, scenarioBoundary, lastClose: frame.last_close,
-      title: `${frame.label} K 线、笔、中枢与条件情景推演，${firstDate} 至 ${lastDate}`,
-      description: "实体 K 线表示收盘后的行情。左侧显示价格刻度与现价；点击现价可查看结构观察。实线为已确认笔，虚线为形成中的笔；阴影表示三根已确认笔的重叠区。笔端点标注价格；底、顶标记是候选观察。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测。移动鼠标或触摸图表可查看 K 线日期和 OHLC；图表获得键盘焦点后，左右键切换 K 线，Home、End 跳到首根、末根，Escape 关闭提示。",
+      title: `${frame.label} K 线、笔、中枢与条件情景推演，${firstDisplayDate} 至 ${lastDisplayDate}`,
+      ruleVersion: recursiveRule,
+      description: "实体 K 线表示收盘后的行情。左侧显示价格刻度与现价；点击现价可查看结构观察。实线为已确认笔，虚线为形成中的笔；阴影表示三根已确认笔的重叠区。笔端点标注价格；底、顶标记是候选观察。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测。移动鼠标或触摸图表可查看 K 线日期和 OHLC；使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。",
       points,
+      chanCandles,
+      structures: [
+        ...selectedStrokes.map((stroke, index) => ({ key: `legacy-stroke-${index}`, type: "笔", level: stroke.level || 0, x1: x(dateIndex(stroke.start.date)), y1: y(stroke.start.price), x2: x(dateIndex(stroke.end.date)), y2: y(stroke.end.price),
+          start: stroke.start.date, end: stroke.end.date, startPrice: stroke.start.price, endPrice: stroke.end.price, confirmed: stroke.confirmed, formedAt: stroke.start.first_observed_at || stroke.start.date, confirmedAt: stroke.confirmed_at || stroke.end.confirmed_at,
+          composition: `输入 bar ${stroke.input_start_bar ?? stroke.start_bar ?? "未知"}–${stroke.input_end_bar ?? stroke.end_bar ?? "未知"}`, ruleVersion: legacyRule })),
+        ...(layers?.penCenters === false ? [] : zones.filter((center) => center.lower < maximum && center.upper > minimum).map((center, index) => ({ key: `legacy-center-${index}`, type: "笔中枢", level: 0, area: true,
+          x1: x(dateIndex(center.start)), x2: center === latest ? historyRight : x(dateIndex(center.end)), y1: y(center.upper), y2: y(center.lower), start: center.start, end: center.end, startPrice: center.lower, endPrice: center.upper,
+          confirmed: true, formedAt: center.confirmed_at || center.start, confirmedAt: center.confirmed_at, composition: `输入笔 ${center.start_stroke}–${center.end_stroke}；共 ${center.stroke_count} 笔`, ruleVersion: legacyRule }))),
+        ...selectedSegments.map((segment, index) => ({ key: `segment-${index}`, type: "线段", level: segment.level || 0, x1: x(dateIndex(segment.start)), y1: y(segment.start_price), x2: x(dateIndex(segment.end)), y2: y(segment.end_price),
+          start: segment.start, end: segment.end, startPrice: segment.start_price, endPrice: segment.end_price, confirmed: segment.confirmed, formedAt: segment.start, confirmedAt: segment.confirmed_at,
+          composition: `输入笔 ${segment.start_stroke ?? "未知"}–${segment.end_stroke ?? "未知"}；输入 bar ${segment.start_input_bar ?? "未知"}–${segment.end_input_bar ?? "未知"}`, ruleVersion: recursiveRule })),
+        ...selectedRecursiveCenters.map((center, index) => {
+          const lowerPrice = Number(center.zd ?? center.lower ?? center.lower_price);
+          const upperPrice = Number(center.zg ?? center.upper ?? center.upper_price);
+          const startX = x(dateIndex(center.start)), endX = center.forming ? historyRight : x(dateIndex(center.end));
+          return { key: `center-${center.center_id || index}`, type: center.level === 0 ? "笔级中枢" : "递归中枢", level: center.level, area: true, x1: startX, x2: endX, y1: y(upperPrice), y2: y(lowerPrice),
+            start: center.start, end: center.end, startPrice: lowerPrice, endPrice: upperPrice, confirmed: !center.forming, formedAt: center.formed_at || center.start, confirmedAt: center.confirmed_at || center.closed_at,
+            composition: `输入线段 ${center.start_segment}–${center.end_segment}；延伸 ${center.extension_count || 0} 段`, ruleVersion: recursiveRule };
+        }),
+        ...selectedV4Signals.filter((signal) => Number.isFinite(Number(signal.price)) && Number(signal.price) > 0).map((signal, index) => ({ key: `signal-${index}`, type: v4SignalLabel(signal.kind), level: signal.level || 0, x1: x(dateIndex(signal.date)), y1: y(Number(signal.price)), x2: x(dateIndex(signal.date)), y2: y(Number(signal.price)),
+          start: signal.date, end: signal.date, startPrice: Number(signal.price), endPrice: Number(signal.price), confirmed: signal.status === "confirmed", formedAt: signal.observed_at || signal.date, confirmedAt: signal.confirmed_at || signal.phase_at,
+          composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule })),
+      ],
+      // `segments` here is the Canvas paint gate: the mapped segment list is
+      // already filtered by the global default and any per-level overrides.
+      layers: { pens: layers?.pens !== false, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: layers?.recursiveCenters || {}, penCenters: layers?.penCenters !== false, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false },
+      // Keep per-level controls stable while users pan and zoom; their options
+      // should describe the loaded structure, not only the current viewport.
+      availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
+      availableRecursiveLevels: [...new Set(visibleRecursiveCenters.map((center) => Number(center.level)).filter((level) => Number.isInteger(level) && level >= 0))].sort((a, b) => a - b),
+      recursiveCenters: selectedRecursiveCenters.filter((center) => {
+        const lowerPrice = Number(center.zd ?? center.lower ?? center.lower_price);
+        const upperPrice = Number(center.zg ?? center.upper ?? center.upper_price);
+        return Number.isFinite(lowerPrice) && Number.isFinite(upperPrice) && lowerPrice < maximum && upperPrice > minimum;
+      }).map((center, index) => {
+        const x1 = x(dateIndex(center.start));
+        const x2 = center.forming ? historyRight : x(dateIndex(center.end));
+        const upperPrice = Number(center.zg ?? center.upper ?? center.upper_price);
+        const lowerPrice = Number(center.zd ?? center.lower ?? center.lower_price);
+        const upper = y(Math.min(upperPrice, maximum)), lower = y(Math.max(lowerPrice, minimum));
+        return { key: center.center_id || String(center.level) + "-" + center.start + "-" + index, level: center.level, kind: center.kind, forming: center.forming,
+          x: x1, y: upper, width: Math.max(1, x2 - x1), height: Math.max(1, lower - upper), extensionCount: center.extension_count || 0,
+          title: (center.level === 0 ? "笔级中枢" : "递归 L" + center.level + " 中枢") + " " + money(lowerPrice) + "–" + money(upperPrice) + " · " + (center.forming ? "形成中" : "闭合于 " + (center.closed_at || center.confirmed_at || center.end)) + " · 延伸 " + (center.extension_count || 0) + " 段" };
+      }),
+      segments: selectedSegments.map((segment, index) => ({
+        key: String(segment.level) + "-" + segment.chain_id + "-" + segment.start + "-" + index, level: segment.level, direction: segment.direction, confirmed: segment.confirmed, forming: segment.forming,
+        x1: x(dateIndex(segment.start)), y1: y(segment.start_price), x2: x(dateIndex(segment.end)), y2: y(segment.end_price),
+        title: "L" + segment.level + " " + (segment.direction === "up" ? "向上线段" : "向下线段") + " · " + displayBarTime(segment.start, frame.period) + " " + money(segment.start_price) + " → " + displayBarTime(segment.end, frame.period) + " " + money(segment.end_price) + " · " + (segment.confirmed ? "确认于 " + displayBarTime(segment.confirmed_at, frame.period) : "形成中"),
+      })),
+      signals: selectedV4Signals.map((signal, index) => {
+        const price = Number(signal.price);
+        if (!Number.isFinite(price) || price <= 0) return null;
+        const date = signal.date;
+        const labelText = v4SignalLabel(signal.kind);
+        return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, x: x(dateIndex(date)), y: y(price), side: signal.side, status: signal.status, label: labelText,
+          title: v4SignalEvidence(signal) };
+      }).filter(Boolean),
+      recursiveCenterLatest: latestRecursiveCenter ? latestRecursiveCenter.center_id || String(latestRecursiveCenter.level) + "-" + latestRecursiveCenter.start : "",
       keyLevels: (() => {
         const ordered = [...endpointList].sort((a, b) => b.date.localeCompare(a.date));
         const lastHigh = ordered.find((point) => point.kind === "top");
@@ -283,20 +493,27 @@
           return !duplicate;
         }).map((level) => ({ ...level, y: y(level.price), x1: x(dateIndex(level.date)), x2: historyRight,
           priceLabel: money(level.price),
-          title: `${level.date} · ${level.label} ${money(level.price)}` }));
+          title: `${displayBarTime(level.date, frame.period)} · ${level.label} ${money(level.price)}` }));
         return distinct;
       })(),
-      candles: bars.map((bar, index) => ({ key: bar.date, date: bar.date, x: x(index),
-        prices: { open: bar.open, high: bar.high, low: bar.low, close: bar.close },
+      candles: bars.map((bar, index) => {
+        const previous = frame.candles[startIndex + index - 1];
+        const previousClose = previous?.close;
+        const closeChangePercent = Number.isFinite(previousClose) && previousClose > 0
+          ? (bar.close - previousClose) / previousClose * 100 : null;
+        const displayDate = displayBarTime(bar.date, frame.period);
+        return { key: bar.date, index, date: bar.date, displayDate, x: x(index),
+        prices: { open: bar.open, high: bar.high, low: bar.low, close: bar.close }, previousClose, closeChangePercent,
         high: y(bar.high), low: y(bar.low), body: Math.min(y(bar.open), y(bar.close)),
         bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, historyWidth / bars.length * 0.56),
         direction: bar.close >= bar.open ? "up" : "down",
-        title: `${bar.date} · 开 ${money(bar.open)} · 高 ${money(bar.high)} · 低 ${money(bar.low)} · 收 ${money(bar.close)}` })),
+        title: `${displayDate} · 开 ${money(bar.open)} · 高 ${money(bar.high)} · 低 ${money(bar.low)} · 收 ${money(bar.close)}` };
+      }),
       strokes: visibleStrokes.map((stroke, index) => ({ key: `${stroke.start.date}-${index}`,
         x1: x(dateIndex(stroke.start.date)), y1: y(stroke.start.price),
         x2: x(dateIndex(stroke.end.date)), y2: y(stroke.end.price),
         direction: stroke.direction, confirmed: stroke.confirmed,
-        title: `${direction(stroke.direction)}笔 · ${stroke.start.date} ${money(stroke.start.price)} → ${stroke.end.date} ${money(stroke.end.price)} · ${stroke.confirmed ? `确认于 ${stroke.confirmed_at}` : "形成中，端点可延伸"}` })),
+        title: `${direction(stroke.direction)}笔 · ${displayBarTime(stroke.start.date, frame.period)} ${money(stroke.start.price)} → ${displayBarTime(stroke.end.date, frame.period)} ${money(stroke.end.price)} · ${stroke.confirmed ? `确认于 ${stroke.confirmed_at}` : "形成中，端点可延伸"}` })),
       centers: zones.filter((center) => center.lower < maximum && center.upper > minimum).map((center, index) => {
         const latestCenter = center === latest;
         const x1 = x(dateIndex(center.start));
@@ -311,10 +528,11 @@
         return { key: index, y: y(price), label: money(price) };
       }),
       dates: [...new Set([0, Math.floor((bars.length - 1) / 2), bars.length - 1])]
-        .map((index) => ({ x: x(index), y: height - 12, label: mobile ? axisDateLabel(bars[index].date).slice(-5) : axisDateLabel(bars[index].date) })),
+        .map((index) => { const displayDate = displayBarTime(bars[index].date, frame.period); return { x: x(index), y: height - 12, label: mobile ? axisDateLabel(displayDate).slice(-5) : axisDateLabel(displayDate) }; }),
     };
     const layouts = cachedLayouts || new Map();
     layouts.set(cacheKey, { chart, minimum, maximum, y });
+    if (layouts.size > 8) layouts.delete(layouts.keys().next().value);
     if (!cachedLayouts) chartCache.set(frame.candles, layouts);
     return chartWithSpot(chart, spot, minimum, maximum, y, scenarios);
   }
@@ -349,7 +567,7 @@
       : invalidated.length ? "之前的候选已触及失效边界，当前没有有效的第三类位置候选。"
       : !center ? "已确认笔还未形成中枢，暂无法识别第三类位置；可先用近期高低点观察价格变化。"
       : "当前没有符合规则的已确认回试结构，未识别出第三类位置候选；近端高低点仍可作为观察边界。";
-    if (close != null) guide.evidence.push(`最近已收盘${frame.label}：${frame.as_of} · ${money(close)}；现价 ${money(price)}。`);
+    if (close != null) guide.evidence.push(`最近已收盘${frame.label}：${displayBarTime(frame.as_of, frame.period)} · ${money(close)}；现价 ${money(price)}。`);
     if (!high || !low || price == null) {
       guide.title = "笔结构尚不足，方向暂待确认";
       guide.focus = `已有 ${frame.bar_count} 根收盘 K 线，尚未识别出可配对的笔高低点；等待有效反向笔形成后再列出观察价位。`;
@@ -465,6 +683,42 @@
     return guide;
   }
 
+  // Explain the recursive signal pipeline's current gate independently of
+  // the legacy pen-level signal message above. This helps distinguish a
+  // missing signal from missing confirmed recursive structure.
+  function recursiveReadinessReason(frame) {
+    const levels = Array.isArray(frame?.recursive_levels) ? frame.recursive_levels : [];
+    if (!levels.length) return "";
+    const pendingSignals = (frame.signals_v4 || []).filter((signal) => signal.status !== "invalidated");
+    if (pendingSignals.length) return "新算法已列出递归信号候选，详情见下方规则条件与待确认项。";
+
+    const base = levels.find((level) => Number(level.level) === 0);
+    if (!base) return "新算法尚未提供 level 0 线段，暂不能建立递归中枢。";
+    const segments = Array.isArray(base.segments) ? base.segments : [];
+    let run = 0, longestRun = 0, previous = null;
+    for (const segment of segments) {
+      const continuous = segment.confirmed && previous && segment.chain_id === previous.chain_id
+        && segment.direction !== previous.direction
+        && (!previous.end || !segment.start || previous.end === segment.start);
+      run = segment.confirmed ? (continuous ? run + 1 : 1) : 0;
+      longestRun = Math.max(longestRun, run);
+      previous = segment;
+    }
+    const centers = Array.isArray(frame.recursive_centers) ? frame.recursive_centers : [];
+    const closedCenters = centers.filter((center) => !center.forming && (center.confirmed_at || center.closed_at));
+    if (longestRun < 3) {
+      const forming = segments.filter((segment) => !segment.confirmed).length;
+      const blocker = base.waiting_for ? ` 算法状态：${base.status || "等待"}；${base.waiting_for}。` : "";
+      return `新算法递归信号尚未进入中枢判断：level 0 最长连续已确认线段为 ${longestRun} 条，当前另有 ${forming} 条形成中；至少需要同链连续、方向交替的 3 条已确认线段，才可检查严格重叠中枢。${blocker}`;
+    }
+    if (!closedCenters.length) {
+      return centers.length
+        ? `已有递归中枢仍在形成，尚未闭合；闭合前不用于一类背驰确认。${base.waiting_for ? ` 当前等待：${base.waiting_for}。` : ""}`
+        : `已有 ${longestRun} 条连续已确认线段，但区间尚未形成严格重叠的递归中枢；中枢形成前不进入背驰判断。${base.waiting_for ? ` 当前等待：${base.waiting_for}。` : ""}`;
+    }
+    return "已有闭合递归中枢；目前没有同级同链的背驰组合同时满足中枢外回试、后段创新高/低及 MACD 力度比阈值。";
+  }
+
   // Summarize how the live quote sits against the closed-bar structure. This
   // describes price location only; it never promotes an intraday move into a
   // confirmed pen or close-based condition.
@@ -509,7 +763,7 @@
       || (low ? (price <= low.price ? "现价已到近期笔低点 " + money(low.price) + " 下方；等待反抽能否收回，再核对收盘。"
         : "观察" + frame.label + "收盘是否跌破近期笔低点 " + money(low.price) + "；跌破后等待反抽确认。") : "等待下方结构边界形成后再评估风险。");
     const change = close != null && close > 0 ? (price / close - 1) * 100 : null;
-    const freshness = frame.label + " K 线截至 " + (frame.as_of || "未知日期")
+    const freshness = frame.label + " K 线截至 " + (displayBarTime(frame.as_of, frame.period) || "未知日期")
       + (change == null ? "" : " · 现价较最近收盘 " + (change > 0 ? "+" : "") + change.toFixed(2) + "%")
       + "。现价越过观察位不等于收盘确认。";
     return { position,
@@ -531,14 +785,20 @@
       freshness };
   }
 
-  function frameView(frame, spot, weekly = null, showScenarios = true, mobileChart = false, mobileBars = 30) {
+  function frameView(frame, spot, weekly = null, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, dataContext = null) {
     if (!frame) return emptyFrame("--");
     const center = frame.position?.center;
     const last = frame.strokes?.[frame.strokes.length - 1];
     const fixed = (frame.strokes || []).filter((stroke) => stroke.confirmed);
     const guidance = frameGuidance(frame, spot, weekly);
-    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars);
-    const markers = chart ? (frame.signals || []).filter((signal) => turningKinds.has(signal.kind) && signal.status !== "invalidated").map((signal) => {
+    const recursiveReason = recursiveReadinessReason(frame);
+    if (recursiveReason) guidance.signalReason = `${guidance.signalReason} ${recursiveReason}`.trim();
+    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars, viewport, layers, ruleVersion);
+    if (chart) {
+      chart.layerLevels = [...new Set((frame.recursive_centers || []).map((center) => Number(center.level)).filter((level) => Number.isInteger(level) && level >= 0))].sort((a, b) => a - b);
+      chart.segmentLevels = chart.availableSegmentLevels || [];
+    }
+    const markers = chart && layers?.signals !== false ? (frame.signals || []).filter((signal) => turningKinds.has(signal.kind) && signal.status !== "invalidated").map((signal) => {
       const point = chart.points.find((item) => item.date === (signal.origin_date || signal.date) && item.price === signal.price);
       if (!point) return null;
       const buy = signal.side === "buy", watch = signal.status === "watch";
@@ -553,8 +813,29 @@
       guidance.title = plan.headline;
       guidance.focus = plan.focus;
     }
+    const quality = frame.quality || {};
+    const basisLabel = quality.price_basis === "split_dividend_adjusted" ? "拆股/分红复权" : quality.price_basis === "raw" ? "未复权" : "价格基准未知";
+    const basisDate = dataContext?.priceCoordinate?.factor_date || frame.as_of || "未知";
+    const gapCount = Array.isArray(quality.gaps) ? quality.gaps.length : 0;
+    const dataSummary = `${basisLabel} · 基准日 ${basisDate} · 输入质量 ${quality.status || "未知"}（${quality.accepted_bars ?? frame.bar_count}/${quality.input_bars ?? frame.bar_count} 根） · 缺口 ${gapCount} 处 · ${timeframeMappingLabel(frame.timeframe_mapping)}${quality.corporate_action_suspected ? " · 公司行动待核验" : ""}`;
+    const marketSummary = marketEnvironmentLabel(frame.market_environment);
+    const legacySignals = (frame.signals || []).filter((signal) => !turningKinds.has(signal.kind)).map((signal, index) => ({ ...signal, key: `legacy-${signal.kind}-${index}`,
+      dateLabel: `结构位置 ${signal.date} · 识别于 ${signal.confirmed_at || signal.observed_at || "未知"}`,
+      statusLabel: signal.status === "invalidated" ? "已失效" : signal.status === "candidate" ? "候选" : "观察中",
+      invalidationLabel: signal.invalidation == null ? "" : `参考边界 ${money(signal.invalidation)}`,
+      ratioLabel: signal.strength_ratio == null ? "" : `同向 MACD 面积比 ${(signal.strength_ratio * 100).toFixed(0)}%`,
+      evidenceLabel: signal.detail || "",
+    }));
+    const recursiveSignals = (frame.signals_v4 || []).map((signal, index) => ({ ...signal, key: `v4-${signal.signal_id || signal.kind}-${index}`,
+      label: v4SignalLabel(signal.kind),
+      dateLabel: `发生 ${signal.date || "未知"} · 可观察 ${signal.observed_at || "未知"} · 确认 ${signal.confirmed_at || "未确认"}`,
+      statusLabel: v4StatusLabels[signal.status] || signal.status || "状态未知",
+      invalidationLabel: signal.invalidation_price == null ? "失效边界未知" : `失效边界 ${money(signal.invalidation_price)}`,
+      ratioLabel: signal.strength_ratio == null ? "" : `同向 MACD 面积比 ${(signal.strength_ratio * 100).toFixed(0)}%`,
+      evidenceLabel: v4SignalEvidence(signal), marketAndLevelLabel: `${marketEnvironmentLabel(signal.market_environment)} · ${v4MarketFilterLabels[signal.market_filter] || signal.market_filter || "未过滤"} · 递归级别确认：${v4LowerLevelLabels[signal.lower_level_status] || signal.lower_level_status || "未提供"} · ${timeframeConfirmationLabel(signal.timeframe_confirmation)}`,
+    }));
     return {
-      label: frame.label, available: frame.bar_count > 0, asOf: frame.as_of || "--", bars: frame.bar_count,
+      label: frame.label, available: frame.bar_count > 0, asOf: displayBarTime(frame.as_of, frame.period) || "--", bars: frame.bar_count,
       position: frame.position?.label || "等待中枢形成", detail: frame.position?.detail || "历史数据不足",
       center: center ? `${money(center.lower)}–${money(center.upper)}` : "尚未形成",
       boundary: center ? `下沿 ${money(center.lower)} · 上沿 ${money(center.upper)}` : "等待三根已确认笔重叠",
@@ -564,24 +845,20 @@
       turning: turningView(frame, spot),
       plan,
       spotGuide: liveSpotGuide(frame, spot, guidance),
-      signals: (frame.signals || []).filter((signal) => !turningKinds.has(signal.kind)).map((signal, index) => ({ ...signal, key: `${signal.kind}-${index}`,
-        dateLabel: `结构位置 ${signal.date} · 识别于 ${signal.confirmed_at}`,
-        statusLabel: signal.status === "invalidated" ? "已失效" : (signal.status === "candidate" ? "候选，待次级别确认" : "力度观察"),
-        invalidationLabel: signal.invalidation == null ? "" : `参考边界 ${money(signal.invalidation)}`,
-        ratioLabel: signal.strength_ratio == null ? "" : `同向 MACD 面积比 ${(signal.strength_ratio * 100).toFixed(0)}%`,
-      })),
+      dataSummary, marketSummary, signals: [...legacySignals, ...recursiveSignals],
       guidance, chart: chart ? { ...chart, markers } : null,
     };
   }
 
-  function view(payload, showScenarios = true, mobileChart = false, mobileBars = 30) {
+  function view(payload, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null) {
     if (!payload) return empty();
     let historyTime = "--";
     if (payload.history?.fetched_at) {
       const date = new Date(payload.history.fetched_at);
       if (!Number.isNaN(date.getTime())) historyTime = date.toLocaleString("zh-CN", { hour12: false });
     }
-    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars);
+    const dataContext = { priceCoordinate: payload.price_coordinate, history: payload.history };
+    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version, dataContext), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version, dataContext);
     const weeklyReady = Boolean(payload.weekly?.position?.center);
     const weeklyContext = weeklyReady ? `周线：${weekly.position}。` : `周线已有 ${weekly.bars} 根收盘 K 线、${weekly.confirmed} 根已确认笔，尚未形成中枢，不能给日线方向增加确认。`;
     return {
@@ -595,14 +872,14 @@
     };
   }
 
-  // Closed-bar intraday view. The server sends one frame for the requested
-  // 15-minute or 4-hour period; reuse the same frame renderer as daily/weekly.
-  function intradayView(payload, showScenarios = true, spotOverride = null, mobileChart = false, mobileBars = 30) {
-    const label = payload?.period === "4h" ? "4小时" : "15分钟";
+  // Closed-bar intraday view. Each requested period is aggregated from stored
+  // 15-minute history and uses the same renderer as daily/weekly.
+  function intradayView(payload, showScenarios = true, spotOverride = null, mobileChart = false, mobileBars = 30, viewport = null, layers = null) {
+    const label = ({ "15m": "15分钟", "1h": "1小时", "2h": "2小时", "4h": "4小时" })[payload?.period] || "盘中";
     if (!payload || !payload.frame) return emptyFrame(label);
     const spot = spotOverride != null && Number.isFinite(Number(spotOverride)) && Number(spotOverride) > 0
       ? Number(spotOverride) : payload.spot;
-    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars);
+    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars, viewport, layers, payload.rule_version, { priceCoordinate: payload.price_coordinate });
   }
 
   // Refresh the current price position without rebuilding historical pens.
@@ -626,8 +903,21 @@
         payload[period] = { ...frame, signals };
       });
     }
-    const price = spot != null && Number.isFinite(Number(spot)) && Number(spot) > 0 ? Number(spot) : payload.spot;
-    payload = { ...payload, daily: withHoldingRisk(payload.daily, price, observed?.symbol === payload.symbol ? observed.daily : null),
+    let livePrice = spot != null && Number.isFinite(Number(spot)) && Number(spot) > 0 ? Number(spot) : null;
+    const coordinate = payload.price_coordinate;
+    if (coordinate?.basis === "split_dividend_adjusted") {
+      // A degraded response must not reuse an old adjusted spot or compare a
+      // raw quote to adjusted structures. Only the API can restore this state
+      // after it has a valid factor for the current history snapshot.
+      if (coordinate.status === "degraded") {
+        livePrice = null;
+      } else if (livePrice != null) {
+        const factor = Number(coordinate.adjustment_factor);
+        livePrice = Number.isFinite(factor) && factor > 0 ? livePrice * factor : null;
+      }
+    }
+    const price = livePrice ?? (coordinate?.status === "degraded" ? null : payload.spot);
+    payload = { ...payload, spot: price, daily: withHoldingRisk(payload.daily, price, observed?.symbol === payload.symbol ? observed.daily : null),
       weekly: withHoldingRisk(payload.weekly, price, observed?.symbol === payload.symbol ? observed.weekly : null) };
     if (price == null || !Number.isFinite(Number(price)) || Number(price) <= 0) return payload;
     spot = price;
@@ -667,5 +957,31 @@
     return { ...payload, spot, daily, weekly, summary };
   }
 
-  window.OptionScopeChan = { empty, view, withSpot, intradayView, emptyFrame };
+  // Each recursive segment level has an independent visibility state.
+  function isSegmentLevelVisible(layers, level) {
+    const key = String(Number(level) || 0);
+    return Object.prototype.hasOwnProperty.call(layers?.segmentLevels || {}, key)
+      ? layers.segmentLevels[key] === true : layers?.segments === true;
+  }
+
+  function allSegmentLevelsVisible(layers, levels) {
+    const available = [...new Set((levels || []).map((level) => Number(level) || 0))];
+    return available.length > 0
+      ? available.every((level) => isSegmentLevelVisible(layers, level))
+      : layers?.segments === true;
+  }
+
+  function toggleSegmentLevel(layers, level) {
+    const numericLevel = Number(level);
+    if (!Number.isInteger(numericLevel) || numericLevel < 0 || numericLevel > 7) return layers;
+    const segmentLevels = { ...(layers?.segmentLevels || {}), [numericLevel]: !isSegmentLevelVisible(layers, numericLevel) };
+    return { ...(layers || {}), segmentLevels };
+  }
+
+  function toggleAllSegmentLevels(layers, levels) {
+    const visible = allSegmentLevelsVisible(layers, levels);
+    return { ...(layers || {}), segments: !visible, segmentLevels: {} };
+  }
+
+  window.OptionScopeChan = { empty, view, withSpot, intradayView, emptyFrame, isSegmentLevelVisible, allSegmentLevelsVisible, toggleSegmentLevel, toggleAllSegmentLevels };
 }(window));

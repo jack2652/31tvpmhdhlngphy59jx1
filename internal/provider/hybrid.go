@@ -24,6 +24,10 @@ type IntradayHistoryClient interface {
 	FetchIntraday(context.Context, string, string) (HistoryResult, error)
 }
 
+type ChanAdjustedHistoryClient interface {
+	FetchChanAdjusted(context.Context, string, string) (ChanAdjustedHistoryResult, error)
+}
+
 type Hybrid struct {
 	Regular       *Yahoo
 	Delayed       *CboeOptionsClient
@@ -332,6 +336,17 @@ func (h *Hybrid) BenchmarkHistory(ctx context.Context, symbol, period string) (H
 		return HistoryResult{}, errors.New("Yahoo benchmark history provider is unavailable")
 	}
 	return h.HistoryClient.FetchAdjusted(ctx, symbol, period)
+}
+
+func (h *Hybrid) ChanAdjustedHistory(ctx context.Context, symbol, period string) (ChanAdjustedHistoryResult, error) {
+	if h == nil || h.HistoryClient == nil {
+		return ChanAdjustedHistoryResult{}, errors.New("Yahoo history provider is unavailable")
+	}
+	client, ok := h.HistoryClient.(ChanAdjustedHistoryClient)
+	if !ok {
+		return ChanAdjustedHistoryResult{}, errors.New("Yahoo history client does not support paired adjusted Chan history")
+	}
+	return client.FetchChanAdjusted(ctx, symbol, period)
 }
 
 func (h *Hybrid) IntradayHistory(ctx context.Context, symbol, interval string) (HistoryResult, error) {

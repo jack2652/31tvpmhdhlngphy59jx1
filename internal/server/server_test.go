@@ -20,7 +20,9 @@ import (
 	"time"
 
 	"context"
+	chananalysis "option-scope-go/internal/chan"
 	"option-scope-go/internal/config"
+	"option-scope-go/internal/marketcalendar"
 	"option-scope-go/internal/model"
 	"option-scope-go/internal/provider"
 	"option-scope-go/internal/store"
@@ -1385,6 +1387,19 @@ type statusTrackingProvider struct {
 	historyErr    error
 	earningsDates []string
 	earningsErr   error
+}
+
+type chanAdjustedRecordingProvider struct {
+	*testMarketProvider
+	requests chan string
+}
+
+func (p *chanAdjustedRecordingProvider) ChanAdjustedHistory(_ context.Context, symbol, period string) (provider.ChanAdjustedHistoryResult, error) {
+	p.requests <- symbol + "|" + period
+	return provider.ChanAdjustedHistoryResult{Symbol: symbol, Timeframe: "1d", AdjustmentType: "split_dividend_auto", Source: "go-yfinance", FetchedAt: time.Now().UTC(), Bars: []map[string]any{{
+		"date": "2026-10-16", "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0, "volume": 1.0,
+		"raw_open": 10.0, "raw_high": 11.0, "raw_low": 9.0, "raw_close": 10.0, "raw_volume": 1.0, "adjustment_factor": 1.0,
+	}}}, nil
 }
 
 func (p *statusTrackingProvider) History(_ context.Context, symbol, _ string) (provider.HistoryResult, error) {
@@ -3416,6 +3431,551 @@ func TestCachedPayloadMetadataTreatsEmptyJSONAsMissing(t *testing.T) {
 	}
 	if got := cachedWarningValue(map[string]any{"value": 1}, "missing"); got != nil {
 		t.Fatalf("non-empty map warning=%#v, want nil", got)
+	}
+}
+
+func TestChanAdjustedEndpointUsesCachedAdjustedPriceBasisAndPreviewVersion(t *testing.T) {
+	service, ts := testService(t, "")
+	fetched := time.Now().UTC()
+	bars := []map[string]any{
+		{"date": "2026-10-16", "open": 49.0, "high": 53.0, "low": 48.0, "close": 52.0, "volume": 1000.0, "raw_open": 98.0, "raw_high": 106.0, "raw_low": 96.0, "raw_close": 104.0, "raw_volume": 1000.0, "adjustment_factor": 0.5},
+	}
+	if err := service.store.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", bars, fetched); err != nil {
+		t.Fatal(err)
+	}
+	day, _ := time.ParseInLocation(time.DateOnly, "2026-10-16", marketLocation())
+	intraday := make([]map[string]any, 0, 26)
+	for index := 0; index < 26; index++ {
+		stamp := day.Add(9*time.Hour + 30*time.Minute + time.Duration(index)*15*time.Minute)
+		price := 100 + float64(index)/10
+		intraday = append(intraday, map[string]any{"date": stamp.Format("2006-01-02 15:04"), "open": price, "high": price + .2, "low": price - .2, "close": price + .1, "volume": 100.0})
+	}
+	service.intradayHistoryCache["QQQ"] = intradayCacheEntry{frame: intraday, fetchedAt: fetched}
+	_, snapshotErr := service.store.RecordChanStructureSnapshot(store.ChanStructureSnapshot{
+		Symbol: "QQQ", Timeframe: "1d", RuleVersion: "chan-recursive-v4-preview.2", InputFingerprint: "old-input",
+		BarFingerprints:     map[string]string{"2026-10-16": "old-bar"},
+		ConfirmedStructures: map[string]json.RawMessage{"segment|level=0|direction=up|start=2026-10-15|end=2026-10-16": json.RawMessage("{\"confirmed\":true}")},
+		UpdatedAt:           fetched,
+	})
+	if snapshotErr != nil {
+		t.Fatal(snapshotErr)
+	}
+	response, err := http.Get(ts.URL + "/api/chan/QQQ/adjusted?spot=110")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	coordinate := payload["price_coordinate"].(map[string]any)
+	if response.StatusCode != http.StatusOK || payload["rule_version"] != "chan-recursive-v4-preview.2" || payload["target_rule_version"] != "chan-recursive-v4.0.0" || coordinate["basis"] != "split_dividend_adjusted" || coordinate["adjusted_spot"] != 55.0 || coordinate["raw_spot"] != 110.0 || coordinate["adjustment_factor"] != 0.5 || coordinate["factor_date"] != "2026-10-16" || coordinate["factor_source"] == "" {
+		t.Fatalf("adjusted response status=%d payload=%#v", response.StatusCode, payload)
+	}
+	daily := payload["daily"].(map[string]any)
+	quality := daily["quality"].(map[string]any)
+	if quality["price_basis"] != "split_dividend_adjusted" || daily["bar_count"] != float64(1) {
+		t.Fatalf("daily adjusted quality/frame = %#v", daily)
+	}
+	dailyMapping := daily["timeframe_mapping"].(map[string]any)
+	weeklyMapping := payload["weekly"].(map[string]any)["timeframe_mapping"].(map[string]any)
+	if dailyMapping["lower_timeframe"] != "4h" || dailyMapping["higher_timeframe"] != "1wk" || dailyMapping["lower_timeframe_status"] != "ready" || weeklyMapping["lower_timeframe"] != "1d" || weeklyMapping["lower_timeframe_status"] != "ready" {
+		t.Fatalf("adjusted timeframe mapping metadata daily=%#v weekly=%#v", dailyMapping, weeklyMapping)
+	}
+	revisions, ok := daily["structure_revisions_v4"].([]any)
+	if !ok || len(revisions) != 1 {
+		t.Fatalf("daily confirmed structure revisions=%#v, want persisted revision", daily["structure_revisions_v4"])
+	}
+	if revisions[0].(map[string]any)["reason"] != "source_data_revision" {
+		t.Fatalf("revision should identify source data change: %#v", revisions[0])
+	}
+}
+
+func TestChanAdjustedHistoryCoverageDetectsShortLegacyCache(t *testing.T) {
+	if adequate, start, end := chanAdjustedHistoryCoverage([]map[string]any{{"date": "2021-10-18"}, {"date": "2026-10-16"}}); !adequate || start != "2021-10-18" || end != "2026-10-16" {
+		t.Fatalf("five-year adjusted history coverage=%v %s..%s, want adequate", adequate, start, end)
+	}
+	if adequate, start, end := chanAdjustedHistoryCoverage([]map[string]any{{"date": "2024-10-16"}, {"date": "2026-10-16"}}); adequate || start != "2024-10-16" || end != "2026-10-16" {
+		t.Fatalf("short legacy cache coverage=%v %s..%s, want insufficient", adequate, start, end)
+	}
+	if adequate, _, _ := chanAdjustedHistoryCoverage([]map[string]any{{"date": "bad-date"}}); adequate {
+		t.Fatal("invalid cache dates must not satisfy five-year coverage")
+	}
+}
+
+func TestChanAdjustedHistoryRefreshRequestsFiveYearContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chan-adjusted-refresh.db")
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &chanAdjustedRecordingProvider{testMarketProvider: &testMarketProvider{}, requests: make(chan string, 1)}
+	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamTimeout: time.Second}, repository, provider)
+	if !service.scheduleChanAdjustedRefresh("QQQ|1d|split_dividend_auto|go-yfinance", "QQQ") {
+		t.Fatal("five-year adjusted history refresh was not scheduled")
+	}
+	select {
+	case request := <-provider.requests:
+		if request != "QQQ|5y" {
+			t.Fatalf("Chan adjusted history request=%q, want QQQ|5y", request)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Chan adjusted history refresh did not reach provider")
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdjustedIntradayBarsMapsDateSpecificAdjustedFactor(t *testing.T) {
+	daily := []chananalysis.Bar{{Date: "2026-10-16", Open: 50, High: 55, Low: 45, Close: 52, RawOpen: 100, RawHigh: 110, RawLow: 90, RawClose: 104, AdjustmentFactor: .5}}
+	input := []chananalysis.Bar{
+		{Date: "2026-10-16 09:30", Open: 100, High: 102, Low: 98, Close: 101, Volume: 10},
+		{Date: "2026-10-15 09:30", Open: 100, High: 102, Low: 98, Close: 101, Volume: 10},
+	}
+	got, skipped := adjustedIntradayBars(input, daily)
+	if len(got) != 1 || skipped != 1 || got[0].Open != 50 || got[0].High != 51 || got[0].Low != 49 || got[0].Close != 50.5 {
+		t.Fatalf("adjusted intraday bars=%+v skipped=%d", got, skipped)
+	}
+}
+
+func TestChanAdjustedEndpointSerializesRecursiveStructureAndSignalEvidence(t *testing.T) {
+	service, ts := testService(t, "")
+	now := time.Now().UTC()
+	location := marketLocation()
+	day := time.Date(2025, 1, 2, 0, 0, 0, 0, location)
+	bars := make([]map[string]any, 0, 180)
+	for len(bars) < 180 {
+		if day.Weekday() != time.Saturday && day.Weekday() != time.Sunday {
+			index := float64(len(bars))
+			close := 100 + index*.018 + 6*math.Sin(index*.31) + 1.5*math.Sin(index*.077)
+			bar := map[string]any{"date": day.Format(time.DateOnly), "open": close - .15, "high": close + 1, "low": close - 1, "close": close, "volume": 1000.0, "raw_volume": 1000.0, "adjustment_factor": 1.0}
+			for _, field := range []string{"open", "high", "low", "close"} {
+				bar["raw_"+field] = bar[field]
+			}
+			bars = append(bars, bar)
+		}
+		day = day.AddDate(0, 0, 1)
+	}
+	if err := service.store.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", bars, now); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Get(ts.URL + "/api/chan/QQQ/adjusted?spot=110")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || payload["rule_version"] != chananalysis.RecursivePreviewVersion {
+		t.Fatalf("adjusted response status=%d version=%v", response.StatusCode, payload["rule_version"])
+	}
+	comparison, ok := payload["algorithm_comparison"].(map[string]any)
+	if !ok || comparison["method"] == "" {
+		t.Fatalf("adjusted response missing algorithm comparison summary: %#v", payload["algorithm_comparison"])
+	}
+	for _, timeframe := range []string{"daily", "weekly"} {
+		frameComparison, ok := comparison[timeframe].(map[string]any)
+		if !ok {
+			t.Fatalf("algorithm comparison missing %s detail: %#v", timeframe, comparison)
+		}
+		for _, field := range []string{"legacy", "recursive", "differences"} {
+			if _, exists := frameComparison[field]; !exists {
+				t.Fatalf("algorithm comparison %s missing %s: %#v", timeframe, field, frameComparison)
+			}
+		}
+	}
+	for _, timeframe := range []string{"daily", "weekly"} {
+		frame := payload[timeframe].(map[string]any)
+		for _, field := range []string{"timeframe", "level", "quality", "merged_candles", "segments", "recursive_centers", "recursive_levels", "strengths_v4", "signals_v4", "trend_context_v4"} {
+			if _, exists := frame[field]; !exists {
+				t.Fatalf("%s frame missing recursive API field %q: %#v", timeframe, field, frame)
+			}
+		}
+	}
+	daily := payload["daily"].(map[string]any)
+	segments := daily["segments"].([]any)
+	if len(segments) == 0 {
+		t.Fatalf("test fixture did not produce recursive segments: strokes=%d", len(daily["strokes_v4"].([]any)))
+	}
+	segment := segments[0].(map[string]any)
+	for _, field := range []string{"level", "start_stroke", "end_stroke", "start", "end", "confirmed", "forming", "start_input_bar", "end_input_bar"} {
+		if _, exists := segment[field]; !exists {
+			t.Fatalf("segment missing API evidence field %q: %#v", field, segment)
+		}
+	}
+	if centers, ok := daily["recursive_centers"].([]any); !ok {
+		t.Fatalf("recursive centers type=%T", daily["recursive_centers"])
+	} else if len(centers) > 0 {
+		center := centers[0].(map[string]any)
+		for _, field := range []string{"level", "start_segment", "end_segment", "formed_at", "confirmed_at", "forming", "zd", "zg"} {
+			if _, exists := center[field]; !exists {
+				t.Fatalf("recursive center missing API evidence field %q: %#v", field, center)
+			}
+		}
+	}
+	for _, signalValue := range daily["signals_v4"].([]any) {
+		signal := signalValue.(map[string]any)
+		for _, field := range []string{"symbol", "level", "side", "rule_version", "date", "observed_at", "structure_refs", "conditions", "missing_conditions", "market_filter", "lower_level_status", "phase_history"} {
+			if _, exists := signal[field]; !exists {
+				t.Fatalf("signal missing API evidence field %q: %#v", field, signal)
+			}
+		}
+	}
+}
+
+func TestChanAdjustedEndpointReturnsPointInTimeSP500Environment(t *testing.T) {
+	service, ts := testService(t, "")
+	now := time.Now().UTC()
+	location := marketLocation()
+	benchmark := make([]map[string]any, 0, 220)
+	day := time.Date(2025, 1, 2, 0, 0, 0, 0, location)
+	for len(benchmark) < 220 {
+		if marketcalendar.IsTradingDay(day) {
+			close := 100 + float64(len(benchmark))*0.2
+			benchmark = append(benchmark, adjustedHistoryRow(day.Format(time.DateOnly), close))
+		}
+		day = day.AddDate(0, 0, 1)
+	}
+	if err := service.store.WriteChanAdjustedHistory("^GSPC", "1d", "split_dividend_auto", "go-yfinance", benchmark, now); err != nil {
+		t.Fatal(err)
+	}
+	stockBars := make([]map[string]any, 0, 220)
+	day = time.Date(2025, 1, 2, 0, 0, 0, 0, location)
+	for len(stockBars) < 220 {
+		if marketcalendar.IsTradingDay(day) {
+			stockBars = append(stockBars, adjustedHistoryRow(day.Format(time.DateOnly), 100+float64(len(stockBars))*0.05+4*math.Sin(float64(len(stockBars))*0.31)))
+		}
+		day = day.AddDate(0, 0, 1)
+	}
+	if err := service.store.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", stockBars, now); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Get(ts.URL + "/api/chan/QQQ/adjusted?spot=150")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d payload=%#v", response.StatusCode, payload)
+	}
+	environment := payload["market_environment"].(map[string]any)
+	if environment["status"] != "classified" || environment["regime"] != "bull" || environment["benchmark"] != "^GSPC" {
+		t.Fatalf("market environment=%#v", environment)
+	}
+	if payload["market_history"].(map[string]any)["source"] != "sqlite" {
+		t.Fatalf("market history metadata=%#v", payload["market_history"])
+	}
+	daily := payload["daily"].(map[string]any)
+	if daily["market_environment"].(map[string]any)["regime"] != "bull" {
+		t.Fatalf("daily environment=%#v", daily["market_environment"])
+	}
+	for _, raw := range daily["signals_v4"].([]any) {
+		signal := raw.(map[string]any)
+		env := signal["market_environment"].(map[string]any)
+		if env["date"].(string) > signal["observed_at"].(string) {
+			t.Fatalf("signal market environment looks ahead: signal=%#v env=%#v", signal, env)
+		}
+		if signal["market_filter"] == "unfiltered" && env["status"] == "classified" {
+			t.Fatalf("classified benchmark should be attached to signal: %#v", signal)
+		}
+	}
+}
+
+func TestAttachMissingSP500EnvironmentKeepsSignalUnfiltered(t *testing.T) {
+	frame := chananalysis.Frame{AsOf: "2026-10-16", SignalsV4: []chananalysis.V4Signal{{
+		SignalID: "candidate-1", Symbol: "QQQ", Level: 1, Kind: "class1_buy", Side: "buy",
+		Status: "observing", Date: "2026-10-15", ObservedAt: "2026-10-16", MarketFilter: "unfiltered",
+	}}}
+	attachMarketEnvironment(&frame, nil)
+	if frame.MarketEnvironment == nil || frame.MarketEnvironment.Status != "unfiltered" || frame.MarketEnvironment.Reason == "" {
+		t.Fatalf("missing benchmark environment=%+v, want explicit unfiltered status and reason", frame.MarketEnvironment)
+	}
+	if len(frame.SignalsV4) != 1 {
+		t.Fatalf("market data absence removed individual structural candidate: %+v", frame.SignalsV4)
+	}
+	signal := frame.SignalsV4[0]
+	if signal.MarketFilter != "unfiltered" || signal.MarketEnvironment == nil || signal.MarketEnvironment.Status != "unfiltered" || signal.MarketEnvironment.Date > signal.ObservedAt {
+		t.Fatalf("candidate should retain point-in-time unfiltered metadata: %+v", signal)
+	}
+}
+
+func adjustedHistoryRow(day string, close float64) map[string]any {
+	return map[string]any{"date": day, "open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1000.0, "raw_open": close, "raw_high": close + 1, "raw_low": close - 1, "raw_close": close, "raw_volume": 1000.0, "adjustment_factor": 1.0}
+}
+
+func TestChanIntradayEndpointDeclaresPreviewVersionAndRawPriceBasis(t *testing.T) {
+	service, ts := testService(t, "")
+	service.intradayHistoryCache["QQQ"] = intradayCacheEntry{
+		frame: []map[string]any{{
+			"date": "2026-10-16 15:45", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0,
+		}},
+		fetchedAt: time.Now().UTC(),
+	}
+	response, err := http.Get(ts.URL + "/api/chan/QQQ/intraday?period=15m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	frame, _ := payload["frame"].(map[string]any)
+	quality, _ := frame["quality"].(map[string]any)
+	coordinate, _ := payload["price_coordinate"].(map[string]any)
+	parameters, _ := payload["parameters"].(map[string]any)
+	if response.StatusCode != http.StatusOK || payload["rule_version"] != chananalysis.RecursivePreviewVersion || payload["target_rule_version"] != chananalysis.RecursiveRuleVersion || payload["legacy_rule_version"] != chananalysis.RuleVersion {
+		t.Fatalf("intraday response status=%d versions=%v/%v/%v", response.StatusCode, payload["rule_version"], payload["target_rule_version"], payload["legacy_rule_version"])
+	}
+	if parameters["implementation_status"] != "preview" || coordinate["basis"] != "raw" || coordinate["status"] != "unadjusted" || quality["price_basis"] != "raw" || frame["timeframe"] != "15m" {
+		t.Fatalf("intraday schema must expose preview state, timeframe and raw price basis: payload=%#v", payload)
+	}
+	if signals, ok := frame["signals_v4"].([]any); !ok || len(signals) != 0 {
+		t.Fatalf("single-bar intraday input must not create a structural signal: %#v", frame["signals_v4"])
+	}
+}
+
+func TestValidAdjustedHistoryRowChecksEveryOHLCFactor(t *testing.T) {
+	bar := map[string]any{"adjustment_factor": .5, "open": 50.0, "high": 55.0, "low": 45.0, "close": 52.0, "raw_open": 100.0, "raw_high": 110.0, "raw_low": 90.0, "raw_close": 104.0}
+	if !validAdjustedHistoryRow(bar) {
+		t.Fatal("valid adjusted OHLC row was rejected")
+	}
+	bar["raw_high"] = 120.0
+	if validAdjustedHistoryRow(bar) {
+		t.Fatal("row with mismatched high adjustment factor was accepted")
+	}
+}
+
+func TestChanLegacyEndpointKeepsStrictOldStrokeAndCenterSemantics(t *testing.T) {
+	service, ts := testService(t, "")
+	now := time.Now().UTC()
+	base := now.In(marketLocation()).AddDate(0, 0, -60)
+	base = time.Date(base.Year(), base.Month(), base.Day(), 0, 0, 0, 0, marketLocation())
+	bars := make([]map[string]any, 0, 45)
+	for day := 0; len(bars) < 45; day++ {
+		date := base.AddDate(0, 0, day)
+		if date.Weekday() == time.Saturday || date.Weekday() == time.Sunday {
+			continue
+		}
+		price := 100 + 10*math.Sin(float64(len(bars))*0.42)
+		bars = append(bars, map[string]any{"date": date.Format(time.DateOnly), "open": price, "high": price + 1, "low": price - 1, "close": price, "volume": 1000.0})
+	}
+	if err := service.store.WriteHistory("QQQ", bars, now); err != nil {
+		t.Fatal(err)
+	}
+	adjustedBars := make([]map[string]any, 0, len(bars))
+	for _, bar := range bars {
+		adjusted := map[string]any{}
+		for key, value := range bar {
+			adjusted[key] = value
+		}
+		for _, field := range []string{"open", "high", "low", "close", "volume"} {
+			adjusted["raw_"+field] = bar[field]
+		}
+		adjusted["adjustment_factor"] = 1.0
+		adjustedBars = append(adjustedBars, adjusted)
+	}
+	if err := service.store.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", adjustedBars, now); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Get(ts.URL + "/api/chan/QQQ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || payload["rule_version"] != chananalysis.RuleVersion {
+		t.Fatalf("legacy response status=%d rule_version=%v payload=%#v", response.StatusCode, payload["rule_version"], payload)
+	}
+	daily := payload["daily"].(map[string]any)
+	if value, exists := daily["strokes_v4"]; exists && value != nil {
+		t.Fatalf("legacy daily response unexpectedly populates v4 strokes: %#v", value)
+	}
+	if value, exists := daily["signals_v4"]; exists && value != nil {
+		t.Fatalf("legacy daily response unexpectedly populates v4 signals: %#v", value)
+	}
+	if _, ok := daily["strokes"].([]any); !ok {
+		t.Fatalf("legacy strokes has type %T, want list", daily["strokes"])
+	}
+	legacyCenters, ok := daily["centers"].([]any)
+	if !ok {
+		t.Fatalf("legacy centers has type %T, want legacy pen-center list", daily["centers"])
+	}
+	for _, raw := range legacyCenters {
+		center := raw.(map[string]any)
+		if center["kind"] != "pen" || center["input_kind"] != "stroke" || center["level"] != float64(0) {
+			t.Fatalf("legacy centers semantics changed: %#v", center)
+		}
+	}
+	adjustedResponse, err := http.Get(ts.URL + "/api/chan/QQQ/adjusted?spot=100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adjustedResponse.Body.Close()
+	var adjustedPayload map[string]any
+	if err := json.NewDecoder(adjustedResponse.Body).Decode(&adjustedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if adjustedResponse.StatusCode != http.StatusOK || adjustedPayload["rule_version"] != chananalysis.RecursivePreviewVersion || adjustedPayload["legacy_rule_version"] != chananalysis.RuleVersion {
+		t.Fatalf("adjusted response status=%d versions=%v/%v", adjustedResponse.StatusCode, adjustedPayload["rule_version"], adjustedPayload["legacy_rule_version"])
+	}
+	adjustedDaily := adjustedPayload["daily"].(map[string]any)
+	legacyStrokeRows, adjustedStrokeRows := daily["strokes"].([]any), adjustedDaily["strokes"].([]any)
+	if len(legacyStrokeRows) != len(adjustedStrokeRows) {
+		t.Fatalf("legacy stroke count differs between endpoints: %d/%d", len(legacyStrokeRows), len(adjustedStrokeRows))
+	}
+	for index := range legacyStrokeRows {
+		oldStroke, newStroke := legacyStrokeRows[index].(map[string]any), adjustedStrokeRows[index].(map[string]any)
+		oldStart, newStart := oldStroke["start"].(map[string]any), newStroke["start"].(map[string]any)
+		oldEnd, newEnd := oldStroke["end"].(map[string]any), newStroke["end"].(map[string]any)
+		for _, field := range []string{"direction", "confirmed", "confirmed_at", "low", "high"} {
+			if !reflect.DeepEqual(oldStroke[field], newStroke[field]) {
+				t.Fatalf("legacy stroke %d %s differs: %v/%v", index, field, oldStroke[field], newStroke[field])
+			}
+		}
+		for _, point := range []struct {
+			name      string
+			old, next map[string]any
+		}{{"start", oldStart, newStart}, {"end", oldEnd, newEnd}} {
+			for _, field := range []string{"kind", "date", "price"} {
+				if !reflect.DeepEqual(point.old[field], point.next[field]) {
+					t.Fatalf("legacy stroke %d %s %s differs: %v/%v", index, point.name, field, point.old[field], point.next[field])
+				}
+			}
+		}
+	}
+	legacyCenterRows, adjustedCenterRows := daily["centers"].([]any), adjustedDaily["centers"].([]any)
+	if len(legacyCenterRows) != len(adjustedCenterRows) {
+		t.Fatalf("legacy center count differs between endpoints: %d/%d", len(legacyCenterRows), len(adjustedCenterRows))
+	}
+	for index := range legacyCenterRows {
+		oldCenter, newCenter := legacyCenterRows[index].(map[string]any), adjustedCenterRows[index].(map[string]any)
+		for _, field := range []string{"kind", "input_kind", "level", "start", "end", "lower", "upper", "confirmed_at"} {
+			if !reflect.DeepEqual(oldCenter[field], newCenter[field]) {
+				t.Fatalf("legacy center %d %s differs: %v/%v", index, field, oldCenter[field], newCenter[field])
+			}
+		}
+	}
+	if _, ok := adjustedDaily["segments"].([]any); !ok {
+		t.Fatalf("adjusted v4 segments type=%T", adjustedDaily["segments"])
+	}
+}
+
+func TestChanAdjustedEndpointReportsVerifiedActionsAndDegradesUnexplainedJump(t *testing.T) {
+	service, ts := testService(t, "")
+	fetched := time.Now().UTC()
+	writeBars := func(symbol string, bars []map[string]any) {
+		t.Helper()
+		if err := service.store.WriteChanAdjustedHistory(symbol, "1d", "split_dividend_auto", "go-yfinance", bars, fetched); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := func(date string, close, high, low, rawClose, rawHigh, rawLow, factor float64) map[string]any {
+		return map[string]any{"date": date, "open": close, "high": high, "low": low, "close": close, "volume": 100.0, "raw_open": rawClose, "raw_high": rawHigh, "raw_low": rawLow, "raw_close": rawClose, "raw_volume": 100.0, "adjustment_factor": factor}
+	}
+	writeBars("SPLIT", []map[string]any{
+		base("2026-10-15", 50, 51, 49, 100, 102, 98, .5),
+		base("2026-10-16", 50, 52, 49, 50, 52, 49, 1),
+	})
+	writeBars("JUMP", []map[string]any{
+		base("2026-10-15", 100, 102, 98, 100, 102, 98, 1),
+		base("2026-10-16", 150, 152, 148, 150, 152, 148, 1),
+	})
+	request := func(symbol string) map[string]any {
+		t.Helper()
+		response, err := http.Get(ts.URL + "/api/chan/" + symbol + "/adjusted?spot=150")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var payload map[string]any
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf("adjusted action response status=%d decode=%v payload=%#v", response.StatusCode, err, payload)
+		}
+		return payload["daily"].(map[string]any)
+	}
+	splitDaily := request("SPLIT")
+	splitQuality := splitDaily["quality"].(map[string]any)
+	if splitQuality["corporate_action_suspected"] != false || splitQuality["status"] != "ok" {
+		t.Fatalf("factor-explained split degraded adjusted history: %#v", splitQuality)
+	}
+	events, ok := splitQuality["corporate_action_events"].([]any)
+	if !ok || len(events) != 1 || events[0].(map[string]any)["kind"] != "split_candidate" || events[0].(map[string]any)["factor_verified"] != true {
+		t.Fatalf("split action event=%#v", splitQuality["corporate_action_events"])
+	}
+	if chains, ok := splitQuality["chains"].([]any); !ok || len(chains) != 1 {
+		t.Fatalf("verified split should remain in one adjusted structure chain: %#v", splitQuality["chains"])
+	}
+
+	jumpDaily := request("JUMP")
+	jumpQuality := jumpDaily["quality"].(map[string]any)
+	if jumpQuality["corporate_action_suspected"] != true || jumpQuality["status"] != "degraded" {
+		t.Fatalf("unexplained adjusted jump should degrade quality: %#v", jumpQuality)
+	}
+	if chains, ok := jumpQuality["chains"].([]any); !ok || len(chains) != 2 {
+		t.Fatalf("unexplained jump should split structure chains: %#v", jumpQuality["chains"])
+	}
+}
+
+func TestChanAdjustedEndpointDegradesAndBlocksComparisonWithoutValidSpotFactor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-chan-factor.db")
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{DatabasePath: path, UpstreamTimeout: time.Second}
+	service := NewWithProvider(cfg, repository, &testMarketProvider{})
+	defer service.Close()
+	ts := httptest.NewServer(service.Router())
+	defer ts.Close()
+	fetched := time.Now().UTC()
+	bar := map[string]any{"date": "2026-10-16", "open": 50.0, "high": 55.0, "low": 45.0, "close": 52.0, "volume": 100.0, "raw_open": 100.0, "raw_high": 110.0, "raw_low": 90.0, "raw_close": 104.0, "raw_volume": 100.0, "adjustment_factor": .5}
+	if err := repository.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", []map[string]any{bar}, fetched); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(30000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	if _, err := admin.Exec(`UPDATE chan_adjusted_history SET adjustment_factor=0.25 WHERE symbol='QQQ' AND bar_date='2026-10-16'`); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Get(ts.URL + "/api/chan/QQQ/adjusted?spot=110")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("missing-factor response status=%d decode=%v payload=%#v", response.StatusCode, err, payload)
+	}
+	coordinate := payload["price_coordinate"].(map[string]any)
+	daily := payload["daily"].(map[string]any)
+	quality := daily["quality"].(map[string]any)
+	if coordinate["status"] != "degraded" || coordinate["adjustment_factor"] != nil || coordinate["adjusted_spot"] != nil || coordinate["raw_spot"] != 110.0 || daily["last_close"] != nil || quality["status"] != "degraded" || daily["bar_count"] != float64(0) {
+		t.Fatalf("invalid factor must block comparison and degrade the frame: coordinate=%#v daily=%#v", coordinate, daily)
+	}
+	warnings, ok := payload["warnings"].([]any)
+	warningFound := false
+	for _, warning := range warnings {
+		if warning == "缺少有效的现价复权因子；当前价未与复权结构比较，数据质量已降级" {
+			warningFound = true
+		}
+	}
+	if !ok || !warningFound {
+		t.Fatalf("missing factor warning not exposed: %#v", payload["warnings"])
 	}
 }
 

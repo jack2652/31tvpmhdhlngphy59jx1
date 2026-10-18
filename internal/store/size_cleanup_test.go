@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -616,6 +617,94 @@ VALUES ('QQQ', ?, 'success'), ('QQQ', ?, 'success')`, oldest, recent); err != ni
 	}
 	if count != 0 {
 		t.Fatalf("option raw_json count=%d, want zero", count)
+	}
+}
+
+func TestCleanupBySizePrunesOldChanAdjustedHistoryAfterSizeLimit(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "size-cleanup-chan-adjusted.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	fetchedAt := time.Now().UTC()
+	start := time.Date(2010, 1, 4, 0, 0, 0, 0, time.UTC)
+	bars := make([]map[string]any, 0, 100)
+	for index := 0; index < 100; index++ {
+		date := start.AddDate(0, 0, index).Format(time.DateOnly)
+		bars = append(bars, map[string]any{
+			"date": date, "open": 50.0, "high": 55.0, "low": 45.0, "close": 52.0, "volume": 1000.0,
+			"raw_open": 100.0, "raw_high": 110.0, "raw_low": 90.0, "raw_close": 104.0, "raw_volume": 1000.0, "adjustment_factor": 0.5,
+		})
+	}
+	if err := repository.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", bars, fetchedAt); err != nil {
+		t.Fatal(err)
+	}
+	result, err := repository.CleanupBySize(1, 1, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result["chan_adjusted_bars_pruned"]; got != int64(len(bars)) {
+		t.Fatalf("pruned adjusted bars=%v, want %d (cleanup result=%#v)", got, len(bars), result)
+	}
+	stored, err := repository.LatestChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", 3000)
+	if err != nil || len(stored["bars"].([]map[string]any)) != 0 {
+		t.Fatalf("adjusted history remains after size cleanup: stored=%#v err=%v", stored, err)
+	}
+}
+
+func TestCleanupBySizePrunesOldChanStructureRevisionsButKeepsRecentAudit(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "size-cleanup-chan-revisions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	oldAt := time.Now().UTC().AddDate(0, 0, -3*365)
+	base := ChanStructureSnapshot{Symbol: "QQQ", Timeframe: "1d", RuleVersion: "preview.1", InputFingerprint: "old-input", BarFingerprints: map[string]string{"2010-01-04": "bar-a"}, ConfirmedStructures: map[string]json.RawMessage{"segment|level=0|start=2010-01-04|end=2010-01-04": json.RawMessage(`{"end_price":100}`)}, UpdatedAt: oldAt}
+	if _, err := repository.RecordChanStructureSnapshot(base); err != nil {
+		t.Fatal(err)
+	}
+	changed := base
+	changed.InputFingerprint = "old-input-revised"
+	changed.BarFingerprints = map[string]string{"2010-01-04": "bar-b"}
+	changed.ConfirmedStructures = map[string]json.RawMessage{"segment|level=0|start=2010-01-04|end=2010-01-04": json.RawMessage(`{"end_price":101}`)}
+	changed.UpdatedAt = oldAt.Add(time.Minute)
+	if revision, err := repository.RecordChanStructureSnapshot(changed); err != nil || revision == nil {
+		t.Fatalf("create old revision=%#v err=%v", revision, err)
+	}
+	changed.InputFingerprint = "recent-input"
+	changed.BarFingerprints = map[string]string{"2010-01-04": "bar-c"}
+	changed.ConfirmedStructures = map[string]json.RawMessage{"segment|level=0|start=2010-01-04|end=2010-01-04": json.RawMessage(`{"end_price":102}`)}
+	changed.UpdatedAt = time.Now().UTC()
+	if revision, err := repository.RecordChanStructureSnapshot(changed); err != nil || revision == nil {
+		t.Fatalf("create recent revision=%#v err=%v", revision, err)
+	}
+	newRule := changed
+	newRule.RuleVersion = "preview.2"
+	newRule.InputFingerprint = "new-rule-input"
+	newRule.UpdatedAt = time.Now().UTC()
+	if _, err := repository.RecordChanStructureSnapshot(newRule); err != nil {
+		t.Fatalf("preserve new rule snapshot: %v", err)
+	}
+	result, err := repository.CleanupBySize(1, 1, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["chan_structure_revisions_pruned"] != int64(1) {
+		t.Fatalf("revision prune count=%v, want 1: %#v", result["chan_structure_revisions_pruned"], result)
+	}
+	var count int
+	if err := repository.db.QueryRow(`SELECT COUNT(*) FROM chan_structure_revisions`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("revision rows=%d, want the recent audit preserved", count)
+	}
+	var snapshots int
+	if err := repository.db.QueryRow(`SELECT COUNT(*) FROM chan_structure_snapshots WHERE symbol='QQQ' AND timeframe='1d'`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 2 {
+		t.Fatalf("structure snapshot count=%d, want one snapshot for each of two rule versions", snapshots)
 	}
 }
 

@@ -32,6 +32,68 @@ func TestNormalizeYFinanceHistoryPreservesBarsAndExtremes(t *testing.T) {
 	}
 }
 
+func TestPairChanAdjustedHistoryValidatesConsistentOHLCFactor(t *testing.T) {
+	date := "2026-10-16"
+	makeResult := func(adjustedClose float64) (HistoryResult, HistoryResult) {
+		return HistoryResult{Symbol: "QQQ", FetchedAt: time.Now(), Source: "go-yfinance", Bars: []map[string]any{{
+			"date": date, "open": 49.0, "high": 53.0, "low": 48.0, "close": adjustedClose, "volume": 1000.0,
+		}}}, HistoryResult{Symbol: "QQQ", FetchedAt: time.Now(), Source: "go-yfinance", Bars: []map[string]any{{
+			"date": date, "open": 98.0, "high": 106.0, "low": 96.0, "close": 104.0, "volume": 1000.0,
+		}}}
+	}
+	adjusted, raw := makeResult(52)
+	joined, err := pairChanAdjustedBars(adjusted, raw)
+	if err != nil || len(joined.Bars) != 1 || joined.Bars[0]["adjustment_factor"] != .5 {
+		t.Fatalf("paired history=%+v err=%v", joined, err)
+	}
+	adjusted, raw = makeResult(52)
+	adjusted.Bars[0]["high"] = 55.0
+	if _, err := pairChanAdjustedBars(adjusted, raw); err == nil {
+		t.Fatal("expected inconsistent adjusted OHLC factor to be rejected")
+	}
+}
+
+func TestFetchChanAdjustedUsesIndependentAdjustedAndRawHistories(t *testing.T) {
+	fixedTime := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	var params []ym.HistoryParams
+	client := &YFinanceHistoryClient{
+		TimeNow:  func() time.Time { return fixedTime },
+		Location: time.UTC,
+		TickerFactory: func(symbol string) (yahooTicker, error) {
+			if symbol != "QQQ" {
+				t.Fatalf("ticker symbol=%q, want QQQ", symbol)
+			}
+			return &yahooSDKTestTicker{historyFunc: func(request ym.HistoryParams) ([]ym.Bar, error) {
+				params = append(params, request)
+				bar := ym.Bar{Date: fixedTime, Volume: 100}
+				if request.AutoAdjust {
+					bar.Open, bar.High, bar.Low, bar.Close = 49, 53, 48, 52
+				} else {
+					bar.Open, bar.High, bar.Low, bar.Close = 98, 106, 96, 104
+				}
+				return []ym.Bar{bar}, nil
+			}}, nil
+		},
+	}
+	result, err := client.FetchChanAdjusted(context.Background(), "qqq", "5y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(params) != 2 || !params[0].AutoAdjust || params[1].AutoAdjust || params[0].Interval != "1d" || params[1].Interval != "1d" {
+		t.Fatalf("history requests=%+v, want separate adjusted then raw daily queries", params)
+	}
+	if params[0].Period != "5y" || params[1].Period != "5y" {
+		t.Fatalf("history periods=%q/%q, want five-year context for adjusted recursive analysis", params[0].Period, params[1].Period)
+	}
+	if result.Timeframe != "1d" || result.AdjustmentType != "split_dividend_auto" || result.Source != "go-yfinance" || !result.FetchedAt.Equal(fixedTime) || len(result.Bars) != 1 {
+		t.Fatalf("Chan adjusted result=%+v, want one independently paired daily bar", result)
+	}
+	bar := result.Bars[0]
+	if bar["close"] != 52.0 || bar["raw_close"] != 104.0 || bar["adjustment_factor"] != .5 || bar["raw_volume"] != float64(100) {
+		t.Fatalf("paired Chan adjusted bar=%#v, want adjusted/raw OHLC and factor", bar)
+	}
+}
+
 func TestNormalizeYFinanceHistoryPreservesMissingPriceSemantics(t *testing.T) {
 	result, err := normalizeYFinanceHistory("QQQ", "6mo", []ym.Bar{
 		{Date: time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC), Open: 10, High: 11, Low: 9, Close: 0, Volume: 100},
@@ -136,6 +198,30 @@ func TestYFinanceHistoryRejectsUnsupportedPeriodBeforeTickerCreation(t *testing.
 	}
 	if called {
 		t.Fatal("unsupported period reached the SDK ticker factory")
+	}
+}
+
+func TestYFinanceHistorySupportsLongDailyPeriods(t *testing.T) {
+	fixedTime := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	for _, period := range []string{"10y", "20y"} {
+		t.Run(period, func(t *testing.T) {
+			var got ym.HistoryParams
+			client := &YFinanceHistoryClient{
+				TimeNow: func() time.Time { return fixedTime }, Location: time.UTC,
+				TickerFactory: func(string) (yahooTicker, error) {
+					return &yahooSDKTestTicker{historyFunc: func(params ym.HistoryParams) ([]ym.Bar, error) {
+						got = params
+						return []ym.Bar{{Date: fixedTime, Open: 10, High: 12, Low: 9, Close: 11}}, nil
+					}}, nil
+				},
+			}
+			if _, err := client.Fetch(context.Background(), "SPY", period); err != nil {
+				t.Fatal(err)
+			}
+			if got.Period != period || got.Interval != "1d" {
+				t.Fatalf("SDK request = %+v, want %s daily bars", got, period)
+			}
+		})
 	}
 }
 

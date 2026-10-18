@@ -4,6 +4,7 @@
 .chan-body p,.chan-body li,.chan-body dd{text-wrap:pretty}
 .chan-summary{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:24px;padding:20px 22px;border:1px solid var(--line);border-left:3px solid var(--blue);background:var(--field)}
 .chan-summary-read{min-width:0}
+.chan-mode-summary{align-items:center;min-height:62px;color:var(--muted);font-size:12px;line-height:1.7}
 .chan-section-label{display:block;margin-bottom:8px;color:var(--muted);font-size:12px}
 .chan-summary h2{margin:0;font-size:20px;line-height:1.45;font-weight:600}
 .chan-summary-read>p{max-width:70ch;margin:10px 0 0;color:var(--text);font-size:13px;line-height:1.8}
@@ -17,12 +18,37 @@
 .chan-overview-item>span{display:block;margin-top:6px;font-size:12px;font-variant-numeric:tabular-nums}
 .chan-overview-item>p{margin:6px 0 0;color:var(--muted);font-size:11px}
 .chan-controls{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:auto auto;grid-template-areas:"controls status" "levels levels";align-items:start;gap:10px 16px;padding:20px 0 8px;color:var(--muted);font-size:12px}
-.chan-chart-controls{grid-area:controls;display:flex;align-items:center;gap:20px}
+.chan-chart-controls{grid-area:controls;display:flex;align-items:center;gap:20px;min-width:0}
 .chan-chart-controls h3{margin:0;color:var(--text);font-size:15px;font-weight:600}
+.chan-control-options{display:flex;align-items:center;flex-wrap:wrap;gap:8px 16px}
+.chan-control-group{display:flex;align-items:center;gap:7px}
+.chan-layer-control-group{min-width:0}
+.chan-control-group>span{color:var(--muted);font-size:11px;white-space:nowrap}
+.chan-control-group .detail-seg{min-height:34px;padding:5px 10px;font-size:11px;white-space:nowrap}
+.chan-layer-switches{display:flex;align-items:center;flex-wrap:nowrap;gap:0}
+.chan-controls .chan-layer-switches.detail-segmented{flex:0 1 auto;min-width:0;max-width:100%;overflow-x:auto;overflow-y:hidden;border:1px solid var(--field-line);border-radius:4px;background:var(--field);scrollbar-width:thin}
+/* 复用周期按钮的分段外观；每个按钮仍通过 aria-pressed 独立切换，可同时开启多个图层。 */
+.chan-layer-switches .detail-seg{flex:0 0 auto;min-height:34px;padding:5px 10px;border:0;border-radius:0;background:transparent;color:var(--muted);font-size:11px;line-height:1.2;white-space:nowrap}
+.chan-layer-switches .detail-seg+.detail-seg{border-left:1px solid var(--field-line)}
+.chan-layer-switches .detail-seg[aria-pressed="true"]{border-color:var(--blue);background:var(--blue);color:var(--on-blue);box-shadow:none}
+.chan-layer-switches .detail-seg[aria-pressed="false"]:hover{border-color:var(--blue);color:var(--blue)}
+.chan-layer-switches .detail-seg:focus-visible{position:relative;z-index:1;outline:2px solid var(--blue);outline-offset:2px}
 .chan-controls>span{grid-area:status;align-self:center;font-size:11px;line-height:1.5;text-align:right;font-variant-numeric:tabular-nums}
-.chan-chart{position:relative;touch-action:pan-y;overflow:visible}
-.chan-chart>svg{display:block;width:100%;height:auto;min-height:270px}
+.chan-chart{position:relative;touch-action:pan-y;overflow:visible;cursor:grab}
+.chan-chart.chan-chart-dragging{cursor:grabbing;user-select:none;-webkit-user-select:none}
+.chan-chart.chan-chart-dragging>svg{user-select:none;-webkit-user-select:none}
+.chan-chart-canvas{position:absolute;inset:0;display:block;width:100%;height:100%;pointer-events:none}
+.chan-chart>svg{position:relative;z-index:1;display:block;width:100%;height:auto;min-height:270px;overflow:visible}
 .chan-chart-mobile>svg{min-height:0}
+.chan-chart-navigation{display:flex;align-items:center;gap:6px;padding:9px 2px 16px}
+.chan-chart-navigation button{display:grid;min-width:42px;min-height:40px;place-items:center;padding:0 10px;border:1px solid var(--line);border-radius:4px;background:var(--field);color:var(--text);font:inherit;font-size:17px;font-weight:600;line-height:1;cursor:pointer}
+.chan-chart-navigation button:last-child{font-size:12px}
+.chan-chart-navigation button:hover:not(:disabled){border-color:var(--blue);color:var(--blue)}
+.chan-chart-navigation button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.chan-chart-navigation button:disabled{opacity:.42;cursor:not-allowed}
+.chan-chart-navigation-spacer{flex:1}
+.chan-chart-range{margin-inline:4px;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.chan-chart-gesture-help{margin:-10px 2px 16px;color:var(--muted);font-size:10px;line-height:1.5}
 .chan-chart>svg:focus,.chan-chart>svg:focus-visible{outline:0!important;box-shadow:none}
 .chan-scenario-toggle-svg{color:var(--muted);cursor:pointer}
 .chan-scenario-toggle-svg-box{fill:var(--panel);stroke:var(--field-line);stroke-width:.8}
@@ -39,18 +65,23 @@
 .chan-chart-tooltip .chan-ohlc-up{color:var(--up)}
 .chan-chart-tooltip .chan-ohlc-down{color:var(--down)}
 .chan-chart-tooltip .chan-ohlc-flat{color:var(--tooltip-muted)}
+.chan-structure-tooltip{display:grid;gap:2px;margin-top:7px;padding-top:6px;border-top:1px solid var(--tooltip-line);white-space:normal}
+.chan-structure-tooltip strong{color:var(--tooltip-title);font-weight:700}
+.chan-structure-tooltip span{color:var(--tooltip-muted);font-size:10px;line-height:1.4}
 .chan-chart-label{fill:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
 .chan-candle-up{fill:var(--up);stroke:var(--up);stroke-width:1}
 .chan-candle-down{fill:var(--down);stroke:var(--down);stroke-width:1}
 .chan-center{fill:var(--blue);fill-opacity:.08;stroke:var(--blue);stroke-opacity:.3;stroke-width:1}
 .chan-center-latest{fill-opacity:.14;stroke-opacity:.6}
+.chan-key-level-summary{grid-area:levels;display:flex;align-content:start;align-items:center;flex-wrap:wrap;gap:6px 8px;padding:0}
+.chan-key-level-chip{display:inline-flex;align-items:baseline;gap:8px;min-height:28px;padding:4px 10px;border:1px solid var(--line);border-left:2px solid var(--blue);background:var(--field);font-size:12px;line-height:1.4;white-space:nowrap}
+.chan-key-level-chip span{color:var(--muted)}
+.chan-key-level-chip strong{color:var(--text);font-size:13px;font-weight:500;font-variant-numeric:tabular-nums}
+.chan-key-level-chip-resistance{border-left-color:var(--down)}
+.chan-key-level-chip-support{border-left-color:var(--up)}
+.chan-key-level-chip-center{border-left-color:var(--blue)}
 .chan-projection-lane{fill:var(--field);fill-opacity:.92;stroke:var(--line);stroke-width:1;stroke-dasharray:2 4}
 .chan-projection-caption{fill:var(--muted);font-size:9px}
-.chan-key-level-line{stroke-width:1;stroke-dasharray:3 4;opacity:.58}
-.chan-key-level-resistance .chan-key-level-line{stroke:var(--down)}
-.chan-key-level-support .chan-key-level-line{stroke:var(--up)}
-.chan-key-level-center .chan-key-level-line{stroke:var(--blue)}
-.chan-key-level-label{fill:var(--muted);font-size:8px;paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
 .chan-projection-path{fill:none;stroke-width:1.8;stroke-dasharray:6 5;opacity:.92}
 .chan-projection-hit-area{fill:none;stroke:transparent;stroke-width:16;pointer-events:stroke;cursor:pointer}
 .chan-projection-up:focus,.chan-projection-down:focus,.chan-projection-range:focus,.chan-projection-up:focus-visible,.chan-projection-down:focus-visible,.chan-projection-range:focus-visible{outline:0!important}
@@ -63,13 +94,6 @@
 .chan-projection-up{color:var(--up)}
 .chan-projection-down{color:var(--down)}
 .chan-projection-range{color:var(--blue)}
-.chan-key-level-summary{grid-area:levels;display:flex;align-content:start;align-items:center;flex-wrap:wrap;gap:6px 8px;padding:0}
-.chan-key-level-chip{display:inline-flex;align-items:baseline;gap:8px;min-height:28px;padding:4px 10px;border:1px solid var(--line);border-left:2px solid var(--blue);background:var(--field);font-size:12px;line-height:1.4;white-space:nowrap}
-.chan-key-level-chip span{color:var(--muted)}
-.chan-key-level-chip strong{color:var(--text);font-size:13px;font-weight:500;font-variant-numeric:tabular-nums}
-.chan-key-level-chip-resistance{border-left-color:var(--down)}
-.chan-key-level-chip-support{border-left-color:var(--up)}
-.chan-key-level-chip-center{border-left-color:var(--blue)}
 .chan-projection-float-card{position:absolute;bottom:calc(100% + 8px);z-index:5;width:min(400px,48%);max-height:min(190px,32vh);overflow:auto;margin:0;padding:9px 11px;border:1px solid var(--line);border-left:3px solid currentColor;background:var(--panel);box-shadow:0 5px 16px rgba(0,0,0,.22);pointer-events:none}
 .chan-projection-float-card.chan-projection-up{border-left-color:var(--up)}
 .chan-projection-float-card.chan-projection-down{border-left-color:var(--down)}
@@ -129,6 +153,18 @@
   .chan-spot-scenario-next>p{font-size:12px}
   .chan-spot-guide-note{margin-top:7px;font-size:10px}
 }
+
+/* Keep dense recursive layer controls scannable on phones, and make each level's visibility state explicit. */
+@media(max-width:600px){
+  .chan-layer-control-group{display:grid;grid-template-columns:minmax(0,1fr);gap:7px;min-width:0;width:100%}
+  .chan-controls .chan-layer-control-group .chan-layer-switches.detail-segmented{display:flex;flex:0 1 auto;flex-wrap:nowrap;width:100%;max-width:100%;min-width:0;gap:0;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}
+  .chan-controls .chan-layer-control-group .chan-layer-switches .detail-seg{flex:0 0 auto;min-width:max-content;min-height:40px;padding:6px 9px;border:0;border-radius:0;background:transparent;color:var(--muted);font-size:12px;line-height:1.2;text-align:center;white-space:nowrap}
+  .chan-controls .chan-layer-control-group .chan-layer-switches .detail-seg+.detail-seg{border-left:1px solid var(--field-line)}
+  .chan-controls .chan-layer-control-group .chan-layer-switches .detail-seg[aria-pressed="true"]{border-color:var(--blue);background:var(--blue);color:var(--on-blue);font-weight:650;box-shadow:none}
+  .chan-controls .chan-layer-control-group .chan-layer-switches .detail-seg:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+}
+/* Separate adjacent enabled layers with a light divider when all toggles are on. */
+.chan-controls .chan-layer-control-group .chan-layer-switches .detail-seg[aria-pressed="true"]+.detail-seg[aria-pressed="true"]{border-left:1px solid color-mix(in srgb,var(--on-blue) 48%,var(--blue))}
 .chan-legend{display:flex;justify-content:center;flex-wrap:wrap;gap:12px 20px;margin:10px 0 20px;font-size:11px;color:var(--muted)}
 .chan-legend>span{display:inline-flex;align-items:center;gap:6px}
 .chan-legend-pen{width:20px;border-top:2px solid var(--blue)}
@@ -136,11 +172,17 @@
 .chan-legend-center{width:14px;height:10px;border:1px solid var(--blue);background:color-mix(in srgb,var(--blue) 14%,transparent)}
 .chan-legend-projection{width:20px;border-top:2px dashed var(--blue)}
 .chan-legend-level{width:20px;border-top:1px dashed var(--muted)}
+.chan-key-level-line{stroke-width:1;stroke-dasharray:3 4;opacity:.58}
+.chan-key-level-resistance .chan-key-level-line{stroke:var(--down)}
+.chan-key-level-support .chan-key-level-line{stroke:var(--up)}
+.chan-key-level-center .chan-key-level-line{stroke:var(--blue)}
+.chan-key-level-label{fill:var(--muted);font-size:8px;paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
 .chan-endpoint{fill:var(--blue);stroke:var(--panel);stroke-width:1.2}
 .chan-endpoint-pending{fill:var(--panel);stroke:var(--blue);stroke-width:1.5}
 .chan-endpoint-label{fill:var(--text);font-size:9px;font-weight:400;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
 .chan-spot-mobile-badge{position:absolute;z-index:2;display:block;padding:2px 4px;border:1px solid color-mix(in srgb,var(--blue) 55%,var(--line));border-radius:3px;background:var(--panel);color:var(--blue);font-size:13px;font-weight:750;line-height:1.25;font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right;transform:translate(-100%,-50%);margin-left:-4px;cursor:pointer;pointer-events:auto}
 .chan-spot-mobile-badge:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.chan-spot-mobile-badge-static{cursor:default;pointer-events:none}
 .chan-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;margin:0;padding:16px 18px;background:var(--field);border:1px solid var(--line)}
 .chan-facts>div{min-width:0}
 .chan-facts dt{color:var(--muted);font-size:12px}
@@ -257,6 +299,7 @@
 .chan-panel button:focus-visible,.chan-panel summary:focus-visible{outline:2px solid var(--blue);outline-offset:4px}
 .chan-panel .detail-header button{min-height:36px;flex:1 1 auto;width:100%}
 .chan-controls .detail-seg{min-width:64px;min-height:36px}
+.chan-control-group .detail-seg{min-width:0;min-height:34px;padding:5px 10px;font-size:11px;white-space:nowrap}
 @media(max-width:1100px){
   .chan-guidance-grid{grid-template-columns:1fr;gap:20px}
   .chan-evidence-block{padding:0;border:0}
@@ -291,16 +334,20 @@
   .chan-overview-item:first-child{padding-top:0;border-right:0;border-bottom:1px solid var(--line)}
   .chan-controls{grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto;grid-template-areas:"controls" "status" "levels";gap:10px}
   .chan-controls>span{text-align:left}
-  /* 四个周期按钮在窄屏独占一行并按等分收缩，避免被 detail-segmented 的 overflow:hidden 裁掉。 */
+  /* 周期按钮在窄屏分为两行排列，避免新增周期后按钮过窄或被裁切。 */
   .chan-chart-controls{flex-wrap:wrap;gap:10px}
   .chan-controls .detail-segmented{display:flex;flex:1 1 100%;flex-wrap:wrap}
   .chan-controls .detail-seg{flex:1 1 25%;min-width:0;padding:5px 6px}
-  .chan-mobile-range{display:grid;grid-template-columns:auto repeat(3,minmax(0,1fr));align-items:center;gap:6px;margin:2px 0 8px;color:var(--muted);font-size:11px}
-  .chan-mobile-range>span{padding-right:3px;white-space:nowrap}
-  .chan-mobile-range button{min-width:0;min-height:34px;padding:5px 4px;border:1px solid var(--line);border-radius:4px;background:var(--field);color:var(--muted);font:inherit;font-size:11px;white-space:nowrap}
-  .chan-mobile-range button[aria-pressed=true]{border-color:var(--blue);background:color-mix(in srgb,var(--blue) 12%,var(--panel));color:var(--text)}
-  .chan-mobile-range button:focus-visible{outline:2px solid var(--blue);outline-offset:1px}
-  .chan-mobile-range small{grid-column:1/-1;margin-left:auto;font-size:10px}
+  .chan-control-options{width:100%;align-items:flex-start;flex-direction:column}
+  .chan-control-group{width:100%;align-items:flex-start;flex-wrap:wrap;min-width:0}
+  .chan-control-group.chan-period-control-group:has(.detail-segmented:not(.chan-layer-switches)){display:grid;grid-template-columns:minmax(0,1fr);gap:6px}
+  .chan-control-group.chan-period-control-group>span{display:block}
+  .chan-period-control-group .detail-segmented{display:flex;flex:0 0 auto;width:100%;max-width:100%;overflow:visible}
+  .chan-period-control-group .detail-segmented{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}
+  .chan-period-control-group .detail-seg{min-width:0;white-space:nowrap}
+  .chan-chart-navigation{gap:4px}
+  .chan-chart-navigation button{min-width:38px;min-height:38px;padding-inline:7px}
+  .chan-chart-range{font-size:10px}
   .chan-chart-mobile .chan-chart-label{font-size:14px}
   .chan-chart-mobile .chan-endpoint-label{font-size:12px;font-weight:550}
   .chan-chart-mobile .chan-projection-caption{display:none}

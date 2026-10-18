@@ -804,6 +804,108 @@ func TestWriteHistoryUpsertsAndReadsBars(t *testing.T) {
 	}
 }
 
+func TestChanAdjustedHistoryIsDimensionedAndIsolated(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "chan-adjusted.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	fetched := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	bar := map[string]any{"date": "2026-10-16", "open": 49.0, "high": 53.0, "low": 48.0, "close": 52.0, "volume": 1000.0, "raw_open": 98.0, "raw_high": 106.0, "raw_low": 96.0, "raw_close": 104.0, "raw_volume": 1000.0, "adjustment_factor": 0.5}
+	if err := repository.WriteChanAdjustedHistory("qqq", "1d", "split_dividend_auto", "go-yfinance", []map[string]any{bar}, fetched); err != nil {
+		t.Fatal(err)
+	}
+	result, err := repository.LatestChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", 3000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bars := result["bars"].([]map[string]any)
+	if len(bars) != 1 || bars[0]["date"] != "2026-10-16" || bars[0]["raw_close"].(*float64) == nil || *bars[0]["raw_close"].(*float64) != 104 || *bars[0]["close"].(*float64) != 52 || result["provider"] != "go-yfinance" {
+		t.Fatalf("adjusted result=%#v", result)
+	}
+	otherProvider, err := repository.LatestChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "other", 3000)
+	if err != nil || len(otherProvider["bars"].([]map[string]any)) != 0 {
+		t.Fatalf("provider cache key was not isolated: %#v err=%v", otherProvider, err)
+	}
+	for _, dimensions := range []struct{ symbol, timeframe, adjustment string }{
+		{"QQQ", "1wk", "split_dividend_auto"},
+		{"QQQ", "1d", "split_only"},
+		{"SPY", "1d", "split_dividend_auto"},
+	} {
+		if err := repository.WriteChanAdjustedHistory(dimensions.symbol, dimensions.timeframe, dimensions.adjustment, "go-yfinance", []map[string]any{bar}, fetched.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		other, queryErr := repository.LatestChanAdjustedHistory(dimensions.symbol, dimensions.timeframe, dimensions.adjustment, "go-yfinance", 3000)
+		if queryErr != nil || len(other["bars"].([]map[string]any)) != 1 {
+			t.Fatalf("cache dimensions %+v not independently queryable: %#v err=%v", dimensions, other, queryErr)
+		}
+	}
+	for _, dimensions := range []struct{ symbol, timeframe, adjustment string }{
+		{"QQQ", "1wk", "split_dividend_auto"},
+		{"QQQ", "1d", "split_only"},
+		{"SPY", "1d", "split_dividend_auto"},
+	} {
+		other, queryErr := repository.LatestChanAdjustedHistory(dimensions.symbol, dimensions.timeframe, dimensions.adjustment, "other", 3000)
+		if queryErr != nil || len(other["bars"].([]map[string]any)) != 0 {
+			t.Fatalf("cache dimensions %+v leaked to another provider: %#v err=%v", dimensions, other, queryErr)
+		}
+	}
+	if err := repository.WriteHistory("QQQ", []map[string]any{{"date": "2026-10-16", "open": 98.0, "high": 106.0, "low": 96.0, "close": 104.0, "volume": 1000.0}}, fetched); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := repository.LatestHistory("QQQ", 3000)
+	if err != nil || *raw["bars"].([]map[string]any)[0]["close"].(*float64) != 104 {
+		t.Fatalf("raw history was contaminated by adjusted write: %#v err=%v", raw, err)
+	}
+}
+
+func TestChanAdjustedHistoryReadsMoreThanLegacyThreeThousandBarLimit(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "chan-adjusted-large.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	fetched := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	bars := make([]map[string]any, 3101)
+	start := time.Date(2014, 1, 2, 0, 0, 0, 0, time.UTC)
+	for index := range bars {
+		day := start.AddDate(0, 0, index)
+		close := 100 + float64(index%100)/10
+		bars[index] = map[string]any{"date": day.Format(time.DateOnly), "open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1000.0, "raw_open": close, "raw_high": close + 1, "raw_low": close - 1, "raw_close": close, "raw_volume": 1000.0, "adjustment_factor": 1.0}
+	}
+	if err := repository.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", bars, fetched); err != nil {
+		t.Fatal(err)
+	}
+	result, err := repository.LatestChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", 3100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(result["bars"].([]map[string]any)); got != 3100 {
+		t.Fatalf("large adjusted history count=%d, want requested 3100 rows", got)
+	}
+}
+
+func TestChanAdjustedHistoryRejectsMismatchedOHLCFactorsAtomically(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "chan-adjusted-validation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	bar := map[string]any{"date": "2026-10-16", "open": 49.0, "high": 53.0, "low": 48.0, "close": 52.0, "volume": 1000.0, "raw_open": 98.0, "raw_high": 106.0, "raw_low": 96.0, "raw_close": 104.0, "raw_volume": 1000.0, "adjustment_factor": 0.5}
+	bad := make(map[string]any, len(bar))
+	for key, value := range bar {
+		bad[key] = value
+	}
+	bad["high"] = 55.0
+	if err := repository.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", []map[string]any{bar, bad}, time.Now()); err == nil {
+		t.Fatal("expected inconsistent OHLC adjustment factor to be rejected")
+	}
+	result, err := repository.LatestChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", 3000)
+	if err != nil || len(result["bars"].([]map[string]any)) != 0 {
+		t.Fatalf("invalid batch was partially persisted: result=%#v err=%v", result, err)
+	}
+}
+
 func TestWriteHistoryValidatesAtomically(t *testing.T) {
 	repository, err := Open(filepath.Join(t.TempDir(), "write-history-validation.db"))
 	if err != nil {

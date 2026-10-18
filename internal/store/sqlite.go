@@ -195,6 +195,31 @@ CREATE TABLE IF NOT EXISTS price_history (
  symbol TEXT NOT NULL, bar_date TEXT NOT NULL, open REAL, high REAL, low REAL, close REAL,
  volume REAL, fetched_at TEXT NOT NULL, PRIMARY KEY(symbol, bar_date)
 );
+CREATE TABLE IF NOT EXISTS chan_adjusted_history (
+ symbol TEXT NOT NULL, timeframe TEXT NOT NULL, adjustment_type TEXT NOT NULL, provider TEXT NOT NULL,
+ bar_date TEXT NOT NULL, open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL, volume REAL NOT NULL,
+ raw_open REAL NOT NULL, raw_high REAL NOT NULL, raw_low REAL NOT NULL, raw_close REAL NOT NULL, raw_volume REAL NOT NULL,
+ adjustment_factor REAL NOT NULL, fetched_at TEXT NOT NULL,
+ PRIMARY KEY(symbol, timeframe, adjustment_type, provider, bar_date)
+);
+CREATE INDEX IF NOT EXISTS idx_chan_adjusted_history_time ON chan_adjusted_history(symbol, timeframe, adjustment_type, provider, bar_date DESC);
+CREATE TABLE IF NOT EXISTS chan_structure_snapshots (
+ symbol TEXT NOT NULL, timeframe TEXT NOT NULL, rule_version TEXT NOT NULL,
+ input_fingerprint TEXT NOT NULL, bar_fingerprints_json TEXT NOT NULL, confirmed_structures_json TEXT NOT NULL,
+ updated_at TEXT NOT NULL, PRIMARY KEY(symbol, timeframe, rule_version)
+);
+CREATE TABLE IF NOT EXISTS chan_structure_revisions (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+ previous_rule_version TEXT NOT NULL, rule_version TEXT NOT NULL, reason TEXT NOT NULL,
+ input_fingerprint TEXT NOT NULL, changed_bars_json TEXT NOT NULL, changed_structures_json TEXT NOT NULL,
+ created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chan_structure_revisions_lookup ON chan_structure_revisions(symbol, timeframe, id DESC);
+CREATE TABLE IF NOT EXISTS intraday_history (
+ symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time TEXT NOT NULL, open REAL, high REAL, low REAL, close REAL,
+ volume REAL, fetched_at TEXT NOT NULL, PRIMARY KEY(symbol, interval, bar_time)
+);
+CREATE INDEX IF NOT EXISTS idx_intraday_history_time ON intraday_history(symbol, interval, bar_time DESC);
 CREATE TABLE IF NOT EXISTS price_extremes (
  symbol TEXT PRIMARY KEY, payload TEXT NOT NULL, fetched_at TEXT NOT NULL
 );
@@ -237,6 +262,9 @@ CREATE TABLE IF NOT EXISTS push_refresh_state (
 	if err := ensureCompatibilityColumns(conn); err != nil {
 		return err
 	}
+	if err := ensureVersionedChanStructureSnapshots(conn); err != nil {
+		return err
+	}
 	// Older Python/Go writers can leave a subset of option_snapshots without a
 	// corresponding latest-batch marker. Repair each symbol/expiration pair,
 	// not only databases where the marker table is completely empty. This runs
@@ -259,6 +287,52 @@ WHERE EXISTS (SELECT 1 FROM option_snapshots snapshot
                                       AND current.expiration=option_latest_batches.expiration
                                       AND current.fetched_at=option_latest_batches.fetched_at)))`); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ensureVersionedChanStructureSnapshots preserves one snapshot per algorithm
+// rule version. Existing databases have a (symbol, timeframe) key, so rebuild
+// the table inside init's migration transaction before any readers start.
+func ensureVersionedChanStructureSnapshots(conn *sql.Conn) error {
+	rows, err := conn.QueryContext(context.Background(), `PRAGMA table_info("chan_structure_snapshots")`)
+	if err != nil {
+		return err
+	}
+	primaryKey := map[string]int{}
+	for rows.Next() {
+		var cid, notNull, keyOrder int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &keyOrder); err != nil {
+			rows.Close()
+			return err
+		}
+		if keyOrder > 0 {
+			primaryKey[name] = keyOrder
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(primaryKey) == 3 && primaryKey["symbol"] == 1 && primaryKey["timeframe"] == 2 && primaryKey["rule_version"] == 3 {
+		return nil
+	}
+	if _, err := conn.ExecContext(context.Background(), `
+CREATE TABLE chan_structure_snapshots_versioned (
+ symbol TEXT NOT NULL, timeframe TEXT NOT NULL, rule_version TEXT NOT NULL,
+ input_fingerprint TEXT NOT NULL, bar_fingerprints_json TEXT NOT NULL, confirmed_structures_json TEXT NOT NULL,
+ updated_at TEXT NOT NULL, PRIMARY KEY(symbol, timeframe, rule_version)
+);
+INSERT INTO chan_structure_snapshots_versioned(symbol,timeframe,rule_version,input_fingerprint,bar_fingerprints_json,confirmed_structures_json,updated_at)
+ SELECT symbol,timeframe,rule_version,input_fingerprint,bar_fingerprints_json,confirmed_structures_json,updated_at FROM chan_structure_snapshots;
+DROP TABLE chan_structure_snapshots;
+ALTER TABLE chan_structure_snapshots_versioned RENAME TO chan_structure_snapshots;`); err != nil {
+		return fmt.Errorf("migrate versioned Chan structure snapshots: %w", err)
 	}
 	return nil
 }
@@ -1311,6 +1385,131 @@ WHERE excluded.fetched_at >= option_latest_batches.fetched_at`, response.Symbol,
 	return tx.Commit()
 }
 
+// WriteChanAdjustedHistory stores adjusted Chan bars and their raw-price
+// counterparts independently from price_history. The composite key isolates
+// symbol, timeframe, adjustment policy, and provider cache entries.
+func (s *SQLite) WriteChanAdjustedHistory(symbol, timeframe, adjustmentType, providerName string, bars []map[string]any, fetchedAt time.Time) error {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	timeframe = strings.TrimSpace(timeframe)
+	adjustmentType = strings.TrimSpace(adjustmentType)
+	providerName = strings.TrimSpace(providerName)
+	if symbol == "" || timeframe == "" || adjustmentType == "" || providerName == "" {
+		return errors.New("Chan adjusted history cache dimensions must not be empty")
+	}
+	if fetchedAt.IsZero() {
+		return errors.New("Chan adjusted history fetched_at must not be zero")
+	}
+	stamp := storedTimestamp(fetchedAt)
+	type preparedBar struct {
+		day    string
+		values [11]float64
+	}
+	prepared := make([]preparedBar, 0, len(bars))
+	fields := []string{"open", "high", "low", "close", "volume", "raw_open", "raw_high", "raw_low", "raw_close", "raw_volume", "adjustment_factor"}
+	for index, bar := range bars {
+		day, ok := bar["date"].(string)
+		parsed, err := time.Parse(time.DateOnly, day)
+		if !ok || err != nil || parsed.Format(time.DateOnly) != day {
+			return fmt.Errorf("Chan adjusted history bar %d has invalid date", index)
+		}
+		row := preparedBar{day: day}
+		for fieldIndex, field := range fields {
+			value, valueErr := finiteSQLiteNumber(bar[field])
+			number, numberOK := value.(float64)
+			if valueErr != nil || !numberOK {
+				return fmt.Errorf("Chan adjusted history bar %d field %s must be finite", index, field)
+			}
+			row.values[fieldIndex] = number
+		}
+		for _, offset := range []int{0, 1, 2, 3, 5, 6, 7, 8, 10} {
+			if row.values[offset] <= 0 {
+				return fmt.Errorf("Chan adjusted history bar %d contains non-positive prices/factor", index)
+			}
+		}
+		if row.values[4] < 0 || row.values[9] < 0 || row.values[1] < math.Max(row.values[0], row.values[3]) || row.values[2] > math.Min(row.values[0], row.values[3]) || row.values[1] < row.values[2] || row.values[6] < math.Max(row.values[5], row.values[8]) || row.values[7] > math.Min(row.values[5], row.values[8]) || row.values[6] < row.values[7] {
+			return fmt.Errorf("Chan adjusted history bar %d has invalid OHLCV", index)
+		}
+		for priceIndex := 0; priceIndex < 4; priceIndex++ {
+			expected := row.values[priceIndex+5] * row.values[10]
+			if math.Abs(row.values[priceIndex]-expected) > 1e-6*math.Max(1, row.values[priceIndex]) {
+				return fmt.Errorf("Chan adjusted history bar %d has mismatched adjustment factor", index)
+			}
+		}
+		prepared = append(prepared, row)
+	}
+	if len(prepared) == 0 {
+		return errors.New("Chan adjusted history contains no bars")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO chan_adjusted_history(symbol,timeframe,adjustment_type,provider,bar_date,open,high,low,close,volume,raw_open,raw_high,raw_low,raw_close,raw_volume,adjustment_factor,fetched_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(symbol,timeframe,adjustment_type,provider,bar_date) DO UPDATE SET
+open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,volume=excluded.volume,
+raw_open=excluded.raw_open,raw_high=excluded.raw_high,raw_low=excluded.raw_low,raw_close=excluded.raw_close,raw_volume=excluded.raw_volume,
+adjustment_factor=excluded.adjustment_factor,fetched_at=excluded.fetched_at
+WHERE excluded.fetched_at >= chan_adjusted_history.fetched_at`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, bar := range prepared {
+		args := []any{symbol, timeframe, adjustmentType, providerName, bar.day}
+		for _, value := range bar.values {
+			args = append(args, value)
+		}
+		args = append(args, stamp)
+		if _, err := stmt.Exec(args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *SQLite) LatestChanAdjustedHistory(symbol, timeframe, adjustmentType, providerName string, limit int) (map[string]any, error) {
+	if limit < 1 || limit > 100000 {
+		limit = 1500
+	}
+	rows, err := s.db.Query(`SELECT bar_date,open,high,low,close,volume,raw_open,raw_high,raw_low,raw_close,raw_volume,adjustment_factor,fetched_at
+FROM (SELECT bar_date,open,high,low,close,volume,raw_open,raw_high,raw_low,raw_close,raw_volume,adjustment_factor,fetched_at
+FROM chan_adjusted_history WHERE symbol=? AND timeframe=? AND adjustment_type=? AND provider=? ORDER BY bar_date DESC LIMIT ?) ORDER BY bar_date`,
+		strings.ToUpper(strings.TrimSpace(symbol)), strings.TrimSpace(timeframe), strings.TrimSpace(adjustmentType), strings.TrimSpace(providerName), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	bars := []map[string]any{}
+	latestFetched := ""
+	for rows.Next() {
+		var day, fetched string
+		values := make([]sql.NullFloat64, 11)
+		args := []any{&day}
+		for index := range values {
+			args = append(args, &values[index])
+		}
+		args = append(args, &fetched)
+		if err := rows.Scan(args...); err != nil {
+			return nil, err
+		}
+		bar := map[string]any{"date": day}
+		for index, field := range []string{"open", "high", "low", "close", "volume", "raw_open", "raw_high", "raw_low", "raw_close", "raw_volume", "adjustment_factor"} {
+			bar[field] = nullableFloat(values[index])
+		}
+		bar["fetched_at"] = fetched
+		bars = append(bars, bar)
+		if fetched > latestFetched {
+			latestFetched = fetched
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"symbol": strings.ToUpper(strings.TrimSpace(symbol)), "timeframe": timeframe, "adjustment_type": adjustmentType, "provider": providerName, "bars": bars, "fetched_at": nilIfEmpty(latestFetched), "source": "sqlite"}, nil
+}
+
 // WriteHistory transactionally inserts or replaces daily bars in the shared
 // Python-compatible price_history table. Nullable OHLCV values are preserved;
 // non-finite numbers and malformed dates are rejected before any write begins.
@@ -1397,6 +1596,118 @@ WHERE excluded.fetched_at >= price_history.fetched_at`)
 		}
 	}
 	return tx.Commit()
+}
+
+// WriteIntradayHistory transactionally stores timestamped intraday bars.
+// Interval is part of the key so future intraday resolutions can coexist.
+func (s *SQLite) WriteIntradayHistory(symbol, interval string, bars []map[string]any, fetchedAt time.Time) error {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	interval = strings.TrimSpace(interval)
+	if symbol == "" {
+		return errors.New("intraday history symbol must not be empty")
+	}
+	if interval != "15m" {
+		return fmt.Errorf("unsupported intraday interval %q", interval)
+	}
+	if fetchedAt.IsZero() {
+		return errors.New("intraday history fetched_at must not be zero")
+	}
+	stamp := storedTimestamp(fetchedAt)
+	type preparedBar struct {
+		at                             string
+		open, high, low, close, volume any
+	}
+	prepared := make([]preparedBar, 0, len(bars))
+	for index, bar := range bars {
+		rawTime, ok := bar["date"].(string)
+		if !ok {
+			return fmt.Errorf("intraday history bar %d date must be YYYY-MM-DD HH:MM", index)
+		}
+		parsed, err := time.ParseInLocation("2006-01-02 15:04", rawTime, time.UTC)
+		if err != nil || parsed.Format("2006-01-02 15:04") != rawTime {
+			return fmt.Errorf("intraday history bar %d has invalid time %q", index, rawTime)
+		}
+		values := make([]any, 5)
+		for valueIndex, field := range []string{"open", "high", "low", "close", "volume"} {
+			value, err := finiteSQLiteNumber(bar[field])
+			if err != nil {
+				return fmt.Errorf("intraday history bar %d field %s: %w", index, field, err)
+			}
+			values[valueIndex] = value
+		}
+		closeValue, closeOK := values[3].(float64)
+		if !closeOK || closeValue <= 0 {
+			continue
+		}
+		openValue, openOK := optionalHistoryNumber(values[0])
+		highValue, highOK := optionalHistoryNumber(values[1])
+		lowValue, lowOK := optionalHistoryNumber(values[2])
+		volumeValue, volumeOK := optionalHistoryNumber(values[4])
+		if !openOK || !highOK || !lowOK || !volumeOK || openValue != nil && *openValue <= 0 || highValue != nil && *highValue <= 0 || lowValue != nil && *lowValue <= 0 || volumeValue != nil && *volumeValue < 0 || highValue != nil && lowValue != nil && *highValue < *lowValue || highValue != nil && *highValue < closeValue || lowValue != nil && *lowValue > closeValue || openValue != nil && highValue != nil && *highValue < *openValue || openValue != nil && lowValue != nil && *lowValue > *openValue {
+			continue
+		}
+		prepared = append(prepared, preparedBar{at: rawTime, open: values[0], high: values[1], low: values[2], close: values[3], volume: values[4]})
+	}
+	if len(prepared) == 0 {
+		return errors.New("intraday history response contains no usable closing prices")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT INTO intraday_history(symbol, interval, bar_time, open, high, low, close, volume, fetched_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(symbol, interval, bar_time) DO UPDATE SET
+open=COALESCE(excluded.open, intraday_history.open), high=COALESCE(excluded.high, intraday_history.high),
+low=COALESCE(excluded.low, intraday_history.low), close=COALESCE(excluded.close, intraday_history.close),
+volume=COALESCE(excluded.volume, intraday_history.volume), fetched_at=excluded.fetched_at
+WHERE excluded.fetched_at >= intraday_history.fetched_at`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, bar := range prepared {
+		if _, err := stmt.Exec(symbol, interval, bar.at, bar.open, bar.high, bar.low, bar.close, bar.volume, stamp); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LatestIntradayHistory returns the most recent stored intraday bars in ascending order.
+func (s *SQLite) LatestIntradayHistory(symbol, interval string, limit int) (map[string]any, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if interval != "15m" {
+		return nil, fmt.Errorf("unsupported intraday interval %q", interval)
+	}
+	if limit <= 0 || limit > 10000 {
+		limit = 5000
+	}
+	rows, err := s.db.Query(`SELECT bar_time, open, high, low, close, volume, fetched_at FROM (
+SELECT bar_time, open, high, low, close, volume, fetched_at FROM intraday_history
+WHERE symbol=? AND interval=? AND close IS NOT NULL AND close > 0 ORDER BY bar_time DESC LIMIT ?) ORDER BY bar_time`, symbol, interval, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	bars := []map[string]any{}
+	latestFetched := ""
+	for rows.Next() {
+		var at, fetched string
+		var open, high, low, close, volume sql.NullFloat64
+		if err := rows.Scan(&at, &open, &high, &low, &close, &volume, &fetched); err != nil {
+			return nil, err
+		}
+		bars = append(bars, map[string]any{"date": at, "open": nullableFloat(open), "high": nullableFloat(high), "low": nullableFloat(low), "close": nullableFloat(close), "volume": nullableFloat(volume)})
+		if fetched > latestFetched {
+			latestFetched = fetched
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"bars": bars, "fetched_at": nilIfEmpty(latestFetched), "source": "sqlite"}, nil
 }
 
 func optionalHistoryNumber(value any) (*float64, bool) {
@@ -1707,7 +2018,7 @@ func (s *SQLite) Cleanup(retentionDays int) (map[string]int64, error) {
 }
 
 func (s *SQLite) cleanupBefore(cutoff string) (map[string]int64, error) {
-	deleted := map[string]int64{"quotes": 0, "options": 0, "runs": 0, "history": 0, "extremes": 0}
+	deleted := map[string]int64{"quotes": 0, "options": 0, "runs": 0, "history": 0, "chan_adjusted_history": 0, "intraday_history": 0, "extremes": 0}
 	// Python performs retention cleanup within one connection context, committing
 	// only when all tables and latest-batch index cleanup succeed. Keep that same
 	// atomicity here so partial failures cannot prune quotes while retaining the
@@ -1730,6 +2041,7 @@ func (s *SQLite) cleanupBefore(cutoff string) (map[string]int64, error) {
 		{"quote_snapshots", "quotes", "fetched_at"},
 		{"option_snapshots", "options", "fetched_at"},
 		{"price_history", "history", "fetched_at"},
+		{"chan_adjusted_history", "chan_adjusted_history", "fetched_at"},
 		{"price_extremes", "extremes", "fetched_at"},
 		{"refresh_runs", "runs", "started_at"},
 	} {
@@ -1746,6 +2058,25 @@ func (s *SQLite) cleanupBefore(cutoff string) (map[string]int64, error) {
 			if count < 5000 {
 				break
 			}
+		}
+	}
+	// Yahoo only serves a recent rolling window of 15-minute bars. Retain a
+	// little longer than that window while bounding storage independently of
+	// the daily-history retention setting.
+	intradayCutoff := time.Now().UTC().AddDate(0, 0, -90).Format("2006-01-02 15:04")
+	for {
+		result, execErr := tx.Exec(`DELETE FROM intraday_history WHERE rowid IN (
+SELECT rowid FROM intraday_history WHERE bar_time < ? LIMIT 5000)`, intradayCutoff)
+		if execErr != nil {
+			return nil, execErr
+		}
+		count, countErr := result.RowsAffected()
+		if countErr != nil {
+			return nil, countErr
+		}
+		deleted["intraday_history"] += count
+		if count < 5000 {
+			break
 		}
 	}
 	if _, err := tx.Exec(`DELETE FROM option_latest_batches AS latest

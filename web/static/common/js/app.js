@@ -26,9 +26,35 @@ const CHAN_FOLD_KEYS = {
   rules: "option-scope-chan-rules",
 };
 const CHAN_SCENARIOS_STORAGE_KEY = "option-scope-chan-scenarios-visible";
+const CHAN_CHART_PREFERENCES_KEY = "option-scope-chan-chart-preferences";
+const CHAN_INTRADAY_PERIODS = ["15m", "4h"];
+const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "4h"];
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true };
 function readChanScenarioVisibility() {
   try { return localStorage.getItem(CHAN_SCENARIOS_STORAGE_KEY) === "1"; } catch (error) { return false; }
 }
+function readChanChartPreferences() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(CHAN_CHART_PREFERENCES_KEY) || "null");
+    if (!stored || typeof stored !== "object") return { period: "daily", layers: { ...DEFAULT_CHAN_CHART_LAYERS } };
+    const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
+    const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
+    for (const key of ["pens", "penCenters", "chanCandles", "segments", "signals"]) {
+      if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
+    }
+    for (const key of ["segmentLevels", "recursiveCenters"]) {
+      const values = sourceLayers[key];
+      if (!values || typeof values !== "object" || Array.isArray(values)) continue;
+      layers[key] = Object.fromEntries(Object.entries(values)
+        .filter(([level, visible]) => /^[0-7]$/.test(level) && typeof visible === "boolean"));
+    }
+    return { period: CHAN_CHART_PERIODS.includes(stored.period) ? stored.period : "daily", layers };
+  } catch (error) { return { period: "daily", layers: { ...DEFAULT_CHAN_CHART_LAYERS } }; }
+}
+function rememberChanChartPreferences(period, layers) {
+  try { localStorage.setItem(CHAN_CHART_PREFERENCES_KEY, JSON.stringify({ period, layers })); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
+}
+const initialChanChartPreferences = readChanChartPreferences();
 const state = {
   symbol: defaultSymbol,
   symbolInput: defaultSymbol,
@@ -37,12 +63,15 @@ const state = {
   expirationPlaceholder: "先载入标的",
   analysisReady: false,
   loadId: 0,
-  chanPeriod: "daily",
+  chanPeriod: initialChanChartPreferences.period,
   chanMobileChart: window.matchMedia ? window.matchMedia("(max-width: 600px)").matches : false,
-  chanMobileBars: 30,
+  chanViewports: { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } },
+  chanChartLayers: initialChanChartPreferences.layers,
   chanScenariosVisible: readChanScenarioVisibility(),
   chanIntradayPayload: { "15m": null, "4h": null },
   chanIntradayLoading: { "15m": false, "4h": false },
+  chanIntradayRetryTimers: { "15m": null, "4h": null },
+  chanIntradayRetryAttempts: { "15m": 0, "4h": 0 },
   chanIntradaySpot: null,
   chanHoveredScenario: null,
   chanScenarioCardX: 0,
@@ -73,6 +102,9 @@ const state = {
   fairValuePollKey: "",
   fairValuePollAttempts: 0,
   fairValuePollInFlight: false,
+  quoteRetryTimer: null,
+  quoteRetryAttempts: 0,
+  quoteRetryInFlightKey: "",
   pushSource: null,
   pushSymbol: "",
   pushReconnectTimer: null,
@@ -756,6 +788,43 @@ function snapshotTimestampIsFresh(fetchedAt, maxAgeSeconds = SNAPSHOT_FRESH_SECO
 
 function quoteIsFresh(quote, maxAgeSeconds = SNAPSHOT_FRESH_SECONDS) {
   return quoteIsReady(quote) && snapshotTimestampIsFresh(quote?.fetched_at, maxAgeSeconds);
+}
+
+function clearQuoteRetry() {
+  if (state.quoteRetryTimer) clearTimeout(state.quoteRetryTimer);
+  state.quoteRetryTimer = null;
+  state.quoteRetryAttempts = 0;
+}
+
+// A new symbol can briefly have no durable quote while the snapshot worker is
+// still fetching upstream. Keep checking the lightweight quote endpoint until
+// the first usable quote arrives; the SSE push remains the fast path.
+function scheduleQuoteRetry(symbol, loadId) {
+  if (!symbol || symbol !== state.symbol || loadId !== state.loadId
+    || (state.lastQuote?.symbol === symbol && quoteIsReady(state.lastQuote))
+    || state.quoteRetryTimer) return;
+  const delay = Math.min(60000, 1000 * (2 ** Math.min(state.quoteRetryAttempts, 6)));
+  state.quoteRetryAttempts += 1;
+  state.quoteRetryTimer = setTimeout(() => {
+    state.quoteRetryTimer = null;
+    fetchQuoteForDisplay(symbol, loadId);
+  }, delay);
+}
+
+function fetchQuoteForDisplay(symbol, loadId, allowStaleValuation = false) {
+  const requestKey = `${loadId}|${symbol}`;
+  if (!symbol || symbol !== state.symbol || loadId !== state.loadId || state.quoteRetryInFlightKey === requestKey) return;
+  state.quoteRetryInFlightKey = requestKey;
+  request(`/api/quote/${encodeURIComponent(symbol)}`).then((quote) => {
+    if (symbol !== state.symbol || loadId !== state.loadId) return;
+    const usableQuote = latestRenderableQuote(symbol, quote, state.lastQuote);
+    if (usableQuote) renderQuote(usableQuote, allowStaleValuation, quoteIsUsableSQLiteSnapshot(usableQuote, symbol));
+    if (!(state.lastQuote?.symbol === symbol && quoteIsReady(state.lastQuote))) scheduleQuoteRetry(symbol, loadId);
+  }).catch(() => {
+    scheduleQuoteRetry(symbol, loadId);
+  }).finally(() => {
+    if (state.quoteRetryInFlightKey === requestKey) state.quoteRetryInFlightKey = "";
+  });
 }
 
 // The live snapshot cadence varies by session: regular hours refresh every
@@ -2517,7 +2586,12 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     : `${priceLabel}暂无数据`;
   // 夜盘、盘前还没进入新的常规交易，开盘价属于上一交易日，文案用昨开；盘中和盘后仍是今开。
   const priorSessionOpen = trendMarket?.market_state === "PRE" || trendMarket?.market_state === "OVERNIGHT";
-  const openTitle = "最近一个已完成交易日的常规时段开盘价";
+  const openTitle = trendMarket?.previous_open_date
+    ? trendMarket.previous_open_date + " 交易日的常规时段开盘价"
+    : "最近一个已完成交易日的常规时段开盘价";
+  const closeTitle = trendMarket?.previous_close_date
+    ? trendMarket.previous_close_date + " 交易日的收盘价"
+    : "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示";
   const stopValue = Number(typeof serverStopLoss === "object" ? serverStopLoss?.price : serverStopLoss);
   const stopBasisPrice = validPrice ? displayedPrice : Number(spot);
   const buyZoneLow = Number(tradePoints?.buy?.zone_low) || Number(tradePoints?.buy?.price);
@@ -2554,7 +2628,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     ["日均斜率", slopeText, "对样本区间的收盘价做线性回归，得到每个交易日相对均价的平均涨跌百分比。正数为上涨，负数为下跌"],
     ["样本", `${Number(trend.bars) || 0} 根日线`, ""],
     ["昨开", formatMoney(trendMarket?.previous_open), openTitle],
-    ["昨收", formatMoney(trendMarket?.previous_close), "昨日收盘价；非交易时段按最近一个已完成交易日的收盘价显示"],
+    ["昨收", formatMoney(trendMarket?.previous_close), closeTitle],
     ["Beta", betaText, betaTitle],
   ].map(([label, value, title, rowClass]) => ({
     label,
@@ -2575,7 +2649,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     };
     const value = values[row.label] ?? "--";
     const label = row.label;
-    const title = row.label === "昨开" ? openTitle : row.title;
+    const title = row.label === "昨开" ? openTitle : (row.label === "昨收" ? closeTitle : row.title);
     const available = value !== "--" && value !== "等待日线";
     return {
       ...row,
@@ -3127,6 +3201,8 @@ function quoteReference(quote) {
   const marketState = quote?.market_state;
   const sessions = quote?.sessions || {};
   const previous = alignedPreviousClose(quote);
+  const previousCloseDate = state.trendMarketSymbol === quote?.symbol
+    ? state.trendMarket?.previous_close_date : null;
   let label = "昨收";
   let price = previous;
   let title = "涨跌幅以最近一个已完成交易日的收盘价为基准";
@@ -3147,6 +3223,9 @@ function quoteReference(quote) {
     label = "昨收";
     price = previous;
     title = "夜盘涨跌以昨收为基准";
+  }
+  if (marketState === "CLOSED" && previousCloseDate) {
+    title = "昨收与趋势通道一致，按 " + previousCloseDate + " 交易日的收盘价显示";
   }
   return {
     text: `${label} ${price == null ? "--" : formatMoney(price)}`,
@@ -3273,6 +3352,7 @@ function renderCurrentChanMarketAnalysis(spot, preserveOptionLevels = false) {
 }
 
 function resetChanAnalysis() {
+  Object.values(state.chanIntradayRetryTimers).forEach((timer) => clearTimeout(timer));
   clearTimeout(state.chanRetryTimer);
   state.chanRetryTimer = null;
   state.chanRequestId += 1;
@@ -3282,11 +3362,28 @@ function resetChanAnalysis() {
   state.chanLoading = false;
   state.chanSpotGuideVisible = false;
   state.chanPayload = null;
+  state.chanViewports = { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } };
   state.chanRefreshPending = false;
   state.view.chan = OptionScopeChan.empty();
   state.chanIntradayPayload = { "15m": null, "4h": null };
   state.chanIntradayLoading = { "15m": false, "4h": false };
+  state.chanIntradayRetryTimers = { "15m": null, "4h": null };
+  state.chanIntradayRetryAttempts = { "15m": 0, "4h": 0 };
   state.chanIntradaySpot = null;
+}
+
+function scheduleChanIntradayRetry(period, symbol) {
+  const attempts = state.chanIntradayRetryAttempts[period] || 0;
+  // Retry briefly while a background history refresh is active; if the
+  // provider fails, the server's stale-cache cooldown bounds the retries.
+  if (attempts >= 60 || state.chanIntradayRetryTimers[period]) return;
+  const delay = Math.min(5000, 1000 + attempts * 250);
+  state.chanIntradayRetryAttempts = { ...state.chanIntradayRetryAttempts, [period]: attempts + 1 };
+  state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: setTimeout(() => {
+    state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: null };
+    if (state.symbol !== symbol || !CHAN_INTRADAY_PERIODS.includes(state.chanPeriod)) return;
+    optionScopeApp?.ensureChanIntraday(period, true);
+  }, delay) };
 }
 
 function refreshChanAnalysis(force = false) {
@@ -3306,12 +3403,12 @@ function refreshChanAnalysis(force = false) {
   const currentQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
   const currentSpot = finitePrice(activeSessionQuote(currentQuote)?.price ?? currentQuote?.price);
   const spotQuery = currentSpot != null ? `?spot=${encodeURIComponent(currentSpot)}` : "";
-  request(`/api/chan/${encodeURIComponent(symbol)}${spotQuery}`).then((payload) => {
+  request(`/api/chan/${encodeURIComponent(symbol)}/adjusted${spotQuery}`).then((payload) => {
     if (state.symbol !== symbol || state.chanRequestId !== token || payload?.symbol !== symbol) return;
     const liveQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
     const liveSpot = finitePrice(activeSessionQuote(liveQuote)?.price ?? liveQuote?.price);
     state.chanPayload = OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload);
-    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, state.chanMobileBars);
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers);
     hydrateTrendFromChan({ ...payload, spot: liveSpot ?? payload.spot }, null,
       displayedSnapshotContextMatches() || sameDisplayedLevelContext());
     // SSE normally refreshes history completion immediately. Bounded retry
@@ -3377,6 +3474,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   const mergedQuote = mergeFairValueSnapshot(quote);
   if (!mergedQuote) return;
   quote = mergedQuote;
+  clearQuoteRetry();
   const active = activeSessionQuote(quote);
   const price = active?.price ?? quote?.price;
   const reference = quoteReference(quote);
@@ -3397,9 +3495,9 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.lastQuote = quote || null;
   if (state.chanPayload?.symbol === state.symbol) {
     state.chanPayload = OptionScopeChan.withSpot(state.chanPayload, finitePrice(price));
-    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, state.chanMobileBars);
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers);
   }
-  if (state.chanIntradayPayload["15m"] || state.chanIntradayPayload["4h"]) {
+  if (CHAN_INTRADAY_PERIODS.some((period) => state.chanIntradayPayload[period])) {
     state.chanIntradaySpot = finitePrice(price);
   }
   refreshChanAnalysis();
@@ -3943,7 +4041,7 @@ function isCurrentLoad(loadId, expiration) {
 }
 
 function quoteIsReady(quote) {
-  const price = Number(quote?.price);
+  const price = Number(activeSessionQuote(quote)?.price ?? quote?.price);
   return Number.isFinite(price) && price > 0;
 }
 
@@ -4076,7 +4174,7 @@ function showPending(message, preserveCache = false) {
 }
 
 function applyCachedQuote(quote) {
-  if (!quote || quote.price == null) {
+  if (!quote || !quoteIsReady(quote)) {
     if (state.lastQuote && state.lastQuote.symbol === state.symbol && quoteIsReady(state.lastQuote)) return;
     state.lastQuote = null;
     state.view.quoteSymbol = state.symbol;
@@ -4778,6 +4876,8 @@ async function loadSymbol() {
   state.analysisBlockUntil = 0;
   state.analysisReady = false;
   const loadId = ++state.loadId;
+  clearQuoteRetry();
+  state.quoteRetryInFlightKey = "";
   setError("");
   // Do not paint an old full-page snapshot during normal navigation. A fresh
   // quote is requested below; client snapshots remain an explicit API-outage
@@ -4790,12 +4890,7 @@ async function loadSymbol() {
   // read. The cache read gives an immediate first paint when available; the
   // SSE subscription and snapshot refresh then publish a live session quote.
   connectPushStream(symbol);
-  request(`/api/quote/${encodeURIComponent(symbol)}`).then((quote) => {
-    if (isCurrentLoad(loadId) && quote?.symbol === symbol) {
-      const usableQuote = latestRenderableQuote(symbol, quote, state.lastQuote);
-      if (usableQuote) renderQuote(usableQuote, false, quoteIsUsableSQLiteSnapshot(usableQuote, symbol));
-    }
-  }).catch(() => {});
+  fetchQuoteForDisplay(symbol, loadId);
   refreshChanAnalysis();
   // Opening the stream starts the server-side snapshot worker immediately;
   // loadChain owns any follow-up read after expiry discovery.
@@ -4871,6 +4966,8 @@ if (window.Vue && window.ELEMENT) Vue.use(ELEMENT);
 // 期权链单独成组件：父页面刷新报价或状态时，行数组引用不变就不重绘这张表。
 if (window.Vue) {
   Vue.directive("chan-chart-hover", OptionScopeCharts.chanChartHover);
+  Vue.directive("chan-chart-canvas", OptionScopeCharts.chanChartCanvas);
+  Vue.directive("chan-chart-interaction", OptionScopeCharts.chanChartInteraction);
   Vue.component("chain-table-body", {
     props: {
       rows: { type: Array, default: () => [] },
@@ -4885,27 +4982,50 @@ const optionScopeApp = new Vue({
   computed: {
     busy() { return this.loading; },
     chanFrame() {
-      if (this.chanPeriod === "15m" || this.chanPeriod === "4h") {
+      if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
         const payload = this.chanIntradayPayload[this.chanPeriod];
         return payload
-          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, this.chanMobileBars)
-          : OptionScopeChan.emptyFrame(this.chanPeriod === "4h" ? "4小时" : "15分钟");
+          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, 30, this.chanViewports[this.chanPeriod], this.chanChartLayers)
+          : OptionScopeChan.emptyFrame(({ "15m": "15分钟", "4h": "4小时" })[this.chanPeriod]);
       }
       return this.view.chan[this.chanPeriod] || this.view.chan.daily;
+    },
+    chanChartInteraction() {
+      return { chart: this.chanFrame?.chart, onPan: (bars) => this.panChanChart(bars), onZoom: (factor, anchor, ratio, baseVisible) => this.zoomChanChart(factor, anchor, ratio, baseVisible) };
+    },
+    chanCanvasBinding() { return { chart: this.chanFrame?.chart, layers: this.chanChartLayers }; },
+    chanLayerLevels() {
+      return this.chanFrame?.chart?.layerLevels || [];
+    },
+    chanSegmentLevels() {
+      return this.chanFrame?.chart?.segmentLevels || [];
     },
   },
   watch: {
     chanPeriod() {
+      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers);
       this.chanHoveredScenario = null;
       this.chanSpotGuideVisible = false;
       this.ensureChanIntraday(this.chanPeriod);
+      if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod) && this.chanIntradayPayload[this.chanPeriod]?.refreshing) {
+        scheduleChanIntradayRetry(this.chanPeriod, state.symbol);
+      }
     },
   },
   methods: {
+    chanTurningStatus(index) {
+      const turning = this.chanFrame?.turning;
+      const item = Array.isArray(turning) ? turning[index] : null;
+      return item?.status || "等待信号";
+    },
     navigateToSymbol() { return navigateToSymbol(); },
-    ensureChanIntraday(period) {
-      if (period !== "15m" && period !== "4h") return;
-      if (this.chanIntradayPayload[period] || this.chanIntradayLoading[period]) return;
+    ensureChanIntraday(period, refresh = false) {
+      if (!CHAN_INTRADAY_PERIODS.includes(period)) return;
+      if (this.chanIntradayLoading[period]) {
+        if (refresh) scheduleChanIntradayRetry(period, state.symbol);
+        return;
+      }
+      if (!refresh && this.chanIntradayPayload[period]) return;
       const symbol = state.symbol;
       if (!symbol) return;
       const quote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
@@ -4914,9 +5034,27 @@ const optionScopeApp = new Vue({
       this.chanIntradayLoading = { ...this.chanIntradayLoading, [period]: true };
       request(`/api/chan/${encodeURIComponent(symbol)}/intraday${query}`).then((payload) => {
         if (state.symbol !== symbol) return;
+        const previousBars = this.chanIntradayPayload[period]?.frame?.bar_count || 0;
+        const nextBars = payload?.frame?.bar_count || 0;
+        const viewport = state.chanViewports[period];
+        if (previousBars > 0 && nextBars > previousBars && viewport?.visibleBars > 0) {
+          const addedBars = nextBars - previousBars;
+          const maxOffset = Math.max(0, nextBars - viewport.visibleBars);
+          const endOffset = Math.max(0, Math.min(maxOffset, (viewport.endOffset || 0) + (viewport.endOffset > 0 ? addedBars : 0)));
+          state.chanViewports = { ...state.chanViewports, [period]: { ...viewport, endOffset } };
+        }
         this.chanIntradayPayload = { ...this.chanIntradayPayload, [period]: payload };
+        if (payload?.refreshing) scheduleChanIntradayRetry(period, symbol);
+        else {
+          clearTimeout(state.chanIntradayRetryTimers[period]);
+          state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: null };
+          state.chanIntradayRetryAttempts = { ...state.chanIntradayRetryAttempts, [period]: 0 };
+        }
       }).catch((error) => {
-        if (state.symbol === symbol) setError(error.message || "盘中周期加载失败");
+        if (state.symbol === symbol) {
+          setError(error.message || "盘中周期加载失败");
+          if (this.chanIntradayPayload[period]?.frame) scheduleChanIntradayRetry(period, symbol);
+        }
       }).then(() => {
         this.chanIntradayLoading = { ...this.chanIntradayLoading, [period]: false };
       });
@@ -5017,12 +5155,79 @@ const optionScopeApp = new Vue({
       if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
       this.chanScenarioHideTimer = null;
       try { localStorage.setItem(CHAN_SCENARIOS_STORAGE_KEY, this.chanScenariosVisible ? "1" : "0"); } catch (error) { /* 存储不可用时保留当前页面状态。 */ }
-      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, this.chanMobileBars);
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
     },
-    setChanMobileBars(count) {
-      if (![30, 60, 160].includes(count) || this.chanMobileBars === count) return;
-      this.chanMobileBars = count;
-      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, count);
+    toggleChanChartLayer(layer) {
+      if (layer === "pens" || layer === "penCenters" || layer === "chanCandles" || layer === "signals") {
+        this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };
+      } else {
+        const level = Number(layer);
+        if (!Number.isInteger(level) || level < 0 || level > 7) return;
+        const recursiveCenters = this.chanChartLayers?.recursiveCenters || {};
+        const centers = { ...recursiveCenters, [level]: recursiveCenters[level] !== true };
+        this.chanChartLayers = { ...this.chanChartLayers, recursiveCenters: centers };
+      }
+      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers);
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
+    },
+    toggleChanSegmentLevel(level) {
+      this.chanChartLayers = OptionScopeChan.toggleSegmentLevel(this.chanChartLayers, level);
+      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers);
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
+    },
+    isChanSegmentLevelVisible(level) {
+      return OptionScopeChan.isSegmentLevelVisible(this.chanChartLayers, level);
+    },
+    changeChanViewport(action) {
+      const chart = this.chanFrame?.chart;
+      if (!chart?.candles?.length) return;
+      const viewport = this.chanViewports[this.chanPeriod];
+      const total = chart.totalBars || chart.candles.length;
+      const current = chart.visibleBars || chart.candles.length;
+      const currentOffset = chart.endOffset || 0;
+      const maxVisible = total;
+      if (action === "reset") { viewport.visibleBars = 0; viewport.endOffset = 0; }
+      else if (action === "zoom-in" || action === "zoom-out") {
+        const next = Math.max(Math.min(12, total), Math.min(maxVisible, Math.round(current * (action === "zoom-in" ? 0.75 : 1.35))));
+        const center = total - currentOffset - current / 2;
+        viewport.visibleBars = next;
+        viewport.endOffset = Math.max(0, Math.min(total - next, Math.round(total - center - next / 2)));
+      } else {
+        const step = Math.max(1, Math.round(current * 0.7));
+        if (action === "left") viewport.endOffset = Math.max(0, Math.min(total - current, currentOffset + step));
+        if (action === "right") viewport.endOffset = Math.max(0, currentOffset - step);
+      }
+      this.commitChanViewport(viewport);
+    },
+    commitChanViewport(viewport) {
+      const period = this.chanPeriod;
+      this.chanViewports = { ...this.chanViewports, [period]: { visibleBars: viewport.visibleBars, endOffset: viewport.endOffset } };
+      if ((period === "daily" || period === "weekly") && this.chanPayload) {
+        this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
+      }
+    },
+    panChanChart(deltaBars) {
+      const chart = this.chanFrame?.chart;
+      if (!chart?.candles?.length || !Number.isFinite(deltaBars) || !deltaBars) return;
+      const viewport = { ...this.chanViewports[this.chanPeriod] };
+      const maxOffset = Math.max(0, chart.totalBars - chart.visibleBars);
+      viewport.visibleBars = chart.visibleBars;
+      viewport.endOffset = Math.max(0, Math.min(maxOffset, (viewport.endOffset || chart.endOffset) + Math.round(deltaBars)));
+      this.commitChanViewport(viewport);
+    },
+    zoomChanChart(factor, anchorIndex = null, anchorRatio = 0.5, baseVisible = null) {
+      const chart = this.chanFrame?.chart;
+      if (!chart?.candles?.length) return;
+      const total = chart.totalBars || chart.candles.length;
+      const minVisible = Math.min(12, total);
+      const viewport = this.chanViewports[this.chanPeriod];
+      const visible = Number.isFinite(baseVisible) ? baseVisible : (viewport.visibleBars || chart.visibleBars);
+      const next = Math.max(minVisible, Math.min(total, Math.round(visible * factor)));
+      const ratioValue = Math.max(0, Math.min(1, Number(anchorRatio) || 0));
+      const currentStart = Math.max(0, total - (viewport.endOffset || chart.endOffset) - visible);
+      const anchor = Number.isFinite(anchorIndex) ? anchorIndex : currentStart + ratioValue * Math.max(0, visible - 1);
+      const start = Math.max(0, Math.min(total - next, Math.round(anchor - ratioValue * (next - 1))));
+      this.commitChanViewport({ visibleBars: next, endOffset: Math.max(0, total - start - next) });
     },
     toggleChanPanel() {
       this.chanExpanded = !this.chanExpanded;
@@ -5092,7 +5297,7 @@ window.addEventListener("resize", () => {
     const mobileChart = Boolean(window.matchMedia && window.matchMedia("(max-width: 600px)").matches);
     if (state.chanMobileChart === mobileChart) return;
     state.chanMobileChart = mobileChart;
-    if (state.chanPayload) state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, mobileChart, state.chanMobileBars);
+    if (state.chanPayload) state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, mobileChart, 30, state.chanViewports, state.chanChartLayers);
   }, 120);
 });
 const initialQuery = parsePageQuery(location.search);
