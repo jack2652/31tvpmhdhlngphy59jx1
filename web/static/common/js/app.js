@@ -31,6 +31,18 @@ const CHAN_INTRADAY_PERIODS = ["15m", "4h"];
 const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "4h"];
 const CHAN_ANALYSIS_RETRY_LIMIT = 16;
 const CHAN_INTRADAY_RETRY_LIMIT = 16;
+const CHAN_INTRADAY_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+// Intraday data and both server/provider caches have a three-minute TTL. Wait
+// just beyond it so each expected new 15m candle can trigger a real refresh.
+const CHAN_INTRADAY_REFRESH_DELAY_MS = 3 * 60 * 1000 + 5000;
+let chanIntradayBoundaryTimer = null;
+let chanIntradayExpiryRetryTimer = null;
+let chanIntradayLastBoundaryAttempt = "";
+let chanIntradayExpiryRetryBoundary = "";
+const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
+  timeZone: "America/New_York", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+});
 const CHAN_CHART_PREFERENCES_VERSION = 4;
 const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true };
 function copyDefaultChanChartLayers() {
@@ -3379,6 +3391,12 @@ function renderCurrentChanMarketAnalysis(spot, preserveOptionLevels = false) {
 
 function resetChanAnalysis() {
   Object.values(state.chanIntradayRetryTimers).forEach((timer) => clearTimeout(timer));
+  clearTimeout(chanIntradayBoundaryTimer);
+  chanIntradayBoundaryTimer = null;
+  clearTimeout(chanIntradayExpiryRetryTimer);
+  chanIntradayExpiryRetryTimer = null;
+  chanIntradayLastBoundaryAttempt = "";
+  chanIntradayExpiryRetryBoundary = "";
   clearTimeout(state.chanRetryTimer);
   state.chanRetryTimer = null;
   state.chanRequestId += 1;
@@ -3411,6 +3429,124 @@ function scheduleChanIntradayRetry(period, symbol) {
     optionScopeApp?.ensureChanIntraday(period, true);
   }, delay) };
 }
+
+function newYorkIntradayParts(date = new Date()) {
+  const values = Object.fromEntries(NEW_YORK_INTRADAY_DATE_FORMATTER
+    .formatToParts(date).map((part) => [part.type, part.value]));
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    minute: Number(values.hour) * 60 + Number(values.minute),
+    weekday: values.weekday,
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+  };
+}
+
+function previousIntradayCandleDate(parts) {
+  const boundaryMinute = Math.floor(parts.minute / 15) * 15 - 15;
+  const localStamp = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, 0, boundaryMinute));
+  return `${localStamp.toISOString().slice(0, 10)} ${localStamp.toISOString().slice(11, 16)}`;
+}
+
+function refreshChanIntradayAtBoundary(symbol) {
+  if (state.symbol !== symbol || state.chanPeriod !== "15m") return;
+  const candles = state.chanIntradayPayload["15m"]?.frame?.candles;
+  if (!Array.isArray(candles) || candles.length === 0) return;
+
+  const now = Date.now();
+  const localClock = new Date(now);
+  const parts = newYorkIntradayParts(localClock);
+  const elapsedIntoQuarter = (parts.minute % 15) * 60 * 1000
+    + localClock.getSeconds() * 1000 + localClock.getMilliseconds();
+  if (elapsedIntoQuarter < CHAN_INTRADAY_REFRESH_DELAY_MS) return;
+  if (parts.weekday === "Sat" || parts.weekday === "Sun") return;
+  const latestDate = String(candles[candles.length - 1]?.date || "");
+
+  const expectedCandleDate = previousIntradayCandleDate(parts);
+  const expectedMinute = Number(expectedCandleDate.slice(11, 13)) * 60 + Number(expectedCandleDate.slice(14, 16));
+  if (expectedCandleDate.slice(0, 10) !== parts.date || expectedMinute < 9 * 60 + 30 || latestDate >= expectedCandleDate) return;
+
+  const marketState = String(state.lastQuote?.market_state || "").toUpperCase();
+  const quoteIsFresh = quoteIsFreshForIntraday(state.lastQuote);
+  const regularSession = parts.minute >= 9 * 60 + 30 && parts.minute < 16 * 60
+    && (marketState === "REGULAR" && quoteIsFresh || latestDate.startsWith(parts.date));
+  // These are the final candle starts for standard and 13:00 early closes.
+  // Checking the expected candle prevents an extra request for a non-session
+  // 13:00 or 16:00 bar after the close.
+  const closingWindow = expectedMinute === 12 * 60 + 45 || expectedMinute === 15 * 60 + 45;
+  const closingSession = closingWindow && latestDate.startsWith(parts.date);
+  if (!regularSession && !closingSession) return;
+
+  const attemptKey = `${symbol}:${expectedCandleDate}`;
+  if (chanIntradayLastBoundaryAttempt === attemptKey) return;
+  chanIntradayLastBoundaryAttempt = attemptKey;
+  if (state.chanIntradayLoading["15m"]) return;
+  window.optionScopeApp?.ensureChanIntraday("15m", true);
+}
+
+function quoteIsFreshForIntraday(quote) {
+  return Boolean(quote && quoteIsFresh(quote, 180));
+}
+
+function scheduleChanIntradayCacheExpiryRetry(symbol, expectedCandleDate, fetchedAt, refreshing) {
+  const retryBoundary = `${symbol}:${expectedCandleDate}`;
+  if (chanIntradayExpiryRetryBoundary === retryBoundary) return;
+  chanIntradayExpiryRetryBoundary = retryBoundary;
+  clearTimeout(chanIntradayExpiryRetryTimer);
+  const fetchedAtMs = Date.parse(fetchedAt || "");
+  const expiresAt = Number.isFinite(fetchedAtMs)
+    ? fetchedAtMs + 3 * 60 * 1000 + 5000
+    : Date.now() + 3 * 60 * 1000 + 5000;
+  const retryDelay = refreshing ? 60 * 1000 : Math.max(60 * 1000, expiresAt - Date.now());
+  chanIntradayExpiryRetryTimer = setTimeout(() => {
+    chanIntradayExpiryRetryTimer = null;
+    if (state.symbol !== symbol || state.chanPeriod !== "15m") return;
+    const candles = state.chanIntradayPayload["15m"]?.frame?.candles;
+    const latestDate = String(candles?.[candles.length - 1]?.date || "");
+    if (latestDate >= expectedCandleDate) {
+      chanIntradayExpiryRetryBoundary = "";
+      return;
+    }
+    chanIntradayLastBoundaryAttempt = "";
+    chanIntradayExpiryRetryBoundary = "";
+    refreshChanIntradayAtBoundary(symbol);
+  }, retryDelay);
+}
+
+function scheduleChanIntradayBoundaryRefresh(period, symbol = state.symbol) {
+  clearTimeout(chanIntradayBoundaryTimer);
+  chanIntradayBoundaryTimer = null;
+  if (period !== "15m") {
+    clearTimeout(chanIntradayExpiryRetryTimer);
+    chanIntradayExpiryRetryTimer = null;
+    chanIntradayLastBoundaryAttempt = "";
+    chanIntradayExpiryRetryBoundary = "";
+    return;
+  }
+  if (!symbol) return;
+
+  const now = Date.now();
+  const date = new Date(now);
+  const parts = newYorkIntradayParts(date);
+  const elapsedIntoQuarter = (parts.minute % 15) * 60 * 1000
+    + date.getSeconds() * 1000 + date.getMilliseconds();
+  const delay = elapsedIntoQuarter < CHAN_INTRADAY_REFRESH_DELAY_MS
+    ? CHAN_INTRADAY_REFRESH_DELAY_MS - elapsedIntoQuarter
+    : CHAN_INTRADAY_REFRESH_INTERVAL_MS - elapsedIntoQuarter + CHAN_INTRADAY_REFRESH_DELAY_MS;
+  chanIntradayBoundaryTimer = setTimeout(() => {
+    chanIntradayBoundaryTimer = null;
+    if (state.symbol !== symbol || state.chanPeriod !== "15m") return;
+    scheduleChanIntradayBoundaryRefresh(period, symbol);
+    refreshChanIntradayAtBoundary(symbol);
+  }, delay);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && state.chanPeriod === "15m") {
+    refreshChanIntradayAtBoundary(state.symbol);
+  }
+});
 
 function scheduleChanAnalysisRetry(symbol, requestId) {
   if (state.chanRetryTimer || state.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT) {
@@ -5068,6 +5204,7 @@ const optionScopeApp = new Vue({
       rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers);
       this.chanHoveredScenario = null;
       this.chanSpotGuideVisible = false;
+      scheduleChanIntradayBoundaryRefresh(this.chanPeriod);
       this.ensureChanIntraday(this.chanPeriod);
     },
   },
@@ -5100,8 +5237,20 @@ const optionScopeApp = new Vue({
     },
     ensureChanIntraday(period, refresh = false) {
       if (!CHAN_INTRADAY_PERIODS.includes(period)) return;
+      if (period === "15m" && !chanIntradayBoundaryTimer) scheduleChanIntradayBoundaryRefresh(period);
+      if (period !== "15m" && chanIntradayBoundaryTimer) {
+        clearTimeout(chanIntradayBoundaryTimer);
+        chanIntradayBoundaryTimer = null;
+      }
+      if (period !== "15m" && chanIntradayExpiryRetryTimer) {
+        clearTimeout(chanIntradayExpiryRetryTimer);
+        chanIntradayExpiryRetryTimer = null;
+      }
       if (this.chanIntradayLoading[period]) return;
-      if (!refresh && this.chanIntradayPayload[period]?.frame?.bar_count > 0 && !this.chanIntradayPayload[period]?.refreshing) return;
+      if (!refresh && this.chanIntradayPayload[period]?.frame?.bar_count > 0 && !this.chanIntradayPayload[period]?.refreshing) {
+        if (period === "15m") refreshChanIntradayAtBoundary(state.symbol);
+        return;
+      }
       const symbol = state.symbol;
       const generation = state.loadId;
       if (!symbol) return;
@@ -5121,7 +5270,22 @@ const optionScopeApp = new Vue({
           state.chanViewports = { ...state.chanViewports, [period]: { ...viewport, endOffset } };
         }
         this.chanIntradayPayload = { ...this.chanIntradayPayload, [period]: payload };
-        if (payload?.refreshing || !nextBars) scheduleChanIntradayRetry(period, symbol);
+        const boundaryPrefix = `${symbol}:`;
+        const expectedCandleDate = period === "15m" && chanIntradayLastBoundaryAttempt.startsWith(boundaryPrefix)
+          ? chanIntradayLastBoundaryAttempt.slice(boundaryPrefix.length)
+          : "";
+        const candles = payload?.frame?.candles;
+        const latestCandleDate = String(candles?.[candles.length - 1]?.date || "");
+        if (expectedCandleDate && latestCandleDate < expectedCandleDate) {
+          scheduleChanIntradayCacheExpiryRetry(symbol, expectedCandleDate, payload?.fetched_at, payload?.refreshing);
+        } else if (expectedCandleDate && latestCandleDate >= expectedCandleDate) {
+          clearTimeout(chanIntradayExpiryRetryTimer);
+          chanIntradayExpiryRetryTimer = null;
+          chanIntradayExpiryRetryBoundary = "";
+        }
+        if (payload?.refreshing || !nextBars) {
+          if (!expectedCandleDate) scheduleChanIntradayRetry(period, symbol);
+        }
         else {
           clearTimeout(state.chanIntradayRetryTimers[period]);
           state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: null };

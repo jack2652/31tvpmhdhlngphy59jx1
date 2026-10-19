@@ -129,7 +129,7 @@ func recursiveLevelUp(lower []Segment, level int) ([]RecursiveTrend, []Recursive
 		// dropping it hides higher-level structures until the next lower segment
 		// is already confirmed. Confirmation remains separate, so forming input
 		// can only produce forming structures and cannot validate signals.
-		units := append([]Segment(nil), lower[chainStart:chainEnd+1]...)
+		units := lower[chainStart : chainEnd+1]
 		inputCount += len(units)
 		moves := decomposeRecursiveUnits(units, level)
 		for _, move := range moves {

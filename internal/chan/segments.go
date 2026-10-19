@@ -3,13 +3,9 @@ package chananalysis
 import (
 	"fmt"
 	"math"
-	"sort"
 )
 
-type featureRange struct {
-	FeatureElement
-	chain int
-}
+type featureRange = FeatureElement
 
 // buildSegments implements the confirmed feature-sequence cases from the
 // reference chan-lun implementation. Segment starts require three overlapping
@@ -44,7 +40,7 @@ func buildSegments(strokes []Stroke) []Segment {
 			next = end + 1
 		}
 		segment := makeSegment(strokes, index, end, direction, chain, complete)
-		segment.Feature = featureElements(segmentFeatures(strokes, index, end, direction, chain))
+		segment.Feature = segmentFeatures(strokes, index, end, direction, chain)
 		if complete {
 			segment.BreakStroke, segment.ConfirmStroke = candidate, evidence
 			segment.ConfirmedAt = strokes[evidence].ConfirmedAt
@@ -111,9 +107,10 @@ func segmentEnd(strokes []Stroke, start int) (candidate, evidence, mode int, ok 
 	if !up {
 		counter = "up"
 	}
-	features := []featureRange{}
+	var featureStorage [3]featureRange
+	features := featureStorage[:0:len(featureStorage)]
 	featureDirection := segmentFeatureDirection(strokes[start].Direction)
-	endings := [][3]int{}
+	bestCandidate, bestEvidence, bestMode := -1, -1, 0
 	for index := start + 1; index < len(strokes); index++ {
 		stroke := strokes[index]
 		if stroke.Chain != strokes[start].Chain || !stroke.Confirmed || stroke.Direction != counter {
@@ -125,11 +122,13 @@ func segmentEnd(strokes []Stroke, start int) (candidate, evidence, mode int, ok 
 		}
 		if index >= start+3 && len(features) > 0 && continuation {
 			if candidate, evidence, mode, found := candidateSegmentEnd(strokes, start, index, features[len(features)-1]); found {
-				endings = append(endings, [3]int{candidate, evidence, mode})
+				if bestEvidence < 0 || evidence < bestEvidence || evidence == bestEvidence && candidate < bestCandidate {
+					bestCandidate, bestEvidence, bestMode = candidate, evidence, mode
+				}
 			}
 			rawIndex := index - 2
 			if rawIndex > start {
-				raw := featureRange{FeatureElement: FeatureElement{StartStroke: rawIndex, EndStroke: rawIndex, Low: strokes[rawIndex].Low, High: strokes[rawIndex].High, Start: strokes[rawIndex].Start.Date, End: strokes[rawIndex].End.Date}, chain: stroke.Chain}
+				raw := featureRange{StartStroke: rawIndex, EndStroke: rawIndex, Low: strokes[rawIndex].Low, High: strokes[rawIndex].High, Start: strokes[rawIndex].Start.Date, End: strokes[rawIndex].End.Date}
 				if candidate, evidence, mode, found := candidateSegmentEnd(strokes, start, index, raw); found {
 					confirmation := strokes[evidence].End.Price < strokes[start].Start.Price
 					if !up {
@@ -147,23 +146,19 @@ func segmentEnd(strokes []Stroke, start int) (candidate, evidence, mode int, ok 
 						overlap = overlapLow <= overlapHigh
 					}
 					if confirmation && overlap && low <= high {
-						endings = append(endings, [3]int{candidate, evidence, mode})
+						if bestEvidence < 0 || evidence < bestEvidence || evidence == bestEvidence && candidate < bestCandidate {
+							bestCandidate, bestEvidence, bestMode = candidate, evidence, mode
+						}
 					}
 				}
 			}
 		}
-		appendFeature(&features, &featureDirection, stroke, index)
+		appendFeatureWindow(&features, &featureDirection, stroke, index, 2)
 	}
-	if len(endings) == 0 {
+	if bestEvidence < 0 {
 		return -1, -1, 0, false
 	}
-	sort.SliceStable(endings, func(i, j int) bool {
-		if endings[i][1] == endings[j][1] {
-			return endings[i][0] < endings[j][0]
-		}
-		return endings[i][1] < endings[j][1]
-	})
-	return endings[0][0], endings[0][1], endings[0][2], true
+	return bestCandidate, bestEvidence, bestMode, true
 }
 
 func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRange) (int, int, int, bool) {
@@ -175,8 +170,12 @@ func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRan
 	if up && counter.High <= left.High || !up && counter.Low >= left.Low {
 		return -1, -1, 0, false
 	}
-	right := []featureRange{{FeatureElement: FeatureElement{StartStroke: candidate, EndStroke: candidate, Low: counter.Low, High: counter.High, Start: counter.Start.Date, End: counter.End.Date}, chain: counter.Chain}}
-	second := []featureRange{}
+	var rightStorage [3]featureRange
+	right := rightStorage[:1]
+	right[0] = featureRange{StartStroke: candidate, EndStroke: candidate, Low: counter.Low, High: counter.High, Start: counter.Start.Date, End: counter.End.Date}
+	rightPairFixed := false
+	var secondStorage [4]featureRange
+	second := secondStorage[:0:len(secondStorage)]
 	rightDirection, secondDirection := segmentFeatureDirection(strokes[start].Direction), segmentFeatureDirection(counter.Direction)
 	extreme := counter.Start.Price
 	gap := left.High < counter.Low
@@ -190,9 +189,15 @@ func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRan
 			break
 		}
 		if stroke.Direction == counter.Direction {
-			appendFeature(&right, &rightDirection, stroke, index)
+			if !rightPairFixed {
+				appendFeature(&right, &rightDirection, stroke, index)
+				if len(right) == 3 {
+					right = right[:2]
+					rightPairFixed = true
+				}
+			}
 		} else {
-			appendFeature(&second, &secondDirection, stroke, index)
+			appendFeatureWindow(&second, &secondDirection, stroke, index, 3)
 			if gap && len(right) >= 2 && hasFeatureFractal(second, featureFractalKind(up)) {
 				return candidate, index, 2, true
 			}
@@ -265,7 +270,7 @@ func segmentEndpoint(strokes []Stroke, start, end int, direction string) int {
 }
 
 func appendFeature(features *[]featureRange, sequenceDirection *int, stroke Stroke, index int) {
-	current := featureRange{FeatureElement: FeatureElement{StartStroke: index, EndStroke: index, Low: stroke.Low, High: stroke.High, Start: stroke.Start.Date, End: stroke.End.Date}, chain: stroke.Chain}
+	current := featureRange{StartStroke: index, EndStroke: index, Low: stroke.Low, High: stroke.High, Start: stroke.Start.Date, End: stroke.End.Date}
 	if len(*features) == 0 {
 		*features = append(*features, current)
 		return
@@ -299,6 +304,17 @@ func appendFeature(features *[]featureRange, sequenceDirection *int, stroke Stro
 	last.EndStroke, last.End = index, current.End
 }
 
+// appendFeatureWindow retains only the recent elements read by its caller.
+// Its backing storage needs one extra slot because appendFeature can append
+// before the old prefix is discarded.
+func appendFeatureWindow(features *[]featureRange, sequenceDirection *int, stroke Stroke, index, window int) {
+	appendFeature(features, sequenceDirection, stroke, index)
+	if len(*features) > window {
+		copy(*features, (*features)[len(*features)-window:])
+		*features = (*features)[:window]
+	}
+}
+
 func segmentFeatures(strokes []Stroke, start, end int, direction string, chain int) []featureRange {
 	features := []featureRange{}
 	featureDirection := segmentFeatureDirection(direction)
@@ -310,14 +326,6 @@ func segmentFeatures(strokes []Stroke, start, end int, direction string, chain i
 		appendFeature(&features, &featureDirection, stroke, i)
 	}
 	return features
-}
-
-func featureElements(features []featureRange) []FeatureElement {
-	result := make([]FeatureElement, 0, len(features))
-	for _, feature := range features {
-		result = append(result, feature.FeatureElement)
-	}
-	return result
 }
 
 // segmentFeatureDirection is fixed by the hypothesized segment direction.
