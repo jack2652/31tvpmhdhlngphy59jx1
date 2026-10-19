@@ -227,7 +227,7 @@
               </div>
             </details>
           </div></div>
-          <span>{{ chanFrame.recursive.acceptedBars }} 根行情 · {{ chanFrame.asOf }}</span>
+          <span>{{ chanFrame.recursive.acceptedBars }} 根行情 · {{ chanFrame.asOf }}<small v-if="chanLoadStatus" class="chan-load-status" role="status">{{ chanLoadStatus }}<button v-if="chanLoadRetryAvailable" class="chan-load-retry" type="button" @click="retryChanChartLoad">重试</button></small></span>
           <div v-if="chanFrame.chart && chanFrame.chart.keyLevels.length" class="chan-key-level-summary" role="list" aria-label="缠论关键观察价位">
             <div v-for="level in chanFrame.chart.keyLevels" :key="level.key" class="chan-key-level-chip" :class="'chan-key-level-chip-' + level.tone" role="listitem" :title="level.title"><span>{{ level.label }}</span><strong>{{ level.priceLabel }}</strong></div>
           </div>
@@ -251,7 +251,7 @@
             <g key="chan-scenario-toggle" class="chan-scenario-toggle-svg" :transform="'translate(' + (chanFrame.chart.historyRight - 19) + ' ' + (chanFrame.chart.plotBottom - 19) + ')'" role="button" tabindex="0" :aria-pressed="chanScenariosVisible ? 'true' : 'false'" :aria-label="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" @click.stop="toggleChanScenarios" @keydown.enter.stop.prevent="toggleChanScenarios" @keydown.space.stop.prevent="toggleChanScenarios">
               <title>{{ chanScenariosVisible ? '隐藏条件情景' : '显示条件情景' }}</title>
               <rect width="16" height="16" class="chan-scenario-toggle-svg-box"></rect>
-              <text x="8" y="8" text-anchor="middle" dominant-baseline="central" class="el-icon-sort chan-scenario-toggle-svg-icon">&#xe6d2;</text>
+              <text x="8" y="8" text-anchor="middle" dominant-baseline="central" class="el-icon-s-help chan-scenario-toggle-svg-icon">&#xe7b3;</text>
             </g>
             <!-- 交互层只负责条件路径和十字线，历史图元由 Canvas 一次性绘制。 -->
             <g v-pre class="chan-crosshair-layer" aria-hidden="true" visibility="hidden">

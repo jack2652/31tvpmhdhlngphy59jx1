@@ -132,6 +132,8 @@
 .chan-layer-switches .detail-seg[aria-pressed="false"]:hover{border-color:var(--blue);color:var(--blue)}
 .chan-layer-switches .detail-seg:focus-visible{position:relative;z-index:1;outline:2px solid var(--blue);outline-offset:2px}
 .chan-controls>span{grid-area:status;align-self:center;font-size:11px;line-height:1.5;text-align:right;font-variant-numeric:tabular-nums}
+.chan-controls>span .chan-load-status{display:block;margin-top:3px;color:var(--blue);font-size:11px;font-weight:600}
+.chan-load-retry{margin-left:7px;padding:1px 5px;border:1px solid var(--blue);border-radius:3px;background:var(--panel);color:var(--blue);font:inherit;cursor:pointer}
 .chan-chart{position:relative;touch-action:pan-y;overflow:visible;cursor:grab}
 .chan-chart.chan-chart-dragging{cursor:grabbing;user-select:none;-webkit-user-select:none}
 .chan-chart.chan-chart-dragging>svg{user-select:none;-webkit-user-select:none}

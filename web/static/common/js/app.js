@@ -29,8 +29,19 @@ const CHAN_SCENARIOS_STORAGE_KEY = "option-scope-chan-scenarios-visible";
 const CHAN_CHART_PREFERENCES_KEY = "option-scope-chan-chart-preferences";
 const CHAN_INTRADAY_PERIODS = ["15m", "4h"];
 const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "4h"];
-const CHAN_CHART_PREFERENCES_VERSION = 3;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: false, penCenters: false, legacySignals: false, chanCandles: true, segments: true, segmentLevels: {}, recursiveCenters: {}, signals: true };
+const CHAN_ANALYSIS_RETRY_LIMIT = 16;
+const CHAN_INTRADAY_RETRY_LIMIT = 16;
+const CHAN_CHART_PREFERENCES_VERSION = 4;
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true };
+function copyDefaultChanChartLayers() {
+  return { ...DEFAULT_CHAN_CHART_LAYERS, segmentLevels: {}, recursiveCenters: {} };
+}
+function matchesPreviousDefaultChanChartLayers(layers) {
+  const previousDefaults = { pens: false, penCenters: false, legacySignals: false, chanCandles: true, segments: true, signals: true };
+  return Object.entries(previousDefaults).every(([key, value]) => layers[key] === value)
+    && Object.keys(layers.segmentLevels || {}).length === 0
+    && Object.keys(layers.recursiveCenters || {}).length === 0;
+}
 function readChanScenarioVisibility() {
   try { return localStorage.getItem(CHAN_SCENARIOS_STORAGE_KEY) === "1"; } catch (error) { return false; }
 }
@@ -38,7 +49,7 @@ function readChanChartPreferences() {
   try {
     const stored = JSON.parse(localStorage.getItem(CHAN_CHART_PREFERENCES_KEY) || "null");
     if (!stored || typeof stored !== "object") {
-      const defaults = { period: "daily", layers: { ...DEFAULT_CHAN_CHART_LAYERS } };
+      const defaults = { period: "daily", layers: copyDefaultChanChartLayers() };
       rememberChanChartPreferences(defaults.period, defaults.layers);
       return defaults;
     }
@@ -54,12 +65,17 @@ function readChanChartPreferences() {
         .filter(([level, visible]) => /^[0-7]$/.test(level) && typeof visible === "boolean"));
     }
     const storedVersion = Number(stored.version) || 1;
+    // Earlier builds persisted their defaults immediately, so upgrade an untouched
+    // old default set while keeping any explicitly customized layer choices.
+    if (storedVersion < CHAN_CHART_PREFERENCES_VERSION && matchesPreviousDefaultChanChartLayers(sourceLayers)) {
+      Object.assign(layers, copyDefaultChanChartLayers());
+    }
     // Persist the unified-menu preference format without resetting explicit
     // layer choices made before the menu redesign.
     const preferences = { period: CHAN_CHART_PERIODS.includes(stored.period) ? stored.period : "daily", layers };
     if (storedVersion < CHAN_CHART_PREFERENCES_VERSION) rememberChanChartPreferences(preferences.period, preferences.layers);
     return preferences;
-  } catch (error) { return { period: "daily", layers: { ...DEFAULT_CHAN_CHART_LAYERS } }; }
+  } catch (error) { return { period: "daily", layers: copyDefaultChanChartLayers() }; }
 }
 function rememberChanChartPreferences(period, layers) {
   try { localStorage.setItem(CHAN_CHART_PREFERENCES_KEY, JSON.stringify({ version: CHAN_CHART_PREFERENCES_VERSION, period, layers })); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
@@ -3384,16 +3400,36 @@ function resetChanAnalysis() {
 
 function scheduleChanIntradayRetry(period, symbol) {
   const attempts = state.chanIntradayRetryAttempts[period] || 0;
-  // Retry briefly while a background history refresh is active; if the
-  // provider fails, the server's stale-cache cooldown bounds the retries.
-  if (attempts >= 60 || state.chanIntradayRetryTimers[period]) return;
-  const delay = Math.min(5000, 1000 + attempts * 250);
+  // Initial history may take a few minutes on a constrained host. Retry with
+  // capped backoff so a missing cache recovers without a manual page reload.
+  if (attempts >= CHAN_INTRADAY_RETRY_LIMIT || state.chanIntradayRetryTimers[period]) return;
+  const delay = Math.min(15000, 1500 * (2 ** Math.min(attempts, 4)));
   state.chanIntradayRetryAttempts = { ...state.chanIntradayRetryAttempts, [period]: attempts + 1 };
   state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: setTimeout(() => {
     state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: null };
-    if (state.symbol !== symbol || !CHAN_INTRADAY_PERIODS.includes(state.chanPeriod)) return;
+    if (state.symbol !== symbol || state.chanPeriod !== period) return;
     optionScopeApp?.ensureChanIntraday(period, true);
   }, delay) };
+}
+
+function scheduleChanAnalysisRetry(symbol, requestId) {
+  if (state.chanRetryTimer || state.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT) {
+    if (state.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT) {
+      state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), "缠论行情暂不可用，自动重试次数已达上限；可手动重试"] )];
+    }
+    return;
+  }
+  state.chanRetryAttempts += 1;
+  const delay = Math.min(15000, 3000 + state.chanRetryAttempts * 1000);
+  state.chanRetryTimer = setTimeout(() => {
+    state.chanRetryTimer = null;
+    if (state.symbol === symbol && state.chanRequestId === requestId) refreshChanAnalysis(true);
+  }, delay);
+}
+
+function isTransientChanRequestError(error) {
+  const status = Number(error?.status) || 0;
+  return error?.timeout === true || status === 0 || status === 408 || status === 425 || status === 429 || (status >= 500 && status < 600);
 }
 
 function refreshChanAnalysis(force = false) {
@@ -3413,7 +3449,7 @@ function refreshChanAnalysis(force = false) {
   const currentQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
   const currentSpot = finitePrice(activeSessionQuote(currentQuote)?.price ?? currentQuote?.price);
   const spotQuery = currentSpot != null ? `?spot=${encodeURIComponent(currentSpot)}` : "";
-  request(`/api/chan/${encodeURIComponent(symbol)}/adjusted${spotQuery}`).then((payload) => {
+  request(`/api/chan/${encodeURIComponent(symbol)}/adjusted${spotQuery}`, { timeout: 60000 }).then((payload) => {
     if (state.symbol !== symbol || state.chanRequestId !== token || payload?.symbol !== symbol) return;
     const liveQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
     const liveSpot = finitePrice(activeSessionQuote(liveQuote)?.price ?? liveQuote?.price);
@@ -3423,17 +3459,16 @@ function refreshChanAnalysis(force = false) {
       displayedSnapshotContextMatches() || sameDisplayedLevelContext());
     // SSE normally refreshes history completion immediately. Bounded retry
     // also covers symbols without options and browsers without EventSource.
-    if (payload.history?.refreshing && state.chanRetryAttempts < 12) {
-      state.chanRetryAttempts += 1;
-      state.chanRetryTimer = setTimeout(() => {
-        state.chanRetryTimer = null;
-        if (state.symbol === symbol) refreshChanAnalysis(true);
-      }, Math.min(15000, 3000 + state.chanRetryAttempts * 1000));
-    } else if (!payload.history?.refreshing) { state.chanRetryAttempts = 0; }
+    if (payload.history?.refreshing) scheduleChanAnalysisRetry(symbol, token);
+    else state.chanRetryAttempts = 0;
   }).catch((error) => {
     if (state.symbol !== symbol || state.chanRequestId !== token) return;
     if (!state.view.chan.available) state.view.chan = OptionScopeChan.empty("缠论分析暂不可用，等待历史行情或下次刷新");
-    state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), `结构更新失败：${error.message}`])];
+    const retrying = isTransientChanRequestError(error) && state.chanRetryAttempts < CHAN_ANALYSIS_RETRY_LIMIT;
+    state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), retrying
+      ? `结构行情暂时获取失败（${error.message}），正在自动重试`
+      : `结构更新失败：${error.message}`])];
+    if (isTransientChanRequestError(error)) scheduleChanAnalysisRetry(symbol, token);
   }).finally(() => {
     if (state.chanRequestId !== token) return;
     state.chanLoading = false;
@@ -4870,7 +4905,6 @@ async function loadSymbol() {
   state.symbolInput = symbol;
   state.symbol = symbol;
   resetChanAnalysis();
-  if (window.optionScopeApp) window.optionScopeApp.ensureChanIntraday(state.chanPeriod);
   state.trendMarket = null;
   state.trendMarketSymbol = "";
   state.trendHistorySymbol = "";
@@ -4886,6 +4920,7 @@ async function loadSymbol() {
   state.analysisBlockUntil = 0;
   state.analysisReady = false;
   const loadId = ++state.loadId;
+  if (window.optionScopeApp) window.optionScopeApp.ensureChanIntraday(state.chanPeriod);
   clearQuoteRetry();
   state.quoteRetryInFlightKey = "";
   setError("");
@@ -5003,6 +5038,23 @@ const optionScopeApp = new Vue({
     chanChartInteraction() {
       return { chart: this.chanFrame?.chart, onPan: (bars) => this.panChanChart(bars), onZoom: (factor, anchor, ratio, baseVisible) => this.zoomChanChart(factor, anchor, ratio, baseVisible) };
     },
+    chanLoadStatus() {
+      if (!CHAN_INTRADAY_PERIODS.includes(this.chanPeriod) && this.chanLoading) return "缠论行情加载中…";
+      if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
+        const attempts = this.chanIntradayRetryAttempts[this.chanPeriod] || 0;
+        if (this.chanIntradayLoading[this.chanPeriod]) return `${this.chanPeriod === "15m" ? "15分钟" : "4小时"}行情加载中…`;
+        if (attempts >= CHAN_INTRADAY_RETRY_LIMIT && !this.chanIntradayRetryTimers[this.chanPeriod]) return "盘中行情暂不可用，稍后可手动重试";
+        if (attempts > 0) return `盘中行情正在自动重试（${attempts}/${CHAN_INTRADAY_RETRY_LIMIT}）`;
+        return "";
+      }
+      if (this.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT && !this.chanRetryTimer) return "缠论行情暂不可用，稍后可手动重试";
+      if (this.chanRetryAttempts > 0) return `缠论行情正在自动重试（${this.chanRetryAttempts}/${CHAN_ANALYSIS_RETRY_LIMIT}）`;
+      return "";
+    },
+    chanLoadRetryAvailable() {
+      if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) return !this.chanIntradayLoading[this.chanPeriod] && !this.chanIntradayRetryTimers[this.chanPeriod] && (this.chanIntradayRetryAttempts[this.chanPeriod] || 0) >= CHAN_INTRADAY_RETRY_LIMIT;
+      return !this.chanLoading && !this.chanRetryTimer && this.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT;
+    },
     chanCanvasBinding() { return { chart: this.chanFrame?.chart, layers: this.chanChartLayers }; },
     chanLayerLevels() {
       return this.chanFrame?.chart?.layerLevels || [];
@@ -5017,9 +5069,6 @@ const optionScopeApp = new Vue({
       this.chanHoveredScenario = null;
       this.chanSpotGuideVisible = false;
       this.ensureChanIntraday(this.chanPeriod);
-      if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod) && this.chanIntradayPayload[this.chanPeriod]?.refreshing) {
-        scheduleChanIntradayRetry(this.chanPeriod, state.symbol);
-      }
     },
   },
   methods: {
@@ -5035,21 +5084,33 @@ const optionScopeApp = new Vue({
       return item?.status || "等待信号";
     },
     navigateToSymbol() { return navigateToSymbol(); },
-    ensureChanIntraday(period, refresh = false) {
-      if (!CHAN_INTRADAY_PERIODS.includes(period)) return;
-      if (this.chanIntradayLoading[period]) {
-        if (refresh) scheduleChanIntradayRetry(period, state.symbol);
+    retryChanChartLoad() {
+      if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
+        const period = this.chanPeriod;
+        clearTimeout(this.chanIntradayRetryTimers[period]);
+        this.chanIntradayRetryTimers = { ...this.chanIntradayRetryTimers, [period]: null };
+        this.chanIntradayRetryAttempts = { ...this.chanIntradayRetryAttempts, [period]: 0 };
+        this.ensureChanIntraday(period, true);
         return;
       }
-      if (!refresh && this.chanIntradayPayload[period]) return;
+      clearTimeout(state.chanRetryTimer);
+      state.chanRetryTimer = null;
+      state.chanRetryAttempts = 0;
+      refreshChanAnalysis(true);
+    },
+    ensureChanIntraday(period, refresh = false) {
+      if (!CHAN_INTRADAY_PERIODS.includes(period)) return;
+      if (this.chanIntradayLoading[period]) return;
+      if (!refresh && this.chanIntradayPayload[period]?.frame?.bar_count > 0 && !this.chanIntradayPayload[period]?.refreshing) return;
       const symbol = state.symbol;
+      const generation = state.loadId;
       if (!symbol) return;
       const quote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
       const spot = finitePrice(activeSessionQuote(quote)?.price ?? quote?.price);
       const query = spot != null ? `?period=${period}&spot=${encodeURIComponent(spot)}` : `?period=${period}`;
       this.chanIntradayLoading = { ...this.chanIntradayLoading, [period]: true };
-      request(`/api/chan/${encodeURIComponent(symbol)}/intraday${query}`).then((payload) => {
-        if (state.symbol !== symbol) return;
+      request(`/api/chan/${encodeURIComponent(symbol)}/intraday${query}`, { timeout: 60000 }).then((payload) => {
+        if (state.symbol !== symbol || state.loadId !== generation) return;
         const previousBars = this.chanIntradayPayload[period]?.frame?.bar_count || 0;
         const nextBars = payload?.frame?.bar_count || 0;
         const viewport = state.chanViewports[period];
@@ -5060,19 +5121,21 @@ const optionScopeApp = new Vue({
           state.chanViewports = { ...state.chanViewports, [period]: { ...viewport, endOffset } };
         }
         this.chanIntradayPayload = { ...this.chanIntradayPayload, [period]: payload };
-        if (payload?.refreshing) scheduleChanIntradayRetry(period, symbol);
+        if (payload?.refreshing || !nextBars) scheduleChanIntradayRetry(period, symbol);
         else {
           clearTimeout(state.chanIntradayRetryTimers[period]);
           state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: null };
           state.chanIntradayRetryAttempts = { ...state.chanIntradayRetryAttempts, [period]: 0 };
         }
       }).catch((error) => {
-        if (state.symbol === symbol) {
-          setError(error.message || "盘中周期加载失败");
-          if (this.chanIntradayPayload[period]?.frame) scheduleChanIntradayRetry(period, symbol);
+        if (state.symbol === symbol && state.loadId === generation) {
+          if (!isTransientChanRequestError(error)) setError(error.message || "盘中周期加载失败");
+          if (isTransientChanRequestError(error)) scheduleChanIntradayRetry(period, symbol);
         }
       }).then(() => {
-        this.chanIntradayLoading = { ...this.chanIntradayLoading, [period]: false };
+        if (state.loadId === generation && state.symbol === symbol) {
+          this.chanIntradayLoading = { ...this.chanIntradayLoading, [period]: false };
+        }
       });
     },
     isChanTouchInput() {

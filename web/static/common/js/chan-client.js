@@ -269,15 +269,19 @@
   // chart geometry is cached.
   function chartWithSpot(chart, value, minimum, maximum, y, scenarios = []) {
     const badgePrice = Number(value);
-    const spot = value != null && Number.isFinite(badgePrice) && badgePrice >= minimum && badgePrice <= maximum
-      ? { y: y(badgePrice), label: money(badgePrice), height: 22 } : null;
+    const spot = value != null && Number.isFinite(badgePrice) && badgePrice > 0
+      ? { y: y(Math.max(minimum, Math.min(maximum, badgePrice))),
+        label: `${badgePrice > maximum ? "↑ " : badgePrice < minimum ? "↓ " : ""}${money(badgePrice)}`,
+        height: 22 } : null;
     const quotePrice = value != null && Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : chart.lastClose;
     const startX = chart.historyRight + 8;
     const endX = chart.plotRight - 8;
     const projectionWidth = Math.max(0, endX - startX);
     const projections = (scenarios || []).map((scenario) => {
       if (!Number.isFinite(Number(quotePrice)) || Number(quotePrice) <= 0) return null;
-      const levels = [{ price: Number(quotePrice), stage: "现价", showPrice: true }, ...(scenario.projection_levels || []).map((level, index) => ({
+      const anchor = Number(scenario.projection_anchor_price);
+      const levels = [{ price: Number.isFinite(anchor) && anchor > 0 ? anchor : Number(quotePrice),
+        stage: scenario.projection_anchor_label || (Number.isFinite(anchor) && anchor > 0 ? "最近收盘" : "现价"), showPrice: true }, ...(scenario.projection_levels || []).map((level, index) => ({
         price: Number(level), stage: scenario.projection_labels?.[index] || "结构观察位",
         showPrice: !(scenario.projection_hide_prices || []).includes(index),
       }))]
@@ -306,6 +310,20 @@
     })) };
   }
 
+  function isIntradayFrame(frame) {
+    return ["15m", "30m", "1h", "2h", "4h"].includes(frame?.period);
+  }
+
+  // Intraday paths follow the live quote; daily and weekly paths stay anchored
+  // to completed bars so ordinary quote updates do not move their geometry.
+  function scenarioReferencePrice(frame, livePrice) {
+    const live = Number(livePrice);
+    const close = Number(frame?.last_close);
+    if (isIntradayFrame(frame) && Number.isFinite(live) && live > 0) return live;
+    if (Number.isFinite(close) && close > 0) return close;
+    return Number.isFinite(live) && live > 0 ? live : null;
+  }
+
   function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null) {
     const cachedLayouts = chartCache.get(frame.candles);
     const totalBars = frame.candles?.length || 0;
@@ -328,10 +346,13 @@
     const cacheKey = `${showScenarios ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${ruleVersion || ""}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
-    const scenarioLevels = showScenarios ? (scenarios || []).flatMap((scenario) => scenario.projection_levels || [])
+    const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
+    const scenarioLevels = showScenarios ? (scenarios || []).flatMap((scenario) => [
+      scenario.projection_anchor_price, ...(scenario.projection_levels || []),
+    ])
       .map(Number).filter((price) => Number.isFinite(price) && price > 0) : [];
     const newLevelsOutsideCache = scenarioLevels.some((price) => price < (cached?.minimum ?? Infinity) || price > (cached?.maximum ?? -Infinity));
-    const quoteOutsideCache = Number.isFinite(currentSpot) && currentSpot > 0
+    const quoteOutsideCache = Number.isFinite(liveScenarioPrice) && liveScenarioPrice > 0
       && (currentSpot < (cached?.minimum ?? -Infinity) || currentSpot > (cached?.maximum ?? Infinity));
     if (cached && !newLevelsOutsideCache && !quoteOutsideCache) {
       return chartWithSpot(cached.chart, spot, cached.minimum, cached.maximum, cached.y, scenarios);
@@ -382,7 +403,9 @@
       const price = Number(signal.price);
       if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
     });
-    if (Number.isFinite(currentSpot) && currentSpot > 0) scenarioLevels.push(currentSpot);
+    // Keep the daily/weekly scale tied to bars and structure. Intraday charts
+    // include the live quote because their scenario paths follow it.
+    if (Number.isFinite(liveScenarioPrice) && liveScenarioPrice > 0) scenarioLevels.push(liveScenarioPrice);
     if (scenarioLevels.length) {
       minimum = Math.min(minimum, ...scenarioLevels);
       maximum = Math.max(maximum, ...scenarioLevels);
@@ -628,6 +651,9 @@
     if (!frame?.bar_count) return guide;
     const price = spot != null && Number.isFinite(Number(spot)) && Number(spot) > 0
       ? Number(spot) : frame.last_close;
+    // Daily and weekly paths use the latest close; intraday paths use the live
+    // quote so their position remains current while the session is moving.
+    const scenarioPrice = scenarioReferencePrice(frame, price);
     const close = frame.last_close;
     const center = frame.position?.center;
     const strokes = frame.strokes || [];
@@ -642,7 +668,7 @@
     const high = recent.find((point) => point.kind === "top");
     const low = recent.find((point) => point.kind === "bottom");
     const lower = low && recent.filter((point) => point.kind === "bottom" && point.confirmed
-      && point.price < Math.min(low.price, price)).sort((a, b) => b.price - a.price)[0];
+      && point.price < Math.min(low.price, scenarioPrice)).sort((a, b) => b.price - a.price)[0];
     const higher = high && recent.find((point) => point.kind === "top" && point.confirmed && point.price > high.price);
     const structural = [...(frame.signals || []).filter((signal) => !turningKinds.has(signal.kind)), ...(frame.pen_signals || [])];
     const active = structural.filter((signal) => signal.status !== "invalidated");
@@ -704,49 +730,51 @@
     guide.evidence.push(`现价${price > high.price ? "高于" : price < low.price ? "低于" : "仍在"}近期笔端点区间 ${money(low.price)}–${money(high.price)}${!high.confirmed || !low.confirmed ? "，其中形成中的端点会随结构更新" : ""}。`);
     if (center) guide.evidence.push(`现价${below ? "低于中枢下沿" : above ? "高于中枢上沿" : "处于中枢内部"}；最近中枢为 ${money(center.lower)}–${money(center.upper)}。`);
     if (latest && !latest.confirmed) guide.evidence.push(`图中虚线是从 ${money(latest.start.price)} 到 ${money(latest.end.price)} 的形成中笔，表示已识别的摆动方向；端点后的回落或反弹还可能尚未成笔。`);
-    const nextUp = [below ? center.lower : null, higher?.price].filter((value) => value != null && value > high.price).sort((a, b) => a - b)[0];
+    const scenarioBelow = center && scenarioPrice < center.lower;
+    const scenarioAbove = center && scenarioPrice > center.upper;
+    const nextUp = [scenarioBelow ? center.lower : null, higher?.price].filter((value) => value != null && value > high.price).sort((a, b) => a - b)[0];
     guide.scenarios = [
-      ...(Math.abs(price - high.price) > 0.000001 ? [{ direction: "up", label: "第一步：反弹改善", status: gate(high.price, true),
+      ...(Math.abs(scenarioPrice - high.price) > 0.000001 ? [{ direction: "up", label: "第一步：反弹改善", status: gate(high.price, true),
         condition: `${frame.label}收盘高于 ${money(high.price)}，随后回落的已确认笔低点高于 ${money(low.price)}。`,
         expectation: nextUp != null ? `形成更高低点后，再观察 ${money(nextUp)} 附近能否继续改善。` : "等待形成更高低点和新的中枢，再评估上涨结构。",
         invalidation: `收盘重新跌回 ${money(high.price)} 以下，突破改善未能保持；跌破 ${money(low.price)} 则反弹结构进一步受损。`,
-        chart_label: price > high.price ? "回踩近期高点" : "收盘站上高点",
-        chart_tone: price > high.price ? "range" : "up",
+        chart_label: scenarioPrice > high.price ? "回踩近期高点" : "收盘站上高点",
+        chart_tone: scenarioPrice > high.price ? "range" : "up",
         // The midpoint is only a visual placeholder inside the valid
         // higher-low zone; its price is intentionally hidden.
-        projection_levels: price > high.price ? [high.price]
-          : price < low.price ? [low.price, high.price, low.price + (high.price - low.price) * 0.45, high.price]
+        projection_levels: scenarioPrice > high.price ? [high.price]
+          : scenarioPrice < low.price ? [low.price, high.price, low.price + (high.price - low.price) * 0.45, high.price]
             : [high.price, low.price + (high.price - low.price) * 0.45, high.price],
-        projection_labels: price > high.price ? ["回踩边界"]
-          : price < low.price ? ["收回近期低点", "突破观察", "更高低点区·示意", "再次确认"]
+        projection_labels: scenarioPrice > high.price ? ["回踩边界"]
+          : scenarioPrice < low.price ? ["收回近期低点", "突破观察", "更高低点区·示意", "再次确认"]
             : ["突破观察", "更高低点区·示意", "再次确认"],
-        projection_hide_prices: price > high.price ? [] : price < low.price ? [2] : [1] }] : []),
-      ...(price > low.price || (lower && price > lower.price) ? [{ direction: "down", label: "风险路径：近期低点失守", status: gate(low.price, false),
+        projection_hide_prices: scenarioPrice > high.price ? [] : scenarioPrice < low.price ? [2] : [1] }] : []),
+      ...(scenarioPrice > low.price || (lower && scenarioPrice > lower.price) ? [{ direction: "down", label: "风险路径：近期低点失守", status: gate(low.price, false),
         condition: `${frame.label}收盘低于 ${money(low.price)}，随后反抽仍未收回该位置。`,
         expectation: lower ? `再观察前低 ${money(lower.price)} 附近是否形成止跌结构。` : "下方没有更低的已确认笔端点，等待新低及反抽结构形成。",
         invalidation: `收盘重新站回 ${money(low.price)} 上方，并形成止跌的反向笔，才重新评估这一风险路径。`,
-        chart_label: price > low.price ? "低点失守 → 前低" : "继续观察前低",
+        chart_label: scenarioPrice > low.price ? "低点失守 → 前低" : "继续观察前低",
         // Below the recent low, continue only to a lower confirmed endpoint.
         // Without one there is no defensible numeric path to draw.
-        projection_levels: price > low.price ? [low.price, ...(lower ? [low.price - (low.price - lower.price) * 0.3, lower.price] : [])]
+        projection_levels: scenarioPrice > low.price ? [low.price, ...(lower ? [low.price - (low.price - lower.price) * 0.3, lower.price] : [])]
           : [lower.price],
-        projection_labels: price > low.price ? ["近期低点失守", ...(lower ? ["反抽未收回·示意", "前低观察"] : [])]
+        projection_labels: scenarioPrice > low.price ? ["近期低点失守", ...(lower ? ["反抽未收回·示意", "前低观察"] : [])]
           : ["前低观察"],
-        projection_hide_prices: price > low.price && lower ? [1] : [] }] : []),
+        projection_hide_prices: scenarioPrice > low.price && lower ? [1] : [] }] : []),
     ];
-    if (center) guide.scenarios.push(below ? { direction: "repair", label: "第二步：收复原中枢", status: gate(center.lower, true),
+    if (center) guide.scenarios.push(scenarioBelow ? { direction: "repair", label: "第二步：收复原中枢", status: gate(center.lower, true),
       condition: `${frame.label}收盘高于中枢下沿 ${money(center.lower)}，随后回落不再跌出中枢。`,
       expectation: `重新评估中枢内修复，再观察上沿 ${money(center.upper)}；近期高点突破只是更早的一步。`,
       invalidation: `收盘再次低于 ${money(center.lower)}，中枢修复条件失效。`,
       chart_label: "中枢修复", projection_levels: [center.lower, center.upper, center.lower + (center.upper - center.lower) * 0.58, center.upper, ...(high.price > center.upper ? [high.price] : [])],
       projection_labels: ["收复下沿", "观察上沿", "中枢回踩·示意", "重新测试上沿", "近期高点"],
       projection_hide_prices: [2] }
-      : above ? { direction: "hold", label: "结构边界：中枢上沿回试", status: gate(center.upper, true),
+      : scenarioAbove ? { direction: "hold", label: "结构边界：中枢上沿回试", status: gate(center.upper, true),
         condition: `回落的已确认笔低点仍高于中枢上沿 ${money(center.upper)}。`,
         expectation: "核对离开中枢后的回试结构，再评估第三类位置候选。",
         invalidation: `回落触及 ${money(center.upper)}，中枢上方回试不进入的条件失效。`,
         chart_label: "回试中枢上沿", chart_tone: "range",
-        projection_levels: [center.upper, price],
+        projection_levels: [center.upper, scenarioPrice],
         projection_labels: ["回试边界", "返回现价区间·示意"],
         projection_hide_prices: [] }
       : { direction: "range", label: "结构边界：中枢内整理", status: "现价位于中枢内",
@@ -754,12 +782,14 @@
         expectation: "先用近端高低点观察摆动变化；突破中枢后再核对回试结构。",
         invalidation: "离开中枢后，形成不重新进入区间的已确认回试笔。",
         chart_label: "中枢内整理",
-        projection_levels: [price <= center.lower || price >= center.upper ? (price < center.lower ? center.lower : center.upper) : price,
-          price <= center.lower || price >= center.upper ? (center.lower + center.upper) / 2 : (price > (center.lower + center.upper) / 2 ? center.lower : center.upper),
-          price <= center.lower || price >= center.upper ? (center.upper + center.lower) / 2 : price > (center.lower + center.upper) / 2 ? center.upper : center.lower],
+        projection_levels: [scenarioPrice <= center.lower || scenarioPrice >= center.upper ? (scenarioPrice < center.lower ? center.lower : center.upper) : scenarioPrice,
+          scenarioPrice <= center.lower || scenarioPrice >= center.upper ? (center.lower + center.upper) / 2 : (scenarioPrice > (center.lower + center.upper) / 2 ? center.lower : center.upper),
+          scenarioPrice <= center.lower || scenarioPrice >= center.upper ? (center.upper + center.lower) / 2 : scenarioPrice > (center.lower + center.upper) / 2 ? center.upper : center.lower],
         projection_labels: ["回到中枢", "区间内摆动·示意", "另一侧边界"],
         projection_hide_prices: [1, 2] });
-    guide.scenarios = scenarioTiltScores(frame, weekly, guide.scenarios);
+    guide.scenarios = scenarioTiltScores(frame, weekly, guide.scenarios)
+      .map((scenario) => ({ ...scenario, projection_anchor_price: scenarioPrice,
+        projection_anchor_label: isIntradayFrame(frame) ? "现价" : "最近收盘" }));
     // A downside path may be intentionally omitted when price is already
     // below the recent low and no lower confirmed endpoint exists. Keep its
     // rule-based tilt available for the live risk summary even without a path.
@@ -1139,13 +1169,13 @@
   function isSegmentLevelVisible(layers, level) {
     const key = String(Number(level) || 0);
     return Object.prototype.hasOwnProperty.call(layers?.segmentLevels || {}, key)
-      ? layers.segmentLevels[key] === true : Number(key) === 0;
+      ? layers.segmentLevels[key] === true : false;
   }
 
   function isRecursiveCenterLevelVisible(layers, level) {
     const key = String(Number(level) || 0);
     return Object.prototype.hasOwnProperty.call(layers?.recursiveCenters || {}, key)
-      ? layers.recursiveCenters[key] === true : Number(key) === 0;
+      ? layers.recursiveCenters[key] === true : false;
   }
 
   function allSegmentLevelsVisible(layers, levels) {
