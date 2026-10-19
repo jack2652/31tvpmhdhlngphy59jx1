@@ -6,7 +6,7 @@ import "time"
 
 const RuleVersion = "strict-old-bi-v3"
 const RecursiveRuleVersion = "chan-recursive-v4.0.0"
-const RecursivePreviewVersion = "chan-recursive-v4-preview.2"
+const RecursivePreviewVersion = "chan-recursive-v4-preview.9"
 
 type Bar struct {
 	// CapturedAt keeps a daily candle fetched before its session close from
@@ -180,6 +180,7 @@ type FeatureElement struct {
 
 type Segment struct {
 	Direction      string           `json:"direction"`
+	TrendKind      string           `json:"trend_kind,omitempty"`
 	Chain          int              `json:"chain_id"`
 	Level          int              `json:"level"`
 	StartStroke    int              `json:"start_stroke"`
@@ -206,26 +207,31 @@ type Segment struct {
 }
 
 type RecursiveCenter struct {
-	Level              int     `json:"level"`
-	Kind               string  `json:"kind"`
-	InputKind          string  `json:"input_kind"`
-	Chain              int     `json:"chain_id"`
-	Start              string  `json:"start"`
-	End                string  `json:"end"`
-	Lower              float64 `json:"zd"`
-	Upper              float64 `json:"zg"`
-	FormedAt           string  `json:"formed_at"`
-	ConfirmedAt        string  `json:"confirmed_at"`
-	Forming            bool    `json:"forming"`
-	ClosedAt           string  `json:"closed_at,omitempty"`
-	StartSegment       int     `json:"start_segment"`
-	EndSegment         int     `json:"end_segment"`
-	ExtensionCount     int     `json:"extension_count"`
-	RelationToPrevious string  `json:"relation_to_previous,omitempty"`
-	RelatedCenter      *int    `json:"related_center,omitempty"`
-	Relation           string  `json:"relation,omitempty"`
-	CenterID           string  `json:"center_id"`
-	PreviousCenterID   string  `json:"previous_center_id,omitempty"`
+	Level       int     `json:"level"`
+	Kind        string  `json:"kind"`
+	InputKind   string  `json:"input_kind"`
+	Chain       int     `json:"chain_id"`
+	Start       string  `json:"start"`
+	End         string  `json:"end"`
+	Lower       float64 `json:"zd"`
+	Upper       float64 `json:"zg"`
+	FormedAt    string  `json:"formed_at"`
+	ConfirmedAt string  `json:"confirmed_at"`
+	Forming     bool    `json:"forming"`
+	ClosedAt    string  `json:"closed_at,omitempty"`
+	// StartSegment and EndSegment index the segments consumed by the level that
+	// form or extend this center. OwnerMoveIndex identifies the higher-level
+	// move that contains it; that is the index to use when searching for later
+	// moves at the center's own recursive level.
+	StartSegment       int    `json:"start_segment"`
+	EndSegment         int    `json:"end_segment"`
+	OwnerMoveIndex     int    `json:"owner_move_index"`
+	ExtensionCount     int    `json:"extension_count"`
+	RelationToPrevious string `json:"relation_to_previous,omitempty"`
+	RelatedCenter      *int   `json:"related_center,omitempty"`
+	Relation           string `json:"relation,omitempty"`
+	CenterID           string `json:"center_id"`
+	PreviousCenterID   string `json:"previous_center_id,omitempty"`
 }
 
 type LevelAnalysis struct {
@@ -234,8 +240,35 @@ type LevelAnalysis struct {
 	InputCount int               `json:"input_count"`
 	Strokes    []Stroke          `json:"strokes"`
 	Segments   []Segment         `json:"segments"`
+	Trends     []RecursiveTrend  `json:"trends,omitempty"`
 	Centers    []RecursiveCenter `json:"centers"`
 	WaitingFor string            `json:"waiting_for,omitempty"`
+}
+
+// RecursiveTrend is a higher-level move produced from a contiguous sequence
+// of lower-level segments. Its center ranges refer to the input level, while
+// the trend's price and time bounds cover all input segments in its span.
+type RecursiveTrend struct {
+	Level         int      `json:"level"`
+	Chain         int      `json:"chain_id"`
+	Kind          string   `json:"kind"`
+	Direction     string   `json:"direction"`
+	Start         string   `json:"start"`
+	End           string   `json:"end"`
+	StartPrice    float64  `json:"start_price"`
+	EndPrice      float64  `json:"end_price"`
+	Low           float64  `json:"low"`
+	High          float64  `json:"high"`
+	Confirmed     bool     `json:"confirmed"`
+	ConfirmedAt   string   `json:"confirmed_at,omitempty"`
+	Forming       bool     `json:"forming"`
+	StartInput    int      `json:"start_input"`
+	EndInput      int      `json:"end_input"`
+	StartRawBar   int      `json:"start_raw_bar"`
+	EndRawBar     int      `json:"end_raw_bar"`
+	StartInputBar int      `json:"start_input_bar"`
+	EndInputBar   int      `json:"end_input_bar"`
+	CenterIDs     []string `json:"center_ids,omitempty"`
 }
 
 type Strength struct {
@@ -384,6 +417,7 @@ type Frame struct {
 	Strokes            []Stroke            `json:"strokes"`
 	Centers            []Center            `json:"centers"`
 	Signals            []Signal            `json:"signals"`
+	PenSignals         []Signal            `json:"pen_signals"`
 	Scenarios          []Scenario          `json:"scenarios"`
 	Warnings           []string            `json:"warnings"`
 	Quality            DataQuality         `json:"quality"`

@@ -151,36 +151,83 @@
       <div class="detail-header">
         <button class="detail-toggle" type="button" :aria-expanded="chanExpanded ? 'true' : 'false'" aria-controls="chan-body" @click="toggleChanPanel">
           <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">CHAN STRUCTURE</span><span class="detail-title" id="chan-title">缠论 · 当前位置与走势推演</span></span>
+          <span class="detail-text"><span class="eyebrow">CHAN STRUCTURE</span><span class="detail-title" id="chan-title">缠论 · 多级结构分析</span></span>
           <span class="detail-action">{{ chanExpanded ? '收起' : '展开' }}</span>
         </button>
       </div>
       <div class="detail-body chan-body" id="chan-body" v-show="chanExpanded">
         <div class="chan-summary">
-          <div class="chan-summary-read"><span class="chan-section-label">{{ chanFrame.label }} · 当前判断</span><h2>{{ chanFrame.guidance.title }}</h2><p>{{ chanFrame.guidance.focus }}</p></div>
-          <div class="chan-meta"><span>现价 {{ view.chan.spot }}</span><span>行情缓存 {{ view.chan.historyTime }}</span><span>{{ chanFrame.dataSummary }}</span><span>{{ chanFrame.marketSummary }}</span><span role="status">{{ chanLoading ? '正在计算…' : (view.chan.refreshing ? '历史行情后台更新中' : '按已收盘行情计算') }}</span></div>
+          <div class="chan-summary-read"><span class="chan-section-label">{{ chanFrame.label }} · 结构概况</span><h2>{{ chanFrame.recursive.heading }}</h2><p>{{ chanFrame.recursive.trend }}</p></div>
+          <div class="chan-meta"><strong class="chan-summary-spot">现价 {{ view.chan.spot }}</strong><span class="chan-status-line" role="status">{{ chanLoading ? '正在计算…' : (view.chan.refreshing ? '行情正在后台更新' : '行情已更新至 ' + chanFrame.asOf) }}</span><span class="chan-summary-quality chan-quality" :class="'chan-quality-' + chanFrame.recursive.qualityClass">行情{{ chanFrame.recursive.quality }}</span></div>
         </div>
-        <div class="chan-overview">
-          <article v-for="item in [view.chan.daily, view.chan.weekly]" :key="item.label" class="chan-overview-item"><h3>{{ item.label }}背景</h3><strong>{{ item.position }}</strong><span>中枢 {{ item.center }}</span><p>{{ item.confirmed }} 根已确认笔 · 截至 {{ item.asOf }}</p></article>
-        </div>
+        <section class="chan-recursive" aria-labelledby="chan-recursive-title">
+          <header class="chan-recursive-header"><span class="chan-section-label" id="chan-recursive-title">当前周期结构统计</span></header>
+          <dl class="chan-recursive-stats">
+            <div><dt>已确认线段</dt><dd>{{ chanFrame.recursive.confirmedSegments }}</dd><small v-if="chanFrame.recursive.formingSegments">另有 {{ chanFrame.recursive.formingSegments }} 条形成中</small></div>
+            <div><dt>已闭合中枢</dt><dd>{{ chanFrame.recursive.closedCenters }}</dd><small v-if="chanFrame.recursive.formingCenters">另有 {{ chanFrame.recursive.formingCenters }} 个形成中</small></div>
+            <div><dt>分析行情</dt><dd>{{ chanFrame.recursive.acceptedBars }}<small>/ {{ chanFrame.recursive.inputBars }} 根有效</small></dd></div>
+          </dl>
+          <details class="chan-recursive-detail"><summary>结构进度与当前等待条件</summary><div class="chan-recursive-levels" role="list" aria-label="各层结构状态"><article v-for="level in chanFrame.recursive.levels" :key="'recursive-level-' + level.level" role="listitem"><strong>第{{ Number(level.level) + 1 }}层</strong><span>{{ level.status }}</span><small>{{ level.confirmedSegments }} 条已确认线段 · {{ level.formingSegments }} 条形成中 · {{ level.closedCenters }} 个闭合中枢<span v-if="level.formingCenters"> · {{ level.formingCenters }} 个形成中</span></small><small v-if="level.waitingFor">当前等待：{{ level.waitingFor }}</small></article><div v-if="!chanFrame.recursive.levels.length" class="chan-muted">该周期尚无结构数据。</div></div><p class="chan-readiness-detail">{{ chanFrame.recursive.readiness }}</p></details>
+          <details class="chan-recursive-detail">
+            <summary>结构信号 <span>{{ chanFrame.recursive.signalCountLabel }}</span></summary>
+            <div class="chan-recursive-signals" aria-live="polite">
+              <article v-for="signal in chanFrame.recursive.signals" :key="signal.key">
+                <header><strong>{{ signal.label }} · 第{{ Number(signal.level) + 1 }}层</strong><span>{{ signal.status }} · {{ signal.phase }}</span></header>
+                <div class="chan-signal-meta"><span>发生 {{ signal.date }}</span><span>{{ signal.invalidation }}</span></div>
+                <details class="chan-signal-evidence">
+                  <summary>查看判断依据</summary>
+                  <dl>
+                    <div><dt>发生时间</dt><dd>{{ signal.date }}</dd></div>
+                    <div><dt>开始观察</dt><dd>{{ signal.observedAt }}</dd></div>
+                    <div><dt>确认时间</dt><dd>{{ signal.confirmedAt }}</dd></div>
+                    <div class="chan-signal-evidence-wide"><dt>已满足条件</dt><dd><ul><li v-for="(condition, index) in signal.conditions" :key="index">{{ condition }}</li><li v-if="!signal.conditions.length">暂无</li></ul></dd></div>
+                    <div class="chan-signal-evidence-wide"><dt>仍需等待</dt><dd><ul><li v-for="(condition, index) in signal.missingConditions" :key="index">{{ condition }}</li><li v-if="!signal.missingConditions.length">无</li></ul></dd></div>
+                    <div><dt>大盘环境</dt><dd>{{ signal.market }}</dd></div>
+                    <div><dt>下级结构确认</dt><dd>{{ signal.lowerLevel }}</dd></div>
+                    <div v-if="signal.timeframe"><dt>跨周期确认</dt><dd>{{ signal.timeframe }}</dd></div>
+                    <div v-if="signal.relatedSignal"><dt>关联信号</dt><dd>{{ signal.relatedSignal }}</dd></div>
+                    <div v-if="signal.relatedCenter"><dt>关联中枢</dt><dd>{{ signal.relatedCenter }}</dd></div>
+                    <div v-if="signal.references.length" class="chan-signal-evidence-wide"><dt>参考结构</dt><dd><ul><li v-for="(reference, index) in signal.references" :key="index">{{ reference }}</li></ul></dd></div>
+                  </dl>
+                </details>
+              </article>
+              <p v-if="!chanFrame.recursive.signals.length" class="chan-muted">当前周期没有符合条件的结构信号。</p>
+            </div>
+          </details>
+          <details class="chan-recursive-detail"><summary>数据与识别说明</summary><p>{{ chanFrame.recursive.priceBasis }} · {{ chanFrame.recursive.mapping }} · {{ chanFrame.recursive.acceptedBars }}/{{ chanFrame.recursive.inputBars }} 根有效行情 · 缺口 {{ chanFrame.recursive.gaps }} 处 · {{ chanFrame.recursive.market }}</p></details>
+        </section>
         <div class="chan-controls">
-          <div class="chan-chart-controls"><h3>价格结构</h3><div class="chan-control-options">
+          <div class="chan-chart-controls"><h3>价格图表</h3><div class="chan-control-options">
             <div class="chan-control-group chan-period-control-group"><span>周期</span><div class="detail-segmented" role="group" aria-label="K 线周期">
               <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'daily' ? 'true' : 'false'" @click="chanPeriod = 'daily'">日线</button>
               <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'weekly' ? 'true' : 'false'" @click="chanPeriod = 'weekly'">周线</button>
               <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '15m' ? 'true' : 'false'" @click="chanPeriod = '15m'">15分钟</button>
               <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '4h' ? 'true' : 'false'" @click="chanPeriod = '4h'">4小时</button>
             </div></div>
-            <div class="chan-control-group chan-layer-control-group"><span>图层</span><div class="detail-segmented chan-layer-switches" role="group" aria-label="缠论图表图层">
-              <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
-              <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.pens ? 'true' : 'false'" @click="toggleChanChartLayer('pens')">笔</button>
-              <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.penCenters ? 'true' : 'false'" @click="toggleChanChartLayer('penCenters')">笔中枢</button>
-              <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.signals ? 'true' : 'false'" @click="toggleChanChartLayer('signals')">信号</button>
-              <button v-for="level in chanSegmentLevels" :key="'segment-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanSegmentLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏 L' + level + ' 级线段'" @click="toggleChanSegmentLevel(level)">L{{ level }}线段</button>
-              <button v-for="level in chanLayerLevels" :key="'center-layer-' + level" class="detail-seg" type="button" :aria-pressed="chanChartLayers.recursiveCenters && chanChartLayers.recursiveCenters[level] === true ? 'true' : 'false'" @click="toggleChanChartLayer(level)">L{{ level }}中枢</button>
-            </div></div>
+            <details class="chan-layer-menu">
+              <summary aria-label="图层设置">图层</summary>
+              <div class="chan-layer-menu-panel">
+                <button class="chan-layer-menu-close" type="button" aria-label="关闭图层面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                <section><h4>图表显示</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="主要图层">
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.signals ? 'true' : 'false'" @click="toggleChanChartLayer('signals')">结构信号</button>
+                  <span v-if="chanChartLayers.signals && chanFrame.chart && !chanFrame.chart.signals.length" class="chan-layer-empty" role="status" :title="chanFrame.chart.totalSignalCount ? '打开结构信号详情查看候选状态' : '笔级顶部与底部观察请使用“顶底观察”图层'">{{ chanFrame.chart.totalPlottableSignalCount ? '当前窗口无标记 · 全周期 ' + chanFrame.chart.totalPlottableSignalCount + ' 处，拖动查看' : chanFrame.chart.totalSignalCount ? '有 ' + chanFrame.chart.totalSignalCount + ' 条候选待确认，查看结构信号详情' : '当前周期暂无递归买卖点' }}</span>
+                </div></section>
+                <section><h4>线段与中枢</h4><div class="detail-segmented chan-layer-switches chan-recursive-layer-switches" role="group" aria-label="各层线段和中枢">
+                  <button v-for="level in chanSegmentLevels" :key="'segment-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanSegmentLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层结构'" @click="toggleChanSegmentLevel(level)">{{ level === 0 ? '第1层线段' : '第' + (level + 1) + '层走势' }}</button>
+                  <span v-if="chanSegmentLevels.length && chanLayerLevels.length" class="chan-layer-divider" aria-hidden="true"></span>
+                  <button v-for="level in chanLayerLevels" :key="'center-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanRecursiveCenterLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层中枢'" @click="toggleChanChartLayer(level)">第{{ level + 1 }}层中枢</button>
+                  <span v-if="!chanSegmentLevels.length && !chanLayerLevels.length" class="chan-layer-empty">等待结构形成</span>
+                </div></section>
+                <section><h4>笔级结构</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="笔级结构图层">
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.pens ? 'true' : 'false'" @click="toggleChanChartLayer('pens')">笔</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.penCenters ? 'true' : 'false'" @click="toggleChanChartLayer('penCenters')">笔中枢</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.legacySignals ? 'true' : 'false'" @click="toggleChanChartLayer('legacySignals')">顶底观察</button>
+                </div></section>
+              </div>
+            </details>
           </div></div>
-          <span>{{ chanFrame.bars }} 根收盘 K 线 · {{ chanFrame.confirmed }} 根已确认笔 · 截至 {{ chanFrame.asOf }}</span>
+          <span>{{ chanFrame.recursive.acceptedBars }} 根行情 · {{ chanFrame.asOf }}</span>
           <div v-if="chanFrame.chart && chanFrame.chart.keyLevels.length" class="chan-key-level-summary" role="list" aria-label="缠论关键观察价位">
             <div v-for="level in chanFrame.chart.keyLevels" :key="level.key" class="chan-key-level-chip" :class="'chan-key-level-chip-' + level.tone" role="listitem" :title="level.title"><span>{{ level.label }}</span><strong>{{ level.priceLabel }}</strong></div>
           </div>
@@ -201,11 +248,10 @@
                 <circle v-for="point in route.points" :key="point.key" :cx="point.x" :cy="point.y" r="3" class="chan-projection-point"></circle>
               </g>
             </g>
-            <g key="chan-scenario-toggle" class="chan-scenario-toggle-svg" :transform="'translate(' + (chanFrame.chart.historyRight - 21) + ' ' + (chanFrame.chart.plotBottom - 21) + ')'" role="button" tabindex="0" :aria-pressed="chanScenariosVisible ? 'true' : 'false'" :aria-label="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" @click.stop="toggleChanScenarios" @keydown.enter.stop.prevent="toggleChanScenarios" @keydown.space.stop.prevent="toggleChanScenarios">
+            <g key="chan-scenario-toggle" class="chan-scenario-toggle-svg" :transform="'translate(' + (chanFrame.chart.historyRight - 19) + ' ' + (chanFrame.chart.plotBottom - 19) + ')'" role="button" tabindex="0" :aria-pressed="chanScenariosVisible ? 'true' : 'false'" :aria-label="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" @click.stop="toggleChanScenarios" @keydown.enter.stop.prevent="toggleChanScenarios" @keydown.space.stop.prevent="toggleChanScenarios">
               <title>{{ chanScenariosVisible ? '隐藏条件情景' : '显示条件情景' }}</title>
-              <rect width="18" height="18" class="chan-scenario-toggle-svg-box"></rect>
-              <path v-if="chanScenariosVisible" d="M4 5 L8 9 L4 13 M9 5 L13 9 L9 13" class="chan-scenario-toggle-svg-icon"></path>
-              <path v-else d="M14 5 L10 9 L14 13 M9 5 L5 9 L9 13" class="chan-scenario-toggle-svg-icon"></path>
+              <rect width="16" height="16" class="chan-scenario-toggle-svg-box"></rect>
+              <text x="8" y="8" text-anchor="middle" dominant-baseline="central" class="el-icon-sort chan-scenario-toggle-svg-icon">&#xe6d2;</text>
             </g>
             <!-- 交互层只负责条件路径和十字线，历史图元由 Canvas 一次性绘制。 -->
             <g v-pre class="chan-crosshair-layer" aria-hidden="true" visibility="hidden">
@@ -229,7 +275,7 @@
           <button type="button" aria-label="重置 K 线范围" title="重置范围并回到最新" :disabled="!chanFrame.chart.canResetViewport" @click="changeChanViewport('reset')">重置</button>
         </div>
         <p class="chan-chart-gesture-help">鼠标按住左右拖动；Ctrl 或 ⌘ + 滚轮缩放。手机单指左右拖动、双指捏合缩放。</p>
-        <div v-if="!chanFrame.chart" class="levels-empty">历史行情到达后展示 K 线、笔与中枢</div>
+        <div v-if="!chanFrame.chart" class="levels-empty">历史行情到达后展示 K 线与多级结构</div>
         <button v-if="chanSpotGuideVisible && isChanTouchInput()" type="button" class="chan-spot-guide-backdrop" aria-label="关闭现价结构观察" @click.stop="dismissChanSpotGuide"></button>
         <article v-if="chanSpotGuideVisible && chanFrame.spotGuide" id="chan-spot-guide-card" class="chan-spot-float-card" :class="{ 'chan-spot-float-card-mobile': isChanTouchInput() }" role="region" aria-label="现价结构观察" @keydown.esc.stop.prevent="dismissChanSpotGuide" :style="{ left: chanSpotGuideX + 'px', top: chanSpotGuideY == null ? null : chanSpotGuideY + 'px' }">
             <header><div><h4>现价结构观察</h4><span>实时行情 · 条件推演</span></div><button type="button" class="chan-spot-guide-close" aria-label="关闭现价结构观察" @click.stop="dismissChanSpotGuide">×</button></header>
@@ -261,9 +307,12 @@
             </dl>
             <p class="chan-spot-guide-note">{{ chanFrame.spotGuide.freshness }} 倾向分是规则估算，不代表胜率。</p>
         </article>
-        <div class="chan-legend"><span><i class="chan-legend-pen"></i>已确认笔</span><span><i class="chan-legend-pen chan-legend-pending"></i>形成中的笔</span><span><i class="chan-legend-center"></i>笔中枢</span><span><i class="chan-legend-level"></i>近期高低点／中枢边界</span><span><i class="chan-legend-projection"></i>右侧为条件情景推演</span><span>倾向分为规则估算，非统计概率</span><span>点击左侧现价查看结构指引，再次点击或按 Esc 关闭</span><span>带 *：形成中的端点价格</span></div>
-        <dl class="chan-facts"><div><dt>最近中枢</dt><dd>{{ chanFrame.boundary }}<small>{{ chanFrame.structure }}</small></dd></div><div><dt>最近一笔</dt><dd>{{ chanFrame.stroke }}<small>{{ chanFrame.observation }}</small></dd></div></dl>
-        <div class="chan-turning">
+        <div class="chan-legend"><span><i class="chan-legend-recursive"></i>多级线段与中枢</span><span><i class="chan-legend-level"></i>近期高低点／中枢边界</span><span><i class="chan-legend-projection"></i>右侧为条件情景推演</span><span>倾向分为规则估算，非统计概率</span><span>点击左侧现价查看结构指引，再次点击或按 Esc 关闭</span></div>
+        <details class="chan-compatibility chan-analysis-more">
+          <summary>更多分析<span>日周背景 · 操作计划 · 关键价位 · 后续观察</span></summary>
+          <div class="chan-compatibility-body">
+            <details class="chan-more-fold"><summary>日线与周线背景</summary><div class="chan-compatibility-structure"><div class="chan-overview"><article v-for="item in [view.chan.daily, view.chan.weekly]" :key="item.label" class="chan-overview-item"><h3>{{ item.label }}背景</h3><strong>{{ item.position }}</strong><span>中枢 {{ item.center }}</span><p>{{ item.confirmed }} 根已确认笔 · 截至 {{ item.asOf }}</p></article></div>
+              <dl class="chan-facts"><div><dt>最近笔级中枢</dt><dd>{{ chanFrame.boundary }}<small>{{ chanFrame.structure }}</small></dd></div><div><dt>最近一笔</dt><dd>{{ chanFrame.stroke }}<small>{{ chanFrame.observation }}</small></dd></div></dl></div></details>
           <details class="chan-fold chan-plan-fold" :open="chanFolds.plan" @toggle="rememberChanFold('plan', $event)">
             <summary><h3 class="chan-fold-title" id="chan-turning-title">错过底部／顶部，现在怎么做<span class="chan-fold-meta">{{ chanFrame.label }} · 新仓与持仓分别判断</span></h3></summary>
             <div class="chan-plan-body">
@@ -297,35 +346,36 @@
             <summary>术语怎么理解：反向笔、回踩、反抽、保护位</summary>
             <dl><div v-for="term in chanFrame.plan.terms" :key="term.name"><dt>{{ term.name }}</dt><dd>{{ term.detail }}</dd></div></dl>
           </details>
-        </div>
-        <section class="chan-guidance" aria-labelledby="chan-guidance-title">
-          <div class="chan-section-heading"><h3 id="chan-guidance-title">关键价位与判断依据</h3><span>先看近期高低点，再看中枢边界</span></div>
-          <div class="chan-guidance-grid">
-            <div class="chan-evidence-block"><h4>判断依据</h4><ul class="chan-evidence" v-if="chanFrame.guidance.evidence.length"><li v-for="reason in chanFrame.guidance.evidence" :key="reason">{{ reason }}</li></ul><p v-else class="chan-muted">等待已收盘行情。</p></div>
-            <div class="chan-levels-wrap" v-if="chanFrame.guidance.levels.length">
-              <table class="chan-levels-table"><caption>{{ chanFrame.label }}关键观察价位</caption><thead><tr><th scope="col">位置</th><th scope="col">价格</th><th scope="col">距现价</th><th scope="col">观察变化</th></tr></thead><tbody><tr v-for="level in chanFrame.guidance.levels" :key="level.key"><th scope="row">{{ level.label }}<small>{{ level.source }} · {{ level.date }}</small></th><td>{{ level.price }}</td><td>{{ level.distance }}</td><td>{{ level.purpose }}</td></tr></tbody></table>
+          <details class="chan-more-fold"><summary>关键价位与判断依据</summary><section class="chan-guidance" aria-labelledby="chan-guidance-title">
+            <div class="chan-section-heading"><h3 id="chan-guidance-title">{{ chanFrame.guidance.title }}</h3><span>{{ chanFrame.guidance.focus }}</span></div>
+            <div class="chan-guidance-grid">
+              <div class="chan-evidence-block"><h4>判断依据</h4><ul class="chan-evidence" v-if="chanFrame.guidance.evidence.length"><li v-for="reason in chanFrame.guidance.evidence" :key="reason">{{ reason }}</li></ul><p v-else class="chan-muted">等待已收盘行情。</p></div>
+              <div class="chan-levels-wrap" v-if="chanFrame.guidance.levels.length">
+                <table class="chan-levels-table"><caption>{{ chanFrame.label }}关键观察价位</caption><thead><tr><th scope="col">位置</th><th scope="col">价格</th><th scope="col">距现价</th><th scope="col">观察变化</th></tr></thead><tbody><tr v-for="level in chanFrame.guidance.levels" :key="level.key"><th scope="row">{{ level.label }}<small>{{ level.source }} · {{ level.date }}</small></th><td>{{ level.price }}</td><td>{{ level.distance }}</td><td>{{ level.purpose }}</td></tr></tbody></table>
+              </div>
             </div>
+            <p class="chan-guidance-note">{{ chanFrame.guidance.note }}</p>
+          </section></details>
+          <details class="chan-more-fold"><summary>笔级观察信号</summary><section class="chan-signals" aria-labelledby="chan-signals-title">
+            <h3 id="chan-signals-title">观察信号</h3>
+            <div class="chan-signal-content"><p>{{ chanFrame.guidance.signalReason }}</p><article v-for="signal in chanFrame.legacySignals" :key="signal.key"><strong>{{ signal.label }} · {{ signal.statusLabel }}</strong><p>{{ signal.evidenceLabel || signal.detail }}</p><small>{{ signal.dateLabel }} · {{ signal.invalidationLabel }}<span v-if="signal.ratioLabel"> · {{ signal.ratioLabel }}</span></small></article><p v-if="!chanFrame.legacySignals.length" class="chan-muted">当前周期没有笔级观察信号。</p></div>
+          </section></details>
+          <details class="chan-more-fold"><summary>后续观察路径</summary><section class="chan-scenarios" aria-labelledby="chan-scenario-title">
+            <div class="chan-section-heading"><h3 id="chan-scenario-title">接下来具体看什么</h3><span>收盘价格条件满足后，仍需后续结构确认</span></div>
+            <div class="chan-scenario-grid">
+              <article v-for="scenario in chanFrame.guidance.scenarios" :key="scenario.direction">
+                <header><h4>{{ scenario.label }}</h4><p class="chan-scenario-status">{{ scenario.status }}</p></header>
+                <dl><div><dt>确认条件</dt><dd>{{ scenario.condition }}</dd></div><div><dt>下一观察位</dt><dd>{{ scenario.expectation }}</dd></div><div><dt>重新评估条件</dt><dd>{{ scenario.invalidation }}</dd></div></dl>
+              </article>
+            </div>
+            <p v-if="!chanFrame.guidance.scenarios.length" class="chan-explanation">尚未形成可配对的笔高低点，等待结构形成后列出具体观察路径。</p>
+          </section></details>
+          <details class="chan-more-fold" :open="chanFolds.rules" @toggle="rememberChanFold('rules', $event)"><summary>数据提示与识别说明</summary><div class="chan-footnotes">
+            <div class="chan-data-note" v-if="view.chan.warnings.length || chanFrame.warnings.length"><h3>数据与结构提示</h3><ul class="chan-warnings"><li v-for="(warning, index) in view.chan.warnings.concat(chanFrame.warnings)" :key="index">{{ warning }}</li></ul></div>
+            <div class="chan-rules"><h3>笔和中枢的确认口径</h3><ul><li v-for="rule in view.chan.rules" :key="rule">{{ rule }}</li></ul><p>图层可分别显示多级线段、中枢、笔、缠论 K 线和观察标记。</p></div>
+          </div></details>
           </div>
-          <p class="chan-guidance-note">{{ chanFrame.guidance.note }}</p>
-        </section>
-        <section class="chan-signals" aria-labelledby="chan-signals-title">
-          <h3 id="chan-signals-title">结构信号</h3>
-          <div class="chan-signal-content"><p>{{ chanFrame.guidance.signalReason }}</p><article v-for="signal in chanFrame.signals" :key="signal.key"><strong>{{ signal.label }} · {{ signal.statusLabel }}</strong><p>{{ signal.evidenceLabel || signal.detail }}</p><small>{{ signal.dateLabel }} · {{ signal.invalidationLabel }}<span v-if="signal.ratioLabel"> · {{ signal.ratioLabel }}</span></small><small v-if="signal.marketAndLevelLabel">{{ signal.marketAndLevelLabel }}</small></article></div>
-        </section>
-        <section class="chan-scenarios" aria-labelledby="chan-scenario-title">
-          <div class="chan-section-heading"><h3 id="chan-scenario-title">接下来具体看什么</h3><span>收盘价格条件满足后，仍需后续结构确认</span></div>
-          <div class="chan-scenario-grid">
-            <article v-for="scenario in chanFrame.guidance.scenarios" :key="scenario.direction">
-              <header><h4>{{ scenario.label }}</h4><p class="chan-scenario-status">{{ scenario.status }}</p></header>
-              <dl><div><dt>确认条件</dt><dd>{{ scenario.condition }}</dd></div><div><dt>下一观察位</dt><dd>{{ scenario.expectation }}</dd></div><div><dt>重新评估条件</dt><dd>{{ scenario.invalidation }}</dd></div></dl>
-            </article>
-          </div>
-          <p v-if="!chanFrame.guidance.scenarios.length" class="chan-explanation">尚未形成可配对的笔高低点，等待结构形成后列出具体观察路径。</p>
-        </section>
-        <div class="chan-footnotes">
-          <div class="chan-data-note" v-if="view.chan.warnings.length || chanFrame.warnings.length"><h3>数据与结构提示</h3><ul class="chan-warnings"><li v-for="(warning, index) in view.chan.warnings.concat(chanFrame.warnings)" :key="index">{{ warning }}</li></ul></div>
-          <details class="chan-rules" :open="chanFolds.rules" @toggle="rememberChanFold('rules', $event)"><summary>计算规则与确认口径</summary><ul><li v-for="rule in view.chan.rules" :key="rule">{{ rule }}</li></ul><p>图中中枢使用笔的重叠区。底部／顶部与第三类买卖位置均为候选；完整递归级别及次级别确认尚未纳入。结构位置时间早于识别时间，实时判断以识别时间为准。</p></details>
-        </div>
+        </details>
       </div>
     </section>
 

@@ -13,13 +13,13 @@ vm.runInNewContext(fs.readFileSync("web/static/common/js/charts.js", "utf8"), sa
 const details = window.OptionScopeCharts.chanStructureTooltipDetails({
   type: "线段", level: 2, confirmed: true, start: "2026-10-01", end: "2026-10-12",
   startPrice: 100, endPrice: 120, formedAt: "2026-10-12", confirmedAt: "2026-10-14",
-  composition: "输入笔 3–7；输入 bar 20–80", ruleVersion: "chan-recursive-v4-preview.2",
+  composition: "输入笔 3–7；输入 bar 20–80", ruleVersion: "chan-recursive-v4-preview.4",
 });
 assert.equal(details.title, "线段 · L2 · 已确认");
 assert.match(details.body, /2026-10-01 100.00 → 2026-10-12 120.00/);
 assert.match(details.body, /形成 2026-10-12 · 确认 2026-10-14/);
 assert.match(details.body, /输入笔 3–7；输入 bar 20–80/);
-assert.match(details.body, /chan-recursive-v4-preview.2/);
+assert.match(details.body, /chan-recursive-v4-preview.4/);
 
 const forming = window.OptionScopeCharts.chanStructureTooltipDetails({
   type: "笔", level: 0, confirmed: false, startPrice: 8, endPrice: 10,

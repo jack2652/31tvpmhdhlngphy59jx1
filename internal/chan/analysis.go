@@ -1429,7 +1429,6 @@ func weeklyGapsFromBars(weekly []Bar) []DataGap {
 
 func mergeBars(bars []Bar) []mergedBar {
 	merged := []mergedBar{}
-	direction := 0
 	for i, bar := range bars {
 		sourceIndex := sourceIndexFor(bars, i)
 		next := mergedBar{high: bar.High, low: bar.Low, highIndex: i, lowIndex: i, start: i, end: i, sourceHigh: sourceIndex, sourceLow: sourceIndex, sourceStart: sourceIndex, sourceEnd: sourceIndex, chain: bar.Chain}
@@ -1439,40 +1438,27 @@ func mergeBars(bars []Bar) []mergedBar {
 		}
 		last := &merged[len(merged)-1]
 		if last.chain != next.chain {
-			direction = 0
 			merged = append(merged, next)
 			continue
 		}
 		contains := (last.high >= next.high && last.low <= next.low) || (next.high >= last.high && next.low <= last.low)
 		if !contains {
-			if direction == 0 {
-				if inferred := directionFromPair(last.high, last.low, next.high, next.low); inferred != 0 {
-					direction = inferred
-				}
-			}
 			merged = append(merged, next)
 			continue
 		}
-		// Before a directional pair exists, retain the union. Guessing an
-		// initial direction from future candles would alter past extrema.
-		if direction == 0 {
-			if next.high >= last.high {
-				last.high, last.highIndex = next.high, i
-				last.sourceHigh = sourceIndex
-			}
-			if next.low <= last.low {
-				last.low, last.lowIndex = next.low, i
-				last.sourceLow = sourceIndex
-			}
-			last.end = i
-			last.sourceEnd = sourceIndex
-			continue
+		// The reference processes inclusion sequentially and decides its
+		// direction from the immediately preceding merged pair at the moment
+		// the inclusion occurs. A persistent direction becomes stale after a
+		// reversal; the first pair uses the incoming candle as its reference.
+		directionUp := next.high >= last.high
+		if len(merged) >= 2 {
+			directionUp = last.high >= merged[len(merged)-2].high
 		}
-		if direction >= 0 && next.high >= last.high || direction < 0 && next.high <= last.high {
+		if directionUp && next.high >= last.high || !directionUp && next.high <= last.high {
 			last.high, last.highIndex = next.high, i
 			last.sourceHigh = sourceIndex
 		}
-		if direction > 0 && next.low >= last.low || direction <= 0 && next.low <= last.low {
+		if directionUp && next.low >= last.low || !directionUp && next.low <= last.low {
 			last.low, last.lowIndex = next.low, i
 			last.sourceLow = sourceIndex
 		}
@@ -1502,7 +1488,13 @@ func findFractals(bars []Bar, merged []mergedBar) []Fractal {
 			continue
 		}
 		confirmedAt := bars[merged[i+2].start].Date
-		fractals = append(fractals, Fractal{Kind: kind, Date: bars[index].Date, Price: price, Level: 0,
+		// Chan's inclusion pipeline timestamps the standardized candle at the
+		// last source bar absorbed into that candle. Keep the pivot price's raw
+		// source index separately, but anchor the fractal and every downstream
+		// pen/segment to the merged candle's date. Using the raw extreme's date
+		// here shifts structural endpoints inside the merged candle and causes
+		// recursive spans to diverge from the reference implementation.
+		fractals = append(fractals, Fractal{Kind: kind, Date: bars[middle.end].Date, Price: price, Level: 0,
 			FirstObservedAt: confirmedAt, ConfirmedAt: confirmedAt, MergedIndex: i, RawIndex: index,
 			RawStartIndex: middle.start, RawEndIndex: middle.end, SourceRawIndex: sourceIndexFor(bars, index),
 			SourceRawStart: middle.sourceStart, SourceRawEnd: middle.sourceEnd, Chain: middle.chain})
@@ -1514,16 +1506,19 @@ func validPen(start, end Fractal, merged []mergedBar) bool {
 	if start.Kind == end.Kind || end.MergedIndex-start.MergedIndex < 4 {
 		return false
 	}
-	low, high := math.Min(start.Price, end.Price), math.Max(start.Price, end.Price)
-	if start.Kind == "bottom" && end.Price <= start.Price || start.Kind == "top" && end.Price >= start.Price {
-		return false
+	// A pen is determined by alternating confirmed fractals, the minimum
+	// independent-bar distance, and the top/bottom price relation. Requiring
+	// every intervening merged candle to stay inside the endpoint price range
+	// rejects valid pens whenever an interior wick crosses an endpoint. That
+	// extra envelope condition is not part of the Python reference's 81-rule
+	// implementation and makes the recursive structure collapse on real data.
+	if start.Kind == "bottom" {
+		return end.Price > start.Price
 	}
-	for _, bar := range merged[start.MergedIndex : end.MergedIndex+1] {
-		if bar.low < low || bar.high > high {
-			return false
-		}
+	if start.Kind == "top" {
+		return end.Price < start.Price
 	}
-	return true
+	return false
 }
 
 func buildStrokes(fractals []Fractal, merged []mergedBar, bars []Bar) ([]Stroke, string) {
@@ -1710,12 +1705,17 @@ func analyzeFrameWithComponents(bars []Bar, period, label string, spot *float64,
 	if len(currentCenters) > 0 {
 		frame.Status = "ready"
 		frame.Signals = append(structuralSignals(frame.Strokes, currentCenters), turningSignals(frame.Strokes, currentCenters, bars)...)
-		invalidateSignals(frame.Signals, bars, spot)
 		frame.Scenarios = scenarios(frame.Position)
 		frame.Structure = centerStructure(currentCenters)
 	} else {
 		frame.Warnings = append(frame.Warnings, "尚未形成由三根已确认笔重叠构成的中枢，暂不推演中枢突破与回试")
 	}
+	// Keep historical pen-level third-point observations in their own field;
+	// they are not recursive v4 buy/sell signals and must not be mixed into the
+	// structural signal contract.
+	frame.PenSignals = penThirdPointSignals(frame.Strokes, frame.Centers)
+	invalidateSignals(frame.Signals, bars, spot)
+	invalidateSignals(frame.PenSignals, bars, spot)
 	if len(bars) < 60 {
 		frame.Warnings = append(frame.Warnings, "历史长度不足 60 根，MACD 力度比较暂不输出")
 	}
@@ -1787,6 +1787,74 @@ func structuralSignals(strokes []Stroke, centers []Center) []Signal {
 		}
 	}
 	return signals
+}
+
+// penThirdPointSignals keeps the reference implementation's historical
+// pen-level third-buy/third-sell observations visible. They are not recursive
+// Chan-level signals: the UI labels them as pen observations, and v4 signal
+// generation continues to use only RecursiveLevels.
+func penThirdPointSignals(strokes []Stroke, centers []Center) []Signal {
+	result := []Signal{}
+	seen := map[string]bool{}
+	for _, center := range centers {
+		if center.StartStroke < 0 || center.StartStroke >= len(strokes) {
+			continue
+		}
+		for _, buy := range []bool{true, false} {
+			leftCenter, departureIndex := false, -1
+			for index := center.StartStroke; index < len(strokes); index++ {
+				stroke := strokes[index]
+				if stroke.Chain != center.Chain {
+					break
+				}
+				if !stroke.Confirmed || stroke.Start.Date < center.Start {
+					continue
+				}
+				leaves := buy && stroke.Direction == "up" && stroke.End.Price > center.Upper ||
+					!buy && stroke.Direction == "down" && stroke.End.Price < center.Lower
+				if !leftCenter && leaves {
+					leftCenter, departureIndex = true, index
+					continue
+				}
+				if !leftCenter || buy && stroke.Direction != "down" || !buy && stroke.Direction != "up" {
+					continue
+				}
+				departure := strokes[departureIndex]
+				boundary, returned := center.Upper, stroke.End.Price >= center.Upper
+				kind, label, side := "third_buy_candidate", "第三类买点观察（笔级）", "buy"
+				leavePower := departure.End.Price/departure.Start.Price - 1
+				pullPower := math.Abs(stroke.End.Price/stroke.Start.Price - 1)
+				if !buy {
+					boundary, returned = center.Lower, stroke.End.Price <= center.Lower
+					kind, label, side = "third_sell_candidate", "第三类卖点观察（笔级）", "sell"
+					leavePower = math.Abs(departure.End.Price/departure.Start.Price - 1)
+					pullPower = stroke.End.Price/stroke.Start.Price - 1
+				}
+				if !returned {
+					leftCenter = false
+					departureIndex = -1
+					continue
+				}
+				if pullPower <= 0 {
+					break
+				}
+				ratio := leavePower / pullPower
+				identity := kind + "|" + stroke.End.Date
+				if ratio > 1 && !seen[identity] {
+					seen[identity] = true
+					result = append(result, Signal{Kind: kind, Label: label, Status: "candidate", Side: side,
+						Date: stroke.End.Date, OriginDate: stroke.End.Date, ObservedAt: stroke.ConfirmedAt,
+						ConfirmedAt: stroke.ConfirmedAt, PhaseAt: stroke.ConfirmedAt, Phase: "pen_observation",
+						Price: ptr(stroke.End.Price), Invalidation: ptr(boundary), StrengthRatio: ptr(ratio),
+						Detail: "同一已形成笔中枢外侧的离开与首次回试满足笔级三类位置条件；这是参考实现的笔级观察，不等同于递归级别买卖点"})
+				}
+				// The reference scans only the first opposite pen. A failed
+				// strength check is not retried with a later, weaker retest.
+				break
+			}
+		}
+	}
+	return result
 }
 
 func invalidateSignals(signals []Signal, bars []Bar, spot *float64) {

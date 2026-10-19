@@ -98,7 +98,7 @@ func TestClass3RequiresFirstRetestStrictlyOutsideCenter(t *testing.T) {
 	}
 	segments[4].Low, segments[4].EndPrice = 11, 11
 	got := class3Signals(Frame{}, []LevelAnalysis{{Level: 0, Segments: segments, Centers: []RecursiveCenter{center}}})
-	if len(got) != 1 || got[0].Kind != "class3_buy" || got[0].Status != "confirmed" || got[0].Date != "05" || got[0].ObservedAt != "06" || got[0].RelatedCenterID != center.CenterID || len(got[0].StructureIDs) != 3 {
+	if len(got) != 1 || got[0].Kind != "class3_buy" || got[0].Status != "confirmed" || got[0].Date != "06" || got[0].ObservedAt != "06" || got[0].RelatedCenterID != center.CenterID || len(got[0].StructureIDs) != 3 {
 		t.Fatalf("strictly outside class-3 candidate=%+v", got)
 	}
 }

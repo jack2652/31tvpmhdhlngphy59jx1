@@ -187,16 +187,16 @@ func TestBrokenFeatureExtremeUsesDirectionalExtreme(t *testing.T) {
 		{FeatureElement: FeatureElement{Low: 7, High: 11}},
 		{FeatureElement: FeatureElement{Low: 9, High: 13}},
 	}
-	if extreme, reclaim, ok := brokenFeatureExtreme(features, Stroke{Low: 6, High: 10}, "up"); !ok || extreme != 7 || reclaim != 7 {
-		t.Fatalf("up break extreme=%v reclaim=%v ok=%v, want broken low 7/7/true", extreme, reclaim, ok)
+	if extreme, reclaim, ok := brokenFeatureExtreme(features, Stroke{Low: 6, High: 10}, "up"); !ok || extreme != 7 || reclaim != 11 {
+		t.Fatalf("up break extreme=%v reclaim=%v ok=%v, want broken low 7 and reclaim high 11", extreme, reclaim, ok)
 	}
 	features = []featureRange{
 		{FeatureElement: FeatureElement{Low: 10, High: 14}},
 		{FeatureElement: FeatureElement{Low: 14, High: 18}},
 		{FeatureElement: FeatureElement{Low: 11, High: 16}},
 	}
-	if extreme, reclaim, ok := brokenFeatureExtreme(features, Stroke{Low: 15, High: 19}, "down"); !ok || extreme != 18 || reclaim != 18 {
-		t.Fatalf("down break extreme=%v reclaim=%v ok=%v, want broken high 18/18/true", extreme, reclaim, ok)
+	if extreme, reclaim, ok := brokenFeatureExtreme(features, Stroke{Low: 15, High: 19}, "down"); !ok || extreme != 18 || reclaim != 14 {
+		t.Fatalf("down break extreme=%v reclaim=%v ok=%v, want broken high 18 and reclaim low 14", extreme, reclaim, ok)
 	}
 }
 
@@ -238,7 +238,7 @@ func TestFeatureBreakRequiresStrictPenetration(t *testing.T) {
 }
 
 func TestFeatureBreakReclaimedByOriginalDirectionRemainsForming(t *testing.T) {
-	strokes := featureBreakFixture(8)
+	strokes := featureBreakFixture(12)
 	segments := buildSegments(strokes)
 	if len(segments) != 1 || segments[0].Confirmed || !segments[0].Forming || segments[0].BreakStroke != -1 || segments[0].ConfirmStroke != -1 || segments[0].EndPointStroke != 6 || segments[0].End != "08" || segments[0].EndPrice != 15 {
 		t.Fatalf("reclaimed feature break must remain a forming segment at its highest endpoint: %+v", segments)
@@ -246,7 +246,9 @@ func TestFeatureBreakReclaimedByOriginalDirectionRemainsForming(t *testing.T) {
 }
 
 func TestFeatureBreakRequiresFollowingStrokeToConfirmAndBacktracksEndpoint(t *testing.T) {
-	segments := buildSegments(featureBreakFixture(6.5))
+	// The rebound ends above the broken feature low (7) but below the
+	// feature element high (11), so it must not erase the break.
+	segments := buildSegments(featureBreakFixture(8))
 	if len(segments) != 2 {
 		t.Fatalf("segments=%+v, want confirmed segment followed by forming segment", segments)
 	}

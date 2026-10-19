@@ -70,7 +70,7 @@ function scheduleChartPointerMove(chartTarget, onMove, hideTooltip) {
   return cancel;
 }
 
-function chanStructureTooltipDetails(structure, fallbackRuleVersion = "未知") {
+function chanStructureTooltipDetails(structure) {
   if (!structure) return null;
   const displayPrice = (value) => value != null && value !== "" && Number.isFinite(Number(value)) ? formatMoney(Number(value)) : "未知";
   const startPrice = displayPrice(structure.startPrice);
@@ -79,9 +79,23 @@ function chanStructureTooltipDetails(structure, fallbackRuleVersion = "未知") 
   const end = structure.end || "未知";
   const formed = structure.formedAt ? `形成 ${structure.formedAt}` : "形成时间未知";
   const confirmation = structure.confirmedAt ? ` · 确认 ${structure.confirmedAt}` : " · 尚未确认";
+  const level = structure.level == null ? "" : `第${Number(structure.level) + 1}层`;
+  const signalTypes = ["一买", "一卖", "二买", "二卖", "三买", "三卖"];
+  if (signalTypes.includes(structure.type)) {
+    const phase = structure.signalPhase && structure.signalPhase !== structure.signalStatus ? ` · ${structure.signalPhase}` : "";
+    const status = structure.signalStatus || (structure.confirmed ? "已确认" : "观察中");
+    const boundary = displayPrice(structure.invalidationPrice);
+    return {
+      title: `${structure.type} · ${status}${phase}`,
+      body: `${start} · 参考价 ${endPrice} · 失效边界 ${boundary}`,
+    };
+  }
+  const type = structure.type === "线段" ? `${level}线段`
+    : structure.type === "走势类型" ? `${level}走势类型${structure.trendKind ? " · " + structure.trendKind : ""}`
+    : structure.type === "基础中枢" || /级中枢$/.test(structure.type) ? `${level}中枢` : structure.type;
   return {
-    title: `${structure.type}${structure.level == null ? "" : ` · L${structure.level}`} · ${structure.confirmed ? "已确认" : "形成中"}`,
-    body: `${start} ${startPrice} → ${end} ${endPrice} · ${formed}${confirmation} · ${structure.composition || "组成范围未知"} · 规则 ${structure.ruleVersion || fallbackRuleVersion || "未知"}`,
+    title: `${type}${["一买", "一卖", "二买", "二卖", "三买", "三卖"].includes(structure.type) ? ` · ${level}` : ""} · ${structure.confirmed ? "已确认" : "形成中"}`,
+    body: `${start} ${startPrice} → ${end} ${endPrice} · ${formed}${confirmation} · ${structure.composition || "组成范围未知"}`,
   };
 }
 
@@ -199,6 +213,18 @@ function bindChanChartHover(target, initialModel) {
       const ratio = lengthSquared ? Math.max(0, Math.min(1, ((localX - item.x1) * dx + (localY - item.y1) * dy) / lengthSquared)) : 0;
       return Math.hypot(localX - (item.x1 + ratio * dx), localY - (item.y1 + ratio * dy));
     };
+    const signalHit = (model.signals || []).map((signal) => {
+      const markerDistance = Math.hypot(localX - signal.x, localY - (Number.isFinite(signal.markerY) ? signal.markerY : signal.y));
+      const halfLabel = (signal.hitLabelWidth || 48) / 2;
+      const labelDistance = localY >= signal.labelY - 12 && localY <= signal.labelY + 4 && Math.abs(localX - signal.x) <= halfLabel ? 0 : Infinity;
+      return { signal, distance: Math.min(markerDistance, labelDistance) };
+    }).filter(({ signal, distance }) => model.layers?.signals === true && distance <= 12)
+      .sort((left, right) => left.distance - right.distance)[0]?.signal;
+    if (signalHit) {
+      structureTitle.textContent = `${signalHit.type} · ${signalHit.signalStatus}${signalHit.signalPhase && signalHit.signalPhase !== signalHit.signalStatus ? ` · ${signalHit.signalPhase}` : ""}`;
+      structureBody.textContent = `${signalHit.start} · 参考价 ${formatMoney(signalHit.endPrice)} · 失效边界 ${signalHit.invalidationPrice == null ? "未知" : formatMoney(signalHit.invalidationPrice)}`;
+      structureDetail.hidden = false;
+    }
     const structure = (model.structures || []).map((item) => {
       const inArea = item.area && localX >= Math.min(item.x1, item.x2) && localX <= Math.max(item.x1, item.x2)
         && localY >= Math.min(item.y1, item.y2) && localY <= Math.max(item.y1, item.y2);
@@ -206,12 +232,12 @@ function bindChanChartHover(target, initialModel) {
     })
       .filter(({ item, distance }) => distance <= (item.area ? 0 : 8))
       .sort((left, right) => left.distance - right.distance)[0]?.item;
-    if (structure) {
-      const detail = chanStructureTooltipDetails(structure, model.ruleVersion);
+    if (!signalHit && structure) {
+      const detail = chanStructureTooltipDetails(structure);
       structureTitle.textContent = detail.title;
       structureBody.textContent = detail.body;
       structureDetail.hidden = false;
-    } else {
+    } else if (!signalHit) {
       structureDetail.hidden = true;
       structureTitle.textContent = ""; structureBody.textContent = "";
     }
@@ -337,13 +363,9 @@ function chanPaleCandleColor(color, amount = 0.54) {
 }
 
 function drawChanCanvas(target, binding) {
-  // The chart model has already filtered segments by the global switch and
-  // per-level overrides; testing the global switch again would hide a level
-  // that was explicitly enabled on its own.
-  const chartLayers = binding?.chart?.layers;
-  const segmentPaintEnabled = chartLayers && Object.prototype.hasOwnProperty.call(chartLayers, "segments")
-    ? chartLayers.segments === true : binding?.layers?.segments === true;
-  const model = binding?.chart ? { ...binding.chart, layers: { ...(chartLayers || {}), ...(binding.layers || {}), segments: segmentPaintEnabled } } : binding;
+  // The view model has already applied per-level preferences. Keep its layer
+  // flags authoritative so a legacy stored segment toggle cannot hide L0.
+  const model = binding?.chart ? { ...binding.chart, layers: binding.chart.layers || binding.layers || {} } : binding;
   const canvas = target.querySelector("canvas.chan-chart-canvas");
   const svg = target.querySelector("svg");
   if (!canvas || !svg || !model) return;
@@ -395,19 +417,19 @@ function drawChanCanvas(target, binding) {
     context.globalAlpha = 1;
   }
   for (const zone of model.recursiveCenters || []) {
-    if (model.layers?.recursiveCenters?.[zone.level] !== true) continue;
+    if (model.layers?.recursiveCenters?.[zone.level] === false) continue;
     const color = levelColor(zone.level);
     context.fillStyle = color; context.globalAlpha = zone.forming ? 0.045 : 0.085;
     context.fillRect(zone.x, zone.y, zone.width, zone.height);
     context.strokeStyle = color; context.globalAlpha = zone.forming ? 0.72 : 0.46;
     context.lineWidth = Math.min(2.6, 1 + (zone.extensionCount || 0) * 0.18);
     context.setLineDash(zone.forming ? [5, 3] : levelDash(zone.level)); context.strokeRect(zone.x, zone.y, zone.width, zone.height); context.setLineDash([]);
-    if (zone.width > 22 && zone.height > 12) label("L" + zone.level, zone.x + 4, zone.y + 10, { font: "9px Inter, ui-sans-serif, system-ui, sans-serif", color });
+    if (zone.width > 34 && zone.height > 12) label("第" + (Number(zone.level) + 1) + "层", zone.x + 4, zone.y + 10, { font: "9px Inter, ui-sans-serif, system-ui, sans-serif", color });
     context.globalAlpha = 1;
   }
-  // Each original candle keeps its normal-colored body. The Chan layer paints
-  // the merged high-low range back onto every source slot it covers, with an
-  // identically sized pale column behind that body.
+  // Keep each original candle body in its market color. Each merged Chan
+  // candle is shown once, anchored at the last source slot in its range, with
+  // an identically sized pale column behind that body's real high-low range.
   const chanCandles = new Map((model.layers?.chanCandles === false ? [] : model.chanCandles || [])
     .map((candle) => [candle.candleIndex, candle]));
   for (const candle of model.candles || []) {
@@ -436,8 +458,8 @@ function drawChanCanvas(target, binding) {
     line(segment.x1, segment.y1, segment.x2, segment.y2, levelColor(segment.level), segment.confirmed ? levelDash(segment.level) : [6, 4], segment.level === 0 ? 2.6 : 2.1);
   }
   // Chan pens and endpoints can be hidden independently of segments.
-  if (model.layers?.pens !== false) for (const pen of model.strokes || []) line(pen.x1, pen.y1, pen.x2, pen.y2, colors.blue, pen.confirmed ? [] : [6, 4], 2.2);
-  if (model.layers?.pens !== false) for (const point of model.points || []) {
+  if (model.layers?.pens === true) for (const pen of model.strokes || []) line(pen.x1, pen.y1, pen.x2, pen.y2, colors.blue, pen.confirmed ? [] : [6, 4], 2.2);
+  if (model.layers?.pens === true) for (const point of model.points || []) {
     context.beginPath(); context.arc(point.x, point.y, 2.6, 0, Math.PI * 2);
     context.fillStyle = point.confirmed ? colors.blue : colors.panel; context.fill();
     context.strokeStyle = colors.blue; context.lineWidth = point.confirmed ? 1 : 1.5; context.stroke();
@@ -446,12 +468,13 @@ function drawChanCanvas(target, binding) {
     context.lineWidth = 3; context.strokeStyle = colors.panel; context.lineJoin = "round";
     context.strokeText(point.label, point.labelX, point.labelY); context.fillStyle = colors.textPrimary; context.fillText(point.label, point.labelX, point.labelY);
   }
-  if (model.layers?.signals !== false) for (const marker of model.markers || []) {
+  if (model.layers?.legacySignals === true) for (const marker of model.markers || []) {
     context.beginPath(); context.arc(marker.x, marker.y, 5, 0, Math.PI * 2);
-    context.fillStyle = colors.panel; context.strokeStyle = colors.blue; context.lineWidth = 1.5; context.setLineDash(marker.watch ? [2, 2] : []); context.fill(); context.stroke(); context.setLineDash([]);
+    const markerColor = marker.invalidated ? colors.text : colors.blue;
+    context.fillStyle = colors.panel; context.strokeStyle = markerColor; context.lineWidth = 1.5; context.setLineDash(marker.watch || marker.invalidated ? [2, 2] : []); context.fill(); context.stroke(); context.setLineDash([]);
     context.font = "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center";
     context.lineWidth = 3; context.strokeStyle = colors.panel; context.strokeText(marker.label, marker.labelX, marker.labelY);
-    context.fillStyle = colors.blue; context.fillText(marker.label, marker.labelX, marker.labelY);
+    context.fillStyle = markerColor; context.fillText(marker.label, marker.labelX, marker.labelY);
   }
   // Chan structural reference levels: recent swing highs/lows and the latest center boundaries.
   for (const level of model.keyLevels || []) {
@@ -459,14 +482,29 @@ function drawChanCanvas(target, binding) {
     line(level.x1, level.y, level.x2, level.y, color, [3, 4], 1);
   }
   if (model.layers?.signals === true) for (const signal of model.signals || []) {
-    const color = signal.side === "buy" ? colors.up : colors.down;
+    const color = signal.invalidated ? colors.text : signal.side === "buy" ? colors.up : colors.down;
+    const markerY = Number.isFinite(signal.markerY) ? signal.markerY : signal.y;
     context.beginPath();
-    context.moveTo(signal.x, signal.y + (signal.side === "buy" ? 6 : -6));
-    context.lineTo(signal.x - 5, signal.y + (signal.side === "buy" ? -2 : 2));
-    context.lineTo(signal.x + 5, signal.y + (signal.side === "buy" ? -2 : 2));
-    context.closePath(); context.fillStyle = color; context.globalAlpha = signal.status === "confirmed" ? 0.95 : 0.64; context.fill(); context.globalAlpha = 1;
-    const status = signal.status === "confirmed" ? "✓" : "?";
-    label(signal.label + status, signal.x, signal.y + (signal.side === "buy" ? 16 : -10), { align: "center", font: "9px Inter, ui-sans-serif, system-ui, sans-serif", color });
+    context.moveTo(signal.x, markerY + (signal.side === "buy" ? 6 : -6));
+    context.lineTo(signal.x - 5, markerY + (signal.side === "buy" ? -2 : 2));
+    context.lineTo(signal.x + 5, markerY + (signal.side === "buy" ? -2 : 2));
+    context.closePath();
+    context.fillStyle = colors.panel; context.strokeStyle = color; context.lineWidth = signal.invalidated ? 1.5 : 0;
+    context.setLineDash(signal.invalidated ? [2, 2] : []);
+    if (signal.invalidated) context.stroke();
+    else { context.fillStyle = color; context.globalAlpha = signal.status === "confirmed" ? 0.95 : 0.64; context.fill(); context.globalAlpha = 1; }
+    context.setLineDash([]);
+    if (signal.invalidated) {
+      context.beginPath(); context.moveTo(signal.x - 3, markerY - 3); context.lineTo(signal.x + 3, markerY + 3);
+      context.moveTo(signal.x + 3, markerY - 3); context.lineTo(signal.x - 3, markerY + 3);
+      context.strokeStyle = color; context.lineWidth = 1.2; context.stroke();
+    }
+    const status = signal.invalidated ? "" : signal.status === "confirmed" ? "✓" : "?";
+    const signalLabel = signal.label + status;
+    const labelY = Number.isFinite(signal.labelY) ? signal.labelY : signal.y + (signal.side === "buy" ? 16 : -10);
+    context.font = "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center"; context.textBaseline = "alphabetic";
+    context.lineWidth = 3; context.lineJoin = "round"; context.strokeStyle = colors.panel; context.strokeText(signalLabel, signal.x, labelY);
+    context.fillStyle = color; context.fillText(signalLabel, signal.x, labelY);
   }
   if (model.spot) line(model.plotLeft, model.spot.y, model.historyRight, model.spot.y, colors.spot, [3, 4], 1);
   // Bottom axis and the three visible date anchors.

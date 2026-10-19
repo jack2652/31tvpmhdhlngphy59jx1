@@ -55,6 +55,9 @@ func mergedCandleOutput(merged []mergedBar) []MergedCandle {
 func buildRecursiveLevels(baseStrokes []Stroke, baseSegments []Segment) []LevelAnalysis {
 	levels := []LevelAnalysis{}
 	baseCenters := buildRecursiveCenters(baseSegments)
+	for index := range baseCenters {
+		baseCenters[index].OwnerMoveIndex = baseCenters[index].EndSegment
+	}
 	status := "ready"
 	if len(baseSegments) == 0 {
 		status = "insufficient"
@@ -68,35 +71,279 @@ func buildRecursiveLevels(baseStrokes []Stroke, baseSegments []Segment) []LevelA
 		levelZeroWaiting = "末端存在形成中笔或线段；高一级只消费已确认对象"
 	}
 	levels = append(levels, LevelAnalysis{Level: 0, Status: status, InputCount: len(baseStrokes), Strokes: confirmedAndForming(baseStrokes), Segments: baseSegments, Centers: baseCenters, WaitingFor: levelZeroWaiting})
-	if len(baseSegments) < 3 {
-		levels = append(levels, LevelAnalysis{Level: 1, Status: "awaiting_lower_level", Strokes: []Stroke{}, Segments: []Segment{}, Centers: []RecursiveCenter{}, WaitingFor: "等待三个连续且方向交替的下级已确认线段"})
-		return levels
-	}
 	lower := baseSegments
 	for level := 1; level < 8; level++ {
-		inputs := recursiveInputStrokes(lower, level)
-		if len(inputs) == 0 {
-			levels = append(levels, LevelAnalysis{Level: level, Status: "awaiting_lower_level", InputCount: 0, Strokes: []Stroke{}, Segments: []Segment{}, Centers: []RecursiveCenter{}, WaitingFor: "等待三个连续且方向交替的下级已确认线段"})
-			break
-		}
-		segments := buildSegments(inputs)
-		for index := range segments {
-			segments[index].Level = level
-		}
-		centers := buildRecursiveCenters(segments)
+		trends, centers, inputCount := recursiveLevelUp(lower, level)
+		segments := recursiveTrendSegments(trends)
 		levelStatus, waiting := "ready", ""
-		if len(segments) == 0 {
-			levelStatus, waiting = "awaiting_lower_level", "等待三个连续且方向交替的下级已确认线段"
-		} else if len(centers) == 0 {
-			levelStatus, waiting = "developing", "等待本级三条走势段形成严格重叠中枢"
+		closedCenters := 0
+		for _, center := range centers {
+			if !center.Forming && center.ConfirmedAt != "" {
+				closedCenters++
+			}
 		}
-		levels = append(levels, LevelAnalysis{Level: level, Status: levelStatus, InputCount: len(inputs), Strokes: inputs, Segments: segments, Centers: centers, WaitingFor: waiting})
-		if len(segments) < 3 {
+		switch {
+		case inputCount == 0:
+			levelStatus, waiting = "awaiting_lower_level", "等待下级产生连续的已确认走势单元"
+		case len(trends) == 0:
+			levelStatus, waiting = "awaiting_lower_level", "等待三个连续下级走势单元形成重叠中枢"
+		case closedCenters == 0:
+			levelStatus, waiting = "developing", "高一级走势正在形成；中枢离开或后续中枢尚未确认"
+		}
+		levels = append(levels, LevelAnalysis{Level: level, Status: levelStatus, InputCount: inputCount, Strokes: []Stroke{}, Segments: segments, Trends: trends, Centers: centers, WaitingFor: waiting})
+		if len(trends) < 3 {
 			break
 		}
 		lower = segments
 	}
 	return levels
+}
+
+type recursiveCenterSpan struct {
+	start, end, through int
+	zd, zg              float64
+	closedAt            string
+}
+
+type recursiveMoveResult struct {
+	trend    RecursiveTrend
+	centers  []recursiveCenterSpan
+	closedAt string
+}
+
+// recursiveLevelUp ports chan-lun's level_up decomposition: the next level
+// consumes confirmed lower-level moves and identifies its center from the
+// earliest three-unit overlap. It does not synthesize market fractals at
+// arithmetic midpoints or rerun the lower-level feature-sequence segmenter.
+func recursiveLevelUp(lower []Segment, level int) ([]RecursiveTrend, []RecursiveCenter, int) {
+	trends := []RecursiveTrend{}
+	centers := []RecursiveCenter{}
+	inputCount := 0
+	for chainStart := 0; chainStart < len(lower); {
+		chainEnd := chainStart
+		for chainEnd+1 < len(lower) && lower[chainEnd+1].Chain == lower[chainStart].Chain && lower[chainEnd].End == lower[chainEnd+1].Start {
+			chainEnd++
+		}
+		// Keep the visible forming tail in the recursive input. The reference
+		// level_up decomposes the current prefix, including its unfinished tail;
+		// dropping it hides higher-level structures until the next lower segment
+		// is already confirmed. Confirmation remains separate, so forming input
+		// can only produce forming structures and cannot validate signals.
+		units := append([]Segment(nil), lower[chainStart:chainEnd+1]...)
+		inputCount += len(units)
+		moves := decomposeRecursiveUnits(units, level)
+		for _, move := range moves {
+			move.trend.Chain = lower[chainStart].Chain
+			move.trend.StartInput += chainStart
+			move.trend.EndInput += chainStart
+			moveIndex := len(trends)
+			for _, span := range move.centers {
+				if span.closedAt == "" && move.trend.Confirmed {
+					span.closedAt = move.closedAt
+				}
+				centerStart := units[span.start].Start
+				centerEnd := units[span.through].End
+				closedAt := span.closedAt
+				if !recursiveUnitsConfirmed(units[span.start : span.through+1]) {
+					closedAt = ""
+				}
+				center := RecursiveCenter{Level: level, Kind: "initial", InputKind: "segment", Chain: move.trend.Chain,
+					Start: centerStart, End: centerEnd, Lower: span.zd, Upper: span.zg,
+					FormedAt: confirmedUnitTime(units[span.end]), StartSegment: span.start + chainStart, EndSegment: span.through + chainStart,
+					OwnerMoveIndex: moveIndex, ExtensionCount: maxInt(0, span.through-span.end), Forming: closedAt == ""}
+				center.CenterID = fmt.Sprintf("L%d-C%d-S%d-E%d-M%d", level, move.trend.Chain, span.start+chainStart, span.through+chainStart, moveIndex)
+				if level > 1 {
+					center.InputKind = "recursive_trend"
+				}
+				if closedAt != "" {
+					center.Forming = false
+					center.ClosedAt = closedAt
+					center.ConfirmedAt = closedAt
+				}
+				for previous := len(centers) - 1; previous >= 0; previous-- {
+					if centers[previous].Chain == center.Chain && centers[previous].Level == center.Level {
+						previousIndex := previous
+						center.RelatedCenter = &previousIndex
+						center.PreviousCenterID = centers[previous].CenterID
+						switch {
+						case center.Lower < centers[previous].Upper && center.Upper > centers[previous].Lower:
+							center.RelationToPrevious, center.Relation, center.Kind = "overlap", "expands", "expansion"
+						case center.Lower == centers[previous].Upper || center.Upper == centers[previous].Lower:
+							center.RelationToPrevious, center.Relation, center.Kind = "touch", "new_after", "newborn"
+						case center.Lower > centers[previous].Upper:
+							center.RelationToPrevious, center.Relation, center.Kind = "separate_up", "new_after", "newborn"
+						case center.Upper < centers[previous].Lower:
+							center.RelationToPrevious, center.Relation, center.Kind = "separate_down", "new_after", "newborn"
+						default:
+							center.Relation, center.Kind = "new_after", "newborn"
+						}
+						break
+					}
+				}
+				centers = append(centers, center)
+				move.trend.CenterIDs = append(move.trend.CenterIDs, center.CenterID)
+			}
+			trends = append(trends, move.trend)
+		}
+		chainStart = chainEnd + 1
+	}
+	return trends, centers, inputCount
+}
+
+// decomposeRecursiveUnits follows the reference level-up state machine for one
+// contiguous chain. Every center is an intersection of three consecutive
+// lower-level units; extensions update its right edge without changing ZD/ZG.
+func decomposeRecursiveUnits(units []Segment, level int) []recursiveMoveResult {
+	result := []recursiveMoveResult{}
+	for position := 0; position < len(units); {
+		centerStart := -1
+		for index := position; index+2 < len(units); index++ {
+			zd := math.Max(units[index].Low, math.Max(units[index+1].Low, units[index+2].Low))
+			zg := math.Min(units[index].High, math.Min(units[index+1].High, units[index+2].High))
+			if zd <= zg {
+				centerStart = index
+				break
+			}
+		}
+		if centerStart < 0 {
+			result = append(result, makeRecursiveMove(units, position, len(units)-1, nil, level, "incomplete", "", false, ""))
+			break
+		}
+		entryDirection := recursiveUnitDirection(units, position, centerStart)
+		zd := math.Max(units[centerStart].Low, math.Max(units[centerStart+1].Low, units[centerStart+2].Low))
+		zg := math.Min(units[centerStart].High, math.Min(units[centerStart+1].High, units[centerStart+2].High))
+		spans := []recursiveCenterSpan{{start: centerStart, end: centerStart + 2, through: centerStart + 2, zd: zd, zg: zg}}
+		kind, k, leaveStart := "consolidation", centerStart+3, -1
+		for {
+			if k >= len(units) {
+				result = append(result, makeRecursiveMove(units, position, len(units)-1, spans, level, kind, entryDirection, false, ""))
+				position = len(units)
+				break
+			}
+			unit := units[k]
+			center := spans[len(spans)-1]
+			if recursiveUnitOverlaps(unit, center.zd, center.zg) {
+				if leaveStart < 0 {
+					spans[len(spans)-1].through = k
+					k++
+					continue
+				}
+				closedAt := confirmedUnitTime(unit)
+				spans[len(spans)-1].closedAt = closedAt
+				result = append(result, makeRecursiveMove(units, position, k-1, spans, level, kind, entryDirection, closedAt != "", closedAt))
+				position = k
+				break
+			}
+			if leaveStart < 0 {
+				leaveStart = k
+			} else if k-2 >= leaveStart {
+				lower := math.Max(units[k-2].Low, math.Max(units[k-1].Low, units[k].Low))
+				upper := math.Min(units[k-2].High, math.Min(units[k-1].High, units[k].High))
+				if lower <= upper {
+					newDirection := ""
+					if lower > center.zg {
+						newDirection = "up"
+					} else if upper < center.zd {
+						newDirection = "down"
+					}
+					if newDirection == "" || entryDirection != "" && entryDirection != newDirection {
+						closedAt := confirmedUnitTime(unit)
+						spans[len(spans)-1].closedAt = closedAt
+						result = append(result, makeRecursiveMove(units, position, leaveStart-1, spans, level, kind, entryDirection, closedAt != "", closedAt))
+						position = leaveStart
+						break
+					}
+					if entryDirection == "" {
+						entryDirection = newDirection
+					}
+					kind = newDirection
+					spans[len(spans)-1].closedAt = confirmedUnitTime(units[k])
+					spans = append(spans, recursiveCenterSpan{start: k - 2, end: k, through: k, zd: lower, zg: upper})
+					leaveStart = -1
+				}
+			}
+			k++
+		}
+	}
+	return result
+}
+
+func makeRecursiveMove(units []Segment, start, end int, spans []recursiveCenterSpan, level int, kind, direction string, confirmed bool, confirmedAt string) recursiveMoveResult {
+	if start < 0 || end < start || end >= len(units) {
+		return recursiveMoveResult{}
+	}
+	first, last := units[start], units[end]
+	confirmed = confirmed && recursiveUnitsConfirmed(units[start:end+1])
+	if !confirmed {
+		confirmedAt = ""
+	}
+	trend := RecursiveTrend{Level: level, Kind: kind, Direction: direction, Start: first.Start, End: last.End,
+		StartPrice: first.StartPrice, EndPrice: last.EndPrice, Low: first.Low, High: first.High,
+		Confirmed: confirmed, ConfirmedAt: confirmedAt, Forming: !confirmed, StartInput: start, EndInput: end,
+		StartRawBar: first.StartRawBar, EndRawBar: last.EndRawBar,
+		StartInputBar: first.StartInputBar, EndInputBar: last.EndInputBar, CenterIDs: []string{}}
+	for index := start + 1; index <= end; index++ {
+		trend.Low = math.Min(trend.Low, units[index].Low)
+		trend.High = math.Max(trend.High, units[index].High)
+	}
+	return recursiveMoveResult{trend: trend, centers: append([]recursiveCenterSpan(nil), spans...), closedAt: confirmedAt}
+}
+
+func confirmedUnitTime(unit Segment) string {
+	if !unit.Confirmed || unit.ConfirmedAt == "" {
+		return ""
+	}
+	return unit.ConfirmedAt
+}
+
+func recursiveUnitsConfirmed(units []Segment) bool {
+	if len(units) == 0 {
+		return false
+	}
+	for _, unit := range units {
+		if !unit.Confirmed || unit.ConfirmedAt == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func recursiveUnitDirection(units []Segment, start, centerStart int) string {
+	if start < centerStart && start >= 0 && start < len(units) && (units[start].Direction == "up" || units[start].Direction == "down") {
+		return units[start].Direction
+	}
+	return ""
+}
+
+func recursiveUnitOverlaps(unit Segment, lower, upper float64) bool {
+	return !(unit.High < lower || unit.Low > upper)
+}
+
+func recursiveTrendSegments(trends []RecursiveTrend) []Segment {
+	segments := make([]Segment, 0, len(trends))
+	for index, trend := range trends {
+		direction := trend.Direction
+		if direction == "" && (trend.Kind == "up" || trend.Kind == "down") {
+			direction = trend.Kind
+		}
+		startKind, endKind := "", ""
+		if direction == "up" {
+			startKind, endKind = "bottom", "top"
+		} else if direction == "down" {
+			startKind, endKind = "top", "bottom"
+		}
+		segment := Segment{Direction: direction, TrendKind: trend.Kind, Chain: trend.Chain, Level: trend.Level, StartStroke: trend.StartInput, EndStroke: trend.EndInput, EndPointStroke: trend.EndInput,
+			Start: trend.Start, End: trend.End, StartKind: startKind, EndKind: endKind, StartPrice: trend.StartPrice, EndPrice: trend.EndPrice,
+			Low: trend.Low, High: trend.High, StartRawBar: trend.StartRawBar, EndRawBar: trend.EndRawBar,
+			StartInputBar: trend.StartInputBar, EndInputBar: trend.EndInputBar,
+			Confirmed: trend.Confirmed, ConfirmedAt: trend.ConfirmedAt, Forming: trend.Forming, BreakStroke: -1, ConfirmStroke: -1, Feature: []FeatureElement{}}
+		if segment.StartRawBar == 0 && segment.EndRawBar == 0 {
+			// Synthetic fixtures and old callers may not provide source offsets.
+			segment.StartInputBar, segment.EndInputBar = index, index
+		}
+		segments = append(segments, segment)
+	}
+	return segments
 }
 
 func hasFormingSegment(segments []Segment) bool {
@@ -121,9 +368,9 @@ func confirmedAndForming(strokes []Stroke) []Stroke {
 	return append([]Stroke(nil), strokes...)
 }
 
-// A recursive pivot is taken from the midpoint of the middle segment in a
-// confirmed alternating triple. Consecutive confirmed pivots make continuous
-// higher-level strokes.
+// A recursive pivot is the shared turning endpoint between the first and
+// middle segment in a confirmed alternating triple. Consecutive confirmed
+// pivots form the input strokes for the next recursive level.
 func recursiveInputStrokes(segments []Segment, level int) []Stroke {
 	pivots := []Fractal{}
 	pivotAt := []int{}
@@ -132,14 +379,14 @@ func recursiveInputStrokes(segments []Segment, level int) []Stroke {
 		if a.Chain != b.Chain || b.Chain != c.Chain || !a.Confirmed || !b.Confirmed || !c.Confirmed || a.Direction != c.Direction || a.Direction == b.Direction || a.End != b.Start || b.End != c.Start {
 			continue
 		}
-		pivotDate, validDate := midpointDate(b.Start, b.End)
-		pivotPrice := (b.StartPrice + b.EndPrice) / 2
-		if !validDate || !finitePositive(pivotPrice) {
+		pivotDate := a.End
+		pivotPrice := a.EndPrice
+		if pivotDate == "" || !finitePositive(pivotPrice) {
 			continue
 		}
-		kind := "top"
-		if b.Direction == "down" {
-			kind = "bottom"
+		kind := "bottom"
+		if a.Direction == "up" {
+			kind = "top"
 		}
 		confirmedAt := maxTimeString(a.ConfirmedAt, b.ConfirmedAt, c.ConfirmedAt)
 		if confirmedAt == "" {
@@ -366,7 +613,7 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 				// The center must have been closed no later than the first push,
 				// and both compared pushes must occur after its final overlapping
 				// segment. The center-closing segment may itself be that first push.
-				if centers[i].Chain == current.Chain && centers[i].ConfirmedAt != "" && centers[i].ConfirmedAt <= previous.ConfirmedAt && centers[i].EndSegment < index-2 {
+				if centers[i].Chain == current.Chain && centers[i].ConfirmedAt != "" && centers[i].ConfirmedAt <= previous.ConfirmedAt && centerOwnerMoveIndex(centers[i]) < index-2 {
 					center = &centers[i]
 				}
 			}
@@ -512,16 +759,24 @@ func findSegmentStrength(strengths []Strength, segment Segment) *Strength {
 	return nil
 }
 
+func centerOwnerMoveIndex(center RecursiveCenter) int {
+	if center.Level == 0 {
+		return center.EndSegment
+	}
+	return center.OwnerMoveIndex
+}
+
 func frameTrendState(level LevelAnalysis) string {
 	center, _ := lastClosedRecursiveCenter(level.Centers)
 	segment, segmentIndex := lastConfirmedSegment(level.Segments)
 	if center == nil || segment == nil {
 		return "unknown"
 	}
-	if segment.Chain != center.Chain || segment.Level != center.Level || segmentIndex <= center.EndSegment {
+	ownerIndex := centerOwnerMoveIndex(*center)
+	if segment.Chain != center.Chain || segment.Level != center.Level || segmentIndex <= ownerIndex {
 		return "unknown"
 	}
-	departureIndex := center.EndSegment + 1
+	departureIndex := ownerIndex + 1
 	if departureIndex >= len(level.Segments) {
 		return "unknown"
 	}
@@ -587,13 +842,14 @@ func buildTrendContext(level LevelAnalysis, status string) TrendContext {
 	default:
 		context.CenterPosition = "inside"
 	}
-	if segment.Chain != center.Chain || segment.Level != center.Level || segmentIndex <= center.EndSegment {
+	ownerIndex := centerOwnerMoveIndex(*center)
+	if segment.Chain != center.Chain || segment.Level != center.Level || segmentIndex <= ownerIndex {
 		context.Status = "unknown"
 		context.DepartureStatus = "unknown"
 		context.Reason = "末端走势段不属于该中枢之后的同链同级结构"
 		return context
 	}
-	departureIndex := center.EndSegment + 1
+	departureIndex := ownerIndex + 1
 	if departureIndex >= len(level.Segments) {
 		context.Status, context.DepartureStatus = "range", "no_departure"
 		context.Reason = "中枢形成后尚无已确认走势段离开"

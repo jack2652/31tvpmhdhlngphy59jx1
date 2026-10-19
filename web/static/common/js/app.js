@@ -29,17 +29,22 @@ const CHAN_SCENARIOS_STORAGE_KEY = "option-scope-chan-scenarios-visible";
 const CHAN_CHART_PREFERENCES_KEY = "option-scope-chan-chart-preferences";
 const CHAN_INTRADAY_PERIODS = ["15m", "4h"];
 const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "4h"];
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true };
+const CHAN_CHART_PREFERENCES_VERSION = 3;
+const DEFAULT_CHAN_CHART_LAYERS = { pens: false, penCenters: false, legacySignals: false, chanCandles: true, segments: true, segmentLevels: {}, recursiveCenters: {}, signals: true };
 function readChanScenarioVisibility() {
   try { return localStorage.getItem(CHAN_SCENARIOS_STORAGE_KEY) === "1"; } catch (error) { return false; }
 }
 function readChanChartPreferences() {
   try {
     const stored = JSON.parse(localStorage.getItem(CHAN_CHART_PREFERENCES_KEY) || "null");
-    if (!stored || typeof stored !== "object") return { period: "daily", layers: { ...DEFAULT_CHAN_CHART_LAYERS } };
+    if (!stored || typeof stored !== "object") {
+      const defaults = { period: "daily", layers: { ...DEFAULT_CHAN_CHART_LAYERS } };
+      rememberChanChartPreferences(defaults.period, defaults.layers);
+      return defaults;
+    }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "chanCandles", "segments", "signals"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -48,11 +53,16 @@ function readChanChartPreferences() {
       layers[key] = Object.fromEntries(Object.entries(values)
         .filter(([level, visible]) => /^[0-7]$/.test(level) && typeof visible === "boolean"));
     }
-    return { period: CHAN_CHART_PERIODS.includes(stored.period) ? stored.period : "daily", layers };
+    const storedVersion = Number(stored.version) || 1;
+    // Persist the unified-menu preference format without resetting explicit
+    // layer choices made before the menu redesign.
+    const preferences = { period: CHAN_CHART_PERIODS.includes(stored.period) ? stored.period : "daily", layers };
+    if (storedVersion < CHAN_CHART_PREFERENCES_VERSION) rememberChanChartPreferences(preferences.period, preferences.layers);
+    return preferences;
   } catch (error) { return { period: "daily", layers: { ...DEFAULT_CHAN_CHART_LAYERS } }; }
 }
 function rememberChanChartPreferences(period, layers) {
-  try { localStorage.setItem(CHAN_CHART_PREFERENCES_KEY, JSON.stringify({ period, layers })); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
+  try { localStorage.setItem(CHAN_CHART_PREFERENCES_KEY, JSON.stringify({ version: CHAN_CHART_PREFERENCES_VERSION, period, layers })); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
 }
 const initialChanChartPreferences = readChanChartPreferences();
 const state = {
@@ -5013,6 +5023,12 @@ const optionScopeApp = new Vue({
     },
   },
   methods: {
+    closeChanLayerMenu(event) {
+      const menu = event?.currentTarget?.closest(".chan-layer-menu");
+      if (!menu) return;
+      menu.open = false;
+      menu.querySelector("summary")?.focus();
+    },
     chanTurningStatus(index) {
       const turning = this.chanFrame?.turning;
       const item = Array.isArray(turning) ? turning[index] : null;
@@ -5158,13 +5174,13 @@ const optionScopeApp = new Vue({
       if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
     },
     toggleChanChartLayer(layer) {
-      if (layer === "pens" || layer === "penCenters" || layer === "chanCandles" || layer === "signals") {
+      if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals") {
         this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };
       } else {
         const level = Number(layer);
         if (!Number.isInteger(level) || level < 0 || level > 7) return;
         const recursiveCenters = this.chanChartLayers?.recursiveCenters || {};
-        const centers = { ...recursiveCenters, [level]: recursiveCenters[level] !== true };
+        const centers = { ...recursiveCenters, [level]: !OptionScopeChan.isRecursiveCenterLevelVisible(this.chanChartLayers, level) };
         this.chanChartLayers = { ...this.chanChartLayers, recursiveCenters: centers };
       }
       rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers);
@@ -5177,6 +5193,9 @@ const optionScopeApp = new Vue({
     },
     isChanSegmentLevelVisible(level) {
       return OptionScopeChan.isSegmentLevelVisible(this.chanChartLayers, level);
+    },
+    isChanRecursiveCenterLevelVisible(level) {
+      return OptionScopeChan.isRecursiveCenterLevelVisible(this.chanChartLayers, level);
     },
     changeChanViewport(action) {
       const chart = this.chanFrame?.chart;

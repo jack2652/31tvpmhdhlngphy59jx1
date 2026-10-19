@@ -3,6 +3,7 @@ package chananalysis
 import (
 	"fmt"
 	"math"
+	"sort"
 )
 
 type featureRange struct {
@@ -10,109 +11,247 @@ type featureRange struct {
 	chain int
 }
 
-// buildSegments implements the v4 standard feature-sequence termination
-// policy. A segment ends only after a confirmed counter-direction stroke
-// breaks its feature sequence and a following confirmed original-direction
-// stroke fails to reclaim that broken extreme.
+// buildSegments implements the confirmed feature-sequence cases from the
+// reference chan-lun implementation. Segment starts require three overlapping
+// strokes; termination checks the un-gapped and gapped feature-sequence cases,
+// and completed ranges are split at the first counter-direction stroke.
 func buildSegments(strokes []Stroke) []Segment {
 	segments := []Segment{}
 	for index := 0; index < len(strokes); {
-		if !strokes[index].Confirmed || !validSegmentStart(strokes[index]) {
-			if index+1 == len(strokes) {
-				break
-			}
-			index++
-			continue
-		}
 		chain, direction := strokes[index].Chain, strokes[index].Direction
 		chainEnd := index
 		for chainEnd+1 < len(strokes) && strokes[chainEnd+1].Chain == chain {
 			chainEnd++
 		}
-		features := []featureRange{}
-		featureDirection := 0
-		breakAt, confirmAt := -1, -1
-		var reclaimThreshold float64
-		for cursor := index + 1; cursor <= chainEnd; cursor++ {
-			stroke := strokes[cursor]
-			if !stroke.Confirmed {
-				break
-			}
-			if stroke.Direction == direction {
-				if breakAt >= 0 {
-					reclaimed := direction == "up" && stroke.End.Price > reclaimThreshold || direction == "down" && stroke.End.Price < reclaimThreshold
-					if reclaimed {
-						appendFeature(&features, &featureDirection, strokes[breakAt], breakAt)
-						breakAt, confirmAt = -1, -1
-						continue
-					}
-					confirmAt = cursor
-					break
-				}
+		if index+2 > chainEnd || !validSegmentStart(strokes[index]) || !overlappingStrokeTriple(strokes, index) {
+			index++
+			continue
+		}
+		confirmedEnd := chainEnd
+		for confirmedEnd >= index && !strokes[confirmedEnd].Confirmed {
+			confirmedEnd--
+		}
+		candidate, evidence, _, complete := segmentEnd(strokes[:confirmedEnd+1], index)
+		end, next := -1, chainEnd+1
+		if complete {
+			end, next = candidate-1, candidate
+		} else {
+			end = formingSegmentEnd(strokes, index, chainEnd, direction)
+			if end < index+2 {
+				index++
 				continue
 			}
-			if _, reclaim, broken := brokenFeatureExtreme(features, stroke, direction); broken {
-				breakAt = cursor
-				reclaimThreshold = reclaim
-				continue
-			}
-			appendFeature(&features, &featureDirection, stroke, cursor)
+			next = end + 1
 		}
-		end := chainEnd
-		segment := Segment{Direction: direction, Chain: chain, Level: strokes[index].Level, StartStroke: index, EndStroke: end, BreakStroke: -1, ConfirmStroke: -1,
-			Start: strokes[index].Start.Date, End: strokes[end].End.Date, StartKind: strokes[index].Start.Kind, EndKind: strokes[end].End.Kind, StartPrice: strokes[index].Start.Price, EndPrice: strokes[end].End.Price,
-			StartRawBar: strokes[index].StartRawBar, EndRawBar: strokes[end].EndRawBar, StartInputBar: strokes[index].InputStartBar, EndInputBar: strokes[end].InputEndBar,
-			Low: strokes[index].Low, High: strokes[index].High, Feature: []FeatureElement{}}
-		if breakAt >= 0 {
-			segment.BreakStroke, segment.ConfirmStroke = breakAt, confirmAt
-			segment.EndStroke = breakAt - 1
-			if segment.EndStroke > segment.StartStroke {
-				segment.Low = strokes[segment.StartStroke].Low
-				segment.High = strokes[segment.StartStroke].High
-				for k := segment.StartStroke + 1; k <= segment.EndStroke; k++ {
-					segment.Low = math.Min(segment.Low, strokes[k].Low)
-					segment.High = math.Max(segment.High, strokes[k].High)
-				}
-			}
-			segment.Confirmed = confirmAt >= 0
-			segment.Forming = !segment.Confirmed
-			if segment.Confirmed {
-				segment.ConfirmedAt = strokes[confirmAt].ConfirmedAt
-			}
-		}
-		endpointStroke := segmentEndpoint(strokes, segment.StartStroke, segment.EndStroke, direction)
-		segment.EndPointStroke = endpointStroke
-		segment.End = strokes[endpointStroke].End.Date
-		segment.EndKind = strokes[endpointStroke].End.Kind
-		segment.EndPrice = strokes[endpointStroke].End.Price
-		segment.EndRawBar = strokes[endpointStroke].EndRawBar
-		segment.EndInputBar = strokes[endpointStroke].InputEndBar
-		featuresEnd := segment.EndStroke
-		features = segmentFeatures(strokes, index, featuresEnd, direction, chain)
-		for i := range features {
-			segment.Feature = append(segment.Feature, features[i].FeatureElement)
-		}
-		for k := segment.StartStroke + 1; k <= segment.EndStroke; k++ {
-			segment.Low = math.Min(segment.Low, strokes[k].Low)
-			segment.High = math.Max(segment.High, strokes[k].High)
-		}
-		if !segment.Confirmed {
-			segment.Forming = true
+		segment := makeSegment(strokes, index, end, direction, chain, complete)
+		segment.Feature = featureElements(segmentFeatures(strokes, index, end, direction, chain))
+		if complete {
+			segment.BreakStroke, segment.ConfirmStroke = candidate, evidence
+			segment.ConfirmedAt = strokes[evidence].ConfirmedAt
+			segment.Forming = false
 		}
 		segments = append(segments, segment)
-		next := chainEnd + 1
-		if segment.Confirmed {
-			// The next segment starts with the counter-direction stroke after the
-			// backtracked endpoint. Starting at the later feature break would
-			// leave a gap and make recursive continuity impossible.
-			next = segment.EndPointStroke + 1
-		}
 		if next <= index {
 			next = index + 1
 		}
 		index = next
 	}
 	return segments
+}
+
+func makeSegment(strokes []Stroke, start, end int, direction string, chain int, confirmed bool) Segment {
+	segment := Segment{Direction: direction, Chain: chain, Level: strokes[start].Level, StartStroke: start, EndStroke: end, EndPointStroke: end, BreakStroke: -1, ConfirmStroke: -1,
+		Start: strokes[start].Start.Date, End: strokes[end].End.Date, StartKind: strokes[start].Start.Kind, EndKind: strokes[end].End.Kind, StartPrice: strokes[start].Start.Price, EndPrice: strokes[end].End.Price,
+		StartRawBar: strokes[start].StartRawBar, EndRawBar: strokes[end].EndRawBar, StartInputBar: strokes[start].InputStartBar, EndInputBar: strokes[end].InputEndBar,
+		Low: strokes[start].Low, High: strokes[start].High, Confirmed: confirmed, Forming: !confirmed, Feature: []FeatureElement{}}
+	for index := start + 1; index <= end; index++ {
+		segment.Low = math.Min(segment.Low, strokes[index].Low)
+		segment.High = math.Max(segment.High, strokes[index].High)
+	}
+	return segment
+}
+
+func overlappingStrokeTriple(strokes []Stroke, start int) bool {
+	if start+2 >= len(strokes) {
+		return false
+	}
+	first, second, third := strokes[start], strokes[start+1], strokes[start+2]
+	lastInChain := start+3 >= len(strokes) || strokes[start+3].Chain != third.Chain
+	if !first.Confirmed || !second.Confirmed || (!third.Confirmed && !lastInChain) || first.Chain != second.Chain || second.Chain != third.Chain || first.Direction != third.Direction || first.Direction == second.Direction {
+		return false
+	}
+	return math.Max(first.Low, math.Max(second.Low, third.Low)) <= math.Min(first.High, math.Min(second.High, third.High))
+}
+
+func formingSegmentEnd(strokes []Stroke, start, end int, direction string) int {
+	best := -1
+	for index := start + 2; index <= end; index += 2 {
+		if strokes[index].Chain != strokes[start].Chain || strokes[index].Direction != direction {
+			continue
+		}
+		if direction == "up" && strokes[index].End.Price > strokes[start].Start.Price {
+			if best < 0 || strokes[index].End.Price > strokes[best].End.Price {
+				best = index
+			}
+		} else if direction == "down" && strokes[index].End.Price < strokes[start].Start.Price {
+			if best < 0 || strokes[index].End.Price < strokes[best].End.Price {
+				best = index
+			}
+		}
+	}
+	return best
+}
+
+func segmentEnd(strokes []Stroke, start int) (candidate, evidence, mode int, ok bool) {
+	if start >= len(strokes) {
+		return -1, -1, 0, false
+	}
+	up := strokes[start].Direction == "up"
+	counter := "down"
+	if !up {
+		counter = "up"
+	}
+	features := []featureRange{}
+	featureDirection := segmentFeatureDirection(strokes[start].Direction)
+	endings := [][3]int{}
+	for index := start + 1; index < len(strokes); index++ {
+		stroke := strokes[index]
+		if stroke.Chain != strokes[start].Chain || !stroke.Confirmed || stroke.Direction != counter {
+			continue
+		}
+		continuation := stroke.Start.Price > strokes[start].Start.Price
+		if !up {
+			continuation = stroke.Start.Price < strokes[start].Start.Price
+		}
+		if index >= start+3 && len(features) > 0 && continuation {
+			if candidate, evidence, mode, found := candidateSegmentEnd(strokes, start, index, features[len(features)-1]); found {
+				endings = append(endings, [3]int{candidate, evidence, mode})
+			}
+			rawIndex := index - 2
+			if rawIndex > start {
+				raw := featureRange{FeatureElement: FeatureElement{StartStroke: rawIndex, EndStroke: rawIndex, Low: strokes[rawIndex].Low, High: strokes[rawIndex].High, Start: strokes[rawIndex].Start.Date, End: strokes[rawIndex].End.Date}, chain: stroke.Chain}
+				if candidate, evidence, mode, found := candidateSegmentEnd(strokes, start, index, raw); found {
+					confirmation := strokes[evidence].End.Price < strokes[start].Start.Price
+					if !up {
+						confirmation = strokes[evidence].End.Price > strokes[start].Start.Price
+					}
+					low, high := math.MaxFloat64, -math.MaxFloat64
+					for reverseIndex := index; reverseIndex <= evidence; reverseIndex++ {
+						low = math.Min(low, strokes[reverseIndex].Low)
+						high = math.Max(high, strokes[reverseIndex].High)
+					}
+					overlap := false
+					if evidence-index+1 >= 3 {
+						overlapLow := math.Max(strokes[index].Low, math.Max(strokes[index+1].Low, strokes[index+2].Low))
+						overlapHigh := math.Min(strokes[index].High, math.Min(strokes[index+1].High, strokes[index+2].High))
+						overlap = overlapLow <= overlapHigh
+					}
+					if confirmation && overlap && low <= high {
+						endings = append(endings, [3]int{candidate, evidence, mode})
+					}
+				}
+			}
+		}
+		appendFeature(&features, &featureDirection, stroke, index)
+	}
+	if len(endings) == 0 {
+		return -1, -1, 0, false
+	}
+	sort.SliceStable(endings, func(i, j int) bool {
+		if endings[i][1] == endings[j][1] {
+			return endings[i][0] < endings[j][0]
+		}
+		return endings[i][1] < endings[j][1]
+	})
+	return endings[0][0], endings[0][1], endings[0][2], true
+}
+
+func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRange) (int, int, int, bool) {
+	up := strokes[start].Direction == "up"
+	counter := strokes[candidate]
+	if counter.Direction == strokes[start].Direction {
+		return -1, -1, 0, false
+	}
+	if up && counter.High <= left.High || !up && counter.Low >= left.Low {
+		return -1, -1, 0, false
+	}
+	right := []featureRange{{FeatureElement: FeatureElement{StartStroke: candidate, EndStroke: candidate, Low: counter.Low, High: counter.High, Start: counter.Start.Date, End: counter.End.Date}, chain: counter.Chain}}
+	second := []featureRange{}
+	rightDirection, secondDirection := segmentFeatureDirection(strokes[start].Direction), segmentFeatureDirection(counter.Direction)
+	extreme := counter.Start.Price
+	gap := left.High < counter.Low
+	if !up {
+		gap = left.Low > counter.High
+	}
+	pendingFirstKind := false
+	for index := candidate + 1; index < len(strokes); index++ {
+		stroke := strokes[index]
+		if stroke.Chain != strokes[start].Chain || !stroke.Confirmed {
+			break
+		}
+		if stroke.Direction == counter.Direction {
+			appendFeature(&right, &rightDirection, stroke, index)
+		} else {
+			appendFeature(&second, &secondDirection, stroke, index)
+			if gap && len(right) >= 2 && hasFeatureFractal(second, featureFractalKind(up)) {
+				return candidate, index, 2, true
+			}
+			if pendingFirstKind {
+				if _, _, _, following := segmentEnd(strokes[:index+1], candidate); following {
+					return candidate, index, 1, true
+				}
+			}
+			newExtreme := stroke.End.Price > extreme
+			if !up {
+				newExtreme = stroke.End.Price < extreme
+			}
+			if newExtreme {
+				return -1, -1, 0, false
+			}
+		}
+		if len(right) < 2 {
+			continue
+		}
+		a, b := right[0], right[1]
+		turned := b.High < a.High && b.Low < a.Low
+		if !up {
+			turned = b.High > a.High && b.Low > a.Low
+		}
+		if turned && !gap && stroke.Direction == counter.Direction {
+			selected := stroke.End.Price < counter.End.Price
+			crossedStart := stroke.End.Price < strokes[start].Start.Price
+			if !up {
+				selected = stroke.End.Price > counter.End.Price
+				crossedStart = stroke.End.Price > strokes[start].Start.Price
+			}
+			if selected || crossedStart {
+				return candidate, index, 1, true
+			}
+			pendingFirstKind = true
+		}
+		if turned && gap && hasFeatureFractal(second, featureFractalKind(up)) {
+			return candidate, index, 2, true
+		}
+	}
+	return -1, -1, 0, false
+}
+
+func featureFractalKind(up bool) string {
+	if up {
+		return "bottom"
+	}
+	return "top"
+}
+
+func hasFeatureFractal(features []featureRange, kind string) bool {
+	if len(features) < 3 {
+		return false
+	}
+	a, b, c := features[len(features)-3], features[len(features)-2], features[len(features)-1]
+	if kind == "top" {
+		return b.High > a.High && b.High > c.High && b.Low > a.Low && b.Low > c.Low
+	}
+	return b.Low < a.Low && b.Low < c.Low && b.High < a.High && b.High < c.High
 }
 
 func segmentEndpoint(strokes []Stroke, start, end int, direction string) int {
@@ -134,11 +273,18 @@ func appendFeature(features *[]featureRange, sequenceDirection *int, stroke Stro
 	last := &(*features)[len(*features)-1]
 	contains := current.High >= last.High && current.Low <= last.Low || last.High >= current.High && last.Low <= current.Low
 	if !contains {
-		if *sequenceDirection == 0 {
-			*sequenceDirection = directionFromPair(last.High, last.Low, current.High, current.Low)
-		}
 		*features = append(*features, current)
 		return
+	}
+	// The feature sequence's inclusion direction is recalculated from its
+	// latest two standardized elements once that pair exists. A direction
+	// inferred from the first pair becomes stale after a later reversal.
+	if len(*features) > 1 {
+		previous := (*features)[len(*features)-2]
+		*sequenceDirection = -1
+		if last.High > previous.High {
+			*sequenceDirection = 1
+		}
 	}
 	if *sequenceDirection < 0 {
 		last.Low = math.Min(last.Low, current.Low)
@@ -155,7 +301,7 @@ func appendFeature(features *[]featureRange, sequenceDirection *int, stroke Stro
 
 func segmentFeatures(strokes []Stroke, start, end int, direction string, chain int) []featureRange {
 	features := []featureRange{}
-	featureDirection := 0
+	featureDirection := segmentFeatureDirection(direction)
 	for i := start + 1; i <= end; i++ {
 		stroke := strokes[i]
 		if stroke.Chain != chain || stroke.Direction == direction {
@@ -166,6 +312,25 @@ func segmentFeatures(strokes []Stroke, start, end int, direction string, chain i
 	return features
 }
 
+func featureElements(features []featureRange) []FeatureElement {
+	result := make([]FeatureElement, 0, len(features))
+	for _, feature := range features {
+		result = append(result, feature.FeatureElement)
+	}
+	return result
+}
+
+// segmentFeatureDirection is fixed by the hypothesized segment direction.
+// Feature-sequence inclusion happens before two non-contained elements may
+// exist to infer a direction, so leaving this unknown and taking a union can
+// erase or invent the feature pivots that terminate a segment.
+func segmentFeatureDirection(direction string) int {
+	if direction == "up" {
+		return 1
+	}
+	return -1
+}
+
 func brokenFeatureExtreme(features []featureRange, stroke Stroke, direction string) (float64, float64, bool) {
 	for index := 1; index+1 < len(features); index++ {
 		left, middle, right := features[index-1], features[index], features[index+1]
@@ -173,12 +338,17 @@ func brokenFeatureExtreme(features []featureRange, stroke Stroke, direction stri
 		if direction == "up" {
 			pivot = middle.Low < left.Low && middle.High < left.High && middle.Low < right.Low && middle.High < right.High
 			if pivot && stroke.Low < middle.Low {
-				return middle.Low, middle.Low, true
+				// A rebound only cancels the break if it recovers through the
+				// other edge of the broken feature element. Comparing against
+				// middle.Low here makes every positive rebound look reclaimed.
+				return middle.Low, middle.High, true
 			}
 		} else {
 			pivot = middle.Low > left.Low && middle.High > left.High && middle.Low > right.Low && middle.High > right.High
 			if pivot && stroke.High > middle.High {
-				return middle.High, middle.High, true
+				// Symmetric to an upward segment: after an upward break, a
+				// pullback must cross the lower edge to cancel the candidate.
+				return middle.High, middle.Low, true
 			}
 		}
 	}

@@ -14,9 +14,11 @@
 
 ## 当前实现基线
 
-- 核心算法位于 [`internal/chan/analysis.go`](../internal/chan/analysis.go)、[`internal/chan/turning.go`](../internal/chan/turning.go)、[`internal/chan/segments.go`](../internal/chan/segments.go)、[`internal/chan/recursive.go`](../internal/chan/recursive.go) 和 [`internal/chan/types.go`](../internal/chan/types.go)；缠论页面当前默认请求 `/api/chan/:symbol/adjusted` 并展示 `chan-recursive-v4-preview.2`，旧 `/api/chan/:symbol` 仍保留 `strict-old-bi-v3` 兼容结果。该默认只表示页面使用 preview 结构，不表示预览算法已完成阈值校准或可作为交易策略。
+- 核心算法位于 [`internal/chan/analysis.go`](../internal/chan/analysis.go)、[`internal/chan/turning.go`](../internal/chan/turning.go)、[`internal/chan/segments.go`](../internal/chan/segments.go)、[`internal/chan/recursive.go`](../internal/chan/recursive.go) 和 [`internal/chan/types.go`](../internal/chan/types.go)；缠论页面当前默认请求 `/api/chan/:symbol/adjusted` 并展示 `chan-recursive-v4-preview.9`，旧 `/api/chan/:symbol` 仍保留 `strict-old-bi-v3` 兼容结果。该默认只表示页面使用 preview 结构，不表示预览算法已完成阈值校准或可作为交易策略。
 - 日线和周线结构使用独立保存的拆股/分红自动复权 OHLC；日期、OHLC、重复/乱序、未完成 bar、交易日缺口和可疑公司行动会进入质量检查，无法安全衔接的数据会降级并切断结构链。
 - 包含处理、严格分型和兼容旧版的笔之外，preview 已实现特征序列线段、形成中状态、同级递归走势和中枢的延伸/扩展/新生关系，以及可追溯的确认时间和输入范围。
+- 递归中枢的输入单元范围与中枢所属级别的走势索引分开记录，买卖点扫描使用所属走势索引；笔级三类历史观察单独返回为 `pen_signals`，避免和严格递归信号混用。页面的笔级观察区同时消费这两类兼容来源，顶底卡片优先展示当前有效候选，避免被更早的失效候选遮住。
+- `chan-recursive-v4-preview.9` 将分型日期锚定到包含合并组末根行情，同时保留极值来源索引；三类点只接受从中枢范围内穿越边界的首次离开，并以回试端点日期和价格绘制。图区空状态区分当前缩放窗口没有标记、候选尚无绘图坐标和全周期没有信号，避免将历史视窗外的信号误读为算法空白。
 - 力度按同方向、同递归级别的已确认走势段积分版本化 MACD；80% 是待历史验证的候选参数，不是已验证结论。背驰与一、二、三类买卖点都保留候选阶段、确认条件、失效边界和信号可见时间。
 - S&P 500 环境标签与明确的 `15m → 4h → 1d → 1wk` 递归映射已接入 preview。日线/周线历史使用复权坐标；当前 15 分钟和 4 小时接口仍声明未复权价格坐标，缺少兼容因子时不用于复权日线信号确认。
 - `/api/chan/:symbol/adjusted` 返回新旧算法并行结果、复权基准、质量、递归结构及规则证据；SQLite 分开保存复权行情和版本化结构快照。Canvas 在 [`web/static/common/js/chan-client.js`](../web/static/common/js/chan-client.js) 与 [`web/static/common/js/charts.js`](../web/static/common/js/charts.js) 绘制可切换的线段、中枢和信号层。
@@ -178,10 +180,10 @@
 
 ### I. 灰度与完成验收
 
-- [x] 新算法与 `strict-old-bi-v3` 并行运行并带有清晰版本标记。`AnalyzeAdjusted` 保留 legacy v3 输出并生成 `chan-recursive-v4-preview.2` 字段；`/api/chan/:symbol/adjusted` 返回 `rule_version`、`target_rule_version`、`legacy_rule_version` 及并行计算的日线/周线结构。server endpoint 测试核验算法版本与双算法结果。
+- [x] 新算法与 `strict-old-bi-v3` 并行运行并带有清晰版本标记。`AnalyzeAdjusted` 保留 legacy v3 输出并生成 `chan-recursive-v4-preview.9` 字段；`/api/chan/:symbol/adjusted` 返回 `rule_version`、`target_rule_version`、`legacy_rule_version` 及并行计算的日线/周线结构。server endpoint 测试核验算法版本与双算法结果。
 - [x] 汇总新旧算法的分型、笔、线段、中枢和信号差异，并能逐例解释。[`comparison.go`](../internal/chan/comparison.go) 汇总所有递归层级，按日期/类型/价格键列出代表性差异并解释旧笔中枢与递归结构的语义区别；`comparison_test.go` 覆盖各层差异和高层级汇总，adjusted endpoint 测试验证响应存在比较摘要；定向测试通过。
 - [x] 验证旧客户端/API 使用方在迁移期间仍可读取旧字段和旧算法结果。旧 `/api/chan/{symbol}` 与 `/adjusted` 的兼容夹具逐项比较严格旧笔和笔中枢语义，新接口额外明确标注 preview 及 legacy 版本；`go test ./internal/server -run '^TestChanLegacyEndpointKeepsStrictOldStrokeAndCenterSemantics$' -count=1` 通过。
-- [x] 将缠论页面默认切换为 `chan-recursive-v4-preview.2`。`web/static/common/js/app.js` 默认请求 `/api/chan/:symbol/adjusted`，页面展示复权行情上的 preview 递归结构；旧 `/api/chan/:symbol` 与 `strict-old-bi-v3` 继续保留作兼容入口。**切换说明**：页面已默认使用 preview 结构；复权行情、递归结构、UI 图层和未来数据隔离的相应验收项已完成。日线可作为大级别观察背景，低级别（30m/15m）作为主要信号捕捉周期是后续验证方案；当前盘中数据仍为未复权坐标，尚未完成与日线复权坐标衔接及阈值样本验证，因此不能据此宣称实盘/纸面交易流程已验收。此项不表示 `chan-recursive-v4.0.0` 目标规则、阈值校准或交易收益已经完成。
+- [x] 将缠论页面默认切换为 `chan-recursive-v4-preview.9`。`web/static/common/js/app.js` 默认请求 `/api/chan/:symbol/adjusted`，页面展示复权行情上的 preview 递归结构；旧 `/api/chan/:symbol` 与 `strict-old-bi-v3` 继续保留作兼容入口。**切换说明**：页面已默认使用 preview 结构；复权行情、递归结构、UI 图层和未来数据隔离的相应验收项已完成。日线可作为大级别观察背景，低级别（30m/15m）作为主要信号捕捉周期是后续验证方案；当前盘中数据仍为未复权坐标，尚未完成与日线复权坐标衔接及阈值样本验证，因此不能据此宣称实盘/纸面交易流程已验收。此项不表示 `chan-recursive-v4.0.0` 目标规则、阈值校准或交易收益已经完成。
 - [x] 更新 README/算法说明，列出规则版本、适用范围、已知限制和回测方法。README 区分 preview/目标版本及旧新字段，说明复权日周线、未复权盘中限制、信号非收益预测、已知待升级功能和回测统计口径，并列出恢复到旧 API 的回退步骤；文档 diff 检查通过。
 - [x] 记录上线后回退到旧算法版本的方法，不需要重写原始行情数据。[`chan-algorithm-rollback.md`](chan-algorithm-rollback.md) 记录已验证旧二进制准备、原子替换、API/健康检查、失败恢复及现有 SQLite 和原始行情保留；旧 API 语义回归测试通过。需在实际目标环境预验证旧二进制对当前 schema 的兼容性。
 
@@ -302,6 +304,6 @@
 
 **关于信号稀疏与端点敏感性的补充说明**：
 
-1. 日线级别的严格旧笔与特征序列线段，在单一标的 5 年窗口下可能因特征序列破坏、假破坏撤销和笔链重启而很难确认；当前样本表现为信号稀疏。该现象本身不能证明是理论正常现象，也不能排除算法实现问题，需通过低周期样本和确定性夹具继续区分。
+1. 已修正一处线段破坏候选的误撤销：上涨线段的特征序列低点被击穿后，反向上行只有越过该中间特征元素高点才视为收复；下跌线段对称要求越过该元素低点。修正后 1,300 根日线样本中 QQQ 从 0 条变为 1 条已确认线段、^GSPC 从 0 条变为 2 条，但仍无连续三条同链交替已确认线段，因此尚未形成递归中枢或背驰信号。该局部修复没有证明其余规则正确，后续仍需用更多市场阶段和周期复核线段及中枢。
 2. 算法对窗口起点敏感（QQQ 1,255 根与 1,300 根窗口的笔/线段数量不同）。未来数据隔离回放已覆盖信号时序，但它不会自动消除 warm-up 边界影响；历史回测需固定、配置并披露预热期与统计期，避免把 warm-up bars 纳入收益样本。
-3. 30m/60m 聚合管线及 4h 完整区间输入已经可运行；4h 当前按完整交易日 09:30–13:30 的四小时段构造，不把剩余 2.5 小时误标成完整 bar。QQQ 短期样本在三种周期下均无严格或形成中候选，且数据质量 degraded；尚需增加历史覆盖、扩大到 S&P 500 成分股或至少 300 个高流动性标的，并披露名单、公司行动、缺失、形成中/已确认样本及样本外统计。80% 仍为占位参数，D 组阈值验证保持未完成。
+3. 30m/60m 聚合管线及 4h 完整区间输入已经可运行；4h 当前按完整交易日 09:30–13:30 的四小时段构造，不把剩余 2.5 小时误标成完整 bar。当前 SQLite 15 分钟历史只覆盖约两个月：QQQ、SPY、AAPL、MSFT、NVDA、ORCL 均有约 1,040 根左右 bar，但质量状态为 degraded；修正后这些盘中样本仍没有已确认线段或递归中枢，数据长度和质量还不足以校准阈值。尚需修复盘中缺失/时间边界来源并扩大历史覆盖与标的池。80% 仍为占位参数，D 组阈值验证保持未完成。

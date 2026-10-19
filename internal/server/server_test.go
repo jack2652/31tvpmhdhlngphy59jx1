@@ -3470,7 +3470,7 @@ func TestChanAdjustedEndpointUsesCachedAdjustedPriceBasisAndPreviewVersion(t *te
 		t.Fatal(err)
 	}
 	coordinate := payload["price_coordinate"].(map[string]any)
-	if response.StatusCode != http.StatusOK || payload["rule_version"] != "chan-recursive-v4-preview.2" || payload["target_rule_version"] != "chan-recursive-v4.0.0" || coordinate["basis"] != "split_dividend_adjusted" || coordinate["adjusted_spot"] != 55.0 || coordinate["raw_spot"] != 110.0 || coordinate["adjustment_factor"] != 0.5 || coordinate["factor_date"] != "2026-10-16" || coordinate["factor_source"] == "" {
+	if response.StatusCode != http.StatusOK || payload["rule_version"] != chananalysis.RecursivePreviewVersion || payload["target_rule_version"] != "chan-recursive-v4.0.0" || coordinate["basis"] != "split_dividend_adjusted" || coordinate["adjusted_spot"] != 55.0 || coordinate["raw_spot"] != 110.0 || coordinate["adjustment_factor"] != 0.5 || coordinate["factor_date"] != "2026-10-16" || coordinate["factor_source"] == "" {
 		t.Fatalf("adjusted response status=%d payload=%#v", response.StatusCode, payload)
 	}
 	daily := payload["daily"].(map[string]any)

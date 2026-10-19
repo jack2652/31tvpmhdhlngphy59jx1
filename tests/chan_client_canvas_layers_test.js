@@ -26,9 +26,9 @@ function frame() {
     ],
     recursive_centers: [{ level: 1, kind: "initial", center_id: "center-l1", chain_id: 0, start: "2026-10-12", end: "2026-10-14", zd: 10, zg: 12, forming: true, extension_count: 2 }],
     signals_v4: [
-      { symbol: "QQQ", signal_id: "s1", level: 1, kind: "class1_buy", side: "buy", status: "awaiting_reversal", phase: "observation", rule_version: "chan-recursive-v4-preview.2", date: "2026-10-15", observed_at: "2026-10-16", price: 8, conditions: ["同级确认走势段"], missing_conditions: ["后续反向线段确认走势端点"], invalidation_price: 8, market_filter: "classified", market_environment: { benchmark: "^GSPC", status: "classified", regime: "bull", date: "2026-10-15", rule_version: "sp500-sma50-sma200-v1" }, lower_level_status: "awaiting_lower_level", structure_ids: ["seg-1"] },
-      { symbol: "QQQ", signal_id: "s2", level: 1, kind: "class2_buy", side: "buy", status: "observing", phase: "first_retest", rule_version: "chan-recursive-v4-preview.2", date: "2026-10-14", observed_at: "2026-10-15", price: 9, conditions: ["首次回试低点严格高于一买低点"], missing_conditions: ["等待本级恢复方向的已确认线段"], invalidation_price: 8, market_filter: "unfiltered", lower_level_status: "ready", related_signal_id: "s1", structure_ids: ["seg-2"] },
-      { symbol: "QQQ", signal_id: "s3", level: 1, kind: "class3_sell", side: "sell", status: "confirmed", phase: "class3_confirmed", rule_version: "chan-recursive-v4-preview.2", date: "2026-10-13", observed_at: "2026-10-14", confirmed_at: "2026-10-15", price: 12, conditions: ["回试高点严格低于 ZD"], missing_conditions: [], invalidation_price: 13, market_filter: "unfiltered", lower_level_status: "unconfirmed", related_center_id: "center-1", structure_ids: ["center-1", "seg-3"] },
+      { symbol: "QQQ", signal_id: "s1", level: 1, kind: "class1_buy", side: "buy", status: "awaiting_reversal", phase: "observation", rule_version: "chan-recursive-v4-preview.4", date: "2026-10-15", observed_at: "2026-10-16", price: 8, conditions: ["同级确认走势段"], missing_conditions: ["后续反向线段确认走势端点"], invalidation_price: 8, market_filter: "classified", market_environment: { benchmark: "^GSPC", status: "classified", regime: "bull", date: "2026-10-15", rule_version: "sp500-sma50-sma200-v1" }, lower_level_status: "awaiting_lower_level", structure_ids: ["seg-1"] },
+      { symbol: "QQQ", signal_id: "s2", level: 1, kind: "class2_buy", side: "buy", status: "observing", phase: "first_retest", rule_version: "chan-recursive-v4-preview.4", date: "2026-10-14", observed_at: "2026-10-15", price: 9, conditions: ["首次回试低点严格高于一买低点"], missing_conditions: ["等待本级恢复方向的已确认线段"], invalidation_price: 8, market_filter: "unfiltered", lower_level_status: "ready", related_signal_id: "s1", structure_ids: ["seg-2"] },
+      { symbol: "QQQ", signal_id: "s3", level: 1, kind: "class3_sell", side: "sell", status: "confirmed", phase: "class3_confirmed", rule_version: "chan-recursive-v4-preview.4", date: "2026-10-13", observed_at: "2026-10-14", confirmed_at: "2026-10-15", price: 12, conditions: ["回试高点严格低于 ZD"], missing_conditions: [], invalidation_price: 13, market_filter: "unfiltered", lower_level_status: "unconfirmed", related_center_id: "center-1", structure_ids: ["center-1", "seg-3"] },
     ],
   };
 }
@@ -56,7 +56,7 @@ assert.match(chart.recursiveCenters[0].title, /递归 L1 中枢 10.00–12.00/);
 assert.equal(chart.signals.length, 3, "enabled recursive signals should be mapped");
 assert.equal(chart.markers.length, 1, "enabled legacy signal markers should be mapped");
 assert.deepEqual(Array.from(chart.signals.map((signal) => signal.label)), ["一买", "二买", "三卖"]);
-assert.match(chart.signals[0].title, /chan-recursive-v4-preview.2/);
+assert.match(chart.signals[0].title, /chan-recursive-v4-preview.4/);
 assert.match(chart.signals[0].title, /等待下级别确认/);
 assert.ok(allLayers.daily.dataSummary.includes("拆股/分红复权"));
 assert.match(allLayers.daily.dataSummary, /基准日 2026-10-15/);
@@ -81,7 +81,7 @@ assert.equal(segmentDetail.level, 0);
 assert.match(segmentDetail.composition, /输入笔/);
 const centerDetail = chart.structures.find((item) => item.type === "递归中枢");
 assert.ok(centerDetail?.area, "selected recursive centers should expose area hover details");
-assert.equal(centerDetail.ruleVersion, "chan-recursive-v4-preview.2");
+assert.equal(centerDetail.ruleVersion, "chan-recursive-v4-preview.4");
 const signalDetail = chart.structures.find((item) => item.type === "一买");
 assert.ok(signalDetail, "recursive signals should expose rule and time details");
 assert.match(signalDetail.composition, /一买 · L1/);
@@ -89,7 +89,7 @@ assert.match(signalDetail.composition, /可观察 2026-10-16/);
 assert.match(signalDetail.composition, /待满足：后续反向线段确认走势端点/);
 assert.match(signalDetail.composition, /失效边界 8.00/);
 assert.match(signalDetail.composition, /关联结构 seg-1/);
-assert.equal(signalDetail.ruleVersion, "chan-recursive-v4-preview.2");
+assert.equal(signalDetail.ruleVersion, "chan-recursive-v4-preview.4");
 
 const levelZeroOnly = window.OptionScopeChan.view(payload, true, false, 30, null, {
   pens: false, penCenters: false, segments: false, segmentLevels: { 0: true }, recursiveCenters: {}, signals: false,

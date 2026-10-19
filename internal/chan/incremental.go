@@ -110,8 +110,8 @@ func (a *IncrementalAnalyzer) Append(input Bar, cutoff time.Time) (Result, error
 			}
 			last.end, last.sourceEnd = mergedBarValue.end, mergedBarValue.sourceEnd
 		} else {
-			if a.mergeDirection == 0 {
-				a.mergeDirection = directionFromPair(last.high, last.low, mergedBarValue.high, mergedBarValue.low)
+			if inferred := directionFromPair(last.high, last.low, mergedBarValue.high, mergedBarValue.low); inferred != 0 {
+				a.mergeDirection = inferred
 			}
 			a.merged = append(a.merged, mergedBarValue)
 		}

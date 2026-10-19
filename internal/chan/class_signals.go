@@ -157,30 +157,45 @@ func class3Signals(frame Frame, levels []LevelAnalysis) []V4Signal {
 			if center.Forming || center.ConfirmedAt == "" {
 				continue
 			}
+			firstAfterCenter := centerOwnerMoveIndex(center) + 1
+			if firstAfterCenter < 0 || firstAfterCenter >= len(level.Segments) {
+				continue
+			}
 			departureIndex := -1
-			for index, segment := range level.Segments {
-				if index <= center.EndSegment || segment.Chain != center.Chain || segment.End <= center.End || segment.ConfirmedAt != "" && segment.ConfirmedAt < center.ConfirmedAt {
+			for index := firstAfterCenter; index < len(level.Segments); index++ {
+				segment := level.Segments[index]
+				if segment.Chain != center.Chain || segment.End <= center.End || segment.ConfirmedAt != "" && segment.ConfirmedAt < center.ConfirmedAt {
 					continue
 				}
-				if segmentMovesAway(segment, &center) {
+				if recursiveSegmentLeavesCenter(segment, &center) {
 					departureIndex = index
 					break
 				}
 			}
 			if departureIndex < 0 {
+				for index := firstAfterCenter; index < len(level.Segments); index++ {
+					segment := level.Segments[index]
+					if segment.Chain != center.Chain || segment.End <= center.End {
+						continue
+					}
+					if !segment.Confirmed && recursiveSegmentLeavesCenter(segment, &center) {
+						result = append(result, class3WaitingSignal(level, center, segment, index, nil, frame.AsOf))
+						break
+					}
+				}
 				continue
 			}
 			departure := level.Segments[departureIndex]
 			if !departure.Confirmed || departure.ConfirmedAt == "" {
-				result = append(result, class3WaitingSignal(level, center, departure, departureIndex, nil, ""))
+				result = append(result, class3WaitingSignal(level, center, departure, departureIndex, nil, frame.AsOf))
 				continue
 			}
 			if departureIndex+1 >= len(level.Segments) {
-				result = append(result, class3WaitingSignal(level, center, departure, departureIndex, nil, ""))
+				result = append(result, class3WaitingSignal(level, center, departure, departureIndex, nil, frame.AsOf))
 				continue
 			}
 			retest := level.Segments[departureIndex+1]
-			if retest.Chain != center.Chain || retest.Direction == departure.Direction || retest.Start < departure.End {
+			if retest.Chain != center.Chain || retest.Direction == departure.Direction || retest.Start != departure.End || retest.StartPrice != departure.EndPrice {
 				continue
 			}
 			buy := departure.Direction == "up" && retest.Direction == "down" && retest.Low > center.Upper
@@ -213,7 +228,7 @@ func class3Signals(frame Frame, levels []LevelAnalysis) []V4Signal {
 				result = append(result, V4Signal{
 					SignalID: classSignalID(level.Level, kind, departure.End, center.CenterID), Level: level.Level, Kind: kind, Side: side,
 					Status: "invalidated", Phase: "invalidated", PhaseAt: at, PhaseHistory: []SignalPhase{{Phase: "invalidated", At: at}}, RuleVersion: RecursivePreviewVersion,
-					Date: departure.End, ObservedAt: at, StructureRefs: []int{departureIndex, departureIndex + 1},
+					Date: retest.End, ObservedAt: at, StructureRefs: []int{departureIndex, departureIndex + 1},
 					StructureIDs: []string{center.CenterID, chanSegmentID(level.Level, departure), chanSegmentID(level.Level, retest)},
 					Conditions:   []string{"已确认中枢闭合", "已确认走势段离开中枢", "首次反方向回试已确认"}, Missing: []string{}, Invalidation: ptr(invalidation), Price: ptr(retest.EndPrice),
 					MarketFilter: "unfiltered", LowerLevelStatus: "unconfirmed", RelatedCenterID: center.CenterID,
@@ -238,7 +253,7 @@ func class3Signals(frame Frame, levels []LevelAnalysis) []V4Signal {
 			} else {
 				conditions = append(conditions, "回试高点严格低于 ZD")
 			}
-			date := departure.End
+			date := retest.End
 			result = append(result, V4Signal{
 				SignalID: classSignalID(level.Level, kind, date, center.CenterID), Level: level.Level, Kind: kind, Side: side,
 				Status: status, Phase: phase, PhaseAt: phaseAt, PhaseHistory: phaseHistory, RuleVersion: RecursivePreviewVersion,
@@ -251,6 +266,17 @@ func class3Signals(frame Frame, levels []LevelAnalysis) []V4Signal {
 		}
 	}
 	return result
+}
+
+// recursiveSegmentLeavesCenter requires a candidate departure to begin from
+// an overlapping swing and finish beyond the center boundary. A later move
+// that starts wholly outside the center is continuation, not a fresh third
+// point departure from this center.
+func recursiveSegmentLeavesCenter(segment Segment, center *RecursiveCenter) bool {
+	if center == nil || !segmentMovesAway(segment, center) {
+		return false
+	}
+	return segment.High >= center.Lower && segment.Low <= center.Upper
 }
 
 func class3WaitingSignal(level LevelAnalysis, center RecursiveCenter, departure Segment, departureIndex int, retest *Segment, asOf string) V4Signal {
@@ -273,6 +299,11 @@ func class3WaitingSignal(level LevelAnalysis, center RecursiveCenter, departure 
 		if !retest.Confirmed && asOf != "" {
 			observedAt = asOf
 		}
+	} else if !departure.Confirmed {
+		// A forming departure has no confirmed exit endpoint yet. Point its
+		// provisional marker at the currently visible boundary and keep the
+		// reason in the missing-condition text.
+		date = departure.End
 	}
 	return V4Signal{
 		SignalID: classSignalID(level.Level, kind, date, center.CenterID), Level: level.Level, Kind: kind, Side: side,

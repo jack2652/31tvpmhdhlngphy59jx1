@@ -104,7 +104,7 @@ func allLevelFractals(frame Frame) []Fractal {
 }
 
 func compareAdjustedAlgorithms(legacy, recursive Result) AlgorithmComparison {
-	return AlgorithmComparison{Method: "同一复权行情分别计算 strict-old-bi-v3 与 chan-recursive-v4-preview.2；列出结构数量和按日期/类型/价格匹配后的代表性差异。差异解释描述规则与结构层级，不评价准确率、收益或胜率。", Daily: compareAlgorithmFrames(legacy.Daily, recursive.Daily), Weekly: compareAlgorithmFrames(legacy.Weekly, recursive.Weekly)}
+	return AlgorithmComparison{Method: "同一复权行情分别计算 strict-old-bi-v3 与 " + RecursivePreviewVersion + "；列出结构数量和按日期/类型/价格匹配后的代表性差异。差异解释描述规则与结构层级，不评价准确率、收益或胜率。", Daily: compareAlgorithmFrames(legacy.Daily, recursive.Daily), Weekly: compareAlgorithmFrames(legacy.Weekly, recursive.Weekly)}
 }
 
 func compareKeys(category string, legacy, recursive []string, explanation string) AlgorithmStructureDifference {

@@ -116,11 +116,12 @@ Gamma 敞口使用 Black-Scholes 根据标的价格、执行价、隐含波动�
 
 ### 缠论递归算法升级预览
 
-新算法的目标规则版本为 `chan-recursive-v4.0.0`，当前 API 标记为 `chan-recursive-v4-preview.2`。`preview` 表示实现仍在升级与验收，不能将其称为正式 v4。旧字段 `strokes` / `centers` 继续使用 `strict-old-bi-v3` 语义；新结构使用 `segments`、`recursive_centers`、`recursive_levels`、`strengths_v4` 和 `signals_v4`，两套字段不应混读。
+新算法的目标规则版本为 `chan-recursive-v4.0.0`，当前 API 标记为 `chan-recursive-v4-preview.9`。`preview` 表示实现仍在升级与验收，不能将其称为正式 v4。旧字段 `strokes` / `centers` 继续使用 `strict-old-bi-v3` 语义；递归结构使用 `segments`、`recursive_centers`、`recursive_levels`、`strengths_v4` 和 `signals_v4`。较宽松的笔级历史观察单独位于 `pen_signals`，不可当作递归买卖点或混入阈值统计。
 
 - `GET /api/chan/{symbol}/adjusted` 使用拆股与分红自动复权的日线历史计算日线、完整周线结构；图表结构与现价需使用响应中的同一复权坐标。历史复权数据缺失或现价换算因子无效时，响应会降级并停止不兼容的现价比较，不静默回退到未复权价格。
 - `GET /api/chan/{symbol}/intraday?period=15m|4h` 只处理已收盘的盘中 bars，并复用 v4 递归结构 schema；这些盘中输入仍在原始价格基准内计算，响应会标出该基准。盘中信号只用于同一原始价格坐标内的结构分析，不直接与复权日线价格比较。`/adjusted` 会按逐日有效复权因子转换 15 分钟历史，再生成 4 小时结构供日线信号进行直接下级确认；因子缺失时对应 bars 不参与确认。
 - 预览结构包括方向性包含处理、严格分型和旧笔、特征序列线段、同级递归中枢与相邻关系、MACD 力度，以及需要中枢背景、价格创新极值和力度减弱条件的候选观察。返回对象带有级别、来源范围、形成／确认状态和时间；数据缺口、异常跳变及结构修订会进入质量或修订信息。
+- `chan-recursive-v4-preview.9` 将分型日期锚定到包含合并组的末根 K 线，同时保留实际极值的原始行情索引；三类位置只从与中枢相交后离开的走势开始判断，标记落在回试端点。结构信号图层在当前窗口无标记时，会区分历史窗口外的信号、尚无绘图位置的候选和全周期无信号。
 - `signals_v4` 目前是候选分析输出，不是收益预测。跨级别信号确认、市场过滤和完整一／二／三类买卖点仍以各结构的状态和缺失条件为准；缺少必要数据时不会把状态默认为通过。
 - 灰度回退方式：停止客户端对 `/adjusted` 与 `/intraday` 的请求，恢复到 `/api/chan/{symbol}` 和旧版 `strokes`／`centers` 消费路径即可；复权行情、结构快照和原始历史不需要重写或删除。
 

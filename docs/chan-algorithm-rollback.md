@@ -1,6 +1,6 @@
 # 缠论算法回退操作
 
-本文说明从 `chan-recursive-v4-preview.2` 回退到兼容 `strict-old-bi-v3` 的应用版本。算法结构和前端资源随 Go 二进制一起发布；回退时更换应用二进制即可恢复旧客户端和旧 API 消费路径，不需要转换、重算或删除原始行情。
+本文说明从 `chan-recursive-v4-preview.4` 回退到兼容 `strict-old-bi-v3` 的应用版本。算法结构和前端资源随 Go 二进制一起发布；回退时更换应用二进制即可恢复旧客户端和旧 API 消费路径，不需要转换、重算或删除原始行情。
 
 ## 发布前准备
 
@@ -36,4 +36,4 @@ ARM64 部署时将文件名中的 `amd64` 改为 `arm64`。如果服务由 syste
 
 ## 恢复 v4
 
-确认回退原因已解决后，停止旧进程，把保留的 v4 二进制放回 `run.sh` 识别的活动文件名并启动。原来的 `.env` 和 SQLite 数据可继续使用；启动后确认 `/api/chan/{symbol}/adjusted` 返回 `chan-recursive-v4-preview.2`，旧 `/api/chan/{symbol}` 仍返回 `strict-old-bi-v3`。
+确认回退原因已解决后，停止旧进程，把保留的 v4 二进制放回 `run.sh` 识别的活动文件名并启动。原来的 `.env` 和 SQLite 数据可继续使用；启动后确认 `/api/chan/{symbol}/adjusted` 返回 `chan-recursive-v4-preview.4`，旧 `/api/chan/{symbol}` 仍返回 `strict-old-bi-v3`。
