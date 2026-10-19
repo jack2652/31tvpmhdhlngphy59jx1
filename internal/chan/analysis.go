@@ -266,13 +266,13 @@ func RecursiveParameters() map[string]any {
 // incomplete terminal intervals are omitted from analysis.
 func AnalyzeIntraday(symbol string, input []Bar, period string, spot *float64, cutoff time.Time) (Result, error) {
 	interval, label := 15*time.Minute, "15分钟"
-	bars, rejected, unfinished, duplicates := completedIntradayBars(input, cutoff, interval)
+	source := prepareIntradaySource(input, cutoff)
+	bars := source.bars
 	var gaps []DataGap
-	quality := DataQuality{InputBars: len(input), AcceptedBars: len(bars), RejectedBars: rejected, IncompleteBars: unfinished, DuplicateBars: duplicates, PriceBasis: "raw", Status: qualityStatus(rejected, unfinished, duplicates)}
+	quality := DataQuality{InputBars: len(input), AcceptedBars: len(bars), RejectedBars: source.rejected, IncompleteBars: source.unfinished, DuplicateBars: source.duplicates, PriceBasis: "raw", Status: qualityStatus(source.rejected, source.unfinished, source.duplicates)}
 	switch period {
 	case "15m":
-		bars, gaps = chainIntradayBars(bars, interval)
-		gaps = mergeGaps(gaps, expectedIntradayGaps(bars, interval, cutoff))
+		gaps = mergeGaps(source.gaps, expectedIntradayGaps(bars, interval, cutoff))
 		quality.AcceptedBars = len(bars)
 		quality.Gaps = gaps
 		if len(gaps) > 0 && quality.Status == "ok" {
@@ -281,11 +281,11 @@ func AnalyzeIntraday(symbol string, input []Bar, period string, spot *float64, c
 	case "4h":
 		interval = intradayPeriodDuration(period)
 		label = intradayPeriodLabel(period)
-		bars, quality, gaps = aggregateFourHourBarsWithQuality(input, cutoff)
+		bars, quality, gaps = aggregateFourHourBarsFromSource(len(input), source.bars, source.rejected, source.unfinished, source.duplicates)
 	case "30m", "60m", "1h", "2h":
 		interval = intradayPeriodDuration(period)
 		label = intradayPeriodLabel(period)
-		bars, quality, gaps = aggregateIntradayBarsWithQuality(input, cutoff, interval)
+		bars, quality, gaps = aggregateIntradayBarsFromSource(len(input), source, interval)
 	default:
 		return Result{}, fmt.Errorf("unsupported intraday period %q", period)
 	}
@@ -303,11 +303,11 @@ func AnalyzeIntraday(symbol string, input []Bar, period string, spot *float64, c
 			"严格旧笔、分型与笔中枢使用与日线相同的结构规则；盘中历史可能较短",
 		}, Warnings: []string{},
 	}
-	if rejected > 0 {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("%d 根日期、时段或 OHLC 无效的盘中 K 线已排除", rejected))
+	if source.rejected > 0 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("%d 根日期、时段或 OHLC 无效的盘中 K 线已排除", source.rejected))
 	}
-	if unfinished > 0 {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("%d 根尚未收盘或所属时段未完整的 K 线已排除", unfinished))
+	if source.unfinished > 0 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("%d 根尚未收盘或所属时段未完整的 K 线已排除", source.unfinished))
 	}
 	if len(bars) == 0 {
 		result.Daily = analyzeFrame(nil, period, label, spot)
@@ -326,7 +326,7 @@ func AnalyzeIntraday(symbol string, input []Bar, period string, spot *float64, c
 	result.Parameters = RecursiveParameters()
 	result.Daily = addRecursiveAnalysis(result.Daily, bars)
 	if relation, ok := timeframeRelationFor(period); ok && relation.lower != "" {
-		lowerBars, lowerQuality, lowerErr := AggregateIntradayBars(input, relation.lower, cutoff)
+		lowerBars, lowerQuality, lowerErr := aggregateIntradayFromSource(len(input), source, relation.lower, cutoff)
 		if lowerErr == nil && len(lowerBars) > 0 {
 			lowerFrame := analyzeFrame(lowerBars, relation.lower, intradayPeriodLabel(relation.lower), spot)
 			lowerFrame.Quality = lowerQuality
@@ -409,28 +409,66 @@ func AggregateIntradayBars(input []Bar, period string, cutoff time.Time) ([]Bar,
 	return bars, quality, nil
 }
 
+type intradaySource struct {
+	bars                 []Bar
+	gaps                 []DataGap
+	rejected, unfinished int
+	duplicates           int
+}
+
+func prepareIntradaySource(input []Bar, cutoff time.Time) intradaySource {
+	bars, rejected, unfinished, duplicates := completedIntradayBars(input, cutoff, 15*time.Minute)
+	bars, gaps := chainIntradayBars(bars, 15*time.Minute)
+	return intradaySource{bars: bars, gaps: gaps, rejected: rejected, unfinished: unfinished, duplicates: duplicates}
+}
+
+func aggregateIntradayFromSource(inputCount int, source intradaySource, period string, cutoff time.Time) ([]Bar, DataQuality, error) {
+	interval := intradayPeriodDuration(period)
+	if interval == 0 {
+		return nil, DataQuality{InputBars: inputCount, PriceBasis: "raw", Status: "unsupported_period"}, fmt.Errorf("unsupported intraday period %q", period)
+	}
+	if period == "15m" {
+		gaps := mergeGaps(source.gaps, expectedIntradayGaps(source.bars, interval, cutoff))
+		quality := DataQuality{InputBars: inputCount, AcceptedBars: len(source.bars), RejectedBars: source.rejected, IncompleteBars: source.unfinished, DuplicateBars: source.duplicates, SourceInputBars: inputCount, SourceAcceptedBars: len(source.bars), SourceRejectedBars: source.rejected, SourceIncompleteBars: source.unfinished, SourceDuplicateBars: source.duplicates, PriceBasis: "raw", Status: qualityStatus(source.rejected, source.unfinished, source.duplicates), Gaps: gaps}
+		if len(gaps) > 0 && quality.Status == "ok" {
+			quality.Status = "partial"
+		}
+		return source.bars, quality, nil
+	}
+	if period == "4h" {
+		bars, quality, _ := aggregateFourHourBarsFromSource(inputCount, source.bars, source.rejected, source.unfinished, source.duplicates)
+		return bars, quality, nil
+	}
+	bars, quality, _ := aggregateIntradayBarsFromSource(inputCount, source, interval)
+	return bars, quality, nil
+}
+
 // aggregateIntradayBarsWithQuality groups complete intervals aligned to the
 // regular-session open.
 func aggregateIntradayBarsWithQuality(input []Bar, cutoff time.Time, interval time.Duration) ([]Bar, DataQuality, []DataGap) {
 	if interval <= 15*time.Minute || interval%(15*time.Minute) != 0 {
 		return nil, DataQuality{InputBars: len(input), PriceBasis: "raw", Status: "invalid_interval"}, nil
 	}
-	source, rejected, unfinished, duplicates := completedIntradayBars(input, cutoff, 15*time.Minute)
-	source, sourceGaps := chainIntradayBars(source, 15*time.Minute)
+	source := prepareIntradaySource(input, cutoff)
+	return aggregateIntradayBarsFromSource(len(input), source, interval)
+}
+
+func aggregateIntradayBarsFromSource(inputCount int, source intradaySource, interval time.Duration) ([]Bar, DataQuality, []DataGap) {
+	if interval <= 15*time.Minute || interval%(15*time.Minute) != 0 {
+		return nil, DataQuality{InputBars: inputCount, PriceBasis: "raw", Status: "invalid_interval"}, nil
+	}
 	groupSize := int(interval / (15 * time.Minute))
 	location := newYorkLocation()
 	byDay := make(map[string]map[int]Bar)
-	for _, bar := range source {
-		stamp, err := time.ParseInLocation("2006-01-02 15:04", bar.Date, location)
-		if err != nil {
+	for _, bar := range source.bars {
+		day, minute, ok := intradayDateMinute(bar.Date)
+		if !ok {
 			continue
 		}
-		open := time.Date(stamp.Year(), stamp.Month(), stamp.Day(), 9, 30, 0, 0, location)
-		index := int(stamp.Sub(open) / (15 * time.Minute))
+		index := (minute - (9*60 + 30)) / 15
 		if index < 0 || index >= 26 {
 			continue
 		}
-		day := stamp.Format(time.DateOnly)
 		if byDay[day] == nil {
 			byDay[day] = map[int]Bar{}
 		}
@@ -471,12 +509,12 @@ func aggregateIntradayBarsWithQuality(input []Bar, cutoff time.Time, interval ti
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Date < result[j].Date })
-	result = chainAggregatedIntradayBars(result, source, interval, groupSize)
-	gaps := append([]DataGap{}, sourceGaps...)
-	aggregateGaps, expectedCount := expectedAggregatedIntradayGaps(source, result, groupSize, interval)
+	result = chainAggregatedIntradayBars(result, source.bars, interval, groupSize)
+	gaps := append([]DataGap{}, source.gaps...)
+	aggregateGaps, expectedCount := expectedAggregatedIntradayGaps(source.bars, result, groupSize, interval)
 	gaps = mergeGaps(gaps, aggregateGaps)
-	incomplete := maxInt(unfinished, expectedCount-len(result))
-	quality := DataQuality{InputBars: expectedCount, AcceptedBars: len(result), RejectedBars: rejected, IncompleteBars: incomplete, DuplicateBars: duplicates, SourceInputBars: len(input), SourceAcceptedBars: len(source), SourceRejectedBars: rejected, SourceIncompleteBars: unfinished, SourceDuplicateBars: duplicates, PriceBasis: "raw", Status: qualityStatus(rejected, incomplete, duplicates), Gaps: gaps}
+	incomplete := maxInt(source.unfinished, expectedCount-len(result))
+	quality := DataQuality{InputBars: expectedCount, AcceptedBars: len(result), RejectedBars: source.rejected, IncompleteBars: incomplete, DuplicateBars: source.duplicates, SourceInputBars: inputCount, SourceAcceptedBars: len(source.bars), SourceRejectedBars: source.rejected, SourceIncompleteBars: source.unfinished, SourceDuplicateBars: source.duplicates, PriceBasis: "raw", Status: qualityStatus(source.rejected, incomplete, source.duplicates), Gaps: gaps}
 	if len(gaps) > 0 && quality.Status == "ok" {
 		quality.Status = "partial"
 	}
@@ -609,20 +647,59 @@ func completeIntradayGroups(source map[int]bool, day time.Time, groupSize int) b
 
 func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration) ([]Bar, int, int, int) {
 	location := newYorkLocation()
-	byTime := make(map[string]Bar, len(input))
-	duplicateTimes := map[string]int{}
+	sortedInput := true
+	for index := 1; index < len(input); index++ {
+		if input[index].Date < input[index-1].Date {
+			sortedInput = false
+			break
+		}
+	}
+	var byTime map[string]Bar
+	var duplicateTimes map[string]int
+	var orderedBars []Bar
+	if sortedInput {
+		orderedBars = make([]Bar, 0, len(input))
+	} else {
+		byTime = make(map[string]Bar, len(input))
+		duplicateTimes = make(map[string]int)
+	}
+	duplicateDate := ""
+	type sessionInfo struct {
+		valid       bool
+		closeMinute int
+	}
+	sessions := make(map[string]sessionInfo)
 	rejected, unfinished, duplicates := 0, 0, 0
 	previousTime := ""
+	cutoffLocal := cutoff.In(location)
+	cutoffDate := cutoffLocal.Format(time.DateOnly)
+	cutoffMinute := cutoffLocal.Hour()*60 + cutoffLocal.Minute()
+	intervalMinutes := int(interval / time.Minute)
 	for _, bar := range input {
-		stamp, err := time.ParseInLocation("2006-01-02 15:04", bar.Date, location)
-		if err != nil || !marketcalendar.IsTradingDay(stamp) || stamp.Hour() < 9 || stamp.Hour() > 15 ||
-			stamp.Hour() == 9 && stamp.Minute() < 30 || stamp.Hour() == 15 && stamp.Minute() > 45 || stamp.Minute()%15 != 0 ||
+		day, minute, validStamp := intradayDateMinute(bar.Date)
+		if !validStamp {
+			rejected++
+			continue
+		}
+		session, checked := sessions[day]
+		if !checked {
+			dayDate, err := time.ParseInLocation(time.DateOnly, day, location)
+			if err == nil && dayDate.Format(time.DateOnly) == day && marketcalendar.IsTradingDay(dayDate) {
+				session = sessionInfo{valid: true, closeMinute: marketcalendar.RegularCloseMinute(dayDate)}
+			}
+			sessions[day] = session
+		}
+		hour := minute / 60
+		minuteOfHour := minute % 60
+		if !session.valid || hour < 9 || hour > 15 ||
+			hour == 9 && minuteOfHour < 30 || hour == 15 && minuteOfHour > 45 || minuteOfHour%15 != 0 ||
 			!finitePositive(bar.Open) || !finitePositive(bar.High) || !finitePositive(bar.Low) || !finitePositive(bar.Close) ||
 			bar.High < math.Max(bar.Open, bar.Close) || bar.Low > math.Min(bar.Open, bar.Close) || bar.High < bar.Low {
 			rejected++
 			continue
 		}
-		if stamp.Hour()*60+stamp.Minute()+int(interval.Minutes()) > marketcalendar.RegularCloseMinute(stamp) {
+		endMinute := minute + intervalMinutes
+		if endMinute > session.closeMinute {
 			rejected++
 			continue
 		}
@@ -632,7 +709,7 @@ func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration
 			continue
 		}
 		previousTime = bar.Date
-		if cutoff.Before(stamp.Add(interval)) {
+		if day > cutoffDate || day == cutoffDate && endMinute > cutoffMinute {
 			unfinished++
 			continue
 		}
@@ -640,8 +717,22 @@ func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration
 			rejected++
 			continue
 		}
-		if count, exists := duplicateTimes[bar.Date]; exists {
-			duplicateTimes[bar.Date] = count + 1
+		if sortedInput {
+			if duplicateDate == bar.Date {
+				duplicates++
+				continue
+			}
+			if len(orderedBars) > 0 && orderedBars[len(orderedBars)-1].Date == bar.Date {
+				orderedBars = orderedBars[:len(orderedBars)-1]
+				duplicateDate = bar.Date
+				duplicates += 2
+				continue
+			}
+			orderedBars = append(orderedBars, bar)
+			continue
+		}
+		if _, exists := duplicateTimes[bar.Date]; exists {
+			duplicateTimes[bar.Date]++
 			duplicates++
 			continue
 		}
@@ -653,12 +744,38 @@ func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration
 		}
 		byTime[bar.Date] = bar
 	}
+	if sortedInput {
+		return orderedBars, rejected, unfinished, duplicates
+	}
 	bars := make([]Bar, 0, len(byTime))
 	for _, bar := range byTime {
 		bars = append(bars, bar)
 	}
 	sort.Slice(bars, func(i, j int) bool { return bars[i].Date < bars[j].Date })
 	return bars, rejected, unfinished, duplicates
+}
+
+// intradayDateMinute parses the fixed provider timestamp without allocating a
+// time.Time for every bar. The date is validated once per distinct session by
+// completedIntradayBars; fixed-width date and time fields sort lexically.
+func intradayDateMinute(value string) (day string, minute int, ok bool) {
+	if len(value) != len("2006-01-02 15:04") || value[4] != '-' || value[7] != '-' || value[10] != ' ' || value[13] != ':' {
+		return "", 0, false
+	}
+	for index := range value {
+		if index == 4 || index == 7 || index == 10 || index == 13 {
+			continue
+		}
+		if value[index] < '0' || value[index] > '9' {
+			return "", 0, false
+		}
+	}
+	hour := int(value[11]-'0')*10 + int(value[12]-'0')
+	minuteOfHour := int(value[14]-'0')*10 + int(value[15]-'0')
+	if hour > 23 || minuteOfHour > 59 {
+		return "", 0, false
+	}
+	return value[:10], hour*60 + minuteOfHour, true
 }
 
 func aggregateFourHourBars(input []Bar, cutoff time.Time) ([]Bar, int, int, int) {
@@ -668,67 +785,63 @@ func aggregateFourHourBars(input []Bar, cutoff time.Time) ([]Bar, int, int, int)
 
 func aggregateFourHourBarsWithQuality(input []Bar, cutoff time.Time) ([]Bar, DataQuality, []DataGap) {
 	const fifteenMinutes = 15 * time.Minute
-	sourceBars, rejected, unfinished, duplicates := completedIntradayBars(input, cutoff, fifteenMinutes)
-	sourceBars, _ = chainIntradayBars(sourceBars, fifteenMinutes)
+	source := prepareIntradaySource(input, cutoff)
+	return aggregateFourHourBarsFromSource(len(input), source.bars, source.rejected, source.unfinished, source.duplicates)
+}
+
+func aggregateFourHourBarsFromSource(inputCount int, sourceBars []Bar, rejected, unfinished, duplicates int) ([]Bar, DataQuality, []DataGap) {
+	const blockBars = 16
 	location := newYorkLocation()
-	sessions := make(map[string]map[int]Bar)
-	for _, bar := range sourceBars {
-		stamp, _ := time.ParseInLocation("2006-01-02 15:04", bar.Date, location)
-		open := time.Date(stamp.Year(), stamp.Month(), stamp.Day(), 9, 30, 0, 0, location)
-		index := int(stamp.Sub(open) / fifteenMinutes)
-		if index < 0 || index >= 26 {
+	result := make([]Bar, 0, len(sourceBars)/26)
+	for start := 0; start < len(sourceBars); {
+		day, _, ok := intradayDateMinute(sourceBars[start].Date)
+		if !ok {
+			start++
 			continue
 		}
-		day := stamp.Format(time.DateOnly)
-		if sessions[day] == nil {
-			sessions[day] = make(map[int]Bar)
+		end := start + 1
+		for end < len(sourceBars) && len(sourceBars[end].Date) >= 10 && sourceBars[end].Date[:10] == day {
+			end++
 		}
-		sessions[day][index] = bar
-	}
-	result := make([]Bar, 0, len(sessions))
-	for day, session := range sessions {
 		dayStart, err := time.ParseInLocation(time.DateOnly, day, location)
 		if err != nil {
+			start = end
 			continue
 		}
-		block := struct{ start, count int }{0, 16}
-		closeMinute := marketcalendar.RegularCloseMinute(dayStart)
-		blockEndMinute := 9*60 + 30 + (block.start+block.count)*15
-		if blockEndMinute <= closeMinute {
+		slots := int(time.Duration(marketcalendar.RegularCloseMinute(dayStart)-9*60-30) * time.Minute / (15 * time.Minute))
+		if blockBars <= slots && end-start >= blockBars {
+			combined := sourceBars[start]
 			complete := true
-			var combined Bar
-			for offset := 0; offset < block.count; offset++ {
-				bar, found := session[block.start+offset]
-				if !found {
+			for offset := 0; offset < blockBars; offset++ {
+				bar := sourceBars[start+offset]
+				_, minute, valid := intradayDateMinute(bar.Date)
+				if !valid || minute != 9*60+30+offset*15 {
 					complete = false
 					break
 				}
 				if offset == 0 {
-					combined = bar
 					continue
 				}
 				combined.High = math.Max(combined.High, bar.High)
 				combined.Low = math.Min(combined.Low, bar.Low)
 				combined.Close, combined.Volume = bar.Close, combined.Volume+bar.Volume
 			}
-			if !complete {
-				continue
+			if complete {
+				startAt := time.Date(dayStart.Year(), dayStart.Month(), dayStart.Day(), 9, 30, 0, 0, location)
+				combined.Date = day + " 09:30"
+				combined.CapturedAt = startAt.Add(blockBars * 15 * time.Minute)
+				result = append(result, combined)
 			}
-			combined.Chain = session[block.start].Chain
-			start := dayStart.Add(9*time.Hour + 30*time.Minute + time.Duration(block.start)*fifteenMinutes)
-			combined.Date = start.Format("2006-01-02 15:04")
-			combined.CapturedAt = start.Add(time.Duration(block.count) * fifteenMinutes)
-			result = append(result, combined)
 		}
+		start = end
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Date < result[j].Date })
 	blocks := expectedFourHourBlocks(sourceBars)
 	result = chainFourHourBars(result, blocks)
 	missingBlocks := maxInt(0, len(blocks)-len(result))
 	status := qualityStatus(rejected, missingBlocks+boolInt(unfinished > 0), duplicates)
 	quality := DataQuality{
 		InputBars: len(blocks), AcceptedBars: len(result), IncompleteBars: missingBlocks,
-		SourceInputBars: len(input), SourceAcceptedBars: len(sourceBars), SourceRejectedBars: rejected,
+		SourceInputBars: inputCount, SourceAcceptedBars: len(sourceBars), SourceRejectedBars: rejected,
 		SourceIncompleteBars: unfinished, SourceDuplicateBars: duplicates,
 		PriceBasis: "raw", Status: status,
 	}
@@ -1428,7 +1541,7 @@ func weeklyGapsFromBars(weekly []Bar) []DataGap {
 }
 
 func mergeBars(bars []Bar) []mergedBar {
-	merged := []mergedBar{}
+	merged := make([]mergedBar, 0, len(bars))
 	for i, bar := range bars {
 		sourceIndex := sourceIndexFor(bars, i)
 		next := mergedBar{high: bar.High, low: bar.Low, highIndex: i, lowIndex: i, start: i, end: i, sourceHigh: sourceIndex, sourceLow: sourceIndex, sourceStart: sourceIndex, sourceEnd: sourceIndex, chain: bar.Chain}

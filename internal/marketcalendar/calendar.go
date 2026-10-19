@@ -9,6 +9,25 @@ import (
 var (
 	newYorkOnce sync.Once
 	newYork     *time.Location
+	calendarMu  sync.RWMutex
+	calendars   = make(map[int]*yearCalendar)
+)
+
+const cachedCalendarYears = 64
+
+// yearCalendar stores the exchange state for each day of a year. History
+// validation asks the same calendar questions thousands of times for bars in
+// the same year, while the holiday rules themselves require several date
+// calculations and formatted-string checks. A compact immutable table keeps
+// those rules out of the per-bar hot path.
+type yearCalendar struct {
+	days [367]uint8
+}
+
+const (
+	calendarClosed uint8 = iota
+	calendarRegular
+	calendarEarlyClose
 )
 
 func location() *time.Location {
@@ -28,10 +47,7 @@ func localDate(value time.Time) time.Time {
 
 func IsTradingDay(value time.Time) bool {
 	day := localDate(value)
-	if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
-		return false
-	}
-	return !isHoliday(day)
+	return calendarDay(day) != calendarClosed
 }
 
 func IsRegularSession(value time.Time) bool {
@@ -47,11 +63,14 @@ func IsRegularSession(value time.Time) bool {
 // midnight Eastern. A few early closes before 1993 ended at 14:00.
 func RegularCloseMinute(value time.Time) int {
 	day := localDate(value)
-	switch day.Format(time.DateOnly) {
-	case "1990-12-24", "1991-12-24", "1992-11-27", "1992-12-24":
+	switch {
+	case day.Year() == 1990 && day.Month() == time.December && day.Day() == 24,
+		day.Year() == 1991 && day.Month() == time.December && day.Day() == 24,
+		day.Year() == 1992 && day.Month() == time.November && day.Day() == 27,
+		day.Year() == 1992 && day.Month() == time.December && day.Day() == 24:
 		return 14 * 60
 	}
-	if IsEarlyClose(day) {
+	if calendarDay(day) == calendarEarlyClose {
 		return 13 * 60
 	}
 	return 16 * 60
@@ -67,10 +86,51 @@ func IsOvernightSession(value time.Time) bool {
 }
 
 func IsEarlyClose(value time.Time) bool {
-	day := localDate(value)
-	if !IsTradingDay(day) {
-		return false
+	return calendarDay(localDate(value)) == calendarEarlyClose
+}
+
+func calendarDay(day time.Time) uint8 {
+	year, dayOfYear := day.Year(), day.YearDay()
+	calendarMu.RLock()
+	calendar := calendars[year]
+	calendarMu.RUnlock()
+	if calendar != nil {
+		return calendar.days[dayOfYear]
 	}
+	built := buildYearCalendar(year)
+	calendarMu.Lock()
+	if existing := calendars[year]; existing != nil {
+		built = existing
+	} else {
+		if len(calendars) >= cachedCalendarYears {
+			for cachedYear := range calendars {
+				delete(calendars, cachedYear)
+				break
+			}
+		}
+		calendars[year] = built
+	}
+	calendarMu.Unlock()
+	return built.days[dayOfYear]
+}
+
+func buildYearCalendar(year int) *yearCalendar {
+	calendar := &yearCalendar{}
+	day := time.Date(year, time.January, 1, 0, 0, 0, 0, location())
+	for day.Year() == year {
+		state := calendarRegular
+		if day.Weekday() == time.Saturday || day.Weekday() == time.Sunday || isHoliday(day) {
+			state = calendarClosed
+		} else if earlyCloseRules(day) {
+			state = calendarEarlyClose
+		}
+		calendar.days[day.YearDay()] = state
+		day = day.AddDate(0, 0, 1)
+	}
+	return calendar
+}
+
+func earlyCloseRules(day time.Time) bool {
 	year := day.Year()
 	thanksgiving := nthWeekday(year, time.November, time.Thursday, 4)
 	christmasEve := time.Date(year, time.December, 24, 0, 0, 0, 0, location())

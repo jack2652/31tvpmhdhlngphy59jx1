@@ -47,14 +47,16 @@ type cachedChain struct {
 }
 
 type intradayCacheEntry struct {
-	frame     []map[string]any
-	fetchedAt time.Time
+	frame      []map[string]any
+	fetchedAt  time.Time
+	lastAccess time.Time
 }
 
 type chanAdjustedHistoryCacheEntry struct {
-	bars      []map[string]any
-	fetchedAt time.Time
-	source    string
+	bars       []map[string]any
+	fetchedAt  time.Time
+	source     string
+	lastAccess time.Time
 }
 
 type cachedValuationRegime struct {
@@ -244,6 +246,9 @@ func New(cfg config.Config) (*Service, error) {
 	if cfg.LowMemory && marketProvider.Delayed != nil {
 		marketProvider.Delayed.CacheLimit = 1
 	}
+	if history, ok := marketProvider.HistoryClient.(*provider.YFinanceHistoryClient); ok {
+		history.IntradayCacheLimit = boundedIntradayCacheEntries(cfg.LowMemory)
+	}
 	repository, err := store.OpenWithOptions(cfg.DatabasePath, cfg.LowMemory)
 	if err != nil {
 		return nil, err
@@ -327,6 +332,43 @@ func (s *Service) Close() error {
 		providerErr = closer.Close()
 	}
 	return errors.Join(providerErr, s.store.Close())
+}
+
+func boundedIntradayCacheEntries(lowMemory bool) int {
+	if lowMemory {
+		return 1
+	}
+	return 2
+}
+
+func boundedAdjustedHistoryCacheEntries(lowMemory bool) int {
+	if lowMemory {
+		return 1
+	}
+	return 3
+}
+
+func evictOldestHistoryCacheEntry[T any](cache map[string]T, keyToKeep string, limit int, lastAccess func(T) time.Time) {
+	if limit < 1 {
+		limit = 1
+	}
+	for len(cache) > limit {
+		oldestKey := ""
+		oldestAt := time.Time{}
+		for key, value := range cache {
+			if key == keyToKeep {
+				continue
+			}
+			at := lastAccess(value)
+			if oldestKey == "" || at.Before(oldestAt) {
+				oldestKey, oldestAt = key, at
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(cache, oldestKey)
+	}
 }
 
 func (s *Service) Router() *gin.Engine {

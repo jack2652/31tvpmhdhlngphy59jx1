@@ -16,13 +16,14 @@ import (
 // representation. It uses the Yahoo ticker factory shared by the other SDK
 // adapters so proxy, timeout, and authentication settings stay consistent.
 type YFinanceHistoryClient struct {
-	Gate          chan struct{}
-	GateWait      time.Duration
-	TickerFactory yahooTickerFactory
-	TimeNow       func() time.Time
-	Location      *time.Location
-	intradayMu    sync.Mutex
-	intradayCache map[string]intradayHistoryCacheEntry
+	Gate               chan struct{}
+	GateWait           time.Duration
+	IntradayCacheLimit int
+	TickerFactory      yahooTickerFactory
+	TimeNow            func() time.Time
+	Location           *time.Location
+	intradayMu         sync.Mutex
+	intradayCache      map[string]intradayHistoryCacheEntry
 }
 
 type intradayHistoryCacheEntry struct {
@@ -37,7 +38,7 @@ func NewYFinanceHistoryClient(gate chan struct{}, gateWait time.Duration, ticker
 	}
 	return &YFinanceHistoryClient{
 		Gate: gate, GateWait: gateWait, TickerFactory: tickerFactory,
-		TimeNow: time.Now, Location: location,
+		TimeNow: time.Now, Location: location, IntradayCacheLimit: 4,
 	}
 }
 
@@ -191,6 +192,25 @@ func (c *YFinanceHistoryClient) FetchIntraday(ctx context.Context, rawSymbol, in
 	c.intradayMu.Lock()
 	if c.intradayCache == nil {
 		c.intradayCache = make(map[string]intradayHistoryCacheEntry)
+	}
+	limit := c.IntradayCacheLimit
+	if limit < 1 {
+		limit = 4
+	}
+	if _, exists := c.intradayCache[cacheKey]; !exists {
+		for len(c.intradayCache) >= limit {
+			oldestKey := ""
+			oldestAt := time.Time{}
+			for key, entry := range c.intradayCache {
+				if oldestKey == "" || entry.fetchedAt.Before(oldestAt) {
+					oldestKey, oldestAt = key, entry.fetchedAt
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(c.intradayCache, oldestKey)
+		}
 	}
 	c.intradayCache[cacheKey] = intradayHistoryCacheEntry{result: result, fetchedAt: now}
 	c.intradayMu.Unlock()

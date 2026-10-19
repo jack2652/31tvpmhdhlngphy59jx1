@@ -79,11 +79,9 @@ func meanTail(values []float64, count int) float64 {
 // before the signal observation date. It does not look ahead to a later bar.
 func MarketEnvironmentAt(series []MarketEnvironment, date string) MarketEnvironment {
 	result := MarketEnvironment{Date: date, Status: "unfiltered", Regime: "unfiltered", RuleVersion: MarketEnvironmentRuleVersion, Benchmark: "^GSPC", Reason: "截至观察日期没有可用的 S&P 500 复权数据"}
-	for _, entry := range series {
-		if entry.Date > date {
-			break
-		}
-		result = entry
+	index := sort.Search(len(series), func(index int) bool { return series[index].Date > date })
+	if index > 0 {
+		result = series[index-1]
 	}
 	return result
 }

@@ -138,7 +138,7 @@ func NewCboeOptionsClient(client *http.Client, endpoint string) *CboeOptionsClie
 	if strings.TrimSpace(endpoint) == "" {
 		endpoint = defaultCboeOptionsURL
 	}
-	return &CboeOptionsClient{Client: client, Endpoint: endpoint, CacheTTL: defaultCboeCacheTTL, cache: make(map[string]cboeCacheEntry), inFlight: make(map[string]*cboeFlight), clockNow: time.Now}
+	return &CboeOptionsClient{Client: client, Endpoint: endpoint, CacheTTL: defaultCboeCacheTTL, CacheLimit: 16, cache: make(map[string]cboeCacheEntry), inFlight: make(map[string]*cboeFlight), clockNow: time.Now}
 }
 
 func (c *CboeOptionsClient) fetch(ctx context.Context, rawSymbol string) (string, CboeOptionsPayloadDTO, error) {

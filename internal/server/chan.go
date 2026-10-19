@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -76,6 +77,8 @@ func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, stri
 	s.intradayMu.Lock()
 	memoryCached, memoryFound := s.intradayHistoryCache[symbol]
 	if memoryFound && time.Since(memoryCached.fetchedAt) < 3*time.Minute {
+		memoryCached.lastAccess = time.Now()
+		s.intradayHistoryCache[symbol] = memoryCached
 		s.intradayMu.Unlock()
 		return memoryCached, "memory", "", false
 	}
@@ -87,7 +90,7 @@ func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, stri
 			if bars, _ := cached["bars"].([]map[string]any); len(bars) > 0 {
 				fetchedAt, _ := historyTimestamp(cached["fetched_at"])
 				if len(persisted.frame) == 0 || !fetchedAt.Before(persisted.fetchedAt) {
-					persisted = intradayCacheEntry{frame: bars, fetchedAt: fetchedAt}
+					persisted = intradayCacheEntry{frame: bars, fetchedAt: fetchedAt, lastAccess: time.Now()}
 					persistedSource = "sqlite"
 				}
 				if !persisted.fetchedAt.IsZero() && time.Since(persisted.fetchedAt) < 3*time.Minute {
@@ -95,7 +98,9 @@ func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, stri
 					if s.intradayHistoryCache == nil {
 						s.intradayHistoryCache = make(map[string]intradayCacheEntry)
 					}
+					persisted.lastAccess = time.Now()
 					s.intradayHistoryCache[symbol] = persisted
+					evictOldestHistoryCacheEntry(s.intradayHistoryCache, symbol, boundedIntradayCacheEntries(s.cfg.LowMemory), func(entry intradayCacheEntry) time.Time { return entry.lastAccess })
 					s.intradayMu.Unlock()
 					return persisted, persistedSource, "", false
 				}
@@ -182,7 +187,7 @@ func (s *Service) scheduleIntradayRefresh(symbol string) bool {
 			s.intradayMu.Unlock()
 			return
 		}
-		entry := intradayCacheEntry{frame: result.Bars, fetchedAt: result.FetchedAt}
+		entry := intradayCacheEntry{frame: result.Bars, fetchedAt: result.FetchedAt, lastAccess: time.Now()}
 		if entry.fetchedAt.IsZero() {
 			entry.fetchedAt = time.Now().UTC()
 		}
@@ -197,6 +202,7 @@ func (s *Service) scheduleIntradayRefresh(symbol string) bool {
 		}
 		if len(entry.frame) > 0 {
 			s.intradayHistoryCache[symbol] = entry
+			evictOldestHistoryCacheEntry(s.intradayHistoryCache, symbol, boundedIntradayCacheEntries(s.cfg.LowMemory), func(entry intradayCacheEntry) time.Time { return entry.lastAccess })
 		}
 		delete(s.intradayRefreshAfter, symbol)
 		s.intradayMu.Unlock()
@@ -209,11 +215,11 @@ func intradayBars(entry intradayCacheEntry) []chananalysis.Bar {
 	for _, raw := range entry.frame {
 		bar := chananalysis.Bar{}
 		bar.Date, _ = raw["date"].(string)
-		for field, target := range map[string]*float64{"open": &bar.Open, "high": &bar.High, "low": &bar.Low, "close": &bar.Close, "volume": &bar.Volume} {
-			if value := numberValue(raw[field]); value != nil {
-				*target = *value
-			}
-		}
+		bar.Open, _ = historyMapNumber(raw, "open")
+		bar.High, _ = historyMapNumber(raw, "high")
+		bar.Low, _ = historyMapNumber(raw, "low")
+		bar.Close, _ = historyMapNumber(raw, "close")
+		bar.Volume, _ = historyMapNumber(raw, "volume")
 		bars = append(bars, bar)
 	}
 	return bars
@@ -247,11 +253,16 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	for _, raw := range entry.bars {
 		bar := chananalysis.Bar{}
 		bar.Date, _ = raw["date"].(string)
-		for field, target := range map[string]*float64{"open": &bar.Open, "high": &bar.High, "low": &bar.Low, "close": &bar.Close, "volume": &bar.Volume, "adjustment_factor": &bar.AdjustmentFactor, "raw_open": &bar.RawOpen, "raw_high": &bar.RawHigh, "raw_low": &bar.RawLow, "raw_close": &bar.RawClose} {
-			if value := numberValue(raw[field]); value != nil {
-				*target = *value
-			}
-		}
+		bar.Open, _ = historyMapNumber(raw, "open")
+		bar.High, _ = historyMapNumber(raw, "high")
+		bar.Low, _ = historyMapNumber(raw, "low")
+		bar.Close, _ = historyMapNumber(raw, "close")
+		bar.Volume, _ = historyMapNumber(raw, "volume")
+		bar.AdjustmentFactor, _ = historyMapNumber(raw, "adjustment_factor")
+		bar.RawOpen, _ = historyMapNumber(raw, "raw_open")
+		bar.RawHigh, _ = historyMapNumber(raw, "raw_high")
+		bar.RawLow, _ = historyMapNumber(raw, "raw_low")
+		bar.RawClose, _ = historyMapNumber(raw, "raw_close")
 		bars = append(bars, bar)
 	}
 	var adjustedSpot *float64
@@ -361,12 +372,15 @@ func validAdjustedIntradayBasis(bar chananalysis.Bar) bool {
 	if !finitePositive(bar.AdjustmentFactor) {
 		return false
 	}
-	for _, pair := range [][2]float64{{bar.Open, bar.RawOpen}, {bar.High, bar.RawHigh}, {bar.Low, bar.RawLow}, {bar.Close, bar.RawClose}} {
-		if !finitePositive(pair[0]) || !finitePositive(pair[1]) || math.Abs(pair[0]-pair[1]*bar.AdjustmentFactor) > 1e-6*math.Max(1, pair[0]) {
-			return false
-		}
-	}
-	return true
+	factor := bar.AdjustmentFactor
+	return adjustedPairMatches(bar.Open, bar.RawOpen, factor) &&
+		adjustedPairMatches(bar.High, bar.RawHigh, factor) &&
+		adjustedPairMatches(bar.Low, bar.RawLow, factor) &&
+		adjustedPairMatches(bar.Close, bar.RawClose, factor)
+}
+
+func adjustedPairMatches(adjusted, raw, factor float64) bool {
+	return finitePositive(adjusted) && finitePositive(raw) && math.Abs(adjusted-raw*factor) <= 1e-6*math.Max(1, adjusted)
 }
 
 func adjustedAnalysisBars(rows []map[string]any, cutoff time.Time) []chananalysis.Bar {
@@ -385,13 +399,78 @@ func adjustedAnalysisBars(rows []map[string]any, cutoff time.Time) []chananalysi
 		if day.Year() == localCutoff.Year() && day.YearDay() == localCutoff.YearDay() && localCutoff.Hour()*60+localCutoff.Minute() < marketcalendar.RegularCloseMinute(day) {
 			continue
 		}
-		close := numberValue(row["close"])
-		if close == nil {
+		close, ok := historyMapNumber(row, "close")
+		if !ok {
 			continue
 		}
-		bars = append(bars, chananalysis.Bar{Date: date, Close: *close})
+		bars = append(bars, chananalysis.Bar{Date: date, Close: close})
 	}
 	return bars
+}
+
+// historyMapNumber reads the scalar values used by history adapters without
+// allocating a temporary *float64 for every OHLC field.
+func historyMapNumber(row map[string]any, field string) (float64, bool) {
+	value, found := row[field]
+	if !found || value == nil {
+		return 0, false
+	}
+	var number float64
+	switch value := value.(type) {
+	case bool:
+		if value {
+			number = 1
+		}
+	case float64:
+		number = value
+	case float32:
+		number = float64(value)
+	case int:
+		number = float64(value)
+	case int8:
+		number = float64(value)
+	case int16:
+		number = float64(value)
+	case int32:
+		number = float64(value)
+	case int64:
+		number = float64(value)
+	case uint:
+		number = float64(value)
+	case uint8:
+		number = float64(value)
+	case uint16:
+		number = float64(value)
+	case uint32:
+		number = float64(value)
+	case uint64:
+		number = float64(value)
+	case *float64:
+		if value == nil {
+			return 0, false
+		}
+		number = *value
+	case *int64:
+		if value == nil {
+			return 0, false
+		}
+		number = float64(*value)
+	case json.Number:
+		parsed, err := value.Float64()
+		if err != nil {
+			return 0, false
+		}
+		number = parsed
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil {
+			return 0, false
+		}
+		number = parsed
+	default:
+		return 0, false
+	}
+	return number, !math.IsNaN(number) && !math.IsInf(number, 0)
 }
 
 func latestMarketEnvironment(series []chananalysis.MarketEnvironment, asOf string) chananalysis.MarketEnvironment {
@@ -454,16 +533,27 @@ type chanSnapshotBar struct {
 
 func chanStructureSnapshot(symbol, timeframe, ruleVersion string, bars []chananalysis.Bar, frame chananalysis.Frame) store.ChanStructureSnapshot {
 	barFingerprints := make(map[string]string, len(bars))
-	ordered := make([]chanSnapshotBar, 0, len(bars))
-	for _, bar := range bars {
+	inputHasher := sha256.New()
+	_, _ = inputHasher.Write([]byte{'['})
+	var encodedBar bytes.Buffer
+	encoder := json.NewEncoder(&encodedBar)
+	for index, bar := range bars {
 		value := chanSnapshotBar{Date: bar.Date, Open: bar.Open, High: bar.High, Low: bar.Low, Close: bar.Close, Volume: bar.Volume, RawOpen: bar.RawOpen, RawHigh: bar.RawHigh, RawLow: bar.RawLow, RawClose: bar.RawClose, AdjustmentFactor: bar.AdjustmentFactor}
-		encoded, _ := json.Marshal(value)
+		encodedBar.Reset()
+		_ = encoder.Encode(value)
+		encoded := encodedBar.Bytes()
+		if len(encoded) > 0 && encoded[len(encoded)-1] == 10 {
+			encoded = encoded[:len(encoded)-1]
+		}
 		sum := sha256.Sum256(encoded)
 		barFingerprints[bar.Date] = hex.EncodeToString(sum[:])
-		ordered = append(ordered, value)
+		if index > 0 {
+			_, _ = inputHasher.Write([]byte{','})
+		}
+		_, _ = inputHasher.Write(encoded)
 	}
-	inputJSON, _ := json.Marshal(ordered)
-	inputSum := sha256.Sum256(inputJSON)
+	_, _ = inputHasher.Write([]byte{']'})
+	inputSum := inputHasher.Sum(nil)
 	confirmed := map[string]json.RawMessage{}
 	add := func(kind, key string, value any) {
 		encoded, err := json.Marshal(value)
@@ -498,7 +588,7 @@ func chanStructureSnapshot(symbol, timeframe, ruleVersion string, bars []chanana
 			}
 		}
 	}
-	return store.ChanStructureSnapshot{Symbol: symbol, Timeframe: timeframe, RuleVersion: ruleVersion, InputFingerprint: hex.EncodeToString(inputSum[:]), BarFingerprints: barFingerprints, ConfirmedStructures: confirmed, UpdatedAt: time.Now().UTC()}
+	return store.ChanStructureSnapshot{Symbol: symbol, Timeframe: timeframe, RuleVersion: ruleVersion, InputFingerprint: hex.EncodeToString(inputSum), BarFingerprints: barFingerprints, ConfirmedStructures: confirmed, UpdatedAt: time.Now().UTC()}
 }
 
 func stableFractal(fractal chananalysis.Fractal) map[string]any {
@@ -528,13 +618,14 @@ func chanStructureRevisionOutput(revisions []store.ChanStructureRevision) []chan
 }
 
 func validAdjustedHistoryRow(bar map[string]any) bool {
-	factor := numberValue(bar["adjustment_factor"])
-	if factor == nil || *factor <= 0 {
+	factor, ok := historyMapNumber(bar, "adjustment_factor")
+	if !ok || factor <= 0 {
 		return false
 	}
 	for _, field := range []string{"open", "high", "low", "close"} {
-		adjusted, raw := numberValue(bar[field]), numberValue(bar["raw_"+field])
-		if adjusted == nil || raw == nil || *adjusted <= 0 || *raw <= 0 || math.Abs(*adjusted-*raw**factor) > 1e-6*math.Max(1, *adjusted) {
+		adjusted, adjustedOK := historyMapNumber(bar, field)
+		raw, rawOK := historyMapNumber(bar, "raw_"+field)
+		if !adjustedOK || !rawOK || !adjustedPairMatches(adjusted, raw, factor) {
 			return false
 		}
 	}
@@ -552,6 +643,10 @@ func (s *Service) chanAdjustedHistory(symbol string) (chanAdjustedHistoryCacheEn
 	cacheKey := symbol + "|" + timeframe + "|" + adjustmentType + "|go-yfinance"
 	s.chanAdjustedMu.Lock()
 	entry, found := s.chanAdjustedCache[cacheKey]
+	if found {
+		entry.lastAccess = time.Now()
+		s.chanAdjustedCache[cacheKey] = entry
+	}
 	s.chanAdjustedMu.Unlock()
 	coverageOK, _, _ := chanAdjustedHistoryCoverage(entry.bars)
 	if !found || !coverageOK || time.Since(entry.fetchedAt) >= 15*time.Minute {
@@ -559,8 +654,12 @@ func (s *Service) chanAdjustedHistory(symbol string) (chanAdjustedHistoryCacheEn
 			if bars, _ := cached["bars"].([]map[string]any); len(bars) > 0 {
 				fetchedAt, _ := historyTimestamp(cached["fetched_at"])
 				if !found || fetchedAt.After(entry.fetchedAt) {
-					entry = chanAdjustedHistoryCacheEntry{bars: bars, fetchedAt: fetchedAt, source: "sqlite"}
+					entry = chanAdjustedHistoryCacheEntry{bars: bars, fetchedAt: fetchedAt, source: "sqlite", lastAccess: time.Now()}
 					found = true
+					s.chanAdjustedMu.Lock()
+					s.chanAdjustedCache[cacheKey] = entry
+					evictOldestHistoryCacheEntry(s.chanAdjustedCache, cacheKey, boundedAdjustedHistoryCacheEntries(s.cfg.LowMemory), func(entry chanAdjustedHistoryCacheEntry) time.Time { return entry.lastAccess })
+					s.chanAdjustedMu.Unlock()
 				}
 			}
 		}
@@ -663,7 +762,8 @@ func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string) bool {
 		if s.chanAdjustedCache == nil {
 			s.chanAdjustedCache = make(map[string]chanAdjustedHistoryCacheEntry)
 		}
-		s.chanAdjustedCache[cacheKey] = chanAdjustedHistoryCacheEntry{bars: result.Bars, fetchedAt: result.FetchedAt, source: "upstream"}
+		s.chanAdjustedCache[cacheKey] = chanAdjustedHistoryCacheEntry{bars: result.Bars, fetchedAt: result.FetchedAt, source: "upstream", lastAccess: time.Now()}
+		evictOldestHistoryCacheEntry(s.chanAdjustedCache, cacheKey, boundedAdjustedHistoryCacheEntries(s.cfg.LowMemory), func(entry chanAdjustedHistoryCacheEntry) time.Time { return entry.lastAccess })
 		delete(s.chanAdjustedRetryAfter, cacheKey)
 		if adequate, _, _ := chanAdjustedHistoryCoverage(result.Bars); !adequate {
 			// Shorter histories are valid for newer listings. Avoid retrying the
@@ -706,11 +806,11 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 		bar := chananalysis.Bar{}
 		bar.Date, _ = raw["date"].(string)
 		bar.CapturedAt, _ = historyTimestamp(raw["captured_at"])
-		for field, target := range map[string]*float64{"open": &bar.Open, "high": &bar.High, "low": &bar.Low, "close": &bar.Close, "volume": &bar.Volume} {
-			if value := numberValue(raw[field]); value != nil {
-				*target = *value
-			}
-		}
+		bar.Open, _ = historyMapNumber(raw, "open")
+		bar.High, _ = historyMapNumber(raw, "high")
+		bar.Low, _ = historyMapNumber(raw, "low")
+		bar.Close, _ = historyMapNumber(raw, "close")
+		bar.Volume, _ = historyMapNumber(raw, "volume")
 		bars = append(bars, bar)
 	}
 	now := time.Now()
