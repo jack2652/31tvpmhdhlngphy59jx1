@@ -29,8 +29,8 @@ const CHAN_SCENARIOS_STORAGE_KEY = "option-scope-chan-scenarios-visible";
 const CHAN_CHART_PREFERENCES_KEY = "option-scope-chan-chart-preferences";
 const CHAN_INTRADAY_PERIODS = ["15m", "4h"];
 const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "4h"];
-const CHAN_ANALYSIS_RETRY_LIMIT = 16;
-const CHAN_INTRADAY_RETRY_LIMIT = 16;
+const CHAN_ANALYSIS_RETRY_LIMIT = 60;
+const CHAN_INTRADAY_RETRY_LIMIT = 60;
 const CHAN_INTRADAY_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 // Intraday data and both server/provider caches have a three-minute TTL. Wait
 // just beyond it so each expected new 15m candle can trigger a real refresh.
@@ -132,6 +132,12 @@ const state = {
   chanLastRequestedAt: 0,
   chanRetryTimer: null,
   chanRetryAttempts: 0,
+  chanMarketRetryTimer: null,
+  chanMarketRetryAttempts: 0,
+  chanMarketInFlight: false,
+  chanMarketLastRequestedAt: 0,
+  chanMarketPayload: null,
+  chanMarketRefreshPending: false,
   chanRefreshPending: false,
   trendHistorySymbol: "",
   loading: false,
@@ -143,6 +149,12 @@ const state = {
   quoteRetryTimer: null,
   quoteRetryAttempts: 0,
   quoteRetryInFlightKey: "",
+  quoteRecoveryTimer: null,
+  quoteRecoveryKey: "",
+  quoteRecoveryAttempts: 0,
+  quoteRecoveryInFlightKey: "",
+  snapshotRetryTimer: null,
+  snapshotRetryAttempts: 0,
   pushSource: null,
   pushSymbol: "",
   pushReconnectTimer: null,
@@ -824,6 +836,12 @@ function snapshotTimestampIsFresh(fetchedAt, maxAgeSeconds = SNAPSHOT_FRESH_SECO
   return age !== null && age <= maxAgeSeconds;
 }
 
+function isTransientRequestError(error) {
+  const status = Number(error?.status) || 0;
+  return error?.timeout === true || status === 0 || status === 408 || status === 425
+    || status === 429 || (status >= 500 && status < 600);
+}
+
 function quoteIsFresh(quote, maxAgeSeconds = SNAPSHOT_FRESH_SECONDS) {
   return quoteIsReady(quote) && snapshotTimestampIsFresh(quote?.fetched_at, maxAgeSeconds);
 }
@@ -832,6 +850,128 @@ function clearQuoteRetry() {
   if (state.quoteRetryTimer) clearTimeout(state.quoteRetryTimer);
   state.quoteRetryTimer = null;
   state.quoteRetryAttempts = 0;
+}
+
+function clearQuoteRecovery(resetAttempts = true) {
+  if (state.quoteRecoveryTimer) clearTimeout(state.quoteRecoveryTimer);
+  state.quoteRecoveryTimer = null;
+  state.quoteRecoveryKey = "";
+  state.quoteRecoveryInFlightKey = "";
+  if (resetAttempts) state.quoteRecoveryAttempts = 0;
+}
+
+function clearSnapshotRetry(resetAttempts = true) {
+  if (state.snapshotRetryTimer) clearTimeout(state.snapshotRetryTimer);
+  state.snapshotRetryTimer = null;
+  if (resetAttempts) state.snapshotRetryAttempts = 0;
+}
+
+function scheduleSnapshotRetry(loadId = state.loadId, minimumDelay = 0) {
+  if (!state.symbol || loadId !== state.loadId || state.snapshotRetryTimer) return;
+    const delay = Math.min(300000, Math.max(minimumDelay, Math.min(300000, 5000 * (2 ** Math.min(state.snapshotRetryAttempts, 6)))));
+  state.snapshotRetryAttempts = Math.min(20, state.snapshotRetryAttempts + 1);
+  state.snapshotRetryTimer = setTimeout(() => {
+    state.snapshotRetryTimer = null;
+    if (loadId !== state.loadId || !state.symbol) return;
+    if (document.hidden) {
+      scheduleSnapshotRetry(loadId);
+      return;
+    }
+    if (state.refreshInFlight || state.loading) {
+      state.snapshotRetryTimer = setTimeout(() => {
+        state.snapshotRetryTimer = null;
+        scheduleSnapshotRetry(loadId);
+      }, 5000);
+      return;
+    }
+    if (state.expirationPlaceholder === "正在获取到期日…") {
+      refreshInBackground(loadId);
+      return;
+    }
+    if (!state.expiration) {
+      if (state.expirationPlaceholder === "无期权缓存") return;
+      refreshInBackground(loadId);
+      return;
+    }
+    refreshInBackground(loadId);
+  }, delay);
+}
+
+function quoteRecoveryThresholdSeconds(quote) {
+  switch (String(quote?.market_state || "").toUpperCase()) {
+    case "REGULAR": return 90;
+    case "PRE": case "POST": case "OVERNIGHT": return 300;
+    default: return 1200;
+  }
+}
+
+function scheduleQuoteRecovery(quote = state.lastQuote, minimumDelay = 0) {
+  const symbol = state.symbol;
+  if (!symbol || quote?.symbol !== symbol || !quoteIsReady(quote)) {
+    clearQuoteRecovery();
+    return;
+  }
+  const key = `${state.loadId}|${symbol}|${quote.fetched_at || ""}`;
+  if (state.quoteRecoveryInFlightKey) return;
+  if (state.quoteRecoveryKey === key && state.quoteRecoveryTimer) return;
+  clearTimeout(state.quoteRecoveryTimer);
+  state.quoteRecoveryKey = key;
+  const fetchedAt = Date.parse(quote.fetched_at || "");
+  const thresholdMs = quoteRecoveryThresholdSeconds(quote) * 1000;
+  const ageMs = Number.isFinite(fetchedAt) ? Math.max(0, syncedNow() - fetchedAt) : thresholdMs;
+  const delay = Math.max(minimumDelay, ageMs >= thresholdMs
+    ? Math.min(300000, 5000 * (2 ** Math.min(state.quoteRecoveryAttempts, 6)))
+    : thresholdMs - ageMs);
+  state.quoteRecoveryTimer = setTimeout(() => {
+    state.quoteRecoveryTimer = null;
+    if (key !== `${state.loadId}|${state.symbol}|${state.lastQuote?.fetched_at || ""}`) return;
+    if (document.hidden) {
+      state.quoteRecoveryKey = "";
+      scheduleQuoteRecovery(quote);
+      return;
+    }
+    refreshStaleQuote(symbol, state.loadId, key);
+  }, delay);
+}
+
+function refreshStaleQuote(symbol, loadId, key) {
+  if (state.quoteRecoveryInFlightKey || symbol !== state.symbol || loadId !== state.loadId) return;
+  const quote = state.lastQuote;
+  const fetchedAt = Date.parse(quote?.fetched_at || "");
+  if (!quoteIsReady(quote) || quote.symbol !== symbol
+    || (Number.isFinite(fetchedAt) && syncedNow() - fetchedAt < quoteRecoveryThresholdSeconds(quote) * 1000)) {
+    state.quoteRecoveryAttempts = 0;
+    scheduleQuoteRecovery(quote);
+    return;
+  }
+  state.quoteRecoveryInFlightKey = key;
+  state.quoteRecoveryAttempts += 1;
+  let retryAfterFailure = true;
+  request(`/api/quote/${encodeURIComponent(symbol)}?refresh=true`, { timeout: 20000 }).then((incoming) => {
+    if (symbol !== state.symbol || loadId !== state.loadId) return;
+    if (quoteIsFresh(incoming) && incoming?.symbol === symbol) {
+      state.quoteRecoveryAttempts = 0;
+      renderQuote(incoming);
+      return;
+    }
+    state.quoteRecoveryKey = "";
+    scheduleQuoteRecovery(state.lastQuote);
+  }).catch((error) => {
+    if (symbol !== state.symbol || loadId !== state.loadId) return;
+    if (!isTransientRequestError(error)) {
+      retryAfterFailure = false;
+      state.quoteRecoveryKey = "";
+      return;
+    }
+    state.quoteRecoveryKey = "";
+    scheduleQuoteRecovery(state.lastQuote, error.retryAfterMs || 0);
+  }).finally(() => {
+    if (state.quoteRecoveryInFlightKey === key) state.quoteRecoveryInFlightKey = "";
+    if (retryAfterFailure && !state.quoteRecoveryTimer && symbol === state.symbol && loadId === state.loadId) {
+      state.quoteRecoveryKey = "";
+      scheduleQuoteRecovery(state.lastQuote);
+    }
+  });
 }
 
 // A new symbol can briefly have no durable quote while the snapshot worker is
@@ -1893,21 +2033,31 @@ function serverLevelsHasUsableProbability(payload, rawPayload = payload) {
 
 function serverLevelsNeedsRetry(payload) {
   const rawPayload = state.levelsPayload?.raw ? state.levelsPayload : null;
-  if (!serverLevelsHasCompleteFields(payload)
-    || (rawPayload && !serverLevelsHasUsableProbability(payload, rawPayload))) return true;
   const warnings = [
     payload?.history?.warning,
     payload?.history?.extremes_warning,
     payload?.beta_meta?.warning,
   ].filter(Boolean).map(String);
+  if (warnings.some((warning) => /不支持历史日线更新/.test(warning))) return false;
   const temporarilyBlocked = warnings.some((warning) => /内存保护|刷新正在进行|租约忙|等待超时|稍后重试/.test(warning));
-  if (!temporarilyBlocked) return false;
-  const betaValue = payload?.beta?.value;
-  const hasBeta = betaValue != null && Number.isFinite(Number(betaValue));
-  return !serverLevelsHasCompleteFields(payload)
-    || Number(payload?.history?.bars) <= 0
-    || !payload?.trend
-    || !hasBeta;
+  if (temporarilyBlocked) return true;
+  if (rawPayload?.fast_levels
+    && !hasUsableTrendHistory({ ...rawPayload, ...rawPayload.fast_levels })) return true;
+  if (rawPayload && !serverLevelsHasUsableProbability(payload, rawPayload)) return true;
+  if (!Array.isArray(payload?.resistance) || !Array.isArray(payload?.support) || !payload?.trade_points) return true;
+  const levels = [...payload.resistance, ...payload.support];
+  // Empty candidates can be a valid result for a quiet or illiquid chain.
+  // Keep the client fallback instead of polling the same complete response.
+  if (!levels.length) return false;
+  return !serverLevelsHasCompleteFields(payload);
+}
+
+function hasUsableTrendHistory(payload) {
+  const bars = Number(payload?.history?.bars || payload?.history_bars);
+  const trend = payload?.trend;
+  return bars > 0
+    && Number.isFinite(Number(trend?.upper)) && Number(trend.upper) > 0
+    && Number.isFinite(Number(trend?.lower)) && Number(trend.lower) > 0;
 }
 
 function levelsPayloadForBasis(payload, spot, staleBasis = false) {
@@ -2130,7 +2280,7 @@ function requestServerFactorLevels(points, spot, key, attempt = 0) {
         // Resource protection can return HTTP 200 before selected-expiry IV,
         // history, or reinforcement metadata is ready. Retry with a bounded
         // backoff for as long as this snapshot remains selected.
-        const delay = Math.min(30000, 3000 * (2 ** Math.min(attempt, 3)));
+        const delay = Math.max(Number(payload?.retry_after_ms) || 0, Math.min(300000, 3000 * (2 ** Math.min(attempt, 7))));
         state.serverLevelsRequestKey = "";
         state.serverLevelsCooldownContext = context;
         state.serverLevelsCooldownUntil = Date.now() + delay;
@@ -2159,10 +2309,17 @@ function requestServerFactorLevels(points, spot, key, attempt = 0) {
         requestServerFactorLevels(state.lastAnalysis?.points || [], latestSpot, state.levelsKey);
       }
     })
-    .catch(() => {
+    .catch((error) => {
       // Leave the raw fallback visible and retry with capped backoff. A single
       // transient error must not disable strengthened levels for two minutes.
       const currentContext = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
+      if (!isTransientRequestError(error)) {
+        state.serverLevelsRequestKey = "";
+        state.serverLevelsInFlightContext = "";
+        state.serverLevelsInFlightKey = "";
+        markApiUnavailable(error.message || "API 暂不可用");
+        return;
+      }
       if (currentContext !== context || state.serverLevelsRequestKey !== key) {
         if (state.serverLevelsInFlightKey === key) {
           state.serverLevelsInFlightContext = "";
@@ -2181,7 +2338,7 @@ function requestServerFactorLevels(points, spot, key, attempt = 0) {
       state.serverLevelsInFlightContext = "";
       state.serverLevelsInFlightKey = "";
       state.serverLevelsCooldownContext = context;
-      const delay = Math.min(30000, 3000 * (2 ** Math.min(attempt, 3)));
+      const delay = Math.max(error?.retryAfterMs || 0, Math.min(300000, 3000 * (2 ** Math.min(attempt, 7))));
       state.serverLevelsCooldownUntil = Date.now() + delay;
       markApiUnavailable("API 暂不可用");
       clearTimeout(state.levelsRetryTimer);
@@ -2221,7 +2378,8 @@ function requestFactorLevels(points, spot, key, attempt = 0) {
       // metadata such as spot and generated_at.
       const fastPayload = { ...payload, ...payload.fast_levels, raw: true };
       const fastComplete = serverLevelsHasCompleteFields(fastPayload)
-        && serverLevelsHasUsableProbability(fastPayload, payload);
+        && serverLevelsHasUsableProbability(fastPayload, payload)
+        && hasUsableTrendHistory(fastPayload);
       const priorComplete = serverLevelsHasCompleteFields(state.serverLevelsPayload)
         && state.serverLevelsContext === `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
       if (fastComplete) {
@@ -2260,14 +2418,18 @@ function requestFactorLevels(points, spot, key, attempt = 0) {
       renderFactorFallback(points, numericSpot);
       if (payload?.raw) requestServerFactorLevels(points, spot, key);
     })
-    .catch(() => {
+    .catch((error) => {
       if (state.levelsKey !== key) return;
+      if (!isTransientRequestError(error)) {
+        markApiUnavailable(error.message || "API 暂不可用");
+        return;
+      }
       // Keep the previous render, if any, and retry raw reads as the API
       // comes back. Without this path a failed raw request left the page on a
       // client fallback forever and the server result (including strength
       // tiers and probabilities) was never requested again.
       const context = `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
-      const delay = Math.min(30000, 3000 * (2 ** Math.min(attempt, 3)));
+      const delay = Math.max(error?.retryAfterMs || 0, Math.min(300000, 3000 * (2 ** Math.min(attempt, 7))));
       markApiUnavailable("API 暂不可用");
       clearTimeout(state.levelsRetryTimer);
       state.levelsRetryTimer = setTimeout(() => {
@@ -3383,7 +3545,9 @@ function hydrateTrendFromChan(payload, preferredSpot = null, preserveOptionLevel
 }
 
 function renderCurrentChanMarketAnalysis(spot, preserveOptionLevels = false) {
-  const payload = state.chanPayload;
+  const payload = state.chanMarketPayload?.symbol === state.symbol && state.chanMarketPayload?.market_analysis
+    ? state.chanMarketPayload
+    : state.chanPayload;
   if (payload?.symbol !== state.symbol || !payload.market_analysis) return false;
   hydrateTrendFromChan(payload, spot, preserveOptionLevels);
   return true;
@@ -3399,13 +3563,19 @@ function resetChanAnalysis() {
   chanIntradayExpiryRetryBoundary = "";
   clearTimeout(state.chanRetryTimer);
   state.chanRetryTimer = null;
+  clearTimeout(state.chanMarketRetryTimer);
+  state.chanMarketRetryTimer = null;
   state.chanRequestId += 1;
   state.chanInFlightSymbol = "";
   state.chanLastRequestedAt = 0;
   state.chanRetryAttempts = 0;
+  state.chanMarketRetryAttempts = 0;
+  state.chanMarketInFlight = false;
+  state.chanMarketLastRequestedAt = 0;
   state.chanLoading = false;
   state.chanSpotGuideVisible = false;
   state.chanPayload = null;
+  state.chanMarketPayload = null;
   state.chanViewports = { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } };
   state.chanRefreshPending = false;
   state.view.chan = OptionScopeChan.empty();
@@ -3416,13 +3586,14 @@ function resetChanAnalysis() {
   state.chanIntradaySpot = null;
 }
 
-function scheduleChanIntradayRetry(period, symbol) {
+function scheduleChanIntradayRetry(period, symbol, minimumDelay = 0) {
   const attempts = state.chanIntradayRetryAttempts[period] || 0;
   // Initial history may take a few minutes on a constrained host. Retry with
   // capped backoff so a missing cache recovers without a manual page reload.
-  if (attempts >= CHAN_INTRADAY_RETRY_LIMIT || state.chanIntradayRetryTimers[period]) return;
-  const delay = Math.min(15000, 1500 * (2 ** Math.min(attempts, 4)));
-  state.chanIntradayRetryAttempts = { ...state.chanIntradayRetryAttempts, [period]: attempts + 1 };
+  if (state.chanIntradayRetryTimers[period]) return;
+  const delay = minimumDelay > 0 ? Math.min(300000, minimumDelay)
+    : Math.min(300000, 3000 * (2 ** Math.min(attempts, 7)));
+  state.chanIntradayRetryAttempts = { ...state.chanIntradayRetryAttempts, [period]: Math.min(CHAN_INTRADAY_RETRY_LIMIT, attempts + 1) };
   state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: setTimeout(() => {
     state.chanIntradayRetryTimers = { ...state.chanIntradayRetryTimers, [period]: null };
     if (state.symbol !== symbol || state.chanPeriod !== period) return;
@@ -3548,15 +3719,12 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-function scheduleChanAnalysisRetry(symbol, requestId) {
-  if (state.chanRetryTimer || state.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT) {
-    if (state.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT) {
-      state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), "缠论行情暂不可用，自动重试次数已达上限；可手动重试"] )];
-    }
-    return;
-  }
-  state.chanRetryAttempts += 1;
-  const delay = Math.min(15000, 3000 + state.chanRetryAttempts * 1000);
+function scheduleChanAnalysisRetry(symbol, requestId, minimumDelay = 0) {
+  if (state.chanRetryTimer) return;
+  const attempts = state.chanRetryAttempts;
+  state.chanRetryAttempts = Math.min(CHAN_ANALYSIS_RETRY_LIMIT, state.chanRetryAttempts + 1);
+  const delay = minimumDelay > 0 ? Math.min(300000, minimumDelay)
+    : Math.min(300000, 3000 * (2 ** Math.min(attempts, 7)));
   state.chanRetryTimer = setTimeout(() => {
     state.chanRetryTimer = null;
     if (state.symbol === symbol && state.chanRequestId === requestId) refreshChanAnalysis(true);
@@ -3566,6 +3734,79 @@ function scheduleChanAnalysisRetry(symbol, requestId) {
 function isTransientChanRequestError(error) {
   const status = Number(error?.status) || 0;
   return error?.timeout === true || status === 0 || status === 408 || status === 425 || status === 429 || (status >= 500 && status < 600);
+}
+
+function chanMarketPayloadNeedsRetry(payload) {
+  const analysis = payload?.market_analysis;
+  const trend = analysis?.trend;
+  const hasTrend = Number(trend?.upper) > 0 && Number(trend?.lower) > 0;
+  const hasHistory = Number(payload?.history?.bars) > 0;
+  const hasLevels = Array.isArray(analysis?.resistance) && Array.isArray(analysis?.support);
+  const warnings = [...(Array.isArray(payload?.warnings) ? payload.warnings : []), payload?.history?.warning,
+    analysis?.history?.warning, analysis?.history?.extremes_warning, analysis?.beta_meta?.warning]
+    .filter(Boolean).join(" ");
+  const blocked = /正在后台|刷新正在进行|租约忙|等待超时|稍后重试/.test(warnings);
+  const unsupportedHistory = /不支持历史日线更新/.test(warnings);
+  return !unsupportedHistory && (!hasTrend || !hasHistory || !hasLevels || blocked);
+}
+
+function scheduleChanMarketRetry(symbol, loadId, minimumDelay = 0) {
+  if (symbol !== state.symbol || loadId !== state.loadId || state.chanMarketRetryTimer) return;
+  state.chanMarketRetryAttempts = Math.min(60, state.chanMarketRetryAttempts + 1);
+  const delay = Math.max(minimumDelay, Math.min(300000, 3000 * (2 ** Math.min(state.chanMarketRetryAttempts - 1, 7))));
+  state.chanMarketRetryTimer = setTimeout(() => {
+    state.chanMarketRetryTimer = null;
+    if (symbol !== state.symbol || loadId !== state.loadId) return;
+    if (document.hidden) {
+      scheduleChanMarketRetry(symbol, loadId);
+      return;
+    }
+    refreshChanMarketAnalysis(true);
+  }, delay);
+}
+
+function refreshChanMarketAnalysis(force = false) {
+  const symbol = state.symbol;
+  const loadId = state.loadId;
+  if (!symbol) return;
+  if (state.chanMarketInFlight) {
+    if (force) state.chanMarketRefreshPending = true;
+    return;
+  }
+  if (!force && Date.now() - state.chanMarketLastRequestedAt < 60000) return;
+  state.chanMarketInFlight = true;
+  state.chanMarketLastRequestedAt = Date.now();
+  const quote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
+  const spot = finitePrice(activeSessionQuote(quote)?.price ?? quote?.price);
+  const query = spot != null ? "?spot=" + encodeURIComponent(spot) : "";
+  request("/api/chan/" + encodeURIComponent(symbol) + query).then((payload) => {
+    if (symbol !== state.symbol || loadId !== state.loadId) return;
+    if (payload?.symbol !== symbol) {
+      scheduleChanMarketRetry(symbol, loadId);
+      return;
+    }
+    state.chanMarketPayload = payload;
+    const latestQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
+    const liveSpot = finitePrice(activeSessionQuote(latestQuote)?.price ?? latestQuote?.price) ?? spot;
+    hydrateTrendFromChan(payload, liveSpot,
+      displayedSnapshotContextMatches() || sameDisplayedLevelContext());
+    if (chanMarketPayloadNeedsRetry(payload)) scheduleChanMarketRetry(symbol, loadId);
+    else {
+      state.chanMarketRetryAttempts = 0;
+      if (state.chanMarketRetryTimer) clearTimeout(state.chanMarketRetryTimer);
+      state.chanMarketRetryTimer = null;
+    }
+  }).catch((error) => {
+    if (isTransientRequestError(error)) scheduleChanMarketRetry(symbol, loadId, error.retryAfterMs || 0);
+  }).finally(() => {
+    if (symbol === state.symbol && loadId === state.loadId) {
+      state.chanMarketInFlight = false;
+      if (state.chanMarketRefreshPending) {
+        state.chanMarketRefreshPending = false;
+        refreshChanMarketAnalysis(true);
+      }
+    }
+  });
 }
 
 function refreshChanAnalysis(force = false) {
@@ -3585,26 +3826,35 @@ function refreshChanAnalysis(force = false) {
   const currentQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
   const currentSpot = finitePrice(activeSessionQuote(currentQuote)?.price ?? currentQuote?.price);
   const spotQuery = currentSpot != null ? `?spot=${encodeURIComponent(currentSpot)}` : "";
-  request(`/api/chan/${encodeURIComponent(symbol)}/adjusted${spotQuery}`, { timeout: 60000 }).then((payload) => {
+  request(`/api/chan/${encodeURIComponent(symbol)}/adjusted${spotQuery}`, { timeout: 60000, retry: false }).then((payload) => {
     if (state.symbol !== symbol || state.chanRequestId !== token || payload?.symbol !== symbol) return;
+    if (payload?.ready === false) {
+      state.chanLoading = false;
+      state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), ...(payload.warnings || [])])];
+      refreshChanMarketAnalysis();
+      scheduleChanAnalysisRetry(symbol, token, Number(payload.retry_after_ms) || 15000);
+      return;
+    }
+    refreshChanMarketAnalysis();
     const liveQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
     const liveSpot = finitePrice(activeSessionQuote(liveQuote)?.price ?? liveQuote?.price);
     state.chanPayload = OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload);
     state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers);
-    hydrateTrendFromChan({ ...payload, spot: liveSpot ?? payload.spot }, null,
-      displayedSnapshotContextMatches() || sameDisplayedLevelContext());
+    // Adjusted Chan results intentionally omit market_analysis. The separate
+    // /api/chan request feeds the trend and price-level cards above the chart.
     // SSE normally refreshes history completion immediately. Bounded retry
     // also covers symbols without options and browsers without EventSource.
-    if (payload.history?.refreshing) scheduleChanAnalysisRetry(symbol, token);
+    if (payload.history?.refreshing) scheduleChanAnalysisRetry(symbol, token, 15000);
     else state.chanRetryAttempts = 0;
   }).catch((error) => {
     if (state.symbol !== symbol || state.chanRequestId !== token) return;
+    refreshChanMarketAnalysis();
     if (!state.view.chan.available) state.view.chan = OptionScopeChan.empty("缠论分析暂不可用，等待历史行情或下次刷新");
-    const retrying = isTransientChanRequestError(error) && state.chanRetryAttempts < CHAN_ANALYSIS_RETRY_LIMIT;
+    const retrying = isTransientChanRequestError(error);
     state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), retrying
       ? `结构行情暂时获取失败（${error.message}），正在自动重试`
       : `结构更新失败：${error.message}`])];
-    if (isTransientChanRequestError(error)) scheduleChanAnalysisRetry(symbol, token);
+    if (isTransientChanRequestError(error)) scheduleChanAnalysisRetry(symbol, token, error?.retryAfterMs || 0);
   }).finally(() => {
     if (state.chanRequestId !== token) return;
     state.chanLoading = false;
@@ -3642,6 +3892,9 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   // older market snapshot roll the visible price, session label, or analysis back.
   if (previous?.symbol === state.symbol && Number.isFinite(incomingAt)
     && Number.isFinite(previousAt) && incomingAt < previousAt) return;
+  if (quoteIsFresh(quote) && (!Number.isFinite(previousAt) || incomingAt > previousAt)) {
+    state.quoteRecoveryAttempts = 0;
+  }
   // The quote endpoint reads the persisted snapshot and marks it "sqlite",
   // while its SSE event retains the original provider. Those are the same
   // market data when their timestamps match, so do not flash the cache label
@@ -3674,6 +3927,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     : quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
+  scheduleQuoteRecovery(state.lastQuote);
   if (state.chanPayload?.symbol === state.symbol) {
     state.chanPayload = OptionScopeChan.withSpot(state.chanPayload, finitePrice(price));
     state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers);
@@ -3682,6 +3936,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     state.chanIntradaySpot = finitePrice(price);
   }
   refreshChanAnalysis();
+  refreshChanMarketAnalysis();
   state.view.quoteReference = reference.text;
   state.view.quoteReferenceTitle = reference.title;
   if (quoteIsETF(quote)) {
@@ -4086,6 +4341,7 @@ function renderChain(payload, quote, analysisPayload) {
     && state.displayedChainSymbol === state.symbol
     && state.displayedChainExpiration === incomingExpiration) {
     state.view.lastStatus = "期权链暂时返回空数据，保留上一份显示并等待更新";
+    scheduleSnapshotRetry(state.loadId);
     return;
   }
   const incomingFetchedAt = Date.parse(payload?.fetched_at || "");
@@ -4103,7 +4359,12 @@ function renderChain(payload, quote, analysisPayload) {
   quote = cachedChain
     ? latestRenderableQuote(state.symbol, quote, state.lastQuote)
     : latestFreshQuote(state.symbol, quote, state.lastQuote);
-  if (!quoteAndChainAreAligned(quote, payload?.fetched_at, cachedChain)) return;
+  if (!quoteAndChainAreAligned(quote, payload?.fetched_at, cachedChain)) {
+    scheduleSnapshotRetry(state.loadId);
+    return;
+  }
+  if (hasValidOptionQuotes(rows) && snapshotTimestampIsFresh(payload?.fetched_at)
+    && state.expirationPlaceholder !== "正在获取到期日…") clearSnapshotRetry();
   const basis = activeBasis(quote);
   const signature = [
     payload?.symbol,
@@ -4734,14 +4995,17 @@ async function refreshInBackground(loadId) {
     }
     // 第一次刷新已经带回全部未过期到期日，立刻填进下拉框，不等期权链下载完，也不只放当前这一期。
     if (Array.isArray(refreshResult?.expirations) && refreshResult.expirations.length) {
-      applyExpirations(refreshResult.expirations, state.expiration || refreshResult.expiration);
+      applyExpirations(refreshResult.expirations, state.expiration || refreshResult.expiration, "该标的没有期权到期日");
+      clearSnapshotRetry();
     } else if (!state.expiration && refreshResult?.expiration) {
-      applyExpirations([refreshResult.expiration], refreshResult.expiration);
+      applyExpirations([refreshResult.expiration], refreshResult.expiration, "该标的没有期权到期日");
+      clearSnapshotRetry();
     }
     if (refreshResult?.skipped) {
       if (!state.expiration) {
         await renderCachedHistoryOnly(loadId, refreshResult.quote || null);
         if (!isCurrentLoad(loadId) || await restartIfExpirationChanged(expiration)) return;
+        if (refreshResult.deferred && state.expirationPlaceholder !== "无期权缓存") scheduleSnapshotRetry(loadId, 15000);
         if (refreshResult.deferred) {
           state.view.lastStatus = "已读取 SQLite 行情/日线缓存；期权数据在后台检查";
         }
@@ -4757,6 +5021,10 @@ async function refreshInBackground(loadId) {
         if (snapshot.shown && !snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
           refreshAnalysisWindow(loadId, snapshot.payload, snapshot.quote);
         }
+        if (isSnapshotFresh(snapshot) && state.expirationPlaceholder !== "正在获取到期日…") clearSnapshotRetry();
+        else scheduleSnapshotRetry(loadId, refreshResult.deferred ? 15000 : 0);
+      } else {
+        if (state.expirationPlaceholder !== "正在获取到期日…") clearSnapshotRetry();
       }
       if (refreshResult.deferred) {
         state.view.lastStatus = /内存保护/.test(String(refreshResult.warning || ""))
@@ -4820,11 +5088,13 @@ async function refreshInBackground(loadId) {
     }
     if (!quoteAndChainAreAligned(resolvedQuote, payload?.fetched_at)) {
       state.view.lastStatus = "行情或期权链仍在刷新，等待一份时间匹配的新快照";
+      scheduleSnapshotRetry(loadId);
       return;
     }
     renderQuote(resolvedQuote);
     // Gamma 窗口继续后台刷新；选中期限的综合价位已在这里与窗口任务并行请求。
     renderChain(payload, resolvedQuote, state.lastAnalysis?.analysisPayload || null);
+    if (!payload?.data?.length) scheduleSnapshotRetry(loadId);
     renderOptionFlow(flow);
     state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
     syncPageQuery();
@@ -4844,6 +5114,7 @@ async function refreshInBackground(loadId) {
     // 失败后不追加读请求：超时的服务端线程可能仍在抓取期权链，恢复读取
     // quote/chain 只会再占一轮连接。保留当前画面，等待 SSE 服务端调度下一轮重试。
     state.refreshInFlight = null;
+    if (isTransientRequestError(error)) scheduleSnapshotRetry(loadId, error.retryAfterMs || 0);
   } finally {
     if (state.refreshInFlight === symbol) state.refreshInFlight = null;
   }
@@ -4859,22 +5130,27 @@ async function loadQuoteOnly(loadId) {
   let requestError = null;
   const [quote, expirations] = await Promise.all([
     request(`/api/quote/${encodedSymbol}`).catch((error) => { requestError = error; return null; }),
-    request(`/api/expirations/${encodedSymbol}?refresh=true`).catch((error) => { requestError = requestError || error; return null; }),
+    request(`/api/expirations/${encodedSymbol}`).catch((error) => { requestError = requestError || error; return null; }),
   ]);
   if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
   // 等待期间用户换了到期日：不要清掉新选择，交给调用方按新期限重入。
   if (state.expiration !== expiration) return;
+  if ((requestError && isTransientRequestError(requestError)) || expirations?.source === "pending") {
+    scheduleSnapshotRetry(loadId, Math.max(10000, requestError?.retryAfterMs || 0));
+  }
   if (requestError && markApiUnavailable("API 暂不可用")) return;
   const dates = expirations?.expirations || [];
   // 回源后拿到了期限：说明本地只是缺缓存，重走一次完整加载。
   if (dates.length) {
-    applyExpirations(dates, null);
+      applyExpirations(dates, null);
+      clearSnapshotRetry();
     state.refreshInFlight = null;
     await refreshInBackground(loadId);
     return true;
   }
   if (expirations?.cached_expirations?.length) {
     applyExpirations(expirations.cached_expirations, state.expiration);
+    clearSnapshotRetry();
     state.refreshInFlight = null;
     await loadChain({ loadId });
     return true;
@@ -4882,22 +5158,32 @@ async function loadQuoteOnly(loadId) {
   // 所选期限可能刚刚全部到期：清掉失效的到期日，避免它继续留在 state 和地址栏里。
   state.expiration = null;
   state.expirationOptions = [];
-  state.expirationPlaceholder = "无期权缓存";
+  state.expirationPlaceholder = expirations?.source === "pending" ? "正在获取到期日…" : "无期权缓存";
   syncPageQuery();
   await renderCachedHistoryOnly(loadId, quote);
   state.view.dataSource = "上游无期权数据";
   state.view.chainEmpty = "SQLite 目前没有期权合约缓存";
-  state.view.lastStatus = "已读取 SQLite 行情与日线缓存；上游没有可用期权合约";
+  state.view.lastStatus = expirations?.source === "pending"
+    ? "已读取 SQLite 行情与日线缓存；正在检查期权期限"
+    : "已读取 SQLite 行情与日线缓存；上游没有可用期权合约";
 }
 
-async function loadExpirations(loadId, fallbackSnapshot = null) {
+async function loadExpirations(loadId, fallbackSnapshot = null, refresh = false) {
   const encodedSymbol = encodeURIComponent(state.symbol);
   let requestError = null;
-  const payload = await request(`/api/expirations/${encodedSymbol}`).catch((error) => {
+  const payload = await request(`/api/expirations/${encodedSymbol}${refresh ? "?refresh=true" : ""}`).catch((error) => {
     requestError = error;
-    return { expirations: [] };
+    return { expirations: [], source: "pending" };
   });
   if (!isCurrentLoad(loadId)) return;
+  const retryable = requestError
+    ? isTransientRequestError(requestError)
+    : payload.source === "pending";
+  if (retryable) {
+    scheduleSnapshotRetry(loadId, Math.max(10000, requestError?.retryAfterMs || 0));
+  } else {
+    clearSnapshotRetry();
+  }
   if (requestError) {
     const restored = restoreClientSnapshot(state.symbol, state.expiration)
       || restoreDisplayedClientSnapshot(fallbackSnapshot);
@@ -4913,7 +5199,9 @@ async function loadExpirations(loadId, fallbackSnapshot = null) {
   const allDates = [...new Set([...dates, ...cachedDates])].sort();
   const cachedExpiration = preferredCachedExpiration(allDates, state.expiration, cachedDates);
   if (cachedExpiration) {
-    applyExpirations(allDates, cachedExpiration, payload.source === "pending" ? "正在获取到期日…" : "该标的没有期权到期日");
+    applyExpirations(allDates, cachedExpiration, retryable ? "正在获取到期日…" : "该标的没有期权到期日");
+    if (!retryable) clearSnapshotRetry();
+    else scheduleSnapshotRetry(loadId, Math.max(10000, requestError?.retryAfterMs || 0));
     await loadChain({ loadId });
     return;
   }
@@ -4923,16 +5211,18 @@ async function loadExpirations(loadId, fallbackSnapshot = null) {
   if (state.displayedChainSymbol === state.symbol
     && state.displayedChainExpiration === state.expiration
     && state.expiration && state.chainRows?.length) {
+    if (!retryable) clearSnapshotRetry();
     return;
   }
   state.expiration = null;
   state.expirationOptions = [];
-  state.expirationPlaceholder = "无期权缓存";
+  state.expirationPlaceholder = retryable ? "正在获取到期日…" : "无期权缓存";
   syncPageQuery();
   // A cached quote/history remains useful even when this symbol has no
   // cached option expirations. Render the durable daily-history analysis
   // independently, but do not make the quote or snapshot request wait for it.
   if (isCurrentLoad(loadId)) {
+    if (retryable) scheduleSnapshotRetry(loadId, Math.max(10000, requestError?.retryAfterMs || 0));
     void refreshInBackground(loadId);
     void renderCachedHistoryOnly(loadId);
   }
@@ -5005,6 +5295,7 @@ async function loadChain(options = {}) {
     // 用户已经切走：不要把新期限的页面清成「正在后台获取」，也不要再为旧期限启动刷新。
     if (snapshot.discarded) return;
     if (!snapshot.shown) {
+      scheduleSnapshotRetry(loadId);
       if (snapshot.apiError && restoreDisplayedClientSnapshot(previousSnapshot)) return;
       if (displayedSnapshotContextMatches()) {
         state.view.lastStatus = "期权链暂不可用，保留当前已显示数据并在后台重试";
@@ -5012,9 +5303,14 @@ async function loadChain(options = {}) {
         showPending("正在后台获取上游快照…");
       }
     }
-    if (options.refresh === false) return;
+    if (options.refresh === false) {
+      if (isSnapshotFresh(snapshot) && state.expirationPlaceholder !== "正在获取到期日…") clearSnapshotRetry();
+      else scheduleSnapshotRetry(loadId);
+      return;
+    }
     // 先读 SQLite 判断新鲜度：仍在新鲜期内直接复用，只有确认过期才请求上游接口。
     if (isSnapshotFresh(snapshot)) {
+      if (state.expirationPlaceholder !== "正在获取到期日…") clearSnapshotRetry();
       showFreshStatus(snapshot);
       // 首次访问可能只有选中期限的缓存，跨期限 Gamma 尚未生成；只补后台分析，不阻塞首屏。
       if (!snapshot.analysisReady && snapshot.payload?.data?.length && snapshot.quote) {
@@ -5023,6 +5319,9 @@ async function loadChain(options = {}) {
       return;
     }
     await refreshInBackground(loadId);
+  } catch (error) {
+    if (isTransientRequestError(error)) scheduleSnapshotRetry(options.loadId || state.loadId, error.retryAfterMs || 0);
+    throw error;
   } finally {
     scheduleAutoRefresh();
     if (state.pendingSnapshotRefresh) setTimeout(applyPendingSnapshotRefresh, 0);
@@ -5040,6 +5339,8 @@ async function loadSymbol() {
   state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
+  clearQuoteRecovery();
+  clearSnapshotRetry();
   resetChanAnalysis();
   state.trendMarket = null;
   state.trendMarketSymbol = "";
@@ -5179,11 +5480,11 @@ const optionScopeApp = new Vue({
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
         const attempts = this.chanIntradayRetryAttempts[this.chanPeriod] || 0;
         if (this.chanIntradayLoading[this.chanPeriod]) return `${this.chanPeriod === "15m" ? "15分钟" : "4小时"}行情加载中…`;
-        if (attempts >= CHAN_INTRADAY_RETRY_LIMIT && !this.chanIntradayRetryTimers[this.chanPeriod]) return "盘中行情暂不可用，稍后可手动重试";
+        if (attempts >= CHAN_INTRADAY_RETRY_LIMIT && !this.chanIntradayRetryTimers[this.chanPeriod]) return "盘中行情失败，继续低频自动重试";
         if (attempts > 0) return `盘中行情正在自动重试（${attempts}/${CHAN_INTRADAY_RETRY_LIMIT}）`;
         return "";
       }
-      if (this.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT && !this.chanRetryTimer) return "缠论行情暂不可用，稍后可手动重试";
+      if (this.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT && !this.chanRetryTimer) return "缠论行情失败，继续低频自动重试";
       if (this.chanRetryAttempts > 0) return `缠论行情正在自动重试（${this.chanRetryAttempts}/${CHAN_ANALYSIS_RETRY_LIMIT}）`;
       return "";
     },
@@ -5294,7 +5595,7 @@ const optionScopeApp = new Vue({
       }).catch((error) => {
         if (state.symbol === symbol && state.loadId === generation) {
           if (!isTransientChanRequestError(error)) setError(error.message || "盘中周期加载失败");
-          if (isTransientChanRequestError(error)) scheduleChanIntradayRetry(period, symbol);
+          if (isTransientChanRequestError(error)) scheduleChanIntradayRetry(period, symbol, error?.retryAfterMs || 0);
         }
       }).then(() => {
         if (state.loadId === generation && state.symbol === symbol) {

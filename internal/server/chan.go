@@ -238,7 +238,24 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	}
 	entry, source, warning, refreshing := s.chanAdjustedHistory(symbol)
 	if len(entry.bars) == 0 {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"symbol": symbol, "rule_version": chananalysis.RecursivePreviewVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "quality": gin.H{"status": "degraded", "price_basis": "unavailable"}, "warnings": []string{warning}})
+		_, supportsHistory := s.provider.(ChanAdjustedHistoryProvider)
+		if refreshing || supportsHistory && strings.Contains(warning, "正在获取") {
+			retryAfter := 15
+			if !refreshing {
+				retryAfter = 30
+				cacheKey := symbol + "|1d|split_dividend_auto|go-yfinance"
+				s.chanAdjustedMu.Lock()
+				retryAt := s.chanAdjustedRetryAfter[cacheKey]
+				s.chanAdjustedMu.Unlock()
+				if remaining := time.Until(retryAt); remaining > 0 {
+					retryAfter = int((remaining + time.Second - 1) / time.Second)
+				}
+			}
+			c.Header("Retry-After", strconv.Itoa(retryAfter))
+			c.JSON(http.StatusAccepted, gin.H{"symbol": symbol, "ready": false, "retry_after_ms": retryAfter * 1000, "rule_version": chananalysis.RecursivePreviewVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "quality": gin.H{"status": "pending", "price_basis": "unavailable"}, "warnings": []string{warning}})
+			return
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{"symbol": symbol, "ready": false, "rule_version": chananalysis.RecursivePreviewVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "quality": gin.H{"status": "degraded", "price_basis": "unavailable"}, "warnings": []string{warning}})
 		return
 	}
 	spotRaw, present := queryValue(c, "spot")
@@ -337,7 +354,7 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	if marketWarning != "" {
 		result.Warnings = append(result.Warnings, marketWarning)
 	}
-	c.JSON(http.StatusOK, gin.H{"symbol": symbol, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": "^GSPC", "source": marketSource, "fetched_at": marketHistory.fetchedAt, "refreshing": marketRefreshing}, "price_coordinate": priceCoordinate, "daily": result.Daily, "weekly": result.Weekly, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}})
+	c.JSON(http.StatusOK, gin.H{"symbol": symbol, "ready": true, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": "^GSPC", "source": marketSource, "fetched_at": marketHistory.fetchedAt, "refreshing": marketRefreshing}, "price_coordinate": priceCoordinate, "daily": result.Daily, "weekly": result.Weekly, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}})
 }
 
 func adjustedIntradayBars(input, daily []chananalysis.Bar) ([]chananalysis.Bar, int) {
@@ -747,16 +764,26 @@ func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string) bool {
 		// documented near-term study instead of truncating it to two years.
 		result, err := loader.ChanAdjustedHistory(ctx, symbol, "5y")
 		if err != nil || result.FetchedAt.IsZero() || len(result.Bars) == 0 {
+			if err == nil {
+				err = errors.New("adjusted Chan history provider returned no bars")
+			}
+			log.Printf("background adjusted Chan history refresh failed symbol=%s: %v", symbol, err)
 			s.chanAdjustedMu.Lock()
 			s.chanAdjustedRetryAfter[cacheKey] = time.Now().Add(30 * time.Second)
 			s.chanAdjustedMu.Unlock()
 			return
 		}
 		if err := s.store.WriteChanAdjustedHistory(symbol, result.Timeframe, result.AdjustmentType, result.Source, result.Bars, result.FetchedAt); err != nil {
+			log.Printf("background adjusted Chan history SQLite write failed symbol=%s: %v", symbol, err)
 			s.chanAdjustedMu.Lock()
 			s.chanAdjustedRetryAfter[cacheKey] = time.Now().Add(30 * time.Second)
 			s.chanAdjustedMu.Unlock()
 			return
+		}
+		if rawBars := rawChanHistoryBars(result.Bars); len(rawBars) > 0 {
+			if err := s.store.WriteHistory(symbol, rawBars, result.FetchedAt); err != nil {
+				log.Printf("background adjusted Chan raw history cache write failed symbol=%s: %v", symbol, err)
+			}
 		}
 		s.chanAdjustedMu.Lock()
 		if s.chanAdjustedCache == nil {
@@ -772,8 +799,32 @@ func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string) bool {
 			s.chanAdjustedRetryAfter[cacheKey] = time.Now().Add(chanAdjustedHistoryRetryDelay)
 		}
 		s.chanAdjustedMu.Unlock()
+		s.publishAnalyticsEvent(symbol)
 	}()
 	return true
+}
+
+func rawChanHistoryBars(adjusted []map[string]any) []map[string]any {
+	if len(adjusted) == 0 {
+		return nil
+	}
+	bars := make([]map[string]any, 0, len(adjusted))
+	for _, row := range adjusted {
+		date, ok := row["date"].(string)
+		if !ok || date == "" {
+			continue
+		}
+		open, openOK := historyMapNumber(row, "raw_open")
+		high, highOK := historyMapNumber(row, "raw_high")
+		low, lowOK := historyMapNumber(row, "raw_low")
+		close, closeOK := historyMapNumber(row, "raw_close")
+		volume, volumeOK := historyMapNumber(row, "raw_volume")
+		if !openOK || !highOK || !lowOK || !closeOK || !volumeOK {
+			continue
+		}
+		bars = append(bars, map[string]any{"date": date, "open": open, "high": high, "low": low, "close": close, "volume": volume})
+	}
+	return bars
 }
 
 // chanAnalysis shares the existing daily history cache and asynchronous
@@ -893,6 +944,16 @@ func chanExpectedHistoryDay(now time.Time) string {
 // TTL. A short freshness window coalesces simultaneous instances through the
 // established history lock, SQLite lease and shared upstream budget.
 func (s *Service) prefetchChanHistory(symbol string, missingClose bool) {
+	// A cold adjusted Chan request fetches the same raw OHLC together with
+	// Yahoo's adjusted close. Let that job seed the shared raw-history cache
+	// instead of launching a competing two-year request.
+	adjustedKey := symbol + "|1d|split_dividend_auto|go-yfinance"
+	s.chanAdjustedMu.Lock()
+	adjustedRefreshActive := s.chanAdjustedJobs[adjustedKey]
+	s.chanAdjustedMu.Unlock()
+	if adjustedRefreshActive {
+		return
+	}
 	s.mu.Lock()
 	if s.background.Err() != nil || s.chanHistoryJobs[symbol] {
 		s.mu.Unlock()

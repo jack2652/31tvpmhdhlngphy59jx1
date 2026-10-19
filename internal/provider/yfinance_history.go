@@ -50,18 +50,91 @@ func (c *YFinanceHistoryClient) FetchAdjusted(ctx context.Context, symbol, perio
 	return c.fetch(ctx, symbol, period, true)
 }
 
-// FetchChanAdjusted fetches adjusted and raw OHLC independently and joins them
-// by session date. Chan analysis must never silently fall back to raw prices.
+// FetchChanAdjusted derives adjusted OHLC from Yahoo's raw OHLC and adjusted
+// close in one history response. Chan analysis must never silently fall back
+// to raw prices.
 func (c *YFinanceHistoryClient) FetchChanAdjusted(ctx context.Context, symbol, period string) (ChanAdjustedHistoryResult, error) {
-	adjusted, err := c.fetch(ctx, symbol, period, true)
+	if err := ctx.Err(); err != nil {
+		return ChanAdjustedHistoryResult{}, err
+	}
+	if c == nil {
+		return ChanAdjustedHistoryResult{}, errors.New("go-yfinance history client is nil")
+	}
+	normalized, err := NormalizeSymbol(symbol)
+	if err != nil {
+		if strings.EqualFold(strings.TrimSpace(symbol), "^GSPC") {
+			normalized = "^GSPC"
+		} else {
+			return ChanAdjustedHistoryResult{}, err
+		}
+	}
+	period = strings.ToLower(strings.TrimSpace(period))
+	if !supportedHistoryPeriod(period) {
+		return ChanAdjustedHistoryResult{}, fmt.Errorf("unsupported Yahoo history period %q", period)
+	}
+	now := time.Now()
+	if c.TimeNow != nil {
+		now = c.TimeNow()
+	}
+	params := historyRequestParams(period, false, now)
+	bars, err := runYahooSDK(ctx, c.Gate, c.GateWait, c.TickerFactory, normalized, func(ticker yahooTicker) ([]ym.Bar, error) {
+		return ticker.History(params)
+	})
+	if err != nil {
+		return ChanAdjustedHistoryResult{}, fmt.Errorf("fetch adjusted Chan history: %w", err)
+	}
+	result, err := normalizeYFinanceChanAdjustedHistory(normalized, bars, c.Location)
 	if err != nil {
 		return ChanAdjustedHistoryResult{}, err
 	}
-	raw, err := c.fetch(ctx, symbol, period, false)
-	if err != nil {
-		return ChanAdjustedHistoryResult{}, fmt.Errorf("fetch raw bars for adjusted Chan history: %w", err)
+	result.FetchedAt, result.Source = now.UTC(), "go-yfinance"
+	return result, nil
+}
+
+func normalizeYFinanceChanAdjustedHistory(symbol string, bars []ym.Bar, location *time.Location) (ChanAdjustedHistoryResult, error) {
+	if len(bars) == 0 {
+		return ChanAdjustedHistoryResult{}, errors.New("go-yfinance returned empty adjusted Chan history")
 	}
-	return pairChanAdjustedBars(adjusted, raw)
+	if location == nil {
+		location = time.UTC
+	}
+	joined := make([]map[string]any, 0, len(bars))
+	for index, bar := range bars {
+		if bar.Date.IsZero() {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("adjusted Chan history bar %d has missing date", index)
+		}
+		adjustedClose := bar.AdjClose
+		if adjustedClose == 0 {
+			// Yahoo may omit adjclose for symbols with no corporate-action
+			// adjustment. The SDK's auto-adjust path treats that as factor 1.
+			adjustedClose = bar.Close
+		}
+		if bar.Close <= 0 || adjustedClose <= 0 || bar.Volume < 0 ||
+			math.IsNaN(bar.Close) || math.IsInf(bar.Close, 0) || math.IsNaN(adjustedClose) || math.IsInf(adjustedClose, 0) {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("adjusted Chan history bar %d has invalid close or volume", index)
+		}
+		factor := adjustedClose / bar.Close
+		if factor <= 0 || math.IsNaN(factor) || math.IsInf(factor, 0) {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("adjusted Chan history bar %d has invalid adjustment factor", index)
+		}
+		values := []float64{bar.Open, bar.High, bar.Low}
+		for _, value := range values {
+			if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+				return ChanAdjustedHistoryResult{}, fmt.Errorf("adjusted Chan history bar %d has invalid raw OHLC", index)
+			}
+		}
+		if bar.High < math.Max(bar.Open, bar.Close) || bar.Low > math.Min(bar.Open, bar.Close) || bar.High < bar.Low {
+			return ChanAdjustedHistoryResult{}, fmt.Errorf("adjusted Chan history bar %d has inconsistent raw OHLC", index)
+		}
+		date := bar.Date.In(location).Format(time.DateOnly)
+		joined = append(joined, map[string]any{
+			"date": date,
+			"open": bar.Open * factor, "high": bar.High * factor, "low": bar.Low * factor, "close": adjustedClose,
+			"volume": float64(bar.Volume), "raw_open": bar.Open, "raw_high": bar.High, "raw_low": bar.Low,
+			"raw_close": bar.Close, "raw_volume": float64(bar.Volume), "adjustment_factor": factor,
+		})
+	}
+	return ChanAdjustedHistoryResult{Symbol: symbol, Bars: joined, Source: "go-yfinance", AdjustmentType: "split_dividend_auto", Timeframe: "1d"}, nil
 }
 
 func pairChanAdjustedBars(adjusted, raw HistoryResult) (ChanAdjustedHistoryResult, error) {
@@ -270,20 +343,11 @@ func (c *YFinanceHistoryClient) fetch(ctx context.Context, rawSymbol, period str
 	// Yahoo's range=max form with daily bars can silently return one bar per
 	// month, which drops valid daily extrema. Keep the Go request on the same
 	// wire shape as the Python provider.
-	historyParams := ym.HistoryParams{
-		Period: period, Interval: "1d", AutoAdjust: adjusted,
-		Actions: false, PrePost: false, KeepNA: false,
+	historyNow := time.Now()
+	if c.TimeNow != nil {
+		historyNow = c.TimeNow()
 	}
-	if period == "max" {
-		now := time.Now()
-		if c.TimeNow != nil {
-			now = c.TimeNow()
-		}
-		end := time.Unix(now.Unix(), 0)
-		historyParams.Period = ""
-		historyParams.Start = ptrTime(time.Unix(end.Unix()-3122064000+5, 0))
-		historyParams.End = ptrTime(end)
-	}
+	historyParams := historyRequestParams(period, adjusted, historyNow)
 	bars, err := runYahooSDK(ctx, c.Gate, c.GateWait, c.TickerFactory, symbol, func(ticker yahooTicker) ([]ym.Bar, error) {
 		return ticker.History(historyParams)
 	})
@@ -301,6 +365,17 @@ func (c *YFinanceHistoryClient) fetch(ctx context.Context, rawSymbol, period str
 	}
 	result.Source = "go-yfinance"
 	return result, nil
+}
+
+func historyRequestParams(period string, adjusted bool, now time.Time) ym.HistoryParams {
+	params := ym.HistoryParams{Period: period, Interval: "1d", AutoAdjust: adjusted, Actions: false, PrePost: false, KeepNA: false}
+	if period == "max" {
+		end := time.Unix(now.Unix(), 0)
+		params.Period = ""
+		params.Start = ptrTime(time.Unix(end.Unix()-3122064000+5, 0))
+		params.End = ptrTime(end)
+	}
+	return params
 }
 
 func ptrTime(value time.Time) *time.Time { return &value }

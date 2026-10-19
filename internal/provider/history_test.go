@@ -53,7 +53,7 @@ func TestPairChanAdjustedHistoryValidatesConsistentOHLCFactor(t *testing.T) {
 	}
 }
 
-func TestFetchChanAdjustedUsesIndependentAdjustedAndRawHistories(t *testing.T) {
+func TestFetchChanAdjustedUsesAdjustedCloseFromOneHistoryRequest(t *testing.T) {
 	fixedTime := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	var params []ym.HistoryParams
 	client := &YFinanceHistoryClient{
@@ -65,12 +65,7 @@ func TestFetchChanAdjustedUsesIndependentAdjustedAndRawHistories(t *testing.T) {
 			}
 			return &yahooSDKTestTicker{historyFunc: func(request ym.HistoryParams) ([]ym.Bar, error) {
 				params = append(params, request)
-				bar := ym.Bar{Date: fixedTime, Volume: 100}
-				if request.AutoAdjust {
-					bar.Open, bar.High, bar.Low, bar.Close = 49, 53, 48, 52
-				} else {
-					bar.Open, bar.High, bar.Low, bar.Close = 98, 106, 96, 104
-				}
+				bar := ym.Bar{Date: fixedTime, Open: 98, High: 106, Low: 96, Close: 104, AdjClose: 52, Volume: 100}
 				return []ym.Bar{bar}, nil
 			}}, nil
 		},
@@ -79,11 +74,11 @@ func TestFetchChanAdjustedUsesIndependentAdjustedAndRawHistories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(params) != 2 || !params[0].AutoAdjust || params[1].AutoAdjust || params[0].Interval != "1d" || params[1].Interval != "1d" {
-		t.Fatalf("history requests=%+v, want separate adjusted then raw daily queries", params)
+	if len(params) != 1 || params[0].AutoAdjust || params[0].Interval != "1d" {
+		t.Fatalf("history requests=%+v, want one raw daily query with adjusted close", params)
 	}
-	if params[0].Period != "5y" || params[1].Period != "5y" {
-		t.Fatalf("history periods=%q/%q, want five-year context for adjusted recursive analysis", params[0].Period, params[1].Period)
+	if params[0].Period != "5y" {
+		t.Fatalf("history period=%q, want five-year context for adjusted recursive analysis", params[0].Period)
 	}
 	if result.Timeframe != "1d" || result.AdjustmentType != "split_dividend_auto" || result.Source != "go-yfinance" || !result.FetchedAt.Equal(fixedTime) || len(result.Bars) != 1 {
 		t.Fatalf("Chan adjusted result=%+v, want one independently paired daily bar", result)

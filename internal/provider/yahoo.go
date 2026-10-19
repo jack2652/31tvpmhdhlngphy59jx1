@@ -49,11 +49,18 @@ type Yahoo struct {
 	// tickers so their own caches cannot serve stale data.
 	quoteTickersMu sync.Mutex
 	quoteTickers   map[string]yahooTicker
+	quoteTickerInit map[string]*yahooTickerInit
 	// interactiveGate reserves one upstream slot for the interactive quote path
 	// (the current-price card). Option chains, Gamma batches, fundamentals, and
 	// history share semaphore and can saturate it; Quote takes this dedicated
 	// slot instead so a busy background batch cannot starve the price.
 	interactiveGate chan struct{}
+}
+
+type yahooTickerInit struct {
+	done   chan struct{}
+	ticker yahooTicker
+	err    error
 }
 
 type yahooCrumbGetter interface {
@@ -81,7 +88,7 @@ func NewYahoo(timeout time.Duration, concurrency int) *Yahoo {
 	fundamentals.Gate, fundamentals.GateWait = semaphore, timeout
 	earnings := NewYahooEarningsClient(client)
 	earnings.Gate, earnings.GateWait = semaphore, timeout
-	return &Yahoo{client: client, optionsURL: optionsURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTicker), interactiveGate: interactiveGate}
+	return &Yahoo{client: client, optionsURL: optionsURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTicker), quoteTickerInit: make(map[string]*yahooTickerInit), interactiveGate: interactiveGate}
 }
 
 func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress string) (*Yahoo, error) {
@@ -136,6 +143,7 @@ func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress stri
 		semaphore:       semaphore,
 		now:             time.Now,
 		quoteTickers:    make(map[string]yahooTicker),
+		quoteTickerInit: make(map[string]*yahooTickerInit),
 		interactiveGate: interactiveGate,
 	}, nil
 }
@@ -156,21 +164,39 @@ func (y *Yahoo) Close() error {
 // refreshes reuse the Yahoo cookie/crumb held by that ticker. The SDK ticker is
 // created with a shared client (ownsClient=false), so runYahooSDK's deferred
 // Close is a no-op and the instance stays warm between refreshes.
-func (y *Yahoo) quoteTicker(symbol string) (yahooTicker, error) {
+func (y *Yahoo) quoteTicker(ctx context.Context, symbol string) (yahooTicker, error) {
 	if y.tickerFactory == nil {
 		return nil, errors.New("go-yfinance ticker factory is unavailable")
 	}
 	y.quoteTickersMu.Lock()
-	defer y.quoteTickersMu.Unlock()
 	if ticker, ok := y.quoteTickers[symbol]; ok {
+		y.quoteTickersMu.Unlock()
 		return ticker, nil
 	}
-	ticker, err := y.tickerFactory(symbol)
-	if err != nil {
-		return nil, err
+	if pending := y.quoteTickerInit[symbol]; pending != nil {
+		y.quoteTickersMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-pending.done:
+			return pending.ticker, pending.err
+		}
 	}
-	y.quoteTickers[symbol] = ticker
-	return ticker, nil
+	pending := &yahooTickerInit{done: make(chan struct{})}
+	y.quoteTickerInit[symbol] = pending
+	y.quoteTickersMu.Unlock()
+	ticker, err := y.tickerFactory(symbol)
+	y.quoteTickersMu.Lock()
+	if err != nil {
+		pending.err = err
+	} else {
+		y.quoteTickers[symbol] = ticker
+		pending.ticker = ticker
+	}
+	delete(y.quoteTickerInit, symbol)
+	close(pending.done)
+	y.quoteTickersMu.Unlock()
+	return pending.ticker, pending.err
 }
 
 // Fundamentals fetches optional Yahoo financial inputs used by valuation. It is
@@ -415,7 +441,7 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 	}
 	var phases quotePhaseTimes
 	startedAt := time.Now()
-	quoteTickerFactory := func(string) (yahooTicker, error) { return y.quoteTicker(symbol) }
+	quoteTickerFactory := func(string) (yahooTicker, error) { return y.quoteTicker(ctx, symbol) }
 	quoteGate := y.semaphore
 	if y.interactiveGate != nil {
 		quoteGate = y.interactiveGate
