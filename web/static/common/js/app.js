@@ -4040,9 +4040,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   // 涨跌色统一走 --up / --down：当前全局口径是绿涨红跌，变量名不再写死颜色。
   state.view.quoteChangeColor = change == null ? "var(--muted)" : (change < 0 ? "var(--down)" : "var(--up)");
   state.view.quoteCurrency = quote?.currency || "USD";
-  state.view.quoteMarket = quote?.source === "sqlite" && quoteCacheBadgeIsStale(quote)
-    ? `缓存 · ${quoteMarketLabel(quote)}`
-    : quoteMarketLabel(quote);
+  state.view.quoteMarket = quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
   scheduleQuoteRecovery(state.lastQuote);
