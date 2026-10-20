@@ -46,7 +46,9 @@ assert.match(client, /guide\.riskNotice = hasDownsidePath/, "the gray card must 
 assert.match(styles, /article\.chan-scenario-risk-note\{border-left:3px solid var\(--muted\)\}/, "the realized-downside card must use the muted gray accent");
 assert.match(client, /function macdSeries\(candles\)/, "the chart must compute MACD from the full candle history");
 assert.match(client, /volumeTop, volumeBottom, volumeMax/, "the chart model must expose volume pane geometry");
+assert.match(client, /indicatorDividerY/, "the chart model must expose the volume/MACD divider position");
 assert.match(client, /macdTop, macdBottom, macdMin, macdMax, macdZeroY/, "the chart model must expose MACD pane geometry");
+assert.match(charts, /model\.indicatorDividerY/, "the canvas must paint the volume/MACD divider");
 assert.match(template, /@click.stop="toggleChanScenarios"/, "scenario visibility control must remain connected to its toggle");
 const scenarioToggle = app.indexOf("toggleChanScenarios() {");
 assert.ok(scenarioToggle >= 0, "scenario toggle method must exist");

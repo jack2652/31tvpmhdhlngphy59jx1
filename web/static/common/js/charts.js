@@ -530,7 +530,9 @@ function indicatorHeaderText(candle) {
 }
 
 function indicatorHeaderFont(model) {
-  return `${model?.mobileChart ? 10 : 9}px Inter, ui-sans-serif, system-ui, sans-serif`;
+  // Mobile charts paint a 420px model into a narrower card, so the indicator
+  // headers use the same scale as the mobile price and date labels.
+  return `${model?.mobileChart ? 14 : 9}px Inter, ui-sans-serif, system-ui, sans-serif`;
 }
 
 // Repaint only the two header strips while hovering. Clearing the whole chart
@@ -722,6 +724,14 @@ function drawChanCanvas(target, binding) {
       { font: indicatorFont, color: colors.text });
     line(model.plotLeft, model.volumeBottom, model.plotRight, model.volumeBottom, colors.axis, [], 1);
   }
+  // Keep the MACD pane visually separate from the volume block; the MACD header
+  // sits in the gap and would otherwise look like the volume pane's footer.
+  if (Number.isFinite(model.volumeBottom) && Number.isFinite(model.macdTop)) {
+    const dividerY = Number.isFinite(model.indicatorDividerY)
+      ? model.indicatorDividerY
+      : model.volumeBottom + (model.macdTop - model.volumeBottom) / 3;
+    line(model.plotLeft, dividerY, model.plotRight, dividerY, colors.fieldLine, [], 1.5);
+  }
   // MACD pane: histogram around zero plus DIF/DEA lines.
   if (Number.isFinite(model.macdTop) && Number.isFinite(model.macdBottom)) {
     const macdHeight = model.macdBottom - model.macdTop;
@@ -760,7 +770,6 @@ function drawChanCanvas(target, binding) {
     label(indicatorHeaderText(latestIndicatorCandle(model)).macd, model.plotLeft, model.macdTop - 6,
       { font: indicatorFont, color: colors.text });
     line(model.plotLeft, model.macdBottom, model.plotRight, model.macdBottom, colors.axis, [], 1);
-    line(model.plotLeft, model.macdBottom, model.plotRight, model.macdBottom, colors.axis, [], 1);
   }
   // Bottom axis and the three visible date anchors.
   line(model.plotLeft, model.plotBottom, model.plotRight, model.plotBottom, colors.axis, [], 1);
@@ -772,7 +781,7 @@ function drawChanCanvas(target, binding) {
   // geometry is already projected into chart coordinates by the view model.
   if (scenariosVisible && model.projections?.length) {
     context.save();
-    const laneLeft = model.historyRight;
+    const laneLeft = Number.isFinite(model.scenarioLaneLeft) ? model.scenarioLaneLeft : model.historyRight;
     const laneWidth = model.plotRight - laneLeft;
     if (laneWidth > 0) {
       context.globalAlpha = 0.92;

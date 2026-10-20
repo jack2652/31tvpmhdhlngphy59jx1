@@ -274,7 +274,8 @@
         label: `${badgePrice > maximum ? "↑ " : badgePrice < minimum ? "↓ " : ""}${money(badgePrice)}`,
         height: 22 } : null;
     const quotePrice = value != null && Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : chart.lastClose;
-    const startX = chart.historyRight + 8;
+    const laneLeft = Number.isFinite(chart.scenarioLaneLeft) ? chart.scenarioLaneLeft : chart.historyRight;
+    const startX = laneLeft + 8;
     const endX = chart.plotRight - 8;
     const projectionWidth = Math.max(0, endX - startX);
     const projections = (scenarios || []).map((scenario) => {
@@ -366,7 +367,18 @@
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
     const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, recursiveCenterVisibility].join(":");
-    const cacheKey = `${showScenarios ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${ruleVersion || ""}`;
+    // Only reserve the scenario lane when there is a path to draw. Reserving
+    // it unconditionally leaves a large blank gutter on mobile charts whose
+    // current structure produced no projection.
+    const spotPrice = Number(spot);
+    const scenarioLane = showScenarios && (scenarios || []).some((scenario) => {
+      const levels = (scenario?.projection_levels || []).map(Number).filter((value) => Number.isFinite(value) && value > 0);
+      if (!levels.length) return false;
+      const anchor = Number(scenario?.projection_anchor_price);
+      const reference = Number.isFinite(anchor) && anchor > 0 ? anchor : spotPrice;
+      return levels.some((level) => !Number.isFinite(reference) || Math.abs(level - reference) > 0.000001);
+    });
+    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${ruleVersion || ""}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
@@ -386,24 +398,30 @@
     const width = mobile ? 420 : 960;
     // Desktop retains room for the left price labels and current-price badge
     // without carrying the oversized axis gutter from the former right axis.
-    const left = mobile ? 94 : 52, right = 20, top = mobile ? 24 : 18, bottom = 38;
+    const left = mobile ? 72 : 52, right = mobile ? 8 : 20, top = mobile ? 24 : 18, bottom = 38;
     // Keep the price pane at its original height and append volume/MACD panes
     // below it; all panes share the same time axis and horizontal geometry.
     const priceHeight = mobile ? 458 : 284;
     const plotHeight = priceHeight;
     const priceBottom = top + plotHeight;
     const panelGap = mobile ? 22 : 20;
+    // The volume and MACD panes need a wider gap than the price pane: the MACD
+    // header sits in this gap and otherwise reads as part of the volume block.
+    const indicatorGap = mobile ? 36 : 34;
     const volumeHeight = mobile ? 84 : 72;
     const macdHeight = mobile ? 112 : 96;
     const volumeTop = priceBottom + panelGap;
     const volumeBottom = volumeTop + volumeHeight;
-    const macdTop = volumeBottom + panelGap;
+    const macdTop = volumeBottom + indicatorGap;
     const macdBottom = macdTop + macdHeight;
+    const indicatorDividerY = volumeBottom + Math.round(indicatorGap / 3);
     const height = macdBottom + bottom;
     const plotWidth = width - left - right;
-    // Keep the scenario lane separate from historical bars when it is shown.
-    const scenarioBoundary = left + plotWidth * (mobile ? 0.78 : 0.88);
-    const historyRight = showScenarios ? scenarioBoundary : width - right;
+    // Keep the scenario lane independent from historical bars. Mobile uses a
+    // slightly wider lane than desktop so the projection stays readable.
+    const scenarioBoundary = left + plotWidth * (mobile ? 0.84 : 0.88);
+    const historyRight = scenarioLane ? scenarioBoundary : width - right;
+    const scenarioLaneLeft = historyRight;
     const historyWidth = historyRight - left;
     const firstDate = bars[0].date, lastDate = bars[bars.length - 1].date;
     const firstDisplayDate = displayBarTime(firstDate, frame.period), lastDisplayDate = displayBarTime(lastDate, frame.period);
@@ -569,7 +587,7 @@
     });
     const chart = {
       width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: priceBottom,
-      priceBottom, volumeTop, volumeBottom, volumeMax,
+      priceBottom, volumeTop, volumeBottom, volumeMax, indicatorDividerY,
       macdTop, macdBottom, macdMin, macdMax, macdZeroY,
       crosshairBottom: macdBottom, interactionBottom: macdBottom, axisBottom: macdBottom,
       totalBars, visibleBars: bars.length, windowStart: startIndex, windowEnd: endIndex, endOffset,
@@ -577,7 +595,7 @@
       canPanLeft: endOffset < maxOffset, canPanRight: endOffset > 0,
       canResetViewport: endOffset > 0 || bars.length !== defaultBars,
       minimum, maximum, periodLabel: frame.label,
-      historyRight, scenarioBoundary, lastClose: frame.last_close,
+      historyRight, scenarioBoundary, scenarioLaneLeft, lastClose: frame.last_close,
       title: `${frame.label} K 线与结构观察，${firstDisplayDate} 至 ${lastDisplayDate}`,
       ruleVersion: recursiveRule,
       description: "实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔和顶底观察均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。价格图下方依次为成交量和 MACD（12、26、9），它们与 K 线共用同一时间轴。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；下方副图显示 MACD。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。",

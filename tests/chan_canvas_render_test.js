@@ -38,19 +38,21 @@ function renderScenarios(visible) {
   return context.strokes.filter((stroke) => stroke.start[0] === 708 && stroke.start[1] === 120 && stroke.end[0] === 932 && stroke.end[1] === 40);
 }
 
+const indicatorChart = {
+  width: 960, height: 548, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, priceBottom: 300,
+  volumeTop: 320, volumeBottom: 392, volumeMax: 1000,
+  macdTop: 412, macdBottom: 508, macdMin: -2, macdMax: 2, macdZeroY: 460,
+  historyRight: 940, grid: [], candles: [
+    { x: 100, bodyWidth: 6, direction: "up", volume: 500, macd: { dif: 1, dea: 0.5, hist: 1 } },
+    { x: 120, bodyWidth: 6, direction: "down", volume: 1000, macd: { dif: -1, dea: -0.5, hist: -1 } },
+  ], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels: [], signals: [], dates: [], segments: [],
+};
+
 function renderIndicators() {
   context.strokes = [];
   context.rects = [];
   window.OptionScopeCharts.renderChanCanvas(target, {
-    chart: {
-      width: 960, height: 548, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, priceBottom: 300,
-      volumeTop: 320, volumeBottom: 392, volumeMax: 1000,
-      macdTop: 412, macdBottom: 508, macdMin: -2, macdMax: 2, macdZeroY: 460,
-      historyRight: 940, grid: [], candles: [
-        { x: 100, bodyWidth: 6, direction: "up", volume: 500, macd: { dif: 1, dea: 0.5, hist: 1 } },
-        { x: 120, bodyWidth: 6, direction: "down", volume: 1000, macd: { dif: -1, dea: -0.5, hist: -1 } },
-      ], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels: [], signals: [], dates: [], segments: [],
-    },
+    chart: indicatorChart,
     layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false },
   });
   return context;
@@ -89,5 +91,24 @@ const macdHeader = indicator.texts.find((text) => text.text.startsWith("MACD"));
 assert.ok(macdHeader, "MACD pane must be labelled");
 assert.equal(macdHeader.x, 50, "MACD title and latest values must sit on the left");
 assert.match(macdHeader.text, /DIF -1\.00 · DEA -0\.50 · 柱 -1\.00/, "latest DIF/DEA/histogram values must follow the MACD title");
+const dividerY = 392 + (412 - 392) / 3;
+const paneDivider = indicator.strokes.find((stroke) => Math.abs(stroke.start[0] - 50) < 0.01
+  && Math.abs(stroke.end[0] - 940) < 0.01
+  && Math.abs(stroke.start[1] - dividerY) < 0.01
+  && Math.abs(stroke.end[1] - dividerY) < 0.01);
+assert.ok(paneDivider, "volume and MACD panes must be separated by a divider line");
+
+context.strokes = [];
+context.texts = [];
+window.OptionScopeCharts.renderChanCanvas(target, {
+  chart: {
+    ...indicatorChart, mobileChart: true,
+  },
+  layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false },
+});
+const mobileVolumeHeader = context.texts.find((text) => text.text.startsWith("成交量"));
+const mobileMacdHeader = context.texts.find((text) => text.text.startsWith("MACD"));
+assert.match(mobileVolumeHeader.font, /^14px/, "mobile volume header must use the mobile label scale");
+assert.match(mobileMacdHeader.font, /^14px/, "mobile MACD header must use the mobile label scale");
 
 console.log("Chan canvas segment and scenario rendering checks passed");

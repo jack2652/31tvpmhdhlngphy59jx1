@@ -3639,6 +3639,39 @@ func TestSnapshotRefreshUsesSingleNearestChainRequest(t *testing.T) {
 	}
 }
 
+func TestSnapshotRefreshWithQuoteOverrideUsesNearestChain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nearest-chain-override.db")
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	price := 123.0
+	fetchedAt := time.Now().UTC()
+	provider := &nearestChainTestProvider{testMarketProvider: &testMarketProvider{}}
+	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamTimeout: time.Second}, repository, provider)
+	defer service.Close()
+	quote := model.Quote{Price: &price, FetchedAt: &fetchedAt, Currency: "USD", Provider: "test", Sessions: map[string]any{}}
+	response, err := service.refreshSnapshotWithOverrides(context.Background(), "QQQ", "", time.Second, nil, &quote)
+	if err != nil {
+		t.Fatalf("refreshSnapshotWithOverrides() error = %v", err)
+	}
+	if got := provider.nearestCalls.Load(); got != 1 {
+		t.Fatalf("NearestChain calls = %d, want 1", got)
+	}
+	if got := provider.expirationCalls.Load(); got != 0 {
+		t.Fatalf("separate Expirations calls = %d, want 0", got)
+	}
+	if got := provider.chainCalls.Load(); got != 0 {
+		t.Fatalf("separate Chain calls = %d, want 0", got)
+	}
+	if got := provider.quoteCalls.Load(); got != 0 {
+		t.Fatalf("upstream quote calls = %d, want 0 for the override", got)
+	}
+	if response.Expiration != "2030-01-18" || response.Rows != 1 || response.Quote == nil || response.Quote.Price == nil || *response.Quote.Price != price {
+		t.Fatalf("refresh response = %+v", response)
+	}
+}
+
 func TestChanAdjustedEndpointSerializesRecursiveStructureAndSignalEvidence(t *testing.T) {
 	service, ts := testService(t, "")
 	now := time.Now().UTC()
@@ -4810,6 +4843,52 @@ func TestSSERefreshLoopRegistersPerSubscription(t *testing.T) {
 	}
 	if fake.quoteCalls.Load() == 0 || fake.expirationCalls.Load() == 0 {
 		t.Fatalf("subscription did not trigger snapshot refresh: quote=%d expiration=%d", fake.quoteCalls.Load(), fake.expirationCalls.Load())
+	}
+}
+
+func TestSubscriptionQuoteRefreshRunsDuringSnapshotBackoff(t *testing.T) {
+	cfg := config.Config{DatabasePath: filepath.Join(t.TempDir(), "priority-quote.db"), UpstreamTimeout: time.Second}
+	repository, err := store.Open(cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a failed chain cycle: its durable retry window must not block
+	// the live quote.
+	if _, err := repository.DeferPushRefresh("QQQ", "", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	price := 100.0
+	fake := &testMarketProvider{
+		quote:       model.Quote{Price: &price, Currency: "USD", Provider: "test", Sessions: map[string]any{}},
+		expirations: []string{time.Now().AddDate(0, 0, 8).Format("2006-01-02")},
+	}
+	service := NewWithProvider(cfg, repository, fake)
+	defer service.Close()
+
+	release := service.registerSubscription("QQQ|", "QQQ", "")
+	defer release()
+	deadline := time.Now().Add(time.Second)
+	var stored model.Quote
+	var found bool
+	for time.Now().Before(deadline) {
+		var err error
+		stored, found, err = repository.LatestQuote("QQQ")
+		if err == nil && found && stored.Price != nil && *stored.Price == price {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := fake.quoteCalls.Load(); got != 1 {
+		t.Fatalf("priority quote calls = %d, want one", got)
+	}
+	if got := fake.expirationCalls.Load(); got != 0 {
+		t.Fatalf("catalog calls = %d, want none while the snapshot retry window is active", got)
+	}
+	if got := fake.chainCalls.Load(); got != 0 {
+		t.Fatalf("chain calls = %d, want none while the snapshot retry window is active", got)
+	}
+	if !found || stored.Price == nil || *stored.Price != price {
+		t.Fatalf("latest quote = %#v, found=%t; want persisted price %v", stored, found, price)
 	}
 }
 

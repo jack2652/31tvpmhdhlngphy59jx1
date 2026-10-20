@@ -37,6 +37,36 @@ const availableView = window.OptionScopeChan.view(available);
 assert.equal(availableView.daily.chart.spot.label, "55.00", "chart marker must use the adjusted live quote");
 assert.equal(availableView.daily.chart.candles[0].prices.close, 54, "hover OHLC must stay in the adjusted candle coordinate");
 
+const mobileChart = window.OptionScopeChan.view(available, true, true, 30).daily.chart;
+assert.equal(mobileChart.plotLeft, 72, "mobile charts must keep the price-label gutter compact");
+assert.equal(mobileChart.historyRight, mobileChart.plotRight, "mobile candles must use the full chart width");
+assert.ok(mobileChart.historyRight - mobileChart.plotLeft >= 330, "mobile candles must use the available chart width");
+
+function scenarioFrame() {
+  return {
+    period: "1d", label: "日线", as_of: "2026-10-16", bar_count: 10, last_close: 54,
+    candles: Array.from({ length: 10 }, (_, index) => ({
+      date: `2026-10-${String(index + 6).padStart(2, "0")}`,
+      open: 50 + index, high: 56 + index, low: 48 + index, close: 52 + index,
+    })),
+    strokes: [
+      { direction: "up", low: 45, high: 60, confirmed: true, start: { date: "2026-10-01", kind: "bottom", price: 45 }, end: { date: "2026-10-10", kind: "top", price: 60 } },
+      { direction: "down", low: 48, high: 60, confirmed: true, start: { date: "2026-10-10", kind: "top", price: 60 }, end: { date: "2026-10-15", kind: "bottom", price: 48 } },
+    ],
+    centers: [{ lower: 50, upper: 58, start: "2026-10-02", end: "2026-10-14" }],
+    recursive_centers: [], recursive_levels: [], signals: [], pen_signals: [],
+    position: { code: "inside", center: { lower: 50, upper: 58 } },
+  };
+}
+const scenarioChart = window.OptionScopeChan.view({
+  symbol: "TEST", spot: 54, daily: scenarioFrame(), weekly: scenarioFrame(), summary: {},
+}, true, true, 30).daily.chart;
+assert.ok(scenarioChart.projections.length > 0, "scenario frame must produce a projection path");
+assert.ok(scenarioChart.historyRight < scenarioChart.plotRight, "mobile scenarios must keep an independent right lane");
+assert.equal(scenarioChart.scenarioLaneLeft, scenarioChart.historyRight, "the scenario path must start at the independent lane");
+assert.ok(scenarioChart.plotRight - scenarioChart.historyRight >= 40, "the mobile scenario lane must leave room for the projection");
+assert.ok(scenarioChart.historyRight - scenarioChart.plotLeft >= 280, "the mobile candle area must remain wide");
+
 const degraded = window.OptionScopeChan.withSpot({
   symbol: "TEST",
   spot: 55,

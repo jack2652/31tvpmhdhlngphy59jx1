@@ -1084,6 +1084,12 @@ func validMarketPrice(price *float64) bool {
 	return price != nil && !math.IsNaN(*price) && !math.IsInf(*price, 0) && *price > 0
 }
 
+// quoteWasFetched distinguishes a provider quote from the SQLite fallback used
+// when another worker holds the quote lease.
+func quoteWasFetched(quote model.Quote) bool {
+	return validMarketPrice(quote.Price) && !strings.EqualFold(strings.TrimSpace(quote.Source), "sqlite")
+}
+
 func (s *Service) cacheQuote(symbol string, quote model.Quote) {
 	if !validMarketPrice(quote.Price) {
 		return
@@ -1848,13 +1854,13 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	var preloadedFetched *time.Time
 	var preloadedExpiration string
 	nearestProvider, supportsNearest := s.provider.(NearestChainProvider)
-	preloadChain := supportsNearest && quoteOverride == nil && expirationsOverride == nil && requestedExpiration == ""
+	preloadChain := supportsNearest && expirationsOverride == nil && requestedExpiration == ""
 	// Quote and the expiration catalog are independent and use the provider's
 	// dedicated first-render lane, which stays available even when the shared
 	// upstream gate is a single slot. Run them together in low-memory mode too:
 	// the price card should never wait behind the catalog, and the heavy chain
 	// fetch still serializes on the shared gate.
-	parallelQuoteAndCatalog := quoteOverride == nil && expirationsOverride == nil
+	parallelQuoteAndCatalog := expirationsOverride == nil
 	upstreamCtx := ctx
 	cancelUpstream := func() {}
 	if parallelQuoteAndCatalog {
@@ -1866,6 +1872,12 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 		upstreamRequests.Add(2)
 		go func() {
 			defer upstreamRequests.Done()
+			if quoteOverride != nil {
+				// The priority quote loop already fetched and published this
+				// price; reuse it while the merged catalog/chain request runs.
+				quote = s.decorateCachedQuote(*quoteOverride)
+				return
+			}
 			started := time.Now()
 			quote, err = s.fetchSnapshotQuoteForExpirationMode(upstreamCtx, symbol, requestedExpiration, false)
 			quoteDuration = time.Since(started)
@@ -2522,66 +2534,104 @@ func (s *Service) releaseSubscription(key string) {
 	s.mu.Unlock()
 }
 
+// subscriptionRefreshLoop gives the live quote its own cadence and schedules
+// option-chain snapshots separately. The quote runs first and never takes the
+// snapshot lease, so a slow or failing chain (and its backoff) cannot delay the
+// price card.
 func (s *Service) subscriptionRefreshLoop(ctx context.Context, key, symbol, expiration string) {
-	failures := 0
+	var chainRefresh sync.WaitGroup
+	defer chainRefresh.Wait()
 	for {
-		cadence := marketRefreshInterval(time.Now())
+		cycleStartedAt := time.Now()
+		cadence := marketRefreshInterval(cycleStartedAt)
+
+		quote, quoteErr := s.refreshSubscriptionQuote(ctx, symbol)
+		if quoteErr != nil && ctx.Err() == nil {
+			log.Printf("priority quote refresh failed for %s: %v", symbol, quoteErr)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+
 		claimed, claimErr := s.store.ClaimPushRefresh(symbol, expiration, cadence)
 		if claimErr != nil {
-			failures++
-			log.Printf("durable push refresh claim failed for %s|%s: %v", symbol, expiration, claimErr)
-			cadence = pushRefreshBackoff(cadence, failures)
-		} else if !claimed {
-			wait, waitErr := s.store.PushRefreshWait(symbol, expiration, cadence)
-			if waitErr != nil {
-				log.Printf("durable push refresh wait failed for %s|%s: %v", symbol, expiration, waitErr)
-				wait = cadence
+			if ctx.Err() == nil {
+				log.Printf("durable push refresh claim failed for %s|%s: %v", symbol, expiration, claimErr)
 			}
-			if wait < 100*time.Millisecond {
-				wait = 100 * time.Millisecond
+		} else if claimed {
+			var quoteOverride *model.Quote
+			if quoteErr == nil {
+				quoteOverride = &quote
 			}
-			if !waitForSubscriptionRefresh(ctx, wait) {
-				return
-			}
-			continue
-		} else {
-			response, err := s.refreshSnapshot(ctx, symbol, expiration, 15*time.Second)
-			if err != nil || response.Stale || response.Warning != "" {
-				failures++
-				backoff := pushRefreshBackoff(cadence, failures)
-				if deferred, deferErr := s.store.DeferPushRefresh(symbol, expiration, backoff); deferErr == nil && deferred > 0 {
-					backoff = deferred
-				} else if deferErr != nil {
-					log.Printf("durable push refresh defer failed for %s|%s: %v", symbol, expiration, deferErr)
-				}
-				cadence = backoff
-			} else {
-				failures = 0
-				if finishErr := s.store.FinishPushRefresh(symbol, expiration); finishErr != nil {
-					log.Printf("durable push refresh finish failed for %s|%s: %v", symbol, expiration, finishErr)
-				}
-			}
+			chainRefresh.Add(1)
+			go func() {
+				defer chainRefresh.Done()
+				s.refreshSubscriptionSnapshot(ctx, symbol, expiration, cadence, quoteOverride)
+			}()
 		}
-		if !waitForSubscriptionRefresh(ctx, cadence) {
+
+		// Measure the cadence from the start of the cycle so a slow chain fetch
+		// does not push the next quote refresh past the market interval.
+		wait := cadence - time.Since(cycleStartedAt)
+		if wait < time.Second {
+			wait = time.Second
+		}
+		if !waitForSubscriptionRefresh(ctx, wait) {
 			return
 		}
 	}
 }
 
-func pushRefreshBackoff(cadence time.Duration, failures int) time.Duration {
-	if cadence <= 0 {
-		cadence = time.Second
+// refreshSubscriptionQuote is the high-priority path: quote only, no snapshot
+// lease and no option catalog. The provider adapters already reserve their
+// interactive upstream slots for the current price.
+func (s *Service) refreshSubscriptionQuote(ctx context.Context, symbol string) (model.Quote, error) {
+	quote, err := s.fetchSnapshotQuoteForExpirationMode(ctx, symbol, "", false)
+	if err != nil {
+		return model.Quote{}, err
 	}
-	for i := 0; i < failures && i < 4; i++ {
-		if cadence >= 5*time.Minute/2 {
-			return 5 * time.Minute
+	if !quoteWasFetched(quote) {
+		// Another worker holds the quote lease and just produced this cached
+		// copy. Do not persist it again; the next cadence retries.
+		return quote, nil
+	}
+	return s.persistQuoteSnapshot(symbol, quote)
+}
+
+func (s *Service) refreshSubscriptionSnapshot(ctx context.Context, symbol, expiration string, cadence time.Duration, quoteOverride *model.Quote) {
+	// The quote was just persisted, so a 15-second window would let quote
+	// freshness mask an older chain and skip every other option refresh. Keep a
+	// short window: the subscription cadence, not the quote write, decides when
+	// the chain refreshes.
+	response, err := s.refreshSnapshotWithOverrides(ctx, symbol, expiration, 5*time.Second, nil, quoteOverride)
+	finish := func() {
+		if finishErr := s.store.FinishPushRefresh(symbol, expiration); finishErr != nil {
+			log.Printf("durable push refresh finish failed for %s|%s: %v", symbol, expiration, finishErr)
 		}
-		cadence *= 2
 	}
-	if cadence > 5*time.Minute {
-		return 5 * time.Minute
+	if ctx.Err() != nil {
+		// Do not leave a 3-minute in-flight lease or a retry delay behind when
+		// the subscription is closing.
+		finish()
+		return
 	}
-	return cadence
+	if response.Deferred {
+		// Another worker owns the snapshot lease; leave the cadence alone.
+		finish()
+		return
+	}
+	if err != nil || response.Stale || response.Warning != "" {
+		warning := response.Warning
+		if warning == "" && err != nil {
+			warning = err.Error()
+		}
+		log.Printf("push snapshot refresh failed for %s|%s: %s", symbol, expiration, warning)
+		if _, deferErr := s.store.DeferPushRefresh(symbol, expiration, cadence); deferErr != nil {
+			log.Printf("durable push refresh defer failed for %s|%s: %v", symbol, expiration, deferErr)
+		}
+		return
+	}
+	finish()
 }
 
 func waitForSubscriptionRefresh(ctx context.Context, delay time.Duration) bool {
