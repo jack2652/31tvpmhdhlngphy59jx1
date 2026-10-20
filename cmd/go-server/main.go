@@ -47,9 +47,9 @@ func run() error {
 		log.Print("configured Go memory limit leaves no RAM headroom for binary mappings, SQLite and the operating system")
 	}
 	if cfg.MemoryLimitBytes > 0 {
-		log.Printf("resource budget: memory_limit=%d MiB upstream_memory_budget=%d MiB low_memory_mode=%s low_memory_enabled=%t upstream_concurrency=%d", cfg.MemoryLimitBytes/(1024*1024), cfg.UpstreamMemoryBytes/(1024*1024), cfg.LowMemoryMode, cfg.LowMemory, cfg.UpstreamConcurrency)
+		log.Printf("resource budget: mode=%s memory_limit=%d MiB upstream_memory_budget=%d MiB low_memory=%t upstream_concurrency=%d upstream_wait=%s", cfg.ResourceMode, cfg.MemoryLimitBytes/(1024*1024), cfg.UpstreamMemoryBytes/(1024*1024), cfg.LowMemory, cfg.UpstreamConcurrency, cfg.UpstreamWait)
 	} else {
-		log.Printf("resource budget: memory_limit=unknown upstream_memory_budget=%d MiB low_memory_mode=%s low_memory_enabled=%t upstream_concurrency=%d", cfg.UpstreamMemoryBytes/(1024*1024), cfg.LowMemoryMode, cfg.LowMemory, cfg.UpstreamConcurrency)
+		log.Printf("resource budget: mode=%s memory_limit=unknown upstream_memory_budget=%d MiB low_memory=%t upstream_concurrency=%d upstream_wait=%s", cfg.ResourceMode, cfg.UpstreamMemoryBytes/(1024*1024), cfg.LowMemory, cfg.UpstreamConcurrency, cfg.UpstreamWait)
 	}
 	service, err := server.New(cfg)
 	if err != nil {

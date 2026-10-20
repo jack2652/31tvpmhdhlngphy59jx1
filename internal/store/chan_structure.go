@@ -250,9 +250,8 @@ func structureIDEndDate(id string) string {
 }
 
 func chanRevisionReason(previousRule, currentRule string, changedBars []ChanBarChange, inputChanged bool) string {
-	if previousRule != currentRule {
-		return "rule_version_changed"
-	}
+	// Source bar revisions explain the change even when the rule version also
+	// moved; the rule label alone would hide the data correction.
 	for _, bar := range changedBars {
 		if bar.Old != "" && bar.New != "" {
 			return "source_data_revision"
@@ -260,6 +259,9 @@ func chanRevisionReason(previousRule, currentRule string, changedBars []ChanBarC
 		if bar.Old != "" && bar.New == "" {
 			return "source_history_revision"
 		}
+	}
+	if previousRule != currentRule {
+		return "rule_version_changed"
 	}
 	if inputChanged {
 		return "confirmed_structure_changed_after_append"

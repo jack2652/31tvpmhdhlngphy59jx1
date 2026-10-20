@@ -33,6 +33,15 @@ const ChromeUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHT
 
 const defaultUserAgent = "option-scope-go/1.0"
 
+// net/http keeps only two idle connections per host by default. Refresh bursts
+// fan out over several symbols and expirations, so the defaults force fresh
+// TCP/TLS handshakes once more than two requests overlap.
+const (
+	maxIdleConnections        = 64
+	maxIdleConnectionsPerHost = 16
+	idleConnectionTimeout     = 60 * time.Second
+)
+
 // BrowserClient uses CycleTLS for HTTPS requests and supports the project's
 // HTTP, HTTPS, SOCKS5, and SOCKS5H proxy schemes. The per-request CycleTLS
 // transport pool leases each CycleTLS transport to one request at a time so
@@ -228,8 +237,16 @@ func ProxyAddressFromTransport(transport http.RoundTripper) string {
 	return proxyURL.String()
 }
 
-func standardTransport(proxyURL *url.URL) *http.Transport {
+func tunedTransport() *http.Transport {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = maxIdleConnections
+	transport.MaxIdleConnsPerHost = maxIdleConnectionsPerHost
+	transport.IdleConnTimeout = idleConnectionTimeout
+	return transport
+}
+
+func standardTransport(proxyURL *url.URL) *http.Transport {
+	transport := tunedTransport()
 	if proxyURL == nil {
 		transport.Proxy = nil
 		return transport
@@ -259,7 +276,7 @@ func apiTransport(proxyURL *url.URL) (*http.Transport, error) {
 	if err != nil {
 		return nil, err
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := tunedTransport()
 	transport.Proxy = nil
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		return dialer.DialContext(ctx, network, address)

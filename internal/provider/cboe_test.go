@@ -62,6 +62,20 @@ func TestCboeOptionsClientExpirationsAndChain(t *testing.T) {
 	if put.ContractType != "put" || put.Strike == nil || *put.Strike != 450 || put.InTheMoney || put.LastPrice == nil || *put.LastPrice != 11.5 || put.Volume == nil || *put.Volume != 9 || put.Gamma != nil || put.ChangePercent == nil || *put.ChangePercent != -3 {
 		t.Errorf("put mapping = %#v", put)
 	}
+
+	nearestExpirations, nearestRows, nearestFetched, err := client.NearestChain(context.Background(), "QQQ")
+	if err != nil {
+		t.Fatalf("NearestChain() error = %v", err)
+	}
+	if !reflect.DeepEqual(nearestExpirations, []string{"2030-01-18", "2030-02-15"}) {
+		t.Fatalf("NearestChain() expirations = %#v", nearestExpirations)
+	}
+	if len(nearestRows) != 3 || nearestRows[0].Expiration != expiration || nearestRows[0].ContractSymbol != "QQQ300118C00450000" {
+		t.Fatalf("NearestChain() rows = %#v", nearestRows)
+	}
+	if nearestFetched == nil || time.Since(*nearestFetched) > time.Minute {
+		t.Fatalf("NearestChain() fetched_at = %v, want recent timestamp", nearestFetched)
+	}
 }
 
 func TestCboeQuotePreservesMissingOrZeroUnderlyingPrice(t *testing.T) {

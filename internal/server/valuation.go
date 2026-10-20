@@ -956,7 +956,7 @@ func (s *Service) mergeCachedValuation(symbol string, quote *model.Quote) {
 	// quote immediately. Preserve that behavior for uncached quotes by passing
 	// this quote into the background worker instead of requiring an SQLite row.
 	if quote.FairValue == nil || (quote.FairValueSource == goFairValueSource && s.goValuationCacheExpired(symbol)) {
-		s.scheduleValuationWithQuote(symbol, quote)
+		s.scheduleValuationAfterSnapshot(symbol, quote, false)
 	}
 }
 
@@ -1221,8 +1221,40 @@ func stringSliceValue(value any) []string {
 	return result
 }
 
-func (s *Service) scheduleValuation(symbol string) {
-	s.scheduleValuationWithQuote(symbol, nil)
+// lowMemoryValuationDelay keeps fundamentals behind the first option chain and
+// adjusted-history fetch. With a single shared upstream slot, valuation used to
+// queue as soon as the quote arrived and run before the history job, delaying
+// the chart by the full fundamentals request.
+const lowMemoryValuationDelay = 2 * time.Second
+
+func (s *Service) scheduleValuationAfterSnapshot(symbol string, quote *model.Quote, force bool) {
+	if !s.cfg.LowMemory {
+		s.scheduleValuationWithQuote(symbol, quote)
+		return
+	}
+	if !force && s.snapshotRefreshActive(symbol) {
+		return
+	}
+	var snapshot *model.Quote
+	if quote != nil {
+		copied := *quote
+		snapshot = &copied
+	}
+	s.backgroundWG.Add(1)
+	go func() {
+		defer s.backgroundWG.Done()
+		timer := time.NewTimer(lowMemoryValuationDelay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-s.background.Done():
+			return
+		}
+		if s.snapshotRefreshActive(symbol) {
+			return
+		}
+		s.scheduleValuationWithQuote(symbol, snapshot)
+	}()
 }
 
 func (s *Service) scheduleValuationWithQuote(symbol string, quote *model.Quote) {
@@ -1300,10 +1332,10 @@ func (s *Service) runValuationWithQuote(parent context.Context, symbol string, i
 	if _, fresh := s.cachedValuation(symbol); fresh {
 		return
 	}
-	// UPSTREAM_WAIT_SECONDS only bounds waiting for a shared provider slot.
+	// UPSTREAM_WAIT only bounds waiting for a shared provider slot.
 	// Valuation composes fundamentals plus several optional regime-history
 	// requests, so using that slot wait as the whole job deadline cancels the
-	// calculation before Yahoo can return a usable result in LOW_MEMORY mode.
+	// calculation before Yahoo can return a usable result in low-memory mode.
 	deadline := s.cfg.UpstreamTimeout * 6
 	if deadline < 60*time.Second {
 		deadline = 60 * time.Second

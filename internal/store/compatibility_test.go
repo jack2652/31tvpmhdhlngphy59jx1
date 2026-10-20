@@ -351,6 +351,9 @@ func TestPythonSQLiteSchemaRoundTripsThroughGoAndBack(t *testing.T) {
 	}
 	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
 	pythonProject := pythonProjectRoot(projectRoot)
+	if pythonProject == "" {
+		t.Skip("legacy Python project is unavailable; cross-language SQLite fixture requires it")
+	}
 	databasePath := filepath.Join(t.TempDir(), "python-round-trip.sqlite")
 
 	pythonCreateFixture := `
@@ -528,6 +531,9 @@ func TestPythonBatchSupersedesGoBatchWithinSameSecond(t *testing.T) {
 	}
 	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
 	pythonProject := pythonProjectRoot(projectRoot)
+	if pythonProject == "" {
+		t.Skip("legacy Python project is unavailable; cross-language SQLite fixture requires it")
+	}
 	databasePath := filepath.Join(t.TempDir(), "python-go-ordering.sqlite")
 
 	repository, err := Open(databasePath)
@@ -587,6 +593,9 @@ func TestPythonAndGoOptionInTheMoneyStorageSemantics(t *testing.T) {
 	}
 	projectRoot := filepath.Clean(filepath.Join(filepath.Dir(sourceFile), "..", ".."))
 	pythonProject := pythonProjectRoot(projectRoot)
+	if pythonProject == "" {
+		t.Skip("legacy Python project is unavailable; cross-language SQLite fixture requires it")
+	}
 	databasePath := filepath.Join(t.TempDir(), "python-go-in-the-money.sqlite")
 
 	pythonCreate := `
@@ -648,5 +657,5 @@ func pythonProjectRoot(goProjectRoot string) string {
 	if _, err := os.Stat(filepath.Join(candidate, "app", "db.py")); err == nil {
 		return candidate
 	}
-	return goProjectRoot
+	return ""
 }

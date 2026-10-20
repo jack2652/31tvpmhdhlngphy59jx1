@@ -36,22 +36,26 @@ function markerLabelWidth(text, weight = 700) {
 // Mouse movement can exceed the display refresh rate, so process one point per frame.
 function scheduleChartPointerMove(chartTarget, onMove, hideTooltip) {
   let frameId = null;
+  let scheduled = false;
   let pending = null;
   const useAnimationFrame = typeof window.requestAnimationFrame === "function"
     && typeof window.cancelAnimationFrame === "function";
   const run = () => {
     frameId = null;
+    scheduled = false;
     const event = pending;
     pending = null;
     if (event) onMove(event);
   };
   const schedule = (event) => {
-    pending = { clientX: event.clientX, clientY: event.clientY, buttons: event.buttons || 0, target: event.target };
-    if (frameId !== null) return;
+    pending = { clientX: event.clientX, clientY: event.clientY, buttons: event.buttons || 0, pointerType: event.pointerType, target: event.target };
+    if (scheduled) return;
+    scheduled = true;
     frameId = useAnimationFrame ? window.requestAnimationFrame(run) : window.setTimeout(run, 16);
   };
   const cancel = () => {
     pending = null;
+    scheduled = false;
     if (frameId === null) return;
     if (useAnimationFrame) window.cancelAnimationFrame(frameId);
     else window.clearTimeout(frameId);
@@ -99,18 +103,49 @@ function chanStructureTooltipDetails(structure) {
   };
 }
 
+// Projection routes are painted into the canvas. Hit testing mirrors the old
+// SVG stroke hit areas so hover and tap still open the scenario card.
+function chanProjectionKeyAt(model, point, tolerance = 8) {
+  if (!model?.projections?.length || !point) return null;
+  if (point.x < model.historyRight || point.x > model.plotRight) return null;
+  if (point.y < model.plotTop || point.y > model.plotBottom) return null;
+  let best = null;
+  let bestDistance = tolerance;
+  for (const route of model.projections) {
+    const points = route.points;
+    if (!points || points.length < 2) continue;
+    let distance = Infinity;
+    for (let index = 1; index < points.length; index += 1) {
+      const ax = points[index - 1].x, ay = points[index - 1].y;
+      const dx = points[index].x - ax, dy = points[index].y - ay;
+      const lengthSquared = dx * dx + dy * dy;
+      const ratio = lengthSquared
+        ? Math.max(0, Math.min(1, ((point.x - ax) * dx + (point.y - ay) * dy) / lengthSquared)) : 0;
+      const offsetX = point.x - (ax + ratio * dx), offsetY = point.y - (ay + ratio * dy);
+      distance = Math.min(distance, offsetX * offsetX + offsetY * offsetY);
+    }
+    if (distance <= bestDistance * bestDistance) { bestDistance = Math.sqrt(distance); best = route.key; }
+  }
+  return best;
+}
+
 // Canvas owns the candle geometry. This controller only updates the SVG hover
 // layer and readout, so pointer movement never redraws the full chart.
-function bindChanChartHover(target, initialModel) {
+function bindChanChartHover(target, initialBinding) {
   const svg = target.querySelector("svg");
   const layer = target.querySelector(".chan-crosshair-layer");
   const tooltip = target.querySelector(".chan-chart-tooltip");
   if (!svg || !layer || !tooltip) return null;
+  const initial = initialBinding?.chart ? initialBinding : { chart: initialBinding };
   const vertical = layer.querySelector(".chart-crosshair");
   const horizontal = layer.querySelector(".chart-crosshair-h");
   const tagX = layer.querySelector(".chart-tag-x");
   const tagY = layer.querySelector(".chart-tag-y");
-  let model = initialModel;
+  let model = initial.chart;
+  let scenariosVisible = initial.scenariosVisible !== false;
+  let onScenarioHover = initial.onScenarioHover;
+  let onScenarioLeave = initial.onScenarioLeave;
+  let hoveredScenario = null;
   let activeIndex = null;
   let lastPointer = null;
   let shownCandle = null;
@@ -148,6 +183,19 @@ function bindChanChartHover(target, initialModel) {
     tooltip.hidden = true;
     activeIndex = null;
     lastPointer = null;
+  };
+  const hideScenarioHover = (event) => {
+    if (hoveredScenario == null) return;
+    hoveredScenario = null;
+    if (target.style) target.style.cursor = "";
+    onScenarioLeave?.(event || { type: "pointerleave" });
+  };
+  const setScenarioHover = (key, event) => {
+    if (key === hoveredScenario) return;
+    if (!key) { hideScenarioHover(event); return; }
+    hoveredScenario = key;
+    if (target.style) target.style.cursor = "pointer";
+    onScenarioHover?.(key, event);
   };
   const localPoint = (clientX, clientY) => {
     const matrix = svg.getScreenCTM();
@@ -255,28 +303,33 @@ function bindChanChartHover(target, initialModel) {
     tooltip.style.bottom = `${bounds.height + 4}px`;
   };
   const onMove = (event) => {
-    if (event.target?.closest?.(".chan-spot-mobile-badge")) { hide(); return; }
-    if (!model?.candles?.length || (event.buttons & 2)) { hide(); return; }
+    if (event.target?.closest?.(".chan-spot-mobile-badge, .chan-scenario-toggle-canvas")) { hide(); hideScenarioHover(event); return; }
+    if (!model?.candles?.length || (event.buttons & 2)) { hide(); hideScenarioHover(event); return; }
     const point = localPoint(event.clientX, event.clientY);
-    if (!point || point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > model.plotBottom) { hide(); return; }
+    if (!point) { hide(); return; }
+    setScenarioHover(
+      scenariosVisible && event.pointerType === "mouse" && !event.buttons ? chanProjectionKeyAt(model, point) : null,
+      event,
+    );
+    if (point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > model.plotBottom) { hide(); return; }
     lastPointer = event;
     const slot = ((model.historyRight ?? model.plotRight) - model.plotLeft) / model.candles.length;
     const index = Math.max(0, Math.min(model.candles.length - 1, Math.floor((point.x - model.plotLeft) / slot)));
     show(index, point.y, point.x);
   };
-  const cancelPointerMove = scheduleChartPointerMove(target, onMove, hide);
+  const cancelPointerMove = scheduleChartPointerMove(target, onMove, () => { hide(); hideScenarioHover(); });
   const showClose = (index) => {
     const close = model?.candles?.[index]?.prices.close;
     if (close == null) return;
     lastPointer = null;
     show(index, model.plotTop + (model.maximum - close) / (model.maximum - model.minimum) * (model.plotBottom - model.plotTop));
   };
-  const onBlur = () => { cancelPointerMove(); hide(); };
+  const onBlur = () => { cancelPointerMove(); hide(); hideScenarioHover(); };
   const onKey = (event) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End", "Escape"].includes(event.key)) return;
     event.preventDefault();
     cancelPointerMove();
-    if (event.key === "Escape") { hide(); return; }
+    if (event.key === "Escape") { hide(); hideScenarioHover(); return; }
     const last = model.candles.length - 1;
     const current = activeIndex ?? last;
     const next = event.key === "Home" ? 0 : event.key === "End" ? last : current + (event.key === "ArrowLeft" ? -1 : 1);
@@ -284,7 +337,7 @@ function bindChanChartHover(target, initialModel) {
   };
   const onDown = (event) => {
     cancelPointerMove();
-    if (event.button === 2) { hide(); return; }
+    if (event.button === 2) { hide(); hideScenarioHover(); return; }
     onMove(event);
   };
   svg.addEventListener("blur", onBlur);
@@ -292,9 +345,14 @@ function bindChanChartHover(target, initialModel) {
   svg.addEventListener("pointerdown", onDown);
   return {
     svg,
-    update(next) {
+    update(nextBinding) {
+      const next = nextBinding?.chart ? nextBinding : { chart: nextBinding };
+      scenariosVisible = next.scenariosVisible !== false;
+      onScenarioHover = next.onScenarioHover;
+      onScenarioLeave = next.onScenarioLeave;
+      if (!scenariosVisible) hideScenarioHover();
       const activeDate = activeIndex == null ? null : model?.candles?.[activeIndex]?.date;
-      model = next;
+      model = next.chart;
       if (lastPointer) onMove(lastPointer);
       else if (activeDate) {
         const nextIndex = model?.candles?.findIndex((candle) => candle.date === activeDate) ?? -1;
@@ -305,6 +363,8 @@ function bindChanChartHover(target, initialModel) {
     destroy() {
       cancelPointerMove.dispose();
       hide();
+      hoveredScenario = null;
+      if (target.style) target.style.cursor = "";
       svg.removeEventListener("blur", onBlur);
       svg.removeEventListener("keydown", onKey);
       svg.removeEventListener("pointerdown", onDown);
@@ -362,10 +422,26 @@ function chanPaleCandleColor(color, amount = 0.54) {
   return "rgb(" + channel(16) + ", " + channel(8) + ", " + channel(0) + ")";
 }
 
+// The scenario toggle is painted into the canvas, but its glyph comes from the
+// Element UI icon font. Load that font explicitly and repaint once it arrives;
+// until then a plain question mark keeps the control legible.
+let elementIconFontReady = false;
+let elementIconFontAttempted = false;
+function ensureElementIconFont(render) {
+  if (elementIconFontReady || elementIconFontAttempted) return;
+  elementIconFontAttempted = true;
+  if (typeof document === "undefined" || !document.fonts?.load) return;
+  document.fonts.load("11px element-icons").then(() => {
+    elementIconFontReady = document.fonts.check("11px element-icons");
+    render();
+  }).catch(() => { /* Keep the plain question-mark fallback. */ });
+}
+
 function drawChanCanvas(target, binding) {
   // The view model has already applied per-level preferences. Keep its layer
   // flags authoritative so a legacy stored segment toggle cannot hide L0.
   const model = binding?.chart ? { ...binding.chart, layers: binding.chart.layers || binding.layers || {} } : binding;
+  const scenariosVisible = binding?.chart ? binding.scenariosVisible !== false : true;
   const canvas = target.querySelector("canvas.chan-chart-canvas");
   const svg = target.querySelector("svg");
   if (!canvas || !svg || !model) return;
@@ -382,11 +458,14 @@ function drawChanCanvas(target, binding) {
   canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
   context.setTransform(pixelWidth / model.width, 0, 0, pixelHeight / model.height, 0, 0);
   context.clearRect(0, 0, model.width, model.height);
+  ensureElementIconFont(() => drawChanCanvas(target, binding));
   const colors = {
     grid: chanThemeColor(target, "--grid", "#344654"), axis: chanThemeColor(target, "--axis", "#81909c"),
     text: chanThemeColor(target, "--muted", "#81909c"), textPrimary: chanThemeColor(target, "--text", "#e8eef3"), panel: chanThemeColor(target, "--panel", "#101923"),
     up: chanThemeColor(target, "--up", "#19bd83"), down: chanThemeColor(target, "--down", "#f04d68"),
     blue: chanThemeColor(target, "--blue", "#69b7ff"), spot: chanThemeColor(target, "--muted", "#81909c"),
+    field: chanThemeColor(target, "--field", "#0b141d"), line: chanThemeColor(target, "--line", "#253543"),
+    fieldLine: chanThemeColor(target, "--field-line", "#3b5263"),
     amber: chanThemeColor(target, "--amber", "#e7b45c"), net: chanThemeColor(target, "--net", "#5478ff"), gex: chanThemeColor(target, "--gex", "#ff7c45"),
   };
   const levelColors = [colors.blue, colors.amber, colors.net, colors.gex, colors.up, colors.down, colors.text, colors.textPrimary];
@@ -513,6 +592,85 @@ function drawChanCanvas(target, binding) {
     const align = date.x < model.width * .1 ? "left" : date.x > model.width * .9 ? "right" : "center";
     label(date.label, date.x, date.y, { align });
   }
+  // Conditional scenarios share the same canvas as the history layer. Their
+  // geometry is already projected into chart coordinates by the view model.
+  if (scenariosVisible && model.projections?.length) {
+    context.save();
+    const laneLeft = model.historyRight;
+    const laneWidth = model.plotRight - laneLeft;
+    if (laneWidth > 0) {
+      context.globalAlpha = 0.92;
+      context.fillStyle = colors.field;
+      context.fillRect(laneLeft, model.plotTop, laneWidth, model.plotBottom - model.plotTop);
+      context.globalAlpha = 1;
+      context.strokeStyle = colors.line;
+      context.lineWidth = 1;
+      context.setLineDash([2, 4]);
+      context.strokeRect(laneLeft + 0.5, model.plotTop + 0.5, laneWidth - 1, model.plotBottom - model.plotTop - 1);
+      context.setLineDash([]);
+      if (!model.mobileChart) {
+        label("条件情景 · 非预测", laneLeft + 8, 31, { font: "9px Inter, ui-sans-serif, system-ui, sans-serif", color: colors.text });
+      }
+    }
+    for (const route of model.projections) {
+      const points = route.points;
+      if (!points || points.length < 2) continue;
+      const color = route.tone === "up" ? colors.up : route.tone === "down" ? colors.down : colors.blue;
+      context.globalAlpha = 0.92;
+      context.strokeStyle = color;
+      context.lineWidth = 1.8;
+      context.setLineDash([6, 5]);
+      context.beginPath();
+      context.moveTo(points[0].x, points[0].y);
+      for (let index = 1; index < points.length; index += 1) context.lineTo(points[index].x, points[index].y);
+      context.stroke();
+      context.setLineDash([]);
+      context.globalAlpha = 1;
+      const last = points[points.length - 1], previous = points[points.length - 2];
+      const angle = Math.atan2(last.y - previous.y, last.x - previous.x);
+      context.save();
+      context.translate(last.x, last.y);
+      context.rotate(angle);
+      context.beginPath();
+      context.moveTo(-5.5, -3.5); context.lineTo(1.5, 0); context.lineTo(-5.5, 3.5); context.closePath();
+      context.fillStyle = color;
+      context.fill();
+      context.restore();
+      for (const point of points) {
+        context.beginPath();
+        context.arc(point.x, point.y, 3, 0, Math.PI * 2);
+        context.fillStyle = colors.panel;
+        context.fill();
+        context.strokeStyle = color;
+        context.lineWidth = 1.5;
+        context.stroke();
+      }
+    }
+    context.restore();
+  }
+  // Scenario visibility control. The glyph is painted here; a transparent
+  // HTML button above the canvas keeps focus, keyboard and tooltip behavior.
+  const toggle = target.querySelector(".chan-scenario-toggle-canvas");
+  const toggleActive = Boolean(toggle?.matches?.(":hover, :focus-visible"));
+  const toggleX = model.historyRight - 19, toggleY = model.plotBottom - 19;
+  context.save();
+  context.globalAlpha = 1;
+  context.fillStyle = colors.panel;
+  context.fillRect(toggleX, toggleY, 16, 16);
+  context.strokeStyle = toggleActive ? colors.blue : colors.fieldLine;
+  context.lineWidth = 0.8;
+  context.strokeRect(toggleX, toggleY, 16, 16);
+  context.fillStyle = toggleActive ? colors.blue : colors.text;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  if (elementIconFontReady) {
+    context.font = "11px element-icons";
+    context.fillText("\ue7b3", toggleX + 8, toggleY + 8);
+  } else {
+    context.font = "700 10px Inter, ui-sans-serif, system-ui, sans-serif";
+    context.fillText("?", toggleX + 8, toggleY + 8.5);
+  }
+  context.restore();
 }
 
 const chanCanvasControllers = new WeakMap();
@@ -520,7 +678,12 @@ function syncChanCanvas(element, binding) {
   let controller = chanCanvasControllers.get(element);
   if (!controller) {
     const render = () => drawChanCanvas(element, controller?.model);
-    controller = { model: binding.value, render, observer: null, themeObserver: null };
+    controller = { model: binding.value, render, observer: null, themeObserver: null, toggle: null, toggleHandlers: [] };
+    controller.toggle = element.querySelector(".chan-scenario-toggle-canvas");
+    if (controller.toggle) {
+      controller.toggleHandlers = [["pointerenter", render], ["pointerleave", render], ["focus", render], ["blur", render]];
+      controller.toggleHandlers.forEach(([type, handler]) => controller.toggle.addEventListener(type, handler));
+    }
     if (typeof ResizeObserver !== "undefined") { controller.observer = new ResizeObserver(render); controller.observer.observe(element); }
     if (typeof MutationObserver !== "undefined") {
       controller.themeObserver = new MutationObserver(render);
@@ -539,6 +702,7 @@ const chanChartCanvas = {
     const controller = chanCanvasControllers.get(element);
     if (!controller) return;
     controller.observer?.disconnect(); controller.themeObserver?.disconnect(); window.removeEventListener("resize", controller.render);
+    controller.toggleHandlers?.forEach(([type, handler]) => controller.toggle?.removeEventListener(type, handler));
     chanCanvasControllers.delete(element);
   },
 };
@@ -550,7 +714,9 @@ const chanInteractionBindRetries = new WeakMap();
 function bindChanChartInteraction(element, binding) {
   const svg = element.querySelector("svg");
   if (!svg) return null;
-  const state = { model: binding.value?.chart, onPan: binding.value?.onPan, onZoom: binding.value?.onZoom, pointers: new Map(), drag: null, pinch: null, lastPinchBars: null, suppressClick: false, clickTimer: null };
+  const state = { model: binding.value?.chart, onPan: binding.value?.onPan, onZoom: binding.value?.onZoom,
+    scenariosVisible: binding.value?.scenariosVisible !== false, onScenarioClick: binding.value?.onScenarioClick,
+    pointers: new Map(), drag: null, pinch: null, lastPinchBars: null, suppressClick: false, clickTimer: null };
   const localPoint = (event) => {
     const matrix = svg.getScreenCTM();
     if (!matrix) return null;
@@ -585,9 +751,9 @@ function bindChanChartInteraction(element, binding) {
   const onPointerDown = (event) => {
     if (event.pointerType === "mouse" && event.button !== 0) return;
     if (event.pointerType !== "touch" && event.pointerType !== "mouse" && event.pointerType !== "pen") return;
-    // SVG controls and projection paths own their click/touch gestures. Taking
+    // SVG controls and the scenario toggle own their click/touch gestures. Taking
     // pointer capture here retargets their click to the chart container.
-    if (event.target.closest?.(".chan-scenario-toggle-svg, .chan-projection-up, .chan-projection-down, .chan-projection-range")) return;
+    if (event.target.closest?.(".chan-scenario-toggle-canvas, .chan-projection-up, .chan-projection-down, .chan-projection-range")) return;
     const point = localPoint(event);
     const model = state.model;
     if (!point || !model || point.x < model.plotLeft || point.x > model.historyRight || point.y < model.plotTop || point.y > model.plotBottom) return;
@@ -655,10 +821,20 @@ function bindChanChartInteraction(element, binding) {
     if (pointer) { try { element.releasePointerCapture(event.pointerId); } catch (_) { /* Pointer capture may already be released. */ } }
   };
   const onClickCapture = (event) => {
-    if (!state.suppressClick) return;
-    window.clearTimeout(state.clickTimer);
-    state.clickTimer = window.setTimeout(() => { state.suppressClick = false; }, 500);
+    if (state.suppressClick) {
+      window.clearTimeout(state.clickTimer);
+      state.clickTimer = window.setTimeout(() => { state.suppressClick = false; }, 500);
+      event.preventDefault(); event.stopPropagation();
+      return;
+    }
+    if (!state.scenariosVisible || !state.onScenarioClick || !state.model) return;
+    const point = localPoint(event);
+    const key = point ? chanProjectionKeyAt(state.model, point, 16) : null;
+    if (!key) return;
+    // The canvas has no per-route DOM node, so stop the container-level
+    // dismiss handler and forward the hit before Vue sees the click.
     event.preventDefault(); event.stopPropagation();
+    state.onScenarioClick(key, event);
   };
   const onWheel = (event) => {
     if (!(event.ctrlKey || event.metaKey) || !state.model?.candles?.length) return;
@@ -676,7 +852,13 @@ function bindChanChartInteraction(element, binding) {
   // modified wheel gesture after switching between Chan and technical modes.
   element.addEventListener("wheel", onWheel, { passive: false, capture: true });
   return {
-    update(value) { state.model = value?.chart; state.onPan = value?.onPan; state.onZoom = value?.onZoom; },
+    update(value) {
+      state.model = value?.chart;
+      state.onPan = value?.onPan;
+      state.onZoom = value?.onZoom;
+      state.scenariosVisible = value?.scenariosVisible !== false;
+      state.onScenarioClick = value?.onScenarioClick;
+    },
     destroy() {
       window.clearTimeout(state.clickTimer); element.classList.remove("chan-chart-dragging");
       element.removeEventListener("pointerdown", onPointerDown); element.removeEventListener("pointermove", onPointerMove);

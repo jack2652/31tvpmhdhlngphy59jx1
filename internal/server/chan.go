@@ -228,10 +228,15 @@ func intradayBars(entry intradayCacheEntry) []chananalysis.Bar {
 // chanAdjustedAnalysis serves the independent adjusted daily history used by
 // recursive Chan analysis. Existing /chan and quote paths remain raw-price.
 func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
-	if !s.validateQuery(c, positiveFloatQueryRule("spot")) {
+	if !s.validateQuery(c, positiveFloatQueryRule("spot"), boolQueryRule("compact")) {
 		return
 	}
 	symbol, err := normalizeAPISymbol(c.Param("symbol"))
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	compact, err := queryBool(c, "compact", false)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
 		return
@@ -354,7 +359,26 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	if marketWarning != "" {
 		result.Warnings = append(result.Warnings, marketWarning)
 	}
-	c.JSON(http.StatusOK, gin.H{"symbol": symbol, "ready": true, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": "^GSPC", "source": marketSource, "fetched_at": marketHistory.fetchedAt, "refreshing": marketRefreshing}, "price_coordinate": priceCoordinate, "daily": result.Daily, "weekly": result.Weekly, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}})
+	response := gin.H{"symbol": symbol, "ready": true, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": "^GSPC", "source": marketSource, "fetched_at": marketHistory.fetchedAt, "refreshing": marketRefreshing}, "price_coordinate": priceCoordinate, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}}
+	if compact {
+		response["daily"] = compactChanFrame{Frame: result.Daily}
+		response["weekly"] = compactChanFrame{Frame: result.Weekly}
+	} else {
+		response["daily"], response["weekly"] = result.Daily, result.Weekly
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+// compactChanFrame omits heavy fields the browser chart does not read. The
+// embedded Frame keeps every field the chart and signal panels consume.
+type compactChanFrame struct {
+	chananalysis.Frame
+	Fractals     []chananalysis.Fractal     `json:"fractals,omitempty"`
+	FractalsV4   []chananalysis.Fractal     `json:"fractals_v4,omitempty"`
+	StrokesV4    []chananalysis.Stroke      `json:"strokes_v4,omitempty"`
+	Strengths    []chananalysis.Strength    `json:"strengths_v4,omitempty"`
+	TrendContext *chananalysis.TrendContext `json:"trend_context_v4,omitempty"`
+	MACD         []chananalysis.MACDPoint   `json:"macd_v4,omitempty"`
 }
 
 func adjustedIntradayBars(input, daily []chananalysis.Bar) ([]chananalysis.Bar, int) {
@@ -652,12 +676,61 @@ func validAdjustedHistoryRow(bar map[string]any) bool {
 const chanAdjustedHistoryBarLimit = 1300 // approximately five years of daily sessions
 const chanAdjustedHistoryRetryDelay = 24 * time.Hour
 
+// Daily adjusted bars change at most once per session; refetching the five-year
+// window every quarter hour made revisiting a symbol needlessly slow.
+const chanAdjustedHistoryFreshness = 15 * time.Minute
+
+func chanAdjustedCacheKey(symbol string) string {
+	return symbol + "|1d|split_dividend_auto|go-yfinance"
+}
+
+func (s *Service) chanAdjustedJobActive(symbol string) bool {
+	key := chanAdjustedCacheKey(symbol)
+	s.chanAdjustedMu.Lock()
+	active := s.chanAdjustedJobs[key]
+	s.chanAdjustedMu.Unlock()
+	return active
+}
+
+// ensureChanAdjustedHistory starts the adjusted history job after a snapshot is
+// committed. On a cold symbol this is the only history request: it writes the
+// raw OHLC cache as well, so a separate two-year fetch would just queue a
+// duplicate behind the same single upstream slot.
+func (s *Service) ensureChanAdjustedHistory(symbol string) {
+	if s == nil || s.store == nil || s.provider == nil {
+		return
+	}
+	if _, ok := s.provider.(ChanAdjustedHistoryProvider); !ok {
+		return
+	}
+	cacheKey := chanAdjustedCacheKey(symbol)
+	s.chanAdjustedMu.Lock()
+	entry, found := s.chanAdjustedCache[cacheKey]
+	s.chanAdjustedMu.Unlock()
+	if found && time.Since(entry.fetchedAt) < chanAdjustedHistoryFreshness {
+		if coverageOK, _, _ := chanAdjustedHistoryCoverage(entry.bars); coverageOK {
+			return
+		}
+	}
+	if cached, err := s.store.LatestChanAdjustedHistory(symbol, "1d", "split_dividend_auto", "go-yfinance", chanAdjustedHistoryBarLimit); err == nil {
+		if bars, _ := cached["bars"].([]map[string]any); len(bars) > 0 {
+			fetchedAt, _ := historyTimestamp(cached["fetched_at"])
+			if time.Since(fetchedAt) < chanAdjustedHistoryFreshness {
+				if coverageOK, _, _ := chanAdjustedHistoryCoverage(bars); coverageOK {
+					return
+				}
+			}
+		}
+	}
+	s.scheduleChanAdjustedRefresh(cacheKey, symbol, true)
+}
+
 func (s *Service) chanAdjustedHistory(symbol string) (chanAdjustedHistoryCacheEntry, string, string, bool) {
 	const timeframe, adjustmentType = "1d", "split_dividend_auto"
 	if s == nil || s.store == nil {
 		return chanAdjustedHistoryCacheEntry{}, "none", "复权缠论历史存储不可用", false
 	}
-	cacheKey := symbol + "|" + timeframe + "|" + adjustmentType + "|go-yfinance"
+	cacheKey := chanAdjustedCacheKey(symbol)
 	s.chanAdjustedMu.Lock()
 	entry, found := s.chanAdjustedCache[cacheKey]
 	if found {
@@ -666,7 +739,7 @@ func (s *Service) chanAdjustedHistory(symbol string) (chanAdjustedHistoryCacheEn
 	}
 	s.chanAdjustedMu.Unlock()
 	coverageOK, _, _ := chanAdjustedHistoryCoverage(entry.bars)
-	if !found || !coverageOK || time.Since(entry.fetchedAt) >= 15*time.Minute {
+	if !found || !coverageOK || time.Since(entry.fetchedAt) >= chanAdjustedHistoryFreshness {
 		if cached, err := s.store.LatestChanAdjustedHistory(symbol, timeframe, adjustmentType, "go-yfinance", chanAdjustedHistoryBarLimit); err == nil {
 			if bars, _ := cached["bars"].([]map[string]any); len(bars) > 0 {
 				fetchedAt, _ := historyTimestamp(cached["fetched_at"])
@@ -682,7 +755,7 @@ func (s *Service) chanAdjustedHistory(symbol string) (chanAdjustedHistoryCacheEn
 		}
 	}
 	coverageOK, coverageStart, coverageEnd := chanAdjustedHistoryCoverage(entry.bars)
-	if found && time.Since(entry.fetchedAt) < 15*time.Minute && coverageOK {
+	if found && time.Since(entry.fetchedAt) < chanAdjustedHistoryFreshness && coverageOK {
 		return entry, entry.source, "", false
 	}
 	_, ok := s.provider.(ChanAdjustedHistoryProvider)
@@ -692,7 +765,7 @@ func (s *Service) chanAdjustedHistory(symbol string) (chanAdjustedHistoryCacheEn
 		}
 		return chanAdjustedHistoryCacheEntry{}, "none", "当前行情提供方不支持复权缠论历史；新算法暂停，未回退到未复权行情", false
 	}
-	refreshing := s.scheduleChanAdjustedRefresh(cacheKey, symbol)
+	refreshing := s.scheduleChanAdjustedRefresh(cacheKey, symbol, false)
 	if found {
 		if !coverageOK {
 			warning := fmt.Sprintf("复权缠论缓存仅覆盖 %s 至 %s（%d 根）；正在后台补齐约五年历史，暂显示已有数据", coverageStart, coverageEnd, len(entry.bars))
@@ -721,8 +794,16 @@ func chanAdjustedHistoryCoverage(bars []map[string]any) (bool, string, string) {
 	return !firstDate.After(minimumStart), first, last
 }
 
-func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string) bool {
+func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string, force bool) bool {
 	if s == nil || s.provider == nil || s.background == nil {
+		return false
+	}
+	if !force && (s.snapshotRefreshActive(symbol) || !s.hasDurableQuote(symbol)) {
+		// The snapshot refresh will call ensureChanAdjustedHistory once the
+		// quote and chain are committed; starting the five-year request now
+		// would occupy the only upstream slot ahead of the option table. A cold
+		// browser can also lose the EventSource handshake race, so require the
+		// durable quote rather than only an in-flight refresh.
 		return false
 	}
 	s.chanAdjustedMu.Lock()
@@ -752,6 +833,10 @@ func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string) bool {
 			s.chanAdjustedMu.Lock()
 			delete(s.chanAdjustedJobs, cacheKey)
 			s.chanAdjustedMu.Unlock()
+			// The raw daily cache was either just written by this job or the job
+			// failed and a two-year fallback is needed. Run the levels prefetch
+			// only after the job leaves the active map so it can proceed.
+			s.prefetchSymbolAnalytics(symbol, true)
 		}()
 		loader, ok := s.provider.(ChanAdjustedHistoryProvider)
 		if !ok {
@@ -799,7 +884,7 @@ func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string) bool {
 			s.chanAdjustedRetryAfter[cacheKey] = time.Now().Add(chanAdjustedHistoryRetryDelay)
 		}
 		s.chanAdjustedMu.Unlock()
-		s.publishAnalyticsEvent(symbol)
+		s.publishAnalyticsEvent(symbol, result.FetchedAt)
 	}()
 	return true
 }
@@ -830,10 +915,15 @@ func rawChanHistoryBars(adjusted []map[string]any) []map[string]any {
 // chanAnalysis shares the existing daily history cache and asynchronous
 // prefetch. It never fetches upstream history on the foreground request.
 func (s *Service) chanAnalysis(c *gin.Context) {
-	if !s.validateQuery(c, positiveFloatQueryRule("spot")) {
+	if !s.validateQuery(c, positiveFloatQueryRule("spot"), boolQueryRule("light")) {
 		return
 	}
 	symbol, err := normalizeAPISymbol(c.Param("symbol"))
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	light, err := queryBool(c, "light", false)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
 		return
@@ -865,7 +955,15 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 		bars = append(bars, bar)
 	}
 	now := time.Now()
-	result := chananalysis.Analyze(symbol, bars, spot, now)
+	var result chananalysis.Result
+	if light {
+		// Light mode feeds the trend/support cards only. The adjusted endpoint
+		// owns the chart structures, so skip the daily/weekly analysis and the
+		// ~470 KiB of frames it would serialize on every analytics refresh.
+		result = chananalysis.Result{Symbol: symbol, Spot: spot, GeneratedAt: now}
+	} else {
+		result = chananalysis.Analyze(symbol, bars, spot, now)
+	}
 	quote := model.Quote{Symbol: symbol, Sessions: map[string]any{}}
 	if cachedQuote, found, quoteErr := s.latestQuoteSnapshot(symbol); quoteErr == nil && found {
 		quote = cachedQuote.value
@@ -890,37 +988,58 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 	}
 	analysisSpot := spot
 	if analysisSpot == nil || *analysisSpot <= 0 {
-		analysisSpot = result.Spot
+		if light {
+			if last := len(rawBars) - 1; last >= 0 {
+				lastClose, _ := historyMapNumber(rawBars[last], "close")
+				analysisSpot = &lastClose
+			}
+		} else {
+			analysisSpot = result.Spot
+		}
 	}
 	marketAnalysis := buildCachedLevelsAt(symbol, "", rawBars, nil, quote, analysisSpot, analysisSpot, history["fetched_at"], extremes, beta, nil, now, map[string]any{})
 	var stopLoss any
 	if spot != nil && *spot > 0 && trend != nil {
 		stopLoss = cachedStopLoss(trend, nil, nil, *spot, cachedATR(rawBars, cachedATRPeriod))
 	}
-	result.Warnings = append(result.Warnings, "历史沿用现有未复权日线；拆股和除息跳空可能改变笔与中枢，请结合公司行动核对")
+	warnings := append([]string(nil), result.Warnings...)
+	warnings = append(warnings, "历史沿用现有未复权日线；拆股和除息跳空可能改变笔与中枢，请结合公司行动核对")
 	expected := chanExpectedHistoryDay(now)
-	missingClose := result.Daily.AsOf < expected
+	asOf := result.Daily.AsOf
+	if light {
+		asOf = ""
+		if last := len(rawBars) - 1; last >= 0 {
+			asOf, _ = rawBars[last]["date"].(string)
+		}
+	}
+	missingClose := asOf < expected
 	needsRefresh := !historyFresh(history["fetched_at"], s.cfg.HistoryMaxAge) || missingClose
 	_, supportsHistory := s.provider.(HistoryProvider)
 	refreshing := needsRefresh && supportsHistory
 	if refreshing {
 		s.prefetchChanHistory(symbol, missingClose)
-		result.Warnings = append(result.Warnings, "历史行情正在后台更新；当前展示已有缓存，更新后重新计算")
+		warnings = append(warnings, "历史行情正在后台更新；当前展示已有缓存，更新后重新计算")
 	}
 	if missingClose {
-		result.Warnings = append(result.Warnings, "日线缓存尚未覆盖最近已收盘交易日 "+expected+"，结构判断以图中截止日为准")
+		warnings = append(warnings, "日线缓存尚未覆盖最近已收盘交易日 "+expected+"，结构判断以图中截止日为准")
 	}
 	if needsRefresh && !supportsHistory {
-		result.Warnings = append(result.Warnings, "当前行情提供方不支持历史日线更新，结构分析暂以已有缓存为准")
+		warnings = append(warnings, "当前行情提供方不支持历史日线更新，结构分析暂以已有缓存为准")
 	}
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"symbol": result.Symbol, "spot": result.Spot, "spot_source": spotSource,
-		"generated_at": result.GeneratedAt, "rule_version": result.RuleVersion, "rules": result.Rules,
-		"summary": result.Summary, "daily": result.Daily, "weekly": result.Weekly, "warnings": result.Warnings,
+		"generated_at": result.GeneratedAt, "warnings": warnings,
 		"trend": trend, "trend_market": trendMarketData, "extremes": extremes["extremes"],
 		"beta": beta["beta"], "trend_stop_loss": stopLoss, "market_analysis": marketAnalysis,
 		"history": gin.H{"source": cacheSource(history["bars"], history["fetched_at"]), "fetched_at": history["fetched_at"], "refreshing": refreshing, "bars": len(rawBars)},
-	})
+	}
+	if light {
+		response["symbol"], response["spot"], response["generated_at"] = symbol, analysisSpot, now
+	} else {
+		response["rule_version"], response["rules"], response["summary"] = result.RuleVersion, result.Rules, result.Summary
+		response["daily"], response["weekly"] = result.Daily, result.Weekly
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func chanExpectedHistoryDay(now time.Time) string {
@@ -944,14 +1063,17 @@ func chanExpectedHistoryDay(now time.Time) string {
 // TTL. A short freshness window coalesces simultaneous instances through the
 // established history lock, SQLite lease and shared upstream budget.
 func (s *Service) prefetchChanHistory(symbol string, missingClose bool) {
+	// Leave the first upstream slot to the quote and chain while a snapshot
+	// refresh is running, and do not start a cold symbol's history before any
+	// durable quote exists: the refresh completion starts it once the page has
+	// data to show.
+	if s.snapshotRefreshActive(symbol) || !s.hasDurableQuote(symbol) {
+		return
+	}
 	// A cold adjusted Chan request fetches the same raw OHLC together with
 	// Yahoo's adjusted close. Let that job seed the shared raw-history cache
 	// instead of launching a competing two-year request.
-	adjustedKey := symbol + "|1d|split_dividend_auto|go-yfinance"
-	s.chanAdjustedMu.Lock()
-	adjustedRefreshActive := s.chanAdjustedJobs[adjustedKey]
-	s.chanAdjustedMu.Unlock()
-	if adjustedRefreshActive {
+	if s.chanAdjustedJobActive(symbol) {
 		return
 	}
 	s.mu.Lock()
@@ -976,7 +1098,7 @@ func (s *Service) prefetchChanHistory(symbol string, missingClose bool) {
 		}
 		history := s.loadHistoryWithMaxAge(ctx, symbol, "2y", maxAge)
 		if ctx.Err() == nil && history["source"] == "upstream" {
-			s.publishAnalyticsEvent(symbol)
+			s.publishAnalyticsEvent(symbol, history["fetched_at"])
 		}
 	}()
 }

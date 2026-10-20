@@ -10,7 +10,7 @@ Option Scope 是一个美股行情与期权分析工具，涵盖现货行情、�
 
 - Gin 路由、中间件、静态资源和 SSE；活跃 SSE 订阅按美东时段及 XNYS 假日、历史临时休市和提前收盘规则调度快照刷新（约 20/60/300 秒），同标的刷新串行合并，失败时退避；
 - `modernc.org/sqlite` 通过标准 `database/sql` 读写现有 `data/options.db`，启动时只做兼容性列检查。驱动完全由 Go 实现，不依赖 CGO 或目标机 libc，数据库使用标准 SQLite 文件格式；
-- Yahoo 行情、历史、到期日和估值可用能力优先通过 `github.com/wnjoon/go-yfinance` 获取。当前依赖为 `v1.7.0`；期权链只对 SDK 尚未暴露的 Gamma 和缺失值/null 存在性保留窄字段适配，fundamentals timeseries 也只补 SDK 当前未提供的时间序列字段。SDK 增加这些字段/API 后，应优先切回 SDK 并删除对应适配。所有行情适配器共享同一个 `UPSTREAM_CONCURRENCY` 并发门（默认上限 6，由启动时可用内存和 CPU 动态收紧），Yahoo、CBOE、Alpaca、估值与刷新统一受此预算约束；基础报价与期限目录可在预算允许时并行，低内存下 Gamma、估值基准和历史等重任务仍采用串行或小批次策略；
+- Yahoo 行情、历史、到期日和估值可用能力优先通过 `github.com/wnjoon/go-yfinance` 获取。当前依赖为 `v1.7.0`；期权链只对 SDK 尚未暴露的 Gamma 和缺失值/null 存在性保留窄字段适配，fundamentals timeseries 也只补 SDK 当前未提供的时间序列字段。SDK 增加这些字段/API 后，应优先切回 SDK 并删除对应适配。所有行情适配器共享同一个上游并发门（默认上限 6，`RESOURCE_MODE=auto` 时由启动检测到的可用内存和 CPU 动态收紧），Yahoo、CBOE、Alpaca、估值与刷新统一受此预算约束；基础报价与期限目录使用独立交互通道，低内存下 Gamma、估值基准和历史等重任务仍采用串行或小批次策略；
 - 启动时读取当前可执行文件所在目录的 `.env` 中未由进程环境设置的变量（支持 `KEY=value`、引号值、注释及 `export KEY=value`）；默认 SQLite 文件位于二进制旁的 `data/options.db`，`.env` 中的相对 `DATABASE_PATH` 也相对于二进制目录解析。开发时通过 `go run` 启动则以当前工作目录为基准，首次编译和复用编译缓存采用相同规则；原始 Yahoo 补充请求、Cboe、Alpaca 和维护工具 API 请求统一经 `internal/outboundhttp` 构造和发送，Yahoo SDK 请求由 SDK 自己管理连接，但使用同一包提供的 `MARKET_PROXY`、Chrome JA3 和 User-Agent 配置；`RAW_RETENTION_DAYS`（默认 30 天）配置清理保留期；
 - 与现有前端兼容的 `/quote`、`/expirations`、`/chain`、`refresh`、`events`、`status`、`health` 路由，以及按 `RAW_RETENTION_DAYS` 清理历史数据、按数据库体积上限阶梯回收冗余快照的 `/api/cleanup`；`SCHEDULER_ENABLED` 开启时还会通过 SQLite 服务租约执行每日维护。
 
@@ -33,9 +33,11 @@ go test -race -p 1 ./...
 go vet ./...
 ```
 
+缠论规则仍在迭代，`internal/chan` 的结构快照 fixture 会随规则版本更新；核心服务包（`internal/server`、`internal/provider`、`internal/store`、`internal/config`）应保持全绿。
+
 服务包含 `/api/flow` 快照分析、Yahoo/Cboe/Alpaca 行情与期权 provider、基于报价的 IV/Gamma、历史日线/极值/Beta 缓存协调、SQLite 服务租约、跨实例快照合并、Gamma 后台分批任务，以及 `/api/levels` 压力位与支撑位分析（包括斐波那契、筹码峰值、承接候选、期权磁吸、合并排序、校准与计划输出）。容量上限阶梯清理和每日维护也由 Go 服务执行。市场 regime 和估值模型均有 Go 测试覆盖。估值模型涵盖金融、REIT、能源/矿业、互联网、公用事业、国防、邮轮、移动科技、重资产转型、芯片及 AI 存储等类别；Yahoo 行情、历史、期权、估值指标和财务报表优先使用 `go-yfinance v1.7.0`，少量补充请求用于 SDK 尚未建模的字段。
 
-项目包含 Go 全量测试、race 检查、vet、API 契约、运行脚本保护和交叉编译发布包验证。市场数据依赖外部上游服务；Yahoo 可能限流，Cboe 与 Alpaca 的生产可用性取决于账号权限和上游状态。生产部署前应验证数据源访问、数据库备份恢复和服务恢复流程。
+项目包含 Go 单元测试、API 契约测试、race 检查、vet、运行脚本保护和交叉编译发布包验证。市场数据依赖外部上游服务；Yahoo 可能限流，Cboe 与 Alpaca 的生产可用性取决于账号权限和上游状态。生产部署前应验证数据源访问、数据库备份恢复和服务恢复流程。
 
 ## 能做什么
 
@@ -52,6 +54,7 @@ go vet ./...
 - 趋势通道与交易计划：趋势通道按最近 60 根日线收盘价做线性回归，给出上行通道 / 下行通道 / 区间震荡以及通道上下轨与日均斜率，并用 RSI(14) 标出超买、超卖或中性，并列出 52 周最高/最低与历史最高/最低价（取日线最高/最低价，52 周窗口按最后一根日线回推 365 天，历史极值取全量日线，悬停显示发生日期与距现价）；推荐买入价位取现价下方最近的 5 个支撑，加仓价位取更深一档的 5 个支撑，卖出价位取现价上方最近的 5 个压力，三张表的每一行都给出价位、距现价、到达概率与综合依据（组成该价位的因子标签，悬停可看综合强度）。
 - 将鼠标或触摸移动到任意图表上，可查看十字虚线（竖线定位价位、横线跟随鼠标高度，两端各带取值标签）和详细数据浮层；Gamma 图额外显示行情价、看涨 GEX、看跌 GEX 和净 GEX。
 - 浏览器通过 SSE 保持当前标的连接；仅活跃订阅触发行情自动刷新，服务端按美股交易时段自调度：常规盘约 20 秒、盘前/盘后约 60 秒、休市约 5 分钟；上游连续失败时指数退避，最长 5 分钟。SSE 断开后停止该订阅的刷新；SQLite 租约协调多 worker，避免重复回源。`DEFAULT_SYMBOLS` 仅用于页面默认标的；页面数据随实时推送自动更新。载入标的时优先读取 SQLite 缓存，跨期限 Gamma 窗口在后台异步刷新，不阻塞表格。
+- 冷启动把到期日目录与最近到期期权链合并为一次上游请求；低内存模式仍启用 gzip（BestSpeed），缠论图表折叠时按需加载，展开后才请求复权结构。
 - 每天按 `RAW_RETENTION_DAYS` 配置分批清理过期的历史行情、期权链、日线历史和刷新运行记录。
 - 首次载入一个从未抓取过的标的时，即使本地 SQLite 还没有它的到期日，也会自动回源补全并正常渲染；如果该标的确实没有挂牌期权（例如 OTC 存托凭证 TCEHY），页面只显示现货行情，期权相关面板统一提示「没有挂牌期权（或可用期限已全部到期）」，刷新按钮仍可用于更新现货。
 - SQLite 使用 WAL 和索引，适合单机或单实例快速部署。
@@ -184,7 +187,7 @@ go run cmd/go-server/main.go
 - 二进制无法运行：确认服务器为 Linux amd64 或 arm64，并检查文件名和执行权限。`run.sh doctor` 会检查环境和服务配置。
 - 端口被占用：执行 `./run.sh status` 查看服务；确认无关进程占用后，可修改 `.env` 中的 `PORT`。
 - 端口与 `.env` 不一致：检查启动日志 `runtime configuration` 的 `dotenv` 路径、`status` 和 `port_source`。`port_source=environment` 表示进程环境中的 `PORT` 覆盖了文件值；开发模式请从项目根目录执行 `go run`。
-- 进程因内存不足退出：查看 `./run.sh logs`、系统 OOM 记录及容器 `memory.events` 中的 `oom_kill`；保持 `GO_MEMORY_LIMIT=auto`、`LOW_MEMORY=auto`，并适当降低 `UPSTREAM_CONCURRENCY`。看门狗的“应用未在运行”只能确认退出，不能单独证明 OOM。
+- 进程因内存不足退出：查看 `./run.sh logs`、系统 OOM 记录及容器 `memory.events` 中的 `oom_kill`；保持 `RESOURCE_MODE=auto`，并确认启动日志中的 `resource budget` 已按实际内存收紧。看门狗的“应用未在运行”只能确认退出，不能单独证明 OOM。
 - 确认服务健康：`curl -fsS http://127.0.0.1:8000/health`。
 
 ## 配置
@@ -204,37 +207,61 @@ go run cmd/go-server/main.go
 | `HISTORY_MAX_AGE_SECONDS` | `3600` | 日线历史（斐波那契/筹码分布/承接位）的回源间隔 |
 | `EXTREMES_MAX_AGE_SECONDS` | `86400` | 52 周和历史最高/最低价的回源间隔 |
 | `SCHEDULER_ENABLED` | `true` | 是否启用定时历史清理和数据库维护；不控制行情刷新 |
-| `UPSTREAM_CONCURRENCY` | `auto` | 按启动时可用内存预算和容器可用 CPU 动态计算；整数值作为并发上限。默认并发上限为 6 |
+| `RESOURCE_MODE` | `auto` | 统一资源开关，只接受 `auto` / `off`。`auto` 启动时检测物理 RAM、cgroup v1/v2（含可见父级）上限和 CPU，自动计算 Go GC 软上限、低内存保护、上游并发与槽位等待时间；`off` 不做任何限制（关闭 Go 软上限，上游并发使用默认上限 6，槽位等待 20 秒） |
 | `UPSTREAM_TIMEOUT_SECONDS` | `12` | Yahoo / Alpaca 请求超时秒数 |
 | `CBOE_TIMEOUT_SECONDS` | `15` | Cboe 期权请求超时秒数 |
-| `UPSTREAM_WAIT_SECONDS` | `20` | 等待上游并发槽位的最长时间，超时后优先使用本地旧快照 |
-| `LOW_MEMORY` | `auto` | 在内存上限不超过 4GiB 或启动时可用内存不超过 2GiB 时自动开启保护；也可强制 `true` / `false`。开启后后台重任务采用保守并发、缓存缩小，并按剩余磁盘收紧数据库上限；基础报价与期限目录仍使用共享并发预算 |
-| `GO_MEMORY_LIMIT` | `auto` | Go GC 软内存上限；自动检测物理 RAM、cgroup v1/v2 及可见父级限制，结合启动时可用 RAM 预留空间。也可填写 `96MiB`、`1GiB`、纯字节数，或 `off` 关闭 |
-| `GOMEMLIMIT` | 未设置 | 标准 Go 运行时配置；当 `GO_MEMORY_LIMIT` 未设置或为 `auto` 时，显式容量或 `off` 优先生效。此变量不支持 `auto` |
+| `GOMEMLIMIT` | 未设置 | 标准 Go 运行时配置；仅 `RESOURCE_MODE=auto` 时作为显式的软上限覆盖，`off` 会关闭软上限。此变量不支持 `auto` |
+| `ANALYSIS_CACHE_ENTRIES` | `128` | 压力位/支撑位分析缓存条目数；低内存模式固定为 8，`.env.example` 面向小磁盘预设为 512 |
+| `SIZE_CLEANUP_TIME_BUDGET_SECONDS` | `120` | 数据库超限清理每次运行的时间预算；`0` 表示不限制 |
 
 表中「默认值」是环境变量缺失时代码的回退值；`.env.example` 面向小磁盘环境，
 已经把 `DATABASE_MAX_MB` 预设为 `256M`、`RAW_RETENTION_DAYS` 预设为 `7`，改成 `0` / 更大的天数即可放宽。
 
-### Go 自动内存预算
+### 资源自动预算
 
-`GO_MEMORY_LIMIT=auto` 无需按机器容量手动填写。每次启动（含看门狗重启）在初始化行情提供方、缓存和 SQLite 前调用 `runtime/debug.SetMemoryLimit`：
+`RESOURCE_MODE=auto` 无需按机器容量手动填写。每次启动（含看门狗重启）都会重新检测环境，并在初始化行情提供方、缓存和 SQLite 前调用 `runtime/debug.SetMemoryLimit`：
 
 1. 实际上限取物理 RAM 和可见容器/父级 cgroup 限制的最小值。
 2. 预算取实际上限和启动时可用 RAM 的最小值，Swap 不计入。
 3. 预留 `max(预算 × 20%, 32MiB)`；极小预算最多预留一半，结果向下取整到 MiB。检测不到 RAM 时保留运行时原设置并记录日志。
+4. 依据同一预算和可用 CPU 计算上游并发与槽位等待；内存上限不超过 4GiB 或可用内存不超过 2GiB 时自动进入低内存模式（重任务串行、缓存缩小）。
 
-例如容器上限约 122MiB、启动时可用约 118MiB，自动 Go 软上限约为 86MiB；实际数值以启动日志 `Go GC memory budget` 为准。手动限制较小时，并发和低内存自动模式也会按这个预算收紧。
+例如容器上限约 122MiB、启动时可用约 118MiB，自动 Go 软上限约为 86MiB；实际数值以启动日志 `resource budget` 与 `Go GC memory budget` 为准。
 
 ```dotenv
 # 自动检测（默认）
-GO_MEMORY_LIMIT=auto
-# 或手动指定
-# GO_MEMORY_LIMIT=96MiB
+RESOURCE_MODE=auto
+# 完全不限制
+# RESOURCE_MODE=off
 ```
 
-显式 `GO_MEMORY_LIMIT` 容量或 `off` 优先；随后是标准 `GOMEMLIMIT`，最后才是自动检测。进程环境对同名 `.env` 项优先。使用 `GO_MEMORY_LIMIT` 表示 `auto`，因为原生 `GOMEMLIMIT=auto` 会在进入 Go 主程序前报错。
+`off` 会关闭 Go 软上限并取消低内存/并发收紧，仅建议在内存充足或自行负责资源上限时使用。`auto` 下显式设置的标准 `GOMEMLIMIT` 仍会覆盖自动计算值。进程环境对同名 `.env` 项优先。
 
 软限制控制 Go 运行时管理的内存，无法覆盖二进制映射、SQLite 的直接 mmap、内核和文件缓存，也不能强制阻止瞬时大对象分配。因此它降低 OOM 风险，但不保证 122MiB 容器能承受全部请求峰值。默认未设置 `GOMEMLIMIT` 时运行时上限为 `math.MaxInt64`，自动检测是本项目增加的启动行为。
+
+### 性能与请求策略
+
+**上游请求**
+
+- 冷启动时到期日目录与最近到期期权链来自同一次无日期 options 响应，不再先查目录再查链；Cboe 延迟行情也复用同一份 payload。
+- 行情走独立交互通道；单独查询到期日时也走该通道。冷启动时目录与最近链合并为一次重任务请求，期权链、历史、Gamma 和基本面共享重任务并发预算；`RESOURCE_MODE=auto` 会按内存收紧，极小内存机器自动降到单槽位。
+- 冷启动时历史与复权预取等到快照提交后再启动；复权历史同时写入原始日线缓存，避免重复抓取 2 年日线。
+- 低内存模式下估值延迟 2 秒启动，并排在期权链与历史之后，避免基本面请求抢走唯一的重任务槽位。
+
+**传输与缓存**
+
+- 支持 gzip 的客户端会收到压缩后的 JSON；低内存模式使用 `BestSpeed`，约 1.5MB 的复权缠论响应仍可压到约 370KB，SSE 流不压缩。
+- `/static/*` 返回 `Cache-Control: public, max-age=31536000, immutable`。页面资源 URL 带内容哈希，Vue、Element UI、jQuery 和业务 JS 首次加载后不再回源校验。
+- 浏览器对同一 URL 的并发 GET 做合并；`quote`、`expirations`、`status`、`flow` 和 Gamma 只读状态额外复用 1 秒结果。主动刷新行情或执行 `/api/refresh` 后会立即清除对应的行情/期限短缓存。
+- `/api/chan?light=true` 只返回趋势与价位卡片所需字段（约 12KB）；缠论图表默认折叠，展开后才请求复权结构，并带上 `compact=true` 省略图表未使用的字段。
+- `/api/levels?raw=true` 只读 SQLite；当日线与 `fast_levels` 已可用时不再附带原始期权行，只有历史缺失、需要期权回退时才返回。首屏尚未选中到期日时按最近有效到期日计算 IV 与触及概率；行情晚于期权链到达时，现价档位变化会自动触发一次价位重算。
+
+**前端渲染**
+
+- 期权链行、分析输入、复权结构、图表视图和盘中 payload 在进入 Vue 2 前冻结顶层，避免为成千上万个只读对象递归建立响应式观察器；表格数据整体替换，从不原地修改。
+- Gamma 结果按 0.05% 现价档位复用，行情每跳动一分钱不会重算整条链；期权链指纹使用 32 位滚动哈希（`Math.imul`），不再逐行拼接字符串。
+- 成交量、持仓量和热力峰值改为单次遍历；价位选择的权重只计算一次；`Intl.NumberFormat` 按小数位复用，时钟格式化器也只创建一次。
+- 缠论历史 K 线、多级结构、条件情景背景、虚线路径、端点以及情景开关全部绘制在同一张 Canvas 上；SVG 只保留十字线读数。情景命中改为按指针到折线的距离判定，情景开关上方覆盖一个透明的 HTML 按钮，继续提供焦点、键盘和原生提示。
 
 ### 小磁盘部署（LXC / 512M 磁盘）
 
@@ -269,9 +296,9 @@ GO_MEMORY_LIMIT=auto
 - `GET /api/flow/{symbol}?expiration=YYYY-MM-DD`（比较同一期限最近两份链快照，估算成交方向与期权流向）
 - `GET /api/events/{symbol}?expiration=YYYY-MM-DD`（SSE 推送活跃订阅标的的快照更新通知）
 - `GET /api/gamma/{symbol}?horizon_days=45&refresh=true`（跨近期期限的 Gamma 分析链）
-- `GET /api/levels/{symbol}?expiration=YYYY-MM-DD&spot=144.57`（压力位/支撑位：斐波那契 + 筹码密集 + 承接位 + 所选到期日期权持仓综合，每行含「到达概率」；`spot` 为可选基准价，缺省用快照常规价）
-- `GET /api/chan/{symbol}?spot=144.57`（日线＋周线缠论结构：包含处理、严格旧笔、笔中枢、当前价相对最近中枢的位置、抄底／逃顶观察与候选、第三类位置候选和条件式走势推演；只读取已落库日线，`spot` 为可选页面现价）
-- `GET /api/chan/{symbol}/adjusted?spot=144.57`（独立复权历史上的递归算法预览；返回规则版本、价格坐标、日／周结构、质量和修订信息）
+- `GET /api/levels/{symbol}?expiration=YYYY-MM-DD&spot=144.57&raw=true`（压力位/支撑位：斐波那契 + 筹码密集 + 承接位 + 所选到期日期权持仓综合，每行含「到达概率」；`spot` 为可选基准价，缺省用快照常规价。`raw=true` 只读 SQLite，并在历史与 `fast_levels` 可用时省略原始期权行）
+- `GET /api/chan/{symbol}?spot=144.57&light=true`（日线＋周线缠论结构：包含处理、严格旧笔、笔中枢、当前价相对最近中枢的位置、抄底／逃顶观察与候选、第三类位置候选和条件式走势推演；只读取已落库日线，`spot` 为可选页面现价。`light=true` 只返回趋势/价位卡片所需的市场分析，不返回日／周结构）
+- `GET /api/chan/{symbol}/adjusted?spot=144.57&compact=true`（独立复权历史上的递归算法预览；返回规则版本、价格坐标、日／周结构、质量和修订信息。`compact=true` 省略图表不使用的 fractals、MACD、strength 等字段）
 - `GET /api/chan/{symbol}/intraday?period=15m|4h&spot=144.57`（已收盘盘中 K 线的递归结构预览；信号使用原始价格坐标，不与复权日线直接比较）
 - `POST /api/refresh/{symbol}?expiration=YYYY-MM-DD&max_age=60`（本地快照在 `max_age` 秒内直接返回 `skipped=true`，不再请求上游接口；`max_age=0` 表示强制刷新）
 - `GET /api/status/{symbol}`
@@ -292,5 +319,7 @@ go test -p 1 ./...
 go test -race -p 1 ./...
 go vet ./...
 ```
+
+缠论规则仍在迭代，`internal/chan` 的结构快照 fixture 会随规则版本更新；核心服务包（`internal/server`、`internal/provider`、`internal/store`、`internal/config`）应保持全绿。
 
 单元测试和 API 测试使用 mock 或隔离环境，不要求访问真实行情上游。真实行情请求需要网络连接及可用的数据源。

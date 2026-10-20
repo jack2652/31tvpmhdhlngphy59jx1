@@ -89,6 +89,82 @@ func setYahooSDKTestTickerFromOptionJSON(t *testing.T, yahoo *Yahoo, body string
 	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{optionChain: chain})
 }
 
+func TestYahooNearestChainUsesSingleNoDateResponse(t *testing.T) {
+	yahoo := NewYahoo(time.Second, 1)
+	t.Cleanup(func() { _ = yahoo.Close() })
+	yahoo.optionsURL = "https://query1.finance.yahoo.com/v7/finance/options/%s"
+	nearest := time.Date(2030, time.January, 18, 0, 0, 0, 0, time.UTC).Unix()
+	later := time.Date(2030, time.February, 15, 0, 0, 0, 0, time.UTC).Unix()
+	calls := 0
+	yahoo.optionsAuth = yahooCrumbGetterFunc(func(endpoint string, query url.Values) (*yahooauth.Response, error) {
+		calls++
+		if endpoint != "https://query1.finance.yahoo.com/v7/finance/options/TEST" {
+			t.Errorf("NearestChain endpoint = %q", endpoint)
+		}
+		if query.Has("date") {
+			t.Errorf("NearestChain query unexpectedly requested a date: %v", query)
+		}
+		return &yahooauth.Response{StatusCode: http.StatusOK, Body: fmt.Sprintf(`{"optionChain":{"result":[{"expirationDates":[%d,%d],"options":[{"expirationDate":%d,"calls":[{"contractSymbol":"TEST300118C00100000","strike":100,"bid":1,"ask":2}],"puts":[]}]}],"error":null}}`, nearest, later, nearest)}, nil
+	})
+	expirations, rows, fetched, err := yahoo.NearestChain(context.Background(), "TEST")
+	if err != nil {
+		t.Fatalf("NearestChain() error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("NearestChain upstream calls = %d, want 1", calls)
+	}
+	if !reflect.DeepEqual(expirations, []string{"2030-01-18", "2030-02-15"}) {
+		t.Fatalf("NearestChain() expirations = %#v", expirations)
+	}
+	if len(rows) != 1 || rows[0].Expiration != "2030-01-18" || rows[0].Provider != "yahoo-options" || rows[0].ContractSymbol != "TEST300118C00100000" {
+		t.Fatalf("NearestChain() rows = %#v", rows)
+	}
+	if fetched == nil || time.Since(*fetched) > time.Minute {
+		t.Fatalf("NearestChain() fetched_at = %v, want recent timestamp", fetched)
+	}
+}
+
+func TestYahooKeepsInteractiveLaneAtSingleConcurrency(t *testing.T) {
+	yahoo := NewYahoo(time.Second, 1)
+	t.Cleanup(func() { _ = yahoo.Close() })
+	if cap(yahoo.semaphore) != 1 {
+		t.Fatalf("shared upstream gate capacity=%d, want 1", cap(yahoo.semaphore))
+	}
+	if yahoo.interactiveGate == nil || cap(yahoo.interactiveGate) != 2 {
+		t.Fatalf("interactive gate=%v, want two dedicated first-render slots", yahoo.interactiveGate)
+	}
+}
+
+func TestYahooInteractiveRequestsBypassSaturatedSharedGate(t *testing.T) {
+	yahoo := NewYahoo(time.Second, 1)
+	t.Cleanup(func() { _ = yahoo.Close() })
+	// Hold the only heavy slot as a five-year history fetch would in low-memory mode.
+	yahoo.semaphore <- struct{}{}
+	t.Cleanup(func() { <-yahoo.semaphore })
+	yahoo.gateWait = 100 * time.Millisecond
+	yahoo.now = func() time.Time { return time.Date(2026, 10, 20, 15, 0, 0, 0, time.UTC) }
+	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
+		quote:       &ymodels.Quote{Symbol: "TEST", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"},
+		expirations: []time.Time{time.Date(2030, time.January, 18, 0, 0, 0, 0, time.UTC)},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	quote, err := yahoo.Quote(ctx, "TEST")
+	if err != nil {
+		t.Fatalf("quote waited on the saturated shared gate: %v", err)
+	}
+	if quote.Price == nil || *quote.Price != 100 {
+		t.Fatalf("quote price=%v, want 100", quote.Price)
+	}
+	expirations, err := yahoo.Expirations(ctx, "TEST")
+	if err != nil {
+		t.Fatalf("expirations waited on the saturated shared gate: %v", err)
+	}
+	if len(expirations) != 1 || expirations[0] != "2030-01-18" {
+		t.Fatalf("expirations=%v, want [2030-01-18]", expirations)
+	}
+}
+
 func TestNewYahooWithProxy(t *testing.T) {
 	proxyHit := make(chan struct{}, 1)
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -827,8 +903,8 @@ func TestYahooSDKCancellationRetainsGateUntilRequestFinishes(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Quote() did not return after cancellation")
 	}
-	if len(yahoo.semaphore) != 1 {
-		t.Fatal("SDK operation released the shared gate after caller cancellation")
+	if len(yahoo.interactiveGate) != 1 {
+		t.Fatal("SDK operation released the interactive gate after caller cancellation")
 	}
 	close(releaseSDK)
 	select {
@@ -837,10 +913,10 @@ func TestYahooSDKCancellationRetainsGateUntilRequestFinishes(t *testing.T) {
 		t.Fatal("SDK ticker was not closed after the request finished")
 	}
 	deadline := time.Now().Add(time.Second)
-	for len(yahoo.semaphore) != 0 && time.Now().Before(deadline) {
+	for len(yahoo.interactiveGate) != 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if len(yahoo.semaphore) != 0 {
+	if len(yahoo.interactiveGate) != 0 {
 		t.Fatal("SDK operation did not release its gate after completion")
 	}
 }

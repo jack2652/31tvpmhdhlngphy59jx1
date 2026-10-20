@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,13 +48,14 @@ type Yahoo struct {
 	// authentication handshake once per process instead of on every refresh.
 	// Only Quote uses these; option-chain and fundamentals keep short-lived
 	// tickers so their own caches cannot serve stale data.
-	quoteTickersMu sync.Mutex
-	quoteTickers   map[string]yahooTicker
+	quoteTickersMu  sync.Mutex
+	quoteTickers    map[string]yahooTicker
 	quoteTickerInit map[string]*yahooTickerInit
-	// interactiveGate reserves one upstream slot for the interactive quote path
-	// (the current-price card). Option chains, Gamma batches, fundamentals, and
-	// history share semaphore and can saturate it; Quote takes this dedicated
-	// slot instead so a busy background batch cannot starve the price.
+	// interactiveGate reserves upstream slots for the first-render requests
+	// (current price and expiration catalogue). Option chains, Gamma batches,
+	// fundamentals, and history share semaphore; without a separate gate a
+	// multi-year history fetch can starve the price card for the whole
+	// single-upstream-slot low-memory configuration.
 	interactiveGate chan struct{}
 }
 
@@ -80,10 +82,11 @@ func NewYahoo(timeout time.Duration, concurrency int) *Yahoo {
 	}
 	client := outboundhttp.DefaultBrowserClient(timeout)
 	semaphore := make(chan struct{}, concurrency)
-	var interactiveGate chan struct{}
-	if concurrency > 1 {
-		interactiveGate = make(chan struct{}, 1)
-	}
+	// Quote and the expiration catalogue are tiny responses on the first-render
+	// path. Keep two dedicated slots even when the shared gate has one, so a
+	// history or chain fetch cannot delay them; both requests together stay far
+	// below the memory cost of one option chain response.
+	interactiveGate := make(chan struct{}, 2)
 	fundamentals := NewFundamentalsClient(client)
 	fundamentals.Gate, fundamentals.GateWait = semaphore, timeout
 	earnings := NewYahooEarningsClient(client)
@@ -115,10 +118,9 @@ func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress stri
 		return nil, fmt.Errorf("create go-yfinance Yahoo client: %w", err)
 	}
 	semaphore := make(chan struct{}, concurrency)
-	var interactiveGate chan struct{}
-	if concurrency > 1 {
-		interactiveGate = make(chan struct{}, 1)
-	}
+	// See NewYahoo: the price and expiry requests keep their own slots in every
+	// concurrency configuration, including the one-slot low-memory profile.
+	interactiveGate := make(chan struct{}, 2)
 	fundamentals := NewFundamentalsClient(client)
 	fundamentals.Gate = semaphore
 	fundamentals.GateWait = timeout
@@ -158,6 +160,18 @@ func (y *Yahoo) Close() error {
 		}
 	}
 	return nil
+}
+
+// interactiveUpstreamGate returns the dedicated first-render lane. It falls
+// back to the shared gate for manually constructed clients that predate it.
+func (y *Yahoo) interactiveUpstreamGate() chan struct{} {
+	if y != nil && y.interactiveGate != nil {
+		return y.interactiveGate
+	}
+	if y == nil {
+		return nil
+	}
+	return y.semaphore
 }
 
 // quoteTicker returns a cached SDK ticker for the symbol so successive quote
@@ -442,10 +456,7 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 	var phases quotePhaseTimes
 	startedAt := time.Now()
 	quoteTickerFactory := func(string) (yahooTicker, error) { return y.quoteTicker(ctx, symbol) }
-	quoteGate := y.semaphore
-	if y.interactiveGate != nil {
-		quoteGate = y.interactiveGate
-	}
+	quoteGate := y.interactiveUpstreamGate()
 	snapshot, fetchErr := runYahooSDK(ctx, quoteGate, y.gateWait, quoteTickerFactory, symbol, func(ticker yahooTicker) (quoteSnapshot, error) {
 		started := time.Now()
 		quote, quoteErr := ticker.Quote()
@@ -529,17 +540,21 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 	}, nil
 }
 
+type yahooOptionChainResult struct {
+	ExpirationDates []int64                 `json:"expirationDates"`
+	Options         []yahooOptionExpiration `json:"options"`
+}
+
+type yahooOptionExpiration struct {
+	ExpirationDate int64                          `json:"expirationDate"`
+	Calls          []yahooOptionContractExtension `json:"calls"`
+	Puts           []yahooOptionContractExtension `json:"puts"`
+}
+
 type yahooOptionExtensions struct {
 	OptionChain struct {
-		Result []struct {
-			ExpirationDates []int64 `json:"expirationDates"`
-			Options         []struct {
-				ExpirationDate int64                          `json:"expirationDate"`
-				Calls          []yahooOptionContractExtension `json:"calls"`
-				Puts           []yahooOptionContractExtension `json:"puts"`
-			} `json:"options"`
-		} `json:"result"`
-		Error *yahooAPIError `json:"error"`
+		Result []yahooOptionChainResult `json:"result"`
+		Error  *yahooAPIError           `json:"error"`
 	} `json:"optionChain"`
 }
 
@@ -662,7 +677,7 @@ func (y *Yahoo) Expirations(ctx context.Context, symbol string) ([]string, error
 	if err != nil {
 		return nil, err
 	}
-	expirations, err := runYahooSDK(ctx, y.semaphore, y.gateWait, y.tickerFactory, normalized, func(ticker yahooTicker) ([]time.Time, error) {
+	expirations, err := runYahooSDK(ctx, y.interactiveUpstreamGate(), y.gateWait, y.tickerFactory, normalized, func(ticker yahooTicker) ([]time.Time, error) {
 		return ticker.Options()
 	})
 	if err != nil {
@@ -709,6 +724,86 @@ func (y *Yahoo) Chain(ctx context.Context, symbol, expiration string) ([]model.O
 	if len(selected.Calls) == 0 && len(selected.Puts) == 0 {
 		return nil, nil, fmt.Errorf("%s %s 没有期权数据", normalizedSymbol, normalized)
 	}
+	rows := yahooOptionRows(selected, normalized)
+	fetched := time.Now().UTC()
+	return rows, &fetched, nil
+}
+
+// NearestChain returns the expiration catalogue and the nearest active chain
+// from a single no-date options response. Cold callers otherwise pay two
+// round trips (catalogue then chain) for the same endpoint.
+func (y *Yahoo) NearestChain(ctx context.Context, symbol string) ([]string, []model.OptionRow, *time.Time, error) {
+	normalized, err := NormalizeSymbol(symbol)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	rawExtensions, err := y.options(ctx, normalized, "")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if rawExtensions.OptionChain.Error != nil {
+		return nil, nil, nil, rawExtensions.OptionChain.Error
+	}
+	if len(rawExtensions.OptionChain.Result) == 0 {
+		return nil, nil, nil, fmt.Errorf("%s 没有期权数据", normalized)
+	}
+	result := rawExtensions.OptionChain.Result[0]
+	dates := result.ExpirationDates
+	if len(dates) == 0 {
+		for _, option := range result.Options {
+			dates = append(dates, option.ExpirationDate)
+		}
+	}
+	expirations := yahooActiveExpirationDates(dates)
+	if len(expirations) == 0 {
+		return nil, nil, nil, fmt.Errorf("%s 没有有效期权到期日", normalized)
+	}
+	selected, found := yahooNearestOption(result.Options, expirations[0])
+	if !found || len(selected.Calls) == 0 && len(selected.Puts) == 0 {
+		return expirations, nil, nil, nil
+	}
+	rows := yahooOptionRows(selected, expirations[0])
+	fetched := time.Now().UTC()
+	return expirations, rows, &fetched, nil
+}
+
+func yahooActiveExpirationDates(values []int64) []string {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	today := time.Now().In(location).Format(time.DateOnly)
+	seen := make(map[string]bool, len(values))
+	expirations := make([]string, 0, len(values))
+	for _, value := range values {
+		date := yahooExpirationDate(value)
+		if date == "" || date < today || seen[date] {
+			continue
+		}
+		seen[date] = true
+		expirations = append(expirations, date)
+	}
+	sort.Strings(expirations)
+	return expirations
+}
+
+func yahooNearestOption(options []yahooOptionExpiration, expiration string) (yahooOptionExpiration, bool) {
+	for _, option := range options {
+		if yahooExpirationDate(option.ExpirationDate) == expiration {
+			return option, true
+		}
+	}
+	return yahooOptionExpiration{}, false
+}
+
+func yahooExpirationDate(unix int64) string {
+	if unix <= 0 {
+		return ""
+	}
+	return time.Unix(unix, 0).UTC().Format(time.DateOnly)
+}
+
+func yahooOptionRows(selected yahooOptionExpiration, expiration string) []model.OptionRow {
 	rows := make([]model.OptionRow, 0, len(selected.Calls)+len(selected.Puts))
 	appendRows := func(contracts []yahooOptionContractExtension, kind string) {
 		for _, extension := range contracts {
@@ -721,14 +816,13 @@ func (y *Yahoo) Chain(ctx context.Context, symbol, expiration string) ([]model.O
 				Gamma:             extension.float("gamma", extension.gamma),
 				InTheMoney:        extension.boolValue("inTheMoney", false),
 				InTheMoneyKnown:   extension.boolKnown("inTheMoney", false),
-				ChangePercent:     extension.float("percentChange", 0), Expiration: normalized,
+				ChangePercent:     extension.float("percentChange", 0), Expiration: expiration,
 			})
 		}
 	}
 	appendRows(selected.Calls, "call")
 	appendRows(selected.Puts, "put")
-	fetched := time.Now().UTC()
-	return rows, &fetched, nil
+	return rows
 }
 
 func yahooSDKExpirationLookupDate(expiration time.Time, location *time.Location) string {

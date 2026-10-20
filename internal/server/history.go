@@ -149,7 +149,7 @@ func (s *Service) scheduleHistoryRefresh(symbol, period string, maxAge time.Dura
 			s.mu.Lock()
 			delete(s.historyRefreshAfter, key)
 			s.mu.Unlock()
-			s.publishAnalyticsEvent(symbol)
+			s.publishAnalyticsEvent(symbol, result["fetched_at"])
 		} else {
 			s.mu.Lock()
 			s.historyRefreshAfter[key] = time.Now().Add(30 * time.Second)

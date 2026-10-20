@@ -26,8 +26,7 @@ CGO_ENABLED=0 go build -o "$server_binary" ./cmd/go-server
     DATABASE_PATH="$TEST_ROOT/options.db" \
     ACCESS_KEY=go-smoke-test \
     SCHEDULER_ENABLED=false \
-    LOW_MEMORY=true \
-    UPSTREAM_CONCURRENCY=1 \
+    RESOURCE_MODE=off \
     "$server_binary"
 ) >"$TEST_ROOT/server.log" 2>&1 &
 SERVER_PID=$!

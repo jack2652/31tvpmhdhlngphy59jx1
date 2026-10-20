@@ -260,9 +260,9 @@
   }
 
   function empty(reason = "正在读取日线与周线结构…") {
-    return { available: false, label: "等待日周结构", detail: reason, alignment: "insufficient",
+    return Object.freeze({ available: false, label: "等待日周结构", detail: reason, alignment: "insufficient",
       daily: emptyFrame("日线"), weekly: emptyFrame("周线"), warnings: [], rules: [],
-      spot: "--", historyTime: "--", refreshing: false };
+      spot: "--", historyTime: "--", refreshing: false });
   }
 
   // Recompute the left-axis current-price marker on quote updates even when
@@ -300,7 +300,6 @@
         status: scenario.status, tiltScore: scenario.tilt_score, points,
         endPoint: points[points.length - 1],
         priceLabel: money(points[points.length - 1].price),
-        path: points.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(1)} ${point.y.toFixed(1)}`).join(" "),
       };
     }).filter(Boolean);
     return { ...chart, spot, projections, grid: chart.grid.map((row) => ({ ...row,
@@ -453,7 +452,13 @@
       return low >= bars.length ? bars.length - 1 : low;
     };
     const latestRecursiveCenter = selectedRecursiveCenters[selectedRecursiveCenters.length - 1];
-    const latestL0Center = [...allRecursiveCenters].reverse().find((center) => Number(center.level) === 0);
+    let latestL0Center = null;
+    for (let index = allRecursiveCenters.length - 1; index >= 0; index -= 1) {
+      if (Number(allRecursiveCenters[index].level) === 0) {
+        latestL0Center = allRecursiveCenters[index];
+        break;
+      }
+    }
     const zones = (frame.centers || []).filter((center) => center.end >= firstDate && center.start <= lastDate);
     const latest = frame.centers?.[frame.centers.length - 1];
     if (latest && latest.end < firstDate && latest.lower < maximum && latest.upper > minimum) zones.push(latest);
@@ -1067,7 +1072,10 @@
     const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version, dataContext), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version, dataContext);
     const weeklyReady = Boolean(payload.weekly?.position?.center);
     const weeklyContext = weeklyReady ? `周线：${weekly.position}。` : `周线已有 ${weekly.bars} 根收盘 K 线、${weekly.confirmed} 根已确认笔，尚未形成中枢，不能给日线方向增加确认。`;
-    return {
+    // The view is replaced wholesale on every refresh; freezing the top level
+    // stops Vue 2 from walking thousands of candles/strokes and attaching
+    // observers to a structure the chart only ever reads.
+    return Object.freeze({
       available: Boolean(payload.daily?.bar_count || payload.weekly?.bar_count),
       label: daily.available ? `日线判断：${daily.guidance.title}` : (payload.summary?.label || "等待结构形成"),
       detail: daily.available ? `${daily.guidance.focus} ${weeklyContext}` : (payload.summary?.detail || "历史数据不足"),
@@ -1075,7 +1083,7 @@
       daily, weekly,
       warnings: payload.warnings || [], rules: payload.rules || [],
       spot: money(payload.spot), historyTime, refreshing: Boolean(payload.history?.refreshing),
-    };
+    });
   }
 
   // Closed-bar intraday view. Each requested period is aggregated from stored

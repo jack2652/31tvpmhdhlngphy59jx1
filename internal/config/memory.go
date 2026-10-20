@@ -44,14 +44,12 @@ func memoryCgroupMounts() []cgroupMemoryMount {
 	}
 }
 
-// GO_MEMORY_LIMIT accepts auto without passing that value to the Go runtime's
-// GOMEMLIMIT parser, which runs before main and rejects auto. An explicit
-// project setting wins; otherwise a standard GOMEMLIMIT override is honored,
-// including one loaded from .env after the runtime has already initialized.
-func goMemoryLimitSetting(memoryLimit, available int64) (int64, string) {
-	raw := strings.TrimSpace(os.Getenv("GO_MEMORY_LIMIT"))
-	if raw != "" && !strings.EqualFold(raw, "auto") {
-		return configuredGoMemoryLimit("GO_MEMORY_LIMIT", raw), "GO_MEMORY_LIMIT"
+// goMemoryLimitSetting applies the consolidated resource switch. off removes
+// the soft limit entirely; auto honors an explicit standard GOMEMLIMIT and
+// otherwise derives a budget from the detected cgroup/host memory.
+func goMemoryLimitSetting(resourceMode string, memoryLimit, available int64) (int64, string) {
+	if resourceMode == "off" {
+		return math.MaxInt64, "off"
 	}
 	if standard := strings.TrimSpace(os.Getenv("GOMEMLIMIT")); standard != "" {
 		return configuredGoMemoryLimit("GOMEMLIMIT", standard), "GOMEMLIMIT"
@@ -77,8 +75,8 @@ func configuredGoMemoryLimit(name, raw string) int64 {
 		}
 	}
 	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || value < 0 || value == 0 && name == "GO_MEMORY_LIMIT" || value > math.MaxInt64/multiplier {
-		panic(fmt.Sprintf("invalid %s: use off or a byte count with optional B/KiB/MiB/GiB/TiB suffix; GO_MEMORY_LIMIT also accepts auto (and requires a positive count)", name))
+	if err != nil || value < 0 || value == 0 || value > math.MaxInt64/multiplier {
+		panic(fmt.Sprintf("invalid %s: use off or a byte count with optional B/KiB/MiB/GiB/TiB suffix", name))
 	}
 	return value * multiplier
 }

@@ -26,8 +26,7 @@ var configEnvKeys = []string{
 	"HOST", "PORT", "DATABASE_PATH", "ACCESS_KEY", "MARKET_PROXY",
 	"DEFAULT_SYMBOLS", "RAW_RETENTION_DAYS", "DATABASE_MAX_MB", "SCHEDULER_ENABLED",
 	"HISTORY_MAX_AGE_SECONDS", "EXTREMES_MAX_AGE_SECONDS", "UPSTREAM_TIMEOUT_SECONDS",
-	"CBOE_TIMEOUT_SECONDS", "UPSTREAM_WAIT_SECONDS", "UPSTREAM_CONCURRENCY", "LOW_MEMORY",
-	"ANALYSIS_CACHE_ENTRIES", "ALPACA_API_KEY", "ALPACA_API_SECRET",
+	"CBOE_TIMEOUT_SECONDS", "RESOURCE_MODE", "ANALYSIS_CACHE_ENTRIES", "ALPACA_API_KEY", "ALPACA_API_SECRET",
 	"SIZE_CLEANUP_TIME_BUDGET_SECONDS",
 }
 
@@ -104,7 +103,7 @@ func unusedLocalPort(t *testing.T) string {
 }
 
 func TestCleanupOfflineUsesTempConfigAndRetentionAndSizeSettings(t *testing.T) {
-	cfg, databasePath := loadConfigFromTempEnv(t, "RAW_RETENTION_DAYS=1\nDATABASE_MAX_MB=1\nSIZE_CLEANUP_TIME_BUDGET_SECONDS=5\nLOW_MEMORY=true\n")
+	cfg, databasePath := loadConfigFromTempEnv(t, "RAW_RETENTION_DAYS=1\nDATABASE_MAX_MB=1\nSIZE_CLEANUP_TIME_BUDGET_SECONDS=5\nRESOURCE_MODE=off\n")
 	if cfg.DatabasePath != databasePath {
 		t.Fatalf("loaded database path = %q, want isolated path %q", cfg.DatabasePath, databasePath)
 	}
@@ -169,7 +168,7 @@ func TestCleanupOfflineUsesTempConfigAndRetentionAndSizeSettings(t *testing.T) {
 }
 
 func TestCleanupOfflinePrunesLegacyRawJSONWithoutSizeLimit(t *testing.T) {
-	cfg, databasePath := loadConfigFromTempEnv(t, "LOW_MEMORY=true\n")
+	cfg, databasePath := loadConfigFromTempEnv(t, "RESOURCE_MODE=off\n")
 	if cfg.DatabaseMaxMB != 0 {
 		t.Fatalf("database size limit = %d MB, want unlimited", cfg.DatabaseMaxMB)
 	}
@@ -228,7 +227,7 @@ VALUES ('QQQ', '2030-01-18', ?, 'QQQ300118C00100000', 'call', 'fixture', '{"lega
 }
 
 func TestCleanupOfflineRejectsActiveHousekeepingLeaseWithoutDeletingRows(t *testing.T) {
-	cfg, databasePath := loadConfigFromTempEnv(t, "RAW_RETENTION_DAYS=1\nLOW_MEMORY=true\n")
+	cfg, databasePath := loadConfigFromTempEnv(t, "RAW_RETENTION_DAYS=1\nRESOURCE_MODE=off\n")
 	initializeDatabase(t, databasePath)
 	database, err := sql.Open("sqlite", databasePath)
 	if err != nil {
@@ -494,7 +493,7 @@ VALUES ('WAL-BACKUP', '2030-01-18T15:00:00Z', 'fixture')`); err != nil {
 }
 
 func TestRestoreReplacesDatabaseAndKeepsRollbackFiles(t *testing.T) {
-	cfg, databasePath := loadConfigFromTempEnv(t, "LOW_MEMORY=true\n")
+	cfg, databasePath := loadConfigFromTempEnv(t, "RESOURCE_MODE=off\n")
 	cfg.Host = "127.0.0.1"
 	cfg.Port = unusedLocalPort(t)
 	initializeDatabase(t, databasePath)
@@ -544,7 +543,7 @@ func TestRestoreReplacesDatabaseAndKeepsRollbackFiles(t *testing.T) {
 }
 
 func TestRestorePreservesExistingDatabaseOwnerAndGroup(t *testing.T) {
-	cfg, databasePath := loadConfigFromTempEnv(t, "LOW_MEMORY=true\n")
+	cfg, databasePath := loadConfigFromTempEnv(t, "RESOURCE_MODE=off\n")
 	cfg.Host = "127.0.0.1"
 	cfg.Port = unusedLocalPort(t)
 	initializeDatabase(t, databasePath)
@@ -603,7 +602,7 @@ func TestRestorePreservesExistingDatabaseOwnerAndGroup(t *testing.T) {
 }
 
 func TestRestoreOwnerPreservationFailureLeavesOriginalDatabaseInPlace(t *testing.T) {
-	cfg, databasePath := loadConfigFromTempEnv(t, "LOW_MEMORY=true\n")
+	cfg, databasePath := loadConfigFromTempEnv(t, "RESOURCE_MODE=off\n")
 	cfg.Host = "127.0.0.1"
 	cfg.Port = unusedLocalPort(t)
 	initializeDatabase(t, databasePath)
@@ -647,7 +646,7 @@ func TestRestoreOwnerPreservationFailureLeavesOriginalDatabaseInPlace(t *testing
 }
 
 func TestRestoreRejectsInvalidBackupWithoutChangingDatabase(t *testing.T) {
-	cfg, databasePath := loadConfigFromTempEnv(t, "LOW_MEMORY=true\n")
+	cfg, databasePath := loadConfigFromTempEnv(t, "RESOURCE_MODE=off\n")
 	cfg.Host = "127.0.0.1"
 	cfg.Port = unusedLocalPort(t)
 	initializeDatabase(t, databasePath)
@@ -674,7 +673,7 @@ func TestRestoreRejectsInvalidBackupWithoutChangingDatabase(t *testing.T) {
 }
 
 func TestRestoreRejectsListeningApplication(t *testing.T) {
-	cfg, databasePath := loadConfigFromTempEnv(t, "LOW_MEMORY=true\n")
+	cfg, databasePath := loadConfigFromTempEnv(t, "RESOURCE_MODE=off\n")
 	cfg.Host = "0.0.0.0"
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

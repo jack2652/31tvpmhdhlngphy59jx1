@@ -183,17 +183,17 @@ func withAlternatingEndpointKinds(segments []Segment) []Segment {
 
 func TestBrokenFeatureExtremeUsesDirectionalExtreme(t *testing.T) {
 	features := []featureRange{
-		{FeatureElement: FeatureElement{Low: 10, High: 14}},
-		{FeatureElement: FeatureElement{Low: 7, High: 11}},
-		{FeatureElement: FeatureElement{Low: 9, High: 13}},
+		{Low: 10, High: 14},
+		{Low: 7, High: 11},
+		{Low: 9, High: 13},
 	}
 	if extreme, reclaim, ok := brokenFeatureExtreme(features, Stroke{Low: 6, High: 10}, "up"); !ok || extreme != 7 || reclaim != 11 {
 		t.Fatalf("up break extreme=%v reclaim=%v ok=%v, want broken low 7 and reclaim high 11", extreme, reclaim, ok)
 	}
 	features = []featureRange{
-		{FeatureElement: FeatureElement{Low: 10, High: 14}},
-		{FeatureElement: FeatureElement{Low: 14, High: 18}},
-		{FeatureElement: FeatureElement{Low: 11, High: 16}},
+		{Low: 10, High: 14},
+		{Low: 14, High: 18},
+		{Low: 11, High: 16},
 	}
 	if extreme, reclaim, ok := brokenFeatureExtreme(features, Stroke{Low: 15, High: 19}, "down"); !ok || extreme != 18 || reclaim != 14 {
 		t.Fatalf("down break extreme=%v reclaim=%v ok=%v, want broken high 18 and reclaim low 14", extreme, reclaim, ok)
@@ -203,16 +203,16 @@ func TestBrokenFeatureExtremeUsesDirectionalExtreme(t *testing.T) {
 func TestFeatureSequenceMergesIncludedElementsByTrendDirection(t *testing.T) {
 	var upwardFeatures, downwardFeatures []featureRange
 	upwardDirection := 0
-	appendFeature(&upwardFeatures, &upwardDirection, Stroke{Direction: "down", Chain: 2, Low: 20, High: 30, Start: Fractal{Date: "01"}, End: Fractal{Date: "02"}}, 1)
-	appendFeature(&upwardFeatures, &upwardDirection, Stroke{Direction: "down", Low: 15, High: 25, Start: Fractal{Date: "02"}, End: Fractal{Date: "03"}}, 3)
-	appendFeature(&upwardFeatures, &upwardDirection, Stroke{Direction: "down", Low: 17, High: 22, Start: Fractal{Date: "03"}, End: Fractal{Date: "04"}}, 5)
+	upwardFeatures = appendFeature(upwardFeatures, &upwardDirection, Stroke{Direction: "down", Chain: 2, Low: 20, High: 30, Start: Fractal{Date: "01"}, End: Fractal{Date: "02"}}, 1)
+	upwardFeatures = appendFeature(upwardFeatures, &upwardDirection, Stroke{Direction: "down", Low: 15, High: 25, Start: Fractal{Date: "02"}, End: Fractal{Date: "03"}}, 3)
+	upwardFeatures = appendFeature(upwardFeatures, &upwardDirection, Stroke{Direction: "down", Low: 17, High: 22, Start: Fractal{Date: "03"}, End: Fractal{Date: "04"}}, 5)
 	if upwardDirection != -1 || len(upwardFeatures) != 2 || upwardFeatures[1].Low != 15 || upwardFeatures[1].High != 22 || upwardFeatures[1].StartStroke != 3 || upwardFeatures[1].EndStroke != 5 || upwardFeatures[1].Start != "02" || upwardFeatures[1].End != "04" {
 		t.Fatalf("upward segment feature inclusion direction=%d ranges=%+v, want downward sequence inclusion [15,22] with provenance", upwardDirection, upwardFeatures)
 	}
 	downwardDirection := 0
-	appendFeature(&downwardFeatures, &downwardDirection, Stroke{Direction: "up", Chain: 4, Low: 10, High: 20, Start: Fractal{Date: "04"}, End: Fractal{Date: "05"}}, 2)
-	appendFeature(&downwardFeatures, &downwardDirection, Stroke{Direction: "up", Low: 15, High: 25, Start: Fractal{Date: "05"}, End: Fractal{Date: "06"}}, 4)
-	appendFeature(&downwardFeatures, &downwardDirection, Stroke{Direction: "up", Low: 17, High: 22, Start: Fractal{Date: "06"}, End: Fractal{Date: "07"}}, 6)
+	downwardFeatures = appendFeature(downwardFeatures, &downwardDirection, Stroke{Direction: "up", Chain: 4, Low: 10, High: 20, Start: Fractal{Date: "04"}, End: Fractal{Date: "05"}}, 2)
+	downwardFeatures = appendFeature(downwardFeatures, &downwardDirection, Stroke{Direction: "up", Low: 15, High: 25, Start: Fractal{Date: "05"}, End: Fractal{Date: "06"}}, 4)
+	downwardFeatures = appendFeature(downwardFeatures, &downwardDirection, Stroke{Direction: "up", Low: 17, High: 22, Start: Fractal{Date: "06"}, End: Fractal{Date: "07"}}, 6)
 	if downwardDirection != 1 || len(downwardFeatures) != 2 || downwardFeatures[1].Low != 17 || downwardFeatures[1].High != 25 || downwardFeatures[1].StartStroke != 4 || downwardFeatures[1].EndStroke != 6 || downwardFeatures[1].Start != "05" || downwardFeatures[1].End != "07" {
 		t.Fatalf("downward segment feature inclusion direction=%d ranges=%+v, want upward sequence inclusion [17,25] with provenance", downwardDirection, downwardFeatures)
 	}
@@ -220,17 +220,17 @@ func TestFeatureSequenceMergesIncludedElementsByTrendDirection(t *testing.T) {
 
 func TestFeatureBreakRequiresStrictPenetration(t *testing.T) {
 	upFeatures := []featureRange{
-		{FeatureElement: FeatureElement{Low: 10, High: 14}},
-		{FeatureElement: FeatureElement{Low: 7, High: 11}},
-		{FeatureElement: FeatureElement{Low: 9, High: 13}},
+		{Low: 10, High: 14},
+		{Low: 7, High: 11},
+		{Low: 9, High: 13},
 	}
 	if _, _, broken := brokenFeatureExtreme(upFeatures, Stroke{Low: 7}, "up"); broken {
 		t.Fatal("touching the feature low must not count as a strict break")
 	}
 	downFeatures := []featureRange{
-		{FeatureElement: FeatureElement{Low: 10, High: 14}},
-		{FeatureElement: FeatureElement{Low: 14, High: 18}},
-		{FeatureElement: FeatureElement{Low: 11, High: 16}},
+		{Low: 10, High: 14},
+		{Low: 14, High: 18},
+		{Low: 11, High: 16},
 	}
 	if _, _, broken := brokenFeatureExtreme(downFeatures, Stroke{High: 18}, "down"); broken {
 		t.Fatal("touching the feature high must not count as a strict break")

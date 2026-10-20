@@ -62,18 +62,8 @@ func IsRegularSession(value time.Time) bool {
 // RegularCloseMinute returns the XNYS regular-session close as minutes after
 // midnight Eastern. A few early closes before 1993 ended at 14:00.
 func RegularCloseMinute(value time.Time) int {
-	day := localDate(value)
-	switch {
-	case day.Year() == 1990 && day.Month() == time.December && day.Day() == 24,
-		day.Year() == 1991 && day.Month() == time.December && day.Day() == 24,
-		day.Year() == 1992 && day.Month() == time.November && day.Day() == 27,
-		day.Year() == 1992 && day.Month() == time.December && day.Day() == 24:
-		return 14 * 60
-	}
-	if calendarDay(day) == calendarEarlyClose {
-		return 13 * 60
-	}
-	return 16 * 60
+	year, month, dayOfMonth := localDate(value).Date()
+	return RegularCloseMinuteOrdinal(DaysFromCivil(year, int(month), dayOfMonth))
 }
 
 func IsOvernightSession(value time.Time) bool {
@@ -90,28 +80,8 @@ func IsEarlyClose(value time.Time) bool {
 }
 
 func calendarDay(day time.Time) uint8 {
-	year, dayOfYear := day.Year(), day.YearDay()
-	calendarMu.RLock()
-	calendar := calendars[year]
-	calendarMu.RUnlock()
-	if calendar != nil {
-		return calendar.days[dayOfYear]
-	}
-	built := buildYearCalendar(year)
-	calendarMu.Lock()
-	if existing := calendars[year]; existing != nil {
-		built = existing
-	} else {
-		if len(calendars) >= cachedCalendarYears {
-			for cachedYear := range calendars {
-				delete(calendars, cachedYear)
-				break
-			}
-		}
-		calendars[year] = built
-	}
-	calendarMu.Unlock()
-	return built.days[dayOfYear]
+	year, month, dayOfMonth := day.Date()
+	return calendarDayOrdinal(DaysFromCivil(year, int(month), dayOfMonth))
 }
 
 func buildYearCalendar(year int) *yearCalendar {

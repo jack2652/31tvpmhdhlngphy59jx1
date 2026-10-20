@@ -332,6 +332,21 @@ func TestRouterUnknownAPIPathUsesFastAPIJSONNotFound(t *testing.T) {
 	}
 }
 
+func TestStaticAssetsAreImmutableAndVaryByEncoding(t *testing.T) {
+	_, ts := testService(t, "")
+	response, err := http.Get(ts.URL + "/static/common/js/request.js?v=test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if got := response.Header.Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+		t.Fatalf("static Cache-Control=%q, want immutable", got)
+	}
+	if !hasVaryToken(response.Header, "Accept-Encoding") {
+		t.Fatalf("static Vary=%v, want Accept-Encoding", response.Header.Values("Vary"))
+	}
+}
+
 func TestRouterWrongAPIMethodUsesFastAPIJSONMethodNotAllowed(t *testing.T) {
 	_, ts := testService(t, "")
 	for _, test := range []struct {
@@ -1357,7 +1372,9 @@ func TestNewSetsCboeCacheLimitForLowMemoryMode(t *testing.T) {
 		lowMemory bool
 		wantLimit int
 	}{
-		{name: "normal", wantLimit: 0},
+		// The provider bounds its delayed payload cache to 16 by default; low
+		// memory keeps only the active symbol.
+		{name: "normal", wantLimit: 16},
 		{name: "low-memory", lowMemory: true, wantLimit: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1420,6 +1437,21 @@ func (p *statusTrackingProvider) EarningsDates(context.Context, string) ([]strin
 		return nil, p.earningsErr
 	}
 	return append([]string(nil), p.earningsDates...), nil
+}
+
+type nearestChainTestProvider struct {
+	*testMarketProvider
+	nearestCalls atomic.Int64
+}
+
+func (p *nearestChainTestProvider) NearestChain(_ context.Context, _ string) ([]string, []model.OptionRow, *time.Time, error) {
+	p.nearestCalls.Add(1)
+	strike := 100.0
+	fetched := time.Now().UTC()
+	return []string{"2030-01-18"}, []model.OptionRow{{
+		ContractSymbol: "TEST300118C00100000", Provider: "test", ContractType: "call",
+		Strike: &strike, Expiration: "2030-01-18",
+	}}, &fetched, nil
 }
 
 type testMarketProvider struct {
@@ -3512,7 +3544,7 @@ func TestChanAdjustedHistoryRefreshRequestsFiveYearContext(t *testing.T) {
 	}
 	provider := &chanAdjustedRecordingProvider{testMarketProvider: &testMarketProvider{}, requests: make(chan string, 1)}
 	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamTimeout: time.Second}, repository, provider)
-	if !service.scheduleChanAdjustedRefresh("QQQ|1d|split_dividend_auto|go-yfinance", "QQQ") {
+	if !service.scheduleChanAdjustedRefresh("QQQ|1d|split_dividend_auto|go-yfinance", "QQQ", true) {
 		t.Fatal("five-year adjusted history refresh was not scheduled")
 	}
 	select {
@@ -3537,6 +3569,73 @@ func TestAdjustedIntradayBarsMapsDateSpecificAdjustedFactor(t *testing.T) {
 	got, skipped := adjustedIntradayBars(input, daily)
 	if len(got) != 1 || skipped != 1 || got[0].Open != 50 || got[0].High != 51 || got[0].Low != 49 || got[0].Close != 50.5 {
 		t.Fatalf("adjusted intraday bars=%+v skipped=%d", got, skipped)
+	}
+}
+
+func TestSnapshotRefreshDefersAdjustedHistoryPrefetch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chan-adjusted-gate.db")
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &chanAdjustedRecordingProvider{testMarketProvider: &testMarketProvider{}, requests: make(chan string, 2)}
+	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamTimeout: time.Second}, repository, provider)
+	defer service.Close()
+	finish, _, acquired := service.tryAcquireRefreshGate(snapshotRefreshGateKey("QQQ", ""))
+	if !acquired {
+		t.Fatal("could not acquire the snapshot refresh gate")
+	}
+	if service.scheduleChanAdjustedRefresh(chanAdjustedCacheKey("QQQ"), "QQQ", false) {
+		t.Fatal("adjusted history started while the snapshot refresh owned the upstream slot")
+	}
+	service.prefetchSymbolAnalytics("QQQ", false)
+	select {
+	case request := <-provider.requests:
+		t.Fatalf("history request %q started before the snapshot commit", request)
+	case <-time.After(100 * time.Millisecond):
+	}
+	finish("", model.RefreshResponse{}, nil)
+	if !service.scheduleChanAdjustedRefresh(chanAdjustedCacheKey("QQQ"), "QQQ", true) {
+		t.Fatal("adjusted history did not start after the snapshot commit")
+	}
+	select {
+	case request := <-provider.requests:
+		if request != "QQQ|5y" {
+			t.Fatalf("Chan adjusted history request=%q, want QQQ|5y", request)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Chan adjusted history refresh did not reach provider")
+	}
+}
+
+func TestSnapshotRefreshUsesSingleNearestChainRequest(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nearest-chain.db")
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	price := 123.0
+	fetchedAt := time.Now().UTC()
+	provider := &nearestChainTestProvider{testMarketProvider: &testMarketProvider{
+		quote: model.Quote{Price: &price, FetchedAt: &fetchedAt, Sessions: map[string]any{}},
+	}}
+	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamTimeout: time.Second}, repository, provider)
+	defer service.Close()
+	response, err := service.refreshSnapshot(context.Background(), "QQQ", "", time.Second)
+	if err != nil {
+		t.Fatalf("refreshSnapshot() error = %v", err)
+	}
+	if got := provider.nearestCalls.Load(); got != 1 {
+		t.Fatalf("NearestChain calls = %d, want 1", got)
+	}
+	if got := provider.expirationCalls.Load(); got != 0 {
+		t.Fatalf("separate Expirations calls = %d, want 0", got)
+	}
+	if got := provider.chainCalls.Load(); got != 0 {
+		t.Fatalf("separate Chain calls = %d, want 0", got)
+	}
+	if response.Expiration != "2030-01-18" || response.Rows != 1 || response.Quote == nil || response.Quote.Price == nil || *response.Quote.Price != price {
+		t.Fatalf("refresh response = %+v", response)
 	}
 }
 
@@ -3869,6 +3968,52 @@ func TestChanLegacyEndpointKeepsStrictOldStrokeAndCenterSemantics(t *testing.T) 
 	}
 	if _, ok := adjustedDaily["segments"].([]any); !ok {
 		t.Fatalf("adjusted v4 segments type=%T", adjustedDaily["segments"])
+	}
+	compactResponse, err := http.Get(ts.URL + "/api/chan/QQQ/adjusted?compact=true&spot=100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer compactResponse.Body.Close()
+	var compactPayload map[string]any
+	if err := json.NewDecoder(compactResponse.Body).Decode(&compactPayload); err != nil {
+		t.Fatal(err)
+	}
+	if compactResponse.StatusCode != http.StatusOK {
+		t.Fatalf("compact response status=%d", compactResponse.StatusCode)
+	}
+	compactDaily, ok := compactPayload["daily"].(map[string]any)
+	if !ok {
+		t.Fatalf("compact daily type=%T", compactPayload["daily"])
+	}
+	for _, required := range []string{"candles", "strokes", "recursive_levels", "signals_v4", "quality"} {
+		if _, present := compactDaily[required]; !present {
+			t.Fatalf("compact daily lost %q", required)
+		}
+	}
+	for _, omitted := range []string{"fractals", "fractals_v4", "strokes_v4", "strengths_v4", "macd_v4", "trend_context_v4"} {
+		if _, present := compactDaily[omitted]; present {
+			t.Fatalf("compact daily unexpectedly carries %q", omitted)
+		}
+	}
+	lightResponse, err := http.Get(ts.URL + "/api/chan/QQQ?light=true&spot=100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lightResponse.Body.Close()
+	var lightPayload map[string]any
+	if err := json.NewDecoder(lightResponse.Body).Decode(&lightPayload); err != nil {
+		t.Fatal(err)
+	}
+	if lightResponse.StatusCode != http.StatusOK {
+		t.Fatalf("light response status=%d", lightResponse.StatusCode)
+	}
+	for _, omitted := range []string{"daily", "weekly", "summary", "rules", "rule_version"} {
+		if _, present := lightPayload[omitted]; present {
+			t.Fatalf("light response unexpectedly carries %q", omitted)
+		}
+	}
+	if lightPayload["market_analysis"] == nil || lightPayload["trend"] == nil || lightPayload["history"] == nil || lightPayload["spot"] != float64(100) {
+		t.Fatalf("light response lost market card inputs: %#v", lightPayload)
 	}
 }
 

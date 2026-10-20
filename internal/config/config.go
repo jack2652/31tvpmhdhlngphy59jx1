@@ -42,7 +42,7 @@ type Config struct {
 	GoMemoryLimitBytes   int64
 	GoMemoryLimitSource  string
 	InboundConcurrency   int
-	LowMemoryMode        string
+	ResourceMode         string
 	LowMemory            bool
 	AnalysisCacheEntries int
 	AlpacaAPIKey         string
@@ -86,21 +86,23 @@ func LoadFromDir(baseDir string) Config {
 	} else if portFromEnvironment {
 		portSource = "default (empty environment PORT)"
 	}
+	resourceMode := resourceModeValue()
 	memoryLimit := effectiveMemoryLimitBytes()
 	memoryAvailable := effectiveMemoryAvailableBytes(memoryLimit)
 	upstreamMemory := memoryAvailable
-	goMemoryLimit, goMemorySource := goMemoryLimitSetting(memoryLimit, memoryAvailable)
-	resourceLimit := memoryLimit
+	goMemoryLimit, goMemorySource := goMemoryLimitSetting(resourceMode, memoryLimit, memoryAvailable)
 	if goMemoryLimit >= 0 && goMemoryLimit < math.MaxInt64 {
-		if resourceLimit <= 0 || goMemoryLimit < resourceLimit {
-			resourceLimit = goMemoryLimit
-		}
 		if upstreamMemory < 0 || goMemoryLimit < upstreamMemory {
 			upstreamMemory = goMemoryLimit
 		}
 	}
-	lowMemoryMode := lowMemoryModeValue()
-	lowMemory := lowMemoryEnabled(lowMemoryMode, resourceLimit, upstreamMemory)
+	lowMemory := false
+	if resourceMode == "auto" {
+		// Trigger on the detected environment, not on the derived GC budget:
+		// on a mid-size host the 80% soft budget already falls under 4GiB, but
+		// the machine itself is not memory constrained.
+		lowMemory = autoLowMemoryEnabled(memoryLimit, memoryAvailable)
+	}
 	defaultSymbols := parseSymbols(env("DEFAULT_SYMBOLS", "QQQ"))
 	defaultSymbol := "QQQ"
 	if len(defaultSymbols) > 0 {
@@ -138,7 +140,7 @@ func LoadFromDir(baseDir string) Config {
 		GoMemoryLimitBytes:   goMemoryLimit,
 		GoMemoryLimitSource:  goMemorySource,
 		InboundConcurrency:   inboundConcurrency(lowMemory),
-		LowMemoryMode:        lowMemoryMode,
+		ResourceMode:         resourceMode,
 		LowMemory:            lowMemory,
 		AnalysisCacheEntries: effectiveAnalysisCacheEntries(lowMemory),
 		AlpacaAPIKey:         strings.TrimSpace(os.Getenv("ALPACA_API_KEY")),
@@ -288,24 +290,21 @@ func envBool(name string, fallback bool) bool {
 	}
 }
 
-func lowMemoryModeValue() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("LOW_MEMORY"))) {
-	case "1", "true", "yes", "on":
-		return "true"
-	case "0", "false", "no", "off":
-		return "false"
-	default:
+// resourceModeValue is the single resource switch. auto detects the current
+// cgroup/host limits and derives the GC budget, cache sizes, upstream
+// concurrency and slot wait; off disables every automatic restriction.
+func resourceModeValue() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("RESOURCE_MODE"))) {
+	case "", "auto":
 		return "auto"
+	case "off":
+		return "off"
+	default:
+		panic("RESOURCE_MODE must be auto or off")
 	}
 }
 
-func lowMemoryEnabled(mode string, memoryLimit, memoryAvailable int64) bool {
-	switch mode {
-	case "true":
-		return true
-	case "false":
-		return false
-	}
+func autoLowMemoryEnabled(memoryLimit, memoryAvailable int64) bool {
 	if memoryLimit > 0 && memoryLimit <= autoLowMemoryLimit {
 		return true
 	}
@@ -492,31 +491,22 @@ func hostMemoryAvailableBytes() int64 {
 }
 
 func upstreamWaitDuration(lowMemory bool) time.Duration {
-	seconds := envInt("UPSTREAM_WAIT_SECONDS", 20)
-	if lowMemory && seconds > 5 {
-		seconds = 5
+	if lowMemory {
+		return 5 * time.Second
 	}
-	return time.Duration(seconds) * time.Second
+	return 20 * time.Second
 }
 
 func effectiveConcurrency(memoryBudget int64, lowMemory bool) int {
-	configuredCap := defaultUpstreamConcurrency
-	if raw, present := os.LookupEnv("UPSTREAM_CONCURRENCY"); present && strings.ToLower(strings.TrimSpace(raw)) != "auto" {
-		configuredCap = envInt("UPSTREAM_CONCURRENCY", defaultUpstreamConcurrency)
-	} else if raw, present := os.LookupEnv("UPSTREAM_CONCURRENCY"); present && strings.TrimSpace(raw) == "" {
-		panic("UPSTREAM_CONCURRENCY must be auto or an integer >= 1")
-	}
 	if lowMemory {
-		// LOW_MEMORY=true is an explicit request for the conservative resource
-		// profile even when the host itself has more memory available.
 		memoryBudget = min(memoryBudget, lowMemoryThreshold)
 	}
-	return upstreamConcurrencyForResources(memoryBudget, runtime.GOMAXPROCS(0), configuredCap)
+	return upstreamConcurrencyForResources(memoryBudget, runtime.GOMAXPROCS(0), defaultUpstreamConcurrency)
 }
 
-// upstreamConcurrencyForResources treats UPSTREAM_CONCURRENCY as a ceiling.
-// The runtime budget scales with memory available to hold concurrent upstream
-// response/decode working sets, and with CPU capacity to bound decode work.
+// upstreamConcurrencyForResources computes the automatic concurrency budget:
+// memory available for concurrent upstream response/decode working sets, CPU
+// capacity to bound decode work, and the default ceiling.
 func upstreamConcurrencyForResources(memoryBytes int64, cpuCount, configuredCap int) int {
 	if cpuCount < 1 {
 		cpuCount = 1

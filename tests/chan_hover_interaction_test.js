@@ -94,6 +94,20 @@ assert.ok(changeRow, "tooltip must include the close-change row");
 assert.equal(changeRow.children[1].textContent, "+5.00%");
 assert.deepEqual(Array.from(tooltip.children.filter((child) => child.className.includes("chan-ohlc-row") && !child.className.includes("change")).map((row) => row.children[1].textContent)), ["$100.00", "$107.00", "$99.00", "$105.00"]);
 
+// Projection routes live on the canvas; hover hit testing must still open and
+// close the scenario card without any per-route SVG nodes.
+const scenarioEvents = [];
+directive.componentUpdated(target, { value: {
+  chart: { ...model, historyRight: 360, plotRight: 450, projections: [{ key: "up", tone: "up", points: [{ x: 368, y: 100 }, { x: 440, y: 50 }] }] },
+  scenariosVisible: true,
+  onScenarioHover: (key) => scenarioEvents.push(["show", key]),
+  onScenarioLeave: () => scenarioEvents.push(["hide"]),
+} });
+targetListeners.get("pointermove")({ clientX: 400, clientY: 78, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.deepEqual(scenarioEvents, [["show", "up"]], "moving onto a canvas projection route must open its scenario card");
+targetListeners.get("pointermove")({ clientX: 150, clientY: 110, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.deepEqual(scenarioEvents, [["show", "up"], ["hide"]], "leaving the projection route must close the scenario card");
+
 targetListeners.get("pointerleave")();
 assert.equal(layer.attributes.visibility, "hidden", "leaving the chart must hide crosshair guides");
 assert.equal(tooltip.hidden, true, "leaving the chart must hide the tooltip");

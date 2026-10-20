@@ -74,7 +74,7 @@ func TestResponseCompressionThresholdAndJSON(t *testing.T) {
 	}
 }
 
-func TestResponseCompressionHonorsLowMemoryAndEncoding(t *testing.T) {
+func TestResponseCompressionHonorsEncodingPreferences(t *testing.T) {
 	body := jsonBodyOfSize(gzipMinimumSize * 2)
 	for _, test := range []struct {
 		name      string
@@ -92,16 +92,34 @@ func TestResponseCompressionHonorsLowMemoryAndEncoding(t *testing.T) {
 			request.Header.Set("Accept-Encoding", test.accept)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
+			if test.accept == "gzip" {
+				if got := response.Header().Get("Content-Encoding"); got != "gzip" {
+					t.Fatalf("Content-Encoding = %q, want gzip", got)
+				}
+				if !hasVaryToken(response.Header(), "Accept-Encoding") {
+					t.Fatalf("Vary = %v, want Accept-Encoding", response.Header().Values("Vary"))
+				}
+				reader, err := gzip.NewReader(response.Body)
+				if err != nil {
+					t.Fatalf("gzip.NewReader: %v", err)
+				}
+				decoded, err := io.ReadAll(reader)
+				if err != nil {
+					t.Fatalf("read compressed body: %v", err)
+				}
+				_ = reader.Close()
+				if string(decoded) != body {
+					t.Fatalf("decoded body differs from JSON payload")
+				}
+				return
+			}
 			if got := response.Header().Get("Content-Encoding"); got != "" {
 				t.Fatalf("Content-Encoding = %q, want empty", got)
 			}
 			if response.Body.String() != body {
 				t.Fatalf("body changed for uncompressed response")
 			}
-			if test.lowMemory && len(response.Header().Values("Vary")) != 0 {
-				t.Fatalf("low-memory response unexpectedly added Vary: %v", response.Header().Values("Vary"))
-			}
-			if !test.lowMemory && len(response.Header().Values("Vary")) != 0 {
+			if len(response.Header().Values("Vary")) != 0 {
 				t.Fatalf("rejected gzip response unexpectedly added Vary: %v", response.Header().Values("Vary"))
 			}
 		})

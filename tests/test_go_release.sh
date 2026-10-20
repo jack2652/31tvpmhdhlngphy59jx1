@@ -33,7 +33,7 @@ PY
 port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 (
   cd "$TEST_ROOT"
-  exec env HOST=127.0.0.1 PORT="$port" DATABASE_PATH="$TEST_ROOT/options.db" ACCESS_KEY=embed-test SCHEDULER_ENABLED=false LOW_MEMORY=true "$BINARY"
+  exec env HOST=127.0.0.1 PORT="$port" DATABASE_PATH="$TEST_ROOT/options.db" ACCESS_KEY=embed-test SCHEDULER_ENABLED=false RESOURCE_MODE=off "$BINARY"
  ) >"$TEST_ROOT/server.log" 2>&1 &
 SERVER_PID=$!
 ready=false

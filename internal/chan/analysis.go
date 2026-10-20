@@ -156,12 +156,30 @@ func analyzeAdjustedValidatedWithComponents(symbol string, input, validated []Ba
 	result.Parameters["divergence_ratio"] = divergenceRatio
 	dailyBars := result.Daily.Candles
 	weeklyBars := result.Weekly.Candles
-	dailyQuality := dailyQuality(input, dailyBars, adjustedRejected, adjustedIncomplete, adjustedDuplicates, adjustedReordered)
+	// The legacy pass already scanned these accepted bars for gaps and
+	// corporate-action events; only the counters and status differ for the
+	// adjusted input, so reuse that scan instead of walking the history twice.
+	dailyQuality := legacyResult.Daily.Quality
+	dailyQuality.InputBars = len(input)
+	dailyQuality.AcceptedBars = len(dailyBars)
+	dailyQuality.RejectedBars = adjustedRejected
+	dailyQuality.IncompleteBars = adjustedIncomplete
+	dailyQuality.DuplicateBars = adjustedDuplicates
+	dailyQuality.ReorderedBars = adjustedReordered
 	dailyQuality.InvalidDateBars = adjustedExclusions.InvalidDate
 	dailyQuality.NonTradingBars = adjustedExclusions.NonTrading
 	dailyQuality.InvalidOHLCBars = adjustedExclusions.InvalidOHLC
 	dailyQuality.InvalidVolumeBars = adjustedExclusions.InvalidVolume
-	dailyQuality.Chains = summarizeDataChains(dailyBars, dailyQuality.Gaps)
+	dailyQuality.Status = qualityStatus(adjustedRejected, adjustedIncomplete, adjustedDuplicates)
+	if dailyQuality.CorporateActionSuspected {
+		dailyQuality.Status = "degraded"
+	}
+	if dailyQuality.Status == "ok" && len(dailyQuality.Gaps) > 0 {
+		dailyQuality.Status = "partial"
+	}
+	if adjustedReordered > 0 {
+		dailyQuality.Status = "degraded"
+	}
 	result.Daily = addRecursiveAnalysisWithComponents(result.Daily, dailyBars, divergenceRatio, cached)
 	for index := range result.Daily.SignalsV4 {
 		result.Daily.SignalsV4[index].Symbol = symbol
@@ -453,34 +471,34 @@ func aggregateIntradayBarsWithQuality(input []Bar, cutoff time.Time, interval ti
 	return aggregateIntradayBarsFromSource(len(input), source, interval)
 }
 
+const (
+	intradaySessionOpenMinute = 9*60 + 30
+	fourHourBlockBars         = 16
+)
+
 func aggregateIntradayBarsFromSource(inputCount int, source intradaySource, interval time.Duration) ([]Bar, DataQuality, []DataGap) {
 	if interval <= 15*time.Minute || interval%(15*time.Minute) != 0 {
 		return nil, DataQuality{InputBars: inputCount, PriceBasis: "raw", Status: "invalid_interval"}, nil
 	}
 	groupSize := int(interval / (15 * time.Minute))
-	location := newYorkLocation()
-	byDay := make(map[string]map[int]Bar)
+	byDay := make(map[int]map[int]Bar)
 	for _, bar := range source.bars {
-		day, minute, ok := intradayDateMinute(bar.Date)
+		days, minute, ok := marketcalendar.ParseDateTime(bar.Date)
 		if !ok {
 			continue
 		}
-		index := (minute - (9*60 + 30)) / 15
+		index := (minute - intradaySessionOpenMinute) / 15
 		if index < 0 || index >= 26 {
 			continue
 		}
-		if byDay[day] == nil {
-			byDay[day] = map[int]Bar{}
+		if byDay[days] == nil {
+			byDay[days] = map[int]Bar{}
 		}
-		byDay[day][index] = bar
+		byDay[days][index] = bar
 	}
 	result := []Bar{}
-	for day, session := range byDay {
-		dayStart, err := time.ParseInLocation(time.DateOnly, day, location)
-		if err != nil {
-			continue
-		}
-		slots := int(time.Duration(marketcalendar.RegularCloseMinute(dayStart)-9*60-30) * time.Minute / (15 * time.Minute))
+	for days, session := range byDay {
+		slots := (marketcalendar.RegularCloseMinuteOrdinal(days) - intradaySessionOpenMinute) / 15
 		for start := 0; start+groupSize <= slots; start += groupSize {
 			complete := true
 			var combined Bar
@@ -502,9 +520,9 @@ func aggregateIntradayBarsFromSource(inputCount int, source intradaySource, inte
 				continue
 			}
 			combined.Chain = session[start].Chain
-			startAt := dayStart.Add(9*time.Hour + 30*time.Minute + time.Duration(start)*15*time.Minute)
-			combined.Date = startAt.Format("2006-01-02 15:04")
-			combined.CapturedAt = startAt.Add(interval)
+			startMinute := intradaySessionOpenMinute + start*15
+			combined.Date = marketcalendar.FormatDateTime(days, startMinute)
+			combined.CapturedAt = dayTime(days, startMinute+int(interval/time.Minute))
 			result = append(result, combined)
 		}
 	}
@@ -525,10 +543,9 @@ func expectedAggregatedIntradayGaps(source, bars []Bar, groupSize int, interval 
 	if len(source) == 0 || groupSize <= 0 || interval <= 0 {
 		return []DataGap{}, 0
 	}
-	location := newYorkLocation()
-	first, errFirst := time.ParseInLocation("2006-01-02 15:04", source[0].Date, location)
-	last, errLast := time.ParseInLocation("2006-01-02 15:04", source[len(source)-1].Date, location)
-	if errFirst != nil || errLast != nil {
+	firstDays, _, okFirst := marketcalendar.ParseDateTime(source[0].Date)
+	lastDays, _, okLast := marketcalendar.ParseDateTime(source[len(source)-1].Date)
+	if !okFirst || !okLast {
 		return []DataGap{}, 0
 	}
 	accepted := make(map[string]bool, len(bars))
@@ -537,27 +554,26 @@ func expectedAggregatedIntradayGaps(source, bars []Bar, groupSize int, interval 
 	}
 	expected := 0
 	gaps := []DataGap{}
-	for day := time.Date(first.Year(), first.Month(), first.Day(), 0, 0, 0, 0, location); !day.After(last); day = day.AddDate(0, 0, 1) {
-		if !marketcalendar.IsTradingDay(day) {
+	cursor := 0
+	for days := firstDays; days <= lastDays; days++ {
+		if !marketcalendar.IsTradingDayOrdinal(days) {
 			continue
 		}
-		open := time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, location)
-		closeMinute := marketcalendar.RegularCloseMinute(day)
-		close := time.Date(day.Year(), day.Month(), day.Day(), closeMinute/60, closeMinute%60, 0, 0, location)
-		slots := int(close.Sub(open) / (15 * time.Minute))
+		slots := (marketcalendar.RegularCloseMinuteOrdinal(days) - intradaySessionOpenMinute) / 15
 		for sourceIndex := 0; sourceIndex+groupSize <= slots; sourceIndex += groupSize {
 			expected++
-			stamp := open.Add(time.Duration(sourceIndex) * 15 * time.Minute)
-			key := stamp.Format("2006-01-02 15:04")
+			key := marketcalendar.FormatDateTime(days, intradaySessionOpenMinute+sourceIndex*15)
 			if accepted[key] {
 				continue
 			}
+			// Accepted aggregated bars are sorted, so the next-gap cursor only
+			// moves forward across the entire scan.
+			for cursor < len(bars) && bars[cursor].Date <= key {
+				cursor++
+			}
 			next := ""
-			for _, candidate := range bars {
-				if candidate.Date > key {
-					next = candidate.Date
-					break
-				}
+			if cursor < len(bars) {
+				next = bars[cursor].Date
 			}
 			gaps = append(gaps, DataGap{ExpectedDate: key, NextDate: next})
 		}
@@ -571,69 +587,60 @@ func chainAggregatedIntradayBars(bars, source []Bar, interval time.Duration, gro
 	if len(bars) == 0 {
 		return bars
 	}
-	location := newYorkLocation()
-	sourceDays := map[string]map[int]bool{}
+	intervalMinutes := int(interval / time.Minute)
+	sourceDays := map[int]map[int]bool{}
 	for _, bar := range source {
-		stamp, err := time.ParseInLocation("2006-01-02 15:04", bar.Date, location)
-		if err != nil {
+		days, minute, ok := marketcalendar.ParseDateTime(bar.Date)
+		if !ok {
 			continue
 		}
-		day := stamp.Format(time.DateOnly)
-		if sourceDays[day] == nil {
-			sourceDays[day] = map[int]bool{}
+		if sourceDays[days] == nil {
+			sourceDays[days] = map[int]bool{}
 		}
-		open := time.Date(stamp.Year(), stamp.Month(), stamp.Day(), 9, 30, 0, 0, location)
-		sourceDays[day][int(stamp.Sub(open)/(15*time.Minute))] = true
+		sourceDays[days][(minute-intradaySessionOpenMinute)/15] = true
 	}
 	chain := 0
-	previousDay := ""
-	previousStart := time.Time{}
-	previousEnd := time.Time{}
+	previousDays, previousMinute, previousEndMinute, hasPrevious := 0, 0, 0, false
 	for index := range bars {
-		start, err := time.ParseInLocation("2006-01-02 15:04", bars[index].Date, location)
-		if err != nil {
+		days, minute, ok := marketcalendar.ParseDateTime(bars[index].Date)
+		if !ok {
 			chain++
 			bars[index].Chain = chain
 			continue
 		}
-		day := start.Format(time.DateOnly)
-		end := start.Add(interval)
+		endMinute := minute + intervalMinutes
 		if index > 0 {
 			split := false
-			if day == previousDay {
-				split = start.Sub(previousStart) != interval
-			} else {
-				previousDate, _ := time.ParseInLocation(time.DateOnly, previousDay, location)
-				nextTrading := previousDate.AddDate(0, 0, 1)
-				for !marketcalendar.IsTradingDay(nextTrading) {
-					nextTrading = nextTrading.AddDate(0, 0, 1)
-				}
-				expectedNext := time.Date(nextTrading.Year(), nextTrading.Month(), nextTrading.Day(), 9, 30, 0, 0, location)
-				previousExpectedEnd := expectedAggregateSessionEnd(previousDate, groupSize, interval)
-				currentExpectedEnd := expectedAggregateSessionEnd(start, groupSize, interval)
-				previousComplete := previousExpectedEnd.After(previousStart) && previousEnd.Equal(previousExpectedEnd) && completeIntradayGroups(sourceDays[previousDay], previousDate, groupSize)
-				currentComplete := start.Equal(expectedNext) && end.Equal(currentExpectedEnd) && completeIntradayGroups(sourceDays[day], start, groupSize)
+			if hasPrevious && days == previousDays {
+				split = minute-previousMinute != intervalMinutes
+			} else if hasPrevious {
+				nextTrading := marketcalendar.NextTradingDayOrdinal(previousDays)
+				previousExpectedEnd := expectedAggregateSessionEndMinute(previousDays, groupSize, intervalMinutes)
+				currentExpectedEnd := expectedAggregateSessionEndMinute(days, groupSize, intervalMinutes)
+				previousComplete := previousExpectedEnd > previousMinute && previousEndMinute == previousExpectedEnd && completeIntradayGroups(sourceDays[previousDays], previousDays, groupSize)
+				currentComplete := days == nextTrading && minute == intradaySessionOpenMinute && endMinute == currentExpectedEnd && completeIntradayGroups(sourceDays[days], days, groupSize)
 				split = !previousComplete || !currentComplete
+			} else {
+				split = true
 			}
 			if split {
 				chain++
 			}
 		}
 		bars[index].Chain = chain
-		previousDay, previousStart, previousEnd = day, start, end
+		previousDays, previousMinute, previousEndMinute, hasPrevious = days, minute, endMinute, true
 	}
 	return bars
 }
 
-func expectedAggregateSessionEnd(day time.Time, groupSize int, interval time.Duration) time.Time {
-	open := time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, newYorkLocation())
-	slots := int(time.Duration(marketcalendar.RegularCloseMinute(day)-9*60-30) * time.Minute / (15 * time.Minute))
+func expectedAggregateSessionEndMinute(days, groupSize, intervalMinutes int) int {
+	slots := (marketcalendar.RegularCloseMinuteOrdinal(days) - intradaySessionOpenMinute) / 15
 	groups := slots / groupSize
-	return open.Add(time.Duration(groups) * interval)
+	return intradaySessionOpenMinute + groups*intervalMinutes
 }
 
-func completeIntradayGroups(source map[int]bool, day time.Time, groupSize int) bool {
-	slots := int(time.Duration(marketcalendar.RegularCloseMinute(day)-9*60-30) * time.Minute / (15 * time.Minute))
+func completeIntradayGroups(source map[int]bool, days, groupSize int) bool {
+	slots := (marketcalendar.RegularCloseMinuteOrdinal(days) - intradaySessionOpenMinute) / 15
 	groupedSlots := (slots / groupSize) * groupSize
 	for start := 0; start < groupedSlots; start += groupSize {
 		for offset := 0; offset < groupSize; offset++ {
@@ -646,7 +653,6 @@ func completeIntradayGroups(source map[int]bool, day time.Time, groupSize int) b
 }
 
 func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration) ([]Bar, int, int, int) {
-	location := newYorkLocation()
 	sortedInput := true
 	for index := 1; index < len(input); index++ {
 		if input[index].Date < input[index-1].Date {
@@ -668,26 +674,23 @@ func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration
 		valid       bool
 		closeMinute int
 	}
-	sessions := make(map[string]sessionInfo)
+	sessions := make(map[int]sessionInfo)
 	rejected, unfinished, duplicates := 0, 0, 0
-	previousTime := ""
-	cutoffLocal := cutoff.In(location)
-	cutoffDate := cutoffLocal.Format(time.DateOnly)
-	cutoffMinute := cutoffLocal.Hour()*60 + cutoffLocal.Minute()
+	previousDays, previousMinute, hasPrevious := 0, 0, false
+	cutoffDays, cutoffMinute := civilDayMinute(cutoff)
 	intervalMinutes := int(interval / time.Minute)
 	for _, bar := range input {
-		day, minute, validStamp := intradayDateMinute(bar.Date)
+		days, minute, validStamp := marketcalendar.ParseDateTime(bar.Date)
 		if !validStamp {
 			rejected++
 			continue
 		}
-		session, checked := sessions[day]
+		session, checked := sessions[days]
 		if !checked {
-			dayDate, err := time.ParseInLocation(time.DateOnly, day, location)
-			if err == nil && dayDate.Format(time.DateOnly) == day && marketcalendar.IsTradingDay(dayDate) {
-				session = sessionInfo{valid: true, closeMinute: marketcalendar.RegularCloseMinute(dayDate)}
+			if marketcalendar.IsTradingDayOrdinal(days) {
+				session = sessionInfo{valid: true, closeMinute: marketcalendar.RegularCloseMinuteOrdinal(days)}
 			}
-			sessions[day] = session
+			sessions[days] = session
 		}
 		hour := minute / 60
 		minuteOfHour := minute % 60
@@ -703,13 +706,13 @@ func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration
 			rejected++
 			continue
 		}
-		if previousTime != "" && bar.Date < previousTime {
+		if hasPrevious && (days < previousDays || days == previousDays && minute < previousMinute) {
 			rejected++
-			previousTime = bar.Date
+			previousDays, previousMinute = days, minute
 			continue
 		}
-		previousTime = bar.Date
-		if day > cutoffDate || day == cutoffDate && endMinute > cutoffMinute {
+		previousDays, previousMinute, hasPrevious = days, minute, true
+		if days > cutoffDays || days == cutoffDays && endMinute > cutoffMinute {
 			unfinished++
 			continue
 		}
@@ -755,29 +758,6 @@ func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration
 	return bars, rejected, unfinished, duplicates
 }
 
-// intradayDateMinute parses the fixed provider timestamp without allocating a
-// time.Time for every bar. The date is validated once per distinct session by
-// completedIntradayBars; fixed-width date and time fields sort lexically.
-func intradayDateMinute(value string) (day string, minute int, ok bool) {
-	if len(value) != len("2006-01-02 15:04") || value[4] != '-' || value[7] != '-' || value[10] != ' ' || value[13] != ':' {
-		return "", 0, false
-	}
-	for index := range value {
-		if index == 4 || index == 7 || index == 10 || index == 13 {
-			continue
-		}
-		if value[index] < '0' || value[index] > '9' {
-			return "", 0, false
-		}
-	}
-	hour := int(value[11]-'0')*10 + int(value[12]-'0')
-	minuteOfHour := int(value[14]-'0')*10 + int(value[15]-'0')
-	if hour > 23 || minuteOfHour > 59 {
-		return "", 0, false
-	}
-	return value[:10], hour*60 + minuteOfHour, true
-}
-
 func aggregateFourHourBars(input []Bar, cutoff time.Time) ([]Bar, int, int, int) {
 	bars, quality, _ := aggregateFourHourBarsWithQuality(input, cutoff)
 	return bars, quality.SourceRejectedBars, quality.SourceIncompleteBars, quality.SourceDuplicateBars
@@ -790,32 +770,26 @@ func aggregateFourHourBarsWithQuality(input []Bar, cutoff time.Time) ([]Bar, Dat
 }
 
 func aggregateFourHourBarsFromSource(inputCount int, sourceBars []Bar, rejected, unfinished, duplicates int) ([]Bar, DataQuality, []DataGap) {
-	const blockBars = 16
-	location := newYorkLocation()
 	result := make([]Bar, 0, len(sourceBars)/26)
 	for start := 0; start < len(sourceBars); {
-		day, _, ok := intradayDateMinute(sourceBars[start].Date)
+		days, _, ok := marketcalendar.ParseDateTime(sourceBars[start].Date)
 		if !ok {
 			start++
 			continue
 		}
+		dayText := sourceBars[start].Date[:10]
 		end := start + 1
-		for end < len(sourceBars) && len(sourceBars[end].Date) >= 10 && sourceBars[end].Date[:10] == day {
+		for end < len(sourceBars) && len(sourceBars[end].Date) >= 10 && sourceBars[end].Date[:10] == dayText {
 			end++
 		}
-		dayStart, err := time.ParseInLocation(time.DateOnly, day, location)
-		if err != nil {
-			start = end
-			continue
-		}
-		slots := int(time.Duration(marketcalendar.RegularCloseMinute(dayStart)-9*60-30) * time.Minute / (15 * time.Minute))
-		if blockBars <= slots && end-start >= blockBars {
+		slots := (marketcalendar.RegularCloseMinuteOrdinal(days) - intradaySessionOpenMinute) / 15
+		if fourHourBlockBars <= slots && end-start >= fourHourBlockBars {
 			combined := sourceBars[start]
 			complete := true
-			for offset := 0; offset < blockBars; offset++ {
+			for offset := 0; offset < fourHourBlockBars; offset++ {
 				bar := sourceBars[start+offset]
-				_, minute, valid := intradayDateMinute(bar.Date)
-				if !valid || minute != 9*60+30+offset*15 {
+				_, minute, valid := marketcalendar.ParseDateTime(bar.Date)
+				if !valid || minute != intradaySessionOpenMinute+offset*15 {
 					complete = false
 					break
 				}
@@ -827,9 +801,8 @@ func aggregateFourHourBarsFromSource(inputCount int, sourceBars []Bar, rejected,
 				combined.Close, combined.Volume = bar.Close, combined.Volume+bar.Volume
 			}
 			if complete {
-				startAt := time.Date(dayStart.Year(), dayStart.Month(), dayStart.Day(), 9, 30, 0, 0, location)
-				combined.Date = day + " 09:30"
-				combined.CapturedAt = startAt.Add(blockBars * 15 * time.Minute)
+				combined.Date = dayText + " 09:30"
+				combined.CapturedAt = dayTime(days, intradaySessionOpenMinute+fourHourBlockBars*15)
 				result = append(result, combined)
 			}
 		}
@@ -861,13 +834,13 @@ func boolInt(value bool) int {
 	return 0
 }
 
-func chainFourHourBars(bars []Bar, expected []time.Time) []Bar {
+func chainFourHourBars(bars []Bar, expected []int) []Bar {
 	if len(bars) == 0 {
 		return bars
 	}
 	indexByDate := make(map[string]int, len(expected))
-	for index, slot := range expected {
-		indexByDate[slot.Format("2006-01-02 15:04")] = index
+	for index, days := range expected {
+		indexByDate[marketcalendar.FormatDateTime(days, intradaySessionOpenMinute)] = index
 	}
 	chain := 0
 	previousSlot, previousSourceChain := -1, bars[0].Chain
@@ -883,24 +856,25 @@ func chainFourHourBars(bars []Bar, expected []time.Time) []Bar {
 	return bars
 }
 
-func expectedFourHourBlocks(sourceBars []Bar) []time.Time {
+func expectedFourHourBlocks(sourceBars []Bar) []int {
 	if len(sourceBars) == 0 {
 		return nil
 	}
-	location := newYorkLocation()
-	first, _ := time.ParseInLocation("2006-01-02 15:04", sourceBars[0].Date, location)
-	last, _ := time.ParseInLocation("2006-01-02 15:04", sourceBars[len(sourceBars)-1].Date, location)
-	blocks := []time.Time{}
-	for day := first; !day.After(last); day = day.AddDate(0, 0, 1) {
-		if !marketcalendar.IsTradingDay(day) {
+	firstDays, _, okFirst := marketcalendar.ParseDateTime(sourceBars[0].Date)
+	lastDays, _, okLast := marketcalendar.ParseDateTime(sourceBars[len(sourceBars)-1].Date)
+	if !okFirst || !okLast {
+		return nil
+	}
+	blocks := []int{}
+	endMinute := intradaySessionOpenMinute + fourHourBlockBars*15
+	for days := firstDays; days <= lastDays; days++ {
+		if !marketcalendar.IsTradingDayOrdinal(days) {
 			continue
 		}
-		endMinute := 9*60 + 30 + 16*15
-		if endMinute > marketcalendar.RegularCloseMinute(day) {
+		if endMinute > marketcalendar.RegularCloseMinuteOrdinal(days) {
 			continue
 		}
-		stamp := time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, location)
-		blocks = append(blocks, stamp)
+		blocks = append(blocks, days)
 	}
 	return blocks
 }
@@ -915,14 +889,14 @@ func fourHourExpectedGaps(sourceBars, bars []Bar) []DataGap {
 	}
 	blocks := expectedFourHourBlocks(sourceBars)
 	gaps := []DataGap{}
-	for slotIndex, slot := range blocks {
-		key := slot.Format("2006-01-02 15:04")
+	for slotIndex, days := range blocks {
+		key := marketcalendar.FormatDateTime(days, intradaySessionOpenMinute)
 		if accepted[key] {
 			continue
 		}
 		next := ""
 		for nextIndex := slotIndex + 1; nextIndex < len(blocks); nextIndex++ {
-			candidate := blocks[nextIndex].Format("2006-01-02 15:04")
+			candidate := marketcalendar.FormatDateTime(blocks[nextIndex], intradaySessionOpenMinute)
 			if accepted[candidate] {
 				next = candidate
 				break
@@ -931,47 +905,6 @@ func fourHourExpectedGaps(sourceBars, bars []Bar) []DataGap {
 		gaps = append(gaps, DataGap{ExpectedDate: key, NextDate: next})
 	}
 	sort.Slice(gaps, func(i, j int) bool { return gaps[i].ExpectedDate < gaps[j].ExpectedDate })
-	return gaps
-}
-
-// fourHourGaps reports missing expected blocks and skipped trading sessions
-// in the aggregated series. Complete overnight/weekend intervals are not gaps.
-func fourHourGaps(bars []Bar) []DataGap {
-	gaps := []DataGap{}
-	if len(bars) < 2 {
-		return gaps
-	}
-	location := newYorkLocation()
-	for index := 1; index < len(bars); index++ {
-		previous, errPrevious := time.ParseInLocation("2006-01-02 15:04", bars[index-1].Date, location)
-		current, errCurrent := time.ParseInLocation("2006-01-02 15:04", bars[index].Date, location)
-		if errPrevious != nil || errCurrent != nil {
-			continue
-		}
-		previousDay, currentDay := previous.Format(time.DateOnly), current.Format(time.DateOnly)
-		if previousDay == currentDay {
-			if current.Sub(previous) != 4*time.Hour || bars[index].Chain != bars[index-1].Chain {
-				gaps = append(gaps, DataGap{ExpectedDate: previous.Add(4 * time.Hour).Format("2006-01-02 15:04"), NextDate: current.Format("2006-01-02 15:04")})
-			}
-			continue
-		}
-		previousDate, _ := time.ParseInLocation(time.DateOnly, previousDay, location)
-		nextTrading := previousDate.AddDate(0, 0, 1)
-		for !marketcalendar.IsTradingDay(nextTrading) {
-			nextTrading = nextTrading.AddDate(0, 0, 1)
-		}
-		currentDate, _ := time.ParseInLocation(time.DateOnly, currentDay, location)
-		previousClose := marketcalendar.RegularCloseMinute(previousDate)
-		previousExpectedLastBlock := previousClose == 16*60 && previous.Hour() == 13 && previous.Minute() == 30
-		currentExpectedFirstBlock := current.Hour() == 9 && current.Minute() == 30
-		if currentDay != nextTrading.Format(time.DateOnly) || !previousExpectedLastBlock || !currentExpectedFirstBlock || bars[index].Chain != bars[index-1].Chain {
-			expected := time.Date(currentDate.Year(), currentDate.Month(), currentDate.Day(), 9, 30, 0, 0, location)
-			if !previousExpectedLastBlock || currentDay != nextTrading.Format(time.DateOnly) {
-				expected = previous.Add(4 * time.Hour)
-			}
-			gaps = append(gaps, DataGap{ExpectedDate: expected.Format("2006-01-02 15:04"), NextDate: current.Format("2006-01-02 15:04")})
-		}
-	}
 	return gaps
 }
 
@@ -994,20 +927,21 @@ func completedBars(input []Bar, cutoff time.Time) ([]Bar, int, int, int, int) {
 }
 
 func completedBarsDetailed(input []Bar, cutoff time.Time) ([]Bar, int, int, int, int, ExclusionCounts) {
-	location := newYorkLocation()
+	cutoffDays, cutoffMinute := civilDayMinute(cutoff)
 	rejected, open, duplicates, reordered := 0, 0, 0, 0
 	exclusions := ExclusionCounts{}
 	byDate := make(map[string]Bar, len(input))
 	duplicateDates := map[string]bool{}
 	previousDate := ""
+	var closeUnix map[int]int64
 	for inputIndex, bar := range input {
-		day, err := time.ParseInLocation(time.DateOnly, bar.Date, location)
-		if err != nil || day.Format(time.DateOnly) != bar.Date {
+		days, validDate := marketcalendar.ParseDateOnly(bar.Date)
+		if !validDate {
 			rejected++
 			exclusions.InvalidDate++
 			continue
 		}
-		if !marketcalendar.IsTradingDay(day) {
+		if !marketcalendar.IsTradingDayOrdinal(days) {
 			rejected++
 			exclusions.NonTrading++
 			continue
@@ -1022,10 +956,25 @@ func completedBarsDetailed(input []Bar, cutoff time.Time) ([]Bar, int, int, int,
 			reordered++
 		}
 		previousDate = bar.Date
-		closeTime := day.Add(time.Duration(marketcalendar.RegularCloseMinute(day)) * time.Minute)
-		if cutoff.Before(closeTime) || !bar.CapturedAt.IsZero() && bar.CapturedAt.Before(closeTime) {
+		closeMinute := marketcalendar.RegularCloseMinuteOrdinal(days)
+		if cutoffDays < days || cutoffDays == days && cutoffMinute < closeMinute {
 			open++
 			continue
+		}
+		if !bar.CapturedAt.IsZero() {
+			if closeUnix == nil {
+				closeUnix = make(map[int]int64, 32)
+			}
+			closeAt, cached := closeUnix[days]
+			if !cached {
+				year, month, dayOfMonth := marketcalendar.CivilFromDays(days)
+				closeAt = time.Date(year, time.Month(month), dayOfMonth, closeMinute/60, closeMinute%60, 0, 0, newYorkLocation()).UnixNano()
+				closeUnix[days] = closeAt
+			}
+			if bar.CapturedAt.UnixNano() < closeAt {
+				open++
+				continue
+			}
 		}
 		if math.IsNaN(bar.Volume) || math.IsInf(bar.Volume, 0) || bar.Volume < 0 {
 			rejected++
@@ -1055,31 +1004,38 @@ func completedBarsDetailed(input []Bar, cutoff time.Time) ([]Bar, int, int, int,
 
 func dailyQuality(input, accepted []Bar, rejected, incomplete, duplicates, reordered int) DataQuality {
 	gaps := []DataGap{}
-	location := newYorkLocation()
-	for i := 1; i < len(accepted); i++ {
-		previous, _ := time.ParseInLocation(time.DateOnly, accepted[i-1].Date, location)
-		expected := previous.AddDate(0, 0, 1)
-		for !marketcalendar.IsTradingDay(expected) {
-			expected = expected.AddDate(0, 0, 1)
-		}
-		if expected.Format(time.DateOnly) != accepted[i].Date {
-			gaps = append(gaps, DataGap{ExpectedDate: expected.Format(time.DateOnly), NextDate: accepted[i].Date})
-		}
-	}
-	quality := DataQuality{InputBars: len(input), AcceptedBars: len(accepted), RejectedBars: rejected, IncompleteBars: incomplete, DuplicateBars: duplicates, ReorderedBars: reordered, Gaps: gaps, CorporateActionEvents: []CorporateActionEvent{}, PriceBasis: "raw", Status: qualityStatus(rejected, incomplete, duplicates)}
-	for i := 1; i < len(accepted); i++ {
-		previous, current := accepted[i-1], accepted[i]
-		if !adjacentTradingSessions(previous.Date, current.Date) {
+	events := []CorporateActionEvent{}
+	suspected := false
+	previousDays, hasPrevious := 0, false
+	for index := range accepted {
+		days, validDate := marketcalendar.ParseDateOnly(accepted[index].Date)
+		if !validDate {
 			continue
 		}
-		event, suspected := classifyCorporateAction(previous, current)
-		if event != nil {
-			quality.CorporateActionEvents = append(quality.CorporateActionEvents, *event)
+		if hasPrevious {
+			expectedGap := marketcalendar.NextTradingDayOrdinal(previousDays)
+			if expectedGap != days {
+				gaps = append(gaps, DataGap{ExpectedDate: marketcalendar.FormatDateOnly(expectedGap), NextDate: accepted[index].Date})
+			}
+			// Match adjacentTradingSessions: advance only over non-trading days
+			// strictly before the current bar.
+			expectedAdjacent := previousDays + 1
+			for expectedAdjacent < days && !marketcalendar.IsTradingDayOrdinal(expectedAdjacent) {
+				expectedAdjacent++
+			}
+			if expectedAdjacent == days {
+				event, eventSuspected := classifyCorporateAction(accepted[index-1], accepted[index])
+				if event != nil {
+					events = append(events, *event)
+				}
+				suspected = suspected || eventSuspected
+			}
 		}
-		if suspected {
-			quality.CorporateActionSuspected = true
-			quality.Status = "degraded"
-		}
+		previousDays, hasPrevious = days, true
+	}
+	quality := DataQuality{InputBars: len(input), AcceptedBars: len(accepted), RejectedBars: rejected, IncompleteBars: incomplete, DuplicateBars: duplicates, ReorderedBars: reordered, Gaps: gaps, CorporateActionEvents: events, CorporateActionSuspected: suspected, PriceBasis: "raw", Status: qualityStatus(rejected, incomplete, duplicates)}
+	if suspected {
+		quality.Status = "degraded"
 	}
 	if quality.Status == "ok" && len(gaps) > 0 {
 		quality.Status = "partial"
@@ -1091,17 +1047,16 @@ func dailyQuality(input, accepted []Bar, rejected, incomplete, duplicates, reord
 }
 
 func adjacentTradingSessions(previousDate, currentDate string) bool {
-	location := newYorkLocation()
-	previous, previousErr := time.ParseInLocation(time.DateOnly, previousDate, location)
-	current, currentErr := time.ParseInLocation(time.DateOnly, currentDate, location)
-	if previousErr != nil || currentErr != nil {
+	previous, previousOK := marketcalendar.ParseDateOnly(previousDate)
+	current, currentOK := marketcalendar.ParseDateOnly(currentDate)
+	if !previousOK || !currentOK {
 		return false
 	}
-	expected := previous.AddDate(0, 0, 1)
-	for expected.Before(current) && !marketcalendar.IsTradingDay(expected) {
-		expected = expected.AddDate(0, 0, 1)
+	expected := previous + 1
+	for expected < current && !marketcalendar.IsTradingDayOrdinal(expected) {
+		expected++
 	}
-	return expected.Format(time.DateOnly) == currentDate
+	return expected == current
 }
 
 func classifyCorporateAction(previous, current Bar) (*CorporateActionEvent, bool) {
@@ -1172,44 +1127,78 @@ func intradayGaps(bars []Bar, expected time.Duration) []DataGap {
 // expectedIntradayGaps finds absent closed session bars, including gaps before
 // the first or after the last supplied bar. It stops at the requested cutoff
 // and respects early closes from the market calendar.
+type intradayStamp struct {
+	days   int
+	minute int
+}
+
+func (stamp intradayStamp) key() int64 {
+	return int64(stamp.days)*1440 + int64(stamp.minute)
+}
+
 func expectedIntradayGaps(bars []Bar, interval time.Duration, cutoff time.Time) []DataGap {
 	if len(bars) == 0 || interval <= 0 {
 		return []DataGap{}
 	}
-	location := newYorkLocation()
-	first, errFirst := time.ParseInLocation("2006-01-02 15:04", bars[0].Date, location)
-	_, errLast := time.ParseInLocation("2006-01-02 15:04", bars[len(bars)-1].Date, location)
-	if errFirst != nil || errLast != nil {
+	firstDays, firstMinute, firstOK := marketcalendar.ParseDateTime(bars[0].Date)
+	_, _, lastOK := marketcalendar.ParseDateTime(bars[len(bars)-1].Date)
+	if !firstOK || !lastOK {
 		return []DataGap{}
 	}
-	known := make(map[string]bool, len(bars))
-	for _, bar := range bars {
-		known[bar.Date] = true
+	intervalMinutes := int(interval / time.Minute)
+	if intervalMinutes <= 0 {
+		return []DataGap{}
 	}
-	gaps := []DataGap{}
-	endDay := time.Date(cutoff.In(location).Year(), cutoff.In(location).Month(), cutoff.In(location).Day(), 0, 0, 0, 0, location)
-	for day := time.Date(first.Year(), first.Month(), first.Day(), 0, 0, 0, 0, location); !day.After(endDay); day = day.AddDate(0, 0, 1) {
-		if !marketcalendar.IsTradingDay(day) {
+	known := make(map[int64]bool, len(bars))
+	knownStamps := make([]intradayStamp, 0, len(bars))
+	for _, bar := range bars {
+		days, minute, ok := marketcalendar.ParseDateTime(bar.Date)
+		if !ok {
 			continue
 		}
-		open := time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, location)
-		closeMinute := marketcalendar.RegularCloseMinute(day)
-		close := time.Date(day.Year(), day.Month(), day.Day(), closeMinute/60, closeMinute%60, 0, 0, location)
-		start := open
-		if day.Format(time.DateOnly) == first.Format(time.DateOnly) {
-			start = first
+		stamp := intradayStamp{days: days, minute: minute}
+		key := stamp.key()
+		if known[key] {
+			continue
 		}
-		for stamp := start; stamp.Add(interval).Compare(close) <= 0 && !stamp.Add(interval).After(cutoff); stamp = stamp.Add(interval) {
-			key := stamp.Format("2006-01-02 15:04")
+		known[key] = true
+		knownStamps = append(knownStamps, stamp)
+	}
+	sort.Slice(knownStamps, func(i, j int) bool {
+		if knownStamps[i].days != knownStamps[j].days {
+			return knownStamps[i].days < knownStamps[j].days
+		}
+		return knownStamps[i].minute < knownStamps[j].minute
+	})
+	cutoffDays, cutoffMinute := civilDayMinute(cutoff)
+	gaps := []DataGap{}
+	cursor := 0
+	for days := firstDays; days <= cutoffDays; days++ {
+		if !marketcalendar.IsTradingDayOrdinal(days) {
+			continue
+		}
+		closeMinute := marketcalendar.RegularCloseMinuteOrdinal(days)
+		startMinute := 9*60 + 30
+		if days == firstDays && firstMinute > startMinute {
+			startMinute = firstMinute
+		}
+		beforeCutoffDay := days < cutoffDays
+		for minute := startMinute; minute+intervalMinutes <= closeMinute; minute += intervalMinutes {
+			if !beforeCutoffDay && minute+intervalMinutes > cutoffMinute {
+				break
+			}
+			key := intradayStamp{days: days, minute: minute}.key()
 			if known[key] {
 				continue
 			}
-			next := ""
-			index := sort.Search(len(bars), func(index int) bool { return bars[index].Date > key })
-			if index < len(bars) {
-				next = bars[index].Date
+			for cursor < len(knownStamps) && knownStamps[cursor].key() <= key {
+				cursor++
 			}
-			gaps = append(gaps, DataGap{ExpectedDate: key, NextDate: next})
+			next := ""
+			if cursor < len(knownStamps) {
+				next = marketcalendar.FormatDateTime(knownStamps[cursor].days, knownStamps[cursor].minute)
+			}
+			gaps = append(gaps, DataGap{ExpectedDate: marketcalendar.FormatDateTime(days, minute), NextDate: next})
 		}
 	}
 	return gaps
@@ -1310,64 +1299,59 @@ func chainIntradayBars(bars []Bar, interval time.Duration) ([]Bar, []DataGap) {
 	if len(bars) == 0 {
 		return bars, nil
 	}
-	location := newYorkLocation()
+	const sessionOpenMinute = 9*60 + 30
+	intervalMinutes := int(interval / time.Minute)
+	if intervalMinutes <= 0 {
+		intervalMinutes = 15
+	}
 	chain := 0
 	gaps := []DataGap{}
-	firstByDay, lastByDay := map[string]time.Time{}, map[string]time.Time{}
+	previousDays, previousMinute, previousValid := 0, 0, false
+	currentDay, firstMinute, lastMinute, hasCurrent := 0, 0, 0, false
 	for index := range bars {
-		stamp, err := time.ParseInLocation("2006-01-02 15:04", bars[index].Date, location)
-		if err != nil {
+		days, minute, valid := marketcalendar.ParseDateTime(bars[index].Date)
+		if !valid {
 			chain++
 			bars[index].Chain = chain
+			previousValid = false
 			continue
 		}
-		day := stamp.Format(time.DateOnly)
-		if index > 0 {
-			previous, previousErr := time.ParseInLocation("2006-01-02 15:04", bars[index-1].Date, location)
-			if previousErr == nil {
-				previousDay := previous.Format(time.DateOnly)
-				if day == previousDay && stamp.Sub(previous) != interval {
+		if previousValid {
+			if days == previousDays {
+				if minute-previousMinute != intervalMinutes {
 					chain++
-					gaps = append(gaps, DataGap{ExpectedDate: previous.Add(interval).Format("2006-01-02 15:04"), NextDate: stamp.Format("2006-01-02 15:04")})
-				} else if day != previousDay {
-					previousLast, hasPreviousLast := lastByDay[previousDay]
-					previousFirst := firstByDay[previousDay]
-					previousDate, _ := time.ParseInLocation(time.DateOnly, previousDay, location)
-					nextTrading := previousDate.AddDate(0, 0, 1)
-					for !marketcalendar.IsTradingDay(nextTrading) {
-						nextTrading = nextTrading.AddDate(0, 0, 1)
-					}
-					expectedNext := nextTrading.Format(time.DateOnly)
-					currentDay, currentDayErr := time.ParseInLocation(time.DateOnly, day, location)
-					currentIsTrading := currentDayErr == nil && marketcalendar.IsTradingDay(currentDay)
-					gap := day != expectedNext
-					closeMinute := marketcalendar.RegularCloseMinute(previousDate)
-					open := time.Date(previousDate.Year(), previousDate.Month(), previousDate.Day(), 9, 30, 0, 0, location)
-					close := time.Date(previousDate.Year(), previousDate.Month(), previousDate.Day(), closeMinute/60, closeMinute%60, 0, 0, location)
-					sessionIntervals := int(close.Sub(open) / interval)
-					expectedLast := open.Add(time.Duration(maxInt(0, sessionIntervals-1)) * interval)
-					openDate, _ := time.ParseInLocation(time.DateOnly, day, location)
-					expectedOpen := time.Date(openDate.Year(), openDate.Month(), openDate.Day(), 9, 30, 0, 0, location)
-					if !currentIsTrading || gap || !hasPreviousLast || !previousLast.Equal(expectedLast) || !previousFirst.Equal(time.Date(previousDate.Year(), previousDate.Month(), previousDate.Day(), 9, 30, 0, 0, location)) || !stamp.Equal(expectedOpen) {
-						chain++
-						expected := expectedOpen
-						if gap || !currentIsTrading || !stamp.Equal(expectedOpen) {
-							expected = expectedOpen
-						} else if !previousFirst.Equal(time.Date(previousDate.Year(), previousDate.Month(), previousDate.Day(), 9, 30, 0, 0, location)) {
-							expected = time.Date(previousDate.Year(), previousDate.Month(), previousDate.Day(), 9, 30, 0, 0, location)
-						} else if !hasPreviousLast || !previousLast.Equal(expectedLast) {
-							expected = expectedLast.Add(interval)
+					gaps = append(gaps, DataGap{ExpectedDate: marketcalendar.FormatDateTime(previousDays, previousMinute+intervalMinutes), NextDate: bars[index].Date})
+				}
+			} else {
+				expectedNext := marketcalendar.NextTradingDayOrdinal(previousDays)
+				currentIsTrading := marketcalendar.IsTradingDayOrdinal(days)
+				gap := days != expectedNext
+				closeMinute := marketcalendar.RegularCloseMinuteOrdinal(previousDays)
+				sessionIntervals := (closeMinute - sessionOpenMinute) / intervalMinutes
+				expectedLastMinute := sessionOpenMinute + maxInt(0, sessionIntervals-1)*intervalMinutes
+				// hasPreviousLast is always true here: the previous bar was
+				// accepted and recorded as the last stamp of its day.
+				if !currentIsTrading || gap || lastMinute != expectedLastMinute || firstMinute != sessionOpenMinute || minute != sessionOpenMinute {
+					chain++
+					expectedDays, expectedMinute := days, sessionOpenMinute
+					if !gap && currentIsTrading && minute == sessionOpenMinute {
+						if firstMinute != sessionOpenMinute {
+							expectedDays, expectedMinute = previousDays, sessionOpenMinute
+						} else if lastMinute != expectedLastMinute {
+							expectedDays, expectedMinute = previousDays, expectedLastMinute+intervalMinutes
 						}
-						gaps = append(gaps, DataGap{ExpectedDate: expected.Format("2006-01-02 15:04"), NextDate: stamp.Format("2006-01-02 15:04")})
 					}
+					gaps = append(gaps, DataGap{ExpectedDate: marketcalendar.FormatDateTime(expectedDays, expectedMinute), NextDate: bars[index].Date})
 				}
 			}
 		}
 		bars[index].Chain = chain
-		if _, exists := firstByDay[day]; !exists {
-			firstByDay[day] = stamp
+		if hasCurrent && days == currentDay {
+			lastMinute = minute
+		} else {
+			currentDay, firstMinute, lastMinute, hasCurrent = days, minute, minute, true
 		}
-		lastByDay[day] = stamp
+		previousDays, previousMinute, previousValid = days, minute, true
 	}
 	return bars, gaps
 }
@@ -1379,20 +1363,17 @@ func chainDailyBars(bars []Bar) ([]Bar, []string) {
 	if len(bars) == 0 {
 		return bars, warnings
 	}
-	location := newYorkLocation()
 	chain := 0
 	missing := ""
 	for i := 1; i < len(bars); i++ {
-		previous, _ := time.ParseInLocation(time.DateOnly, bars[i-1].Date, location)
-		expected := previous.AddDate(0, 0, 1)
-		for !marketcalendar.IsTradingDay(expected) {
-			expected = expected.AddDate(0, 0, 1)
-		}
-		gap := expected.Format(time.DateOnly) != bars[i].Date
+		previousDays, previousOK := marketcalendar.ParseDateOnly(bars[i-1].Date)
+		days, currentOK := marketcalendar.ParseDateOnly(bars[i].Date)
+		expected := marketcalendar.NextTradingDayOrdinal(previousDays)
+		gap := !previousOK || !currentOK || expected != days
 		jump := bars[i-1].Close > 0 && math.Abs(bars[i].Close/bars[i-1].Close-1) > 0.20
 		if gap || jump {
 			chain++
-			missing = expected.Format(time.DateOnly)
+			missing = marketcalendar.FormatDateOnly(expected)
 			if jump && !gap {
 				missing = bars[i].Date
 			}
@@ -1416,37 +1397,39 @@ func weeklyBarsDetailed(daily []Bar, cutoff time.Time) ([]Bar, bool, int) {
 }
 
 func weeklyBarsQualityDetailed(daily []Bar, cutoff time.Time) ([]Bar, bool, int, int, WeeklyExclusionCounts) {
-	location := newYorkLocation()
+	cutoffDays, cutoffMinute := civilDayMinute(cutoff)
 	result := []Bar{}
 	partial, incompleteWeeks, inputWeeks := false, 0, 0
 	exclusions := WeeklyExclusionCounts{}
+	days := make([]int, len(daily))
+	for index := range daily {
+		days[index], _ = marketcalendar.ParseDateOnly(daily[index].Date)
+	}
 	for start := 0; start < len(daily); {
-		day, _ := time.ParseInLocation(time.DateOnly, daily[start].Date, location)
-		monday := day.AddDate(0, 0, -(int(day.Weekday())+6)%7)
-		nextWeek := monday.AddDate(0, 0, 7).Format(time.DateOnly)
+		monday := days[start] - (marketcalendar.WeekdayOrdinal(days[start])+6)%7
+		nextWeek := marketcalendar.FormatDateOnly(monday + 7)
 		end := start + 1
 		for end < len(daily) && daily[end].Date < nextWeek {
 			end++
 		}
 		firstTrading := monday
-		for !marketcalendar.IsTradingDay(firstTrading) && firstTrading.Before(monday.AddDate(0, 0, 5)) {
-			firstTrading = firstTrading.AddDate(0, 0, 1)
+		for !marketcalendar.IsTradingDayOrdinal(firstTrading) && firstTrading < monday+5 {
+			firstTrading++
 		}
-		lastTrading := monday.AddDate(0, 0, 4)
-		for !marketcalendar.IsTradingDay(lastTrading) && !lastTrading.Before(monday) {
-			lastTrading = lastTrading.AddDate(0, 0, -1)
+		lastTrading := monday + 4
+		for !marketcalendar.IsTradingDayOrdinal(lastTrading) && lastTrading >= monday {
+			lastTrading--
 		}
-		weekClose := lastTrading.Add(time.Duration(marketcalendar.RegularCloseMinute(lastTrading)) * time.Minute)
 		// Count every excluded partial week, including a truncated first week, in
 		// weekly units.
 		expected := 0
-		for date := monday; date.Before(monday.AddDate(0, 0, 5)); date = date.AddDate(0, 0, 1) {
-			if marketcalendar.IsTradingDay(date) {
+		for date := monday; date < monday+5; date++ {
+			if marketcalendar.IsTradingDayOrdinal(date) {
 				expected++
 			}
 		}
-		firstDate := daily[start].Date
-		truncatedFirstWeek := start == 0 && firstDate != firstTrading.Format(time.DateOnly)
+		firstDate := days[start]
+		truncatedFirstWeek := start == 0 && firstDate != firstTrading
 		inputWeeks++
 		chain := daily[start].Chain
 		sameChain := true
@@ -1456,8 +1439,8 @@ func weeklyBarsQualityDetailed(daily []Bar, cutoff time.Time) ([]Bar, bool, int,
 				break
 			}
 		}
-		openWeek := cutoff.Before(weekClose)
-		missingSessions := !openWeek && !truncatedFirstWeek && (firstDate != firstTrading.Format(time.DateOnly) || daily[end-1].Date != lastTrading.Format(time.DateOnly) || end-start != expected)
+		openWeek := cutoffDays < lastTrading || cutoffDays == lastTrading && cutoffMinute < marketcalendar.RegularCloseMinuteOrdinal(lastTrading)
+		missingSessions := !openWeek && !truncatedFirstWeek && (firstDate != firstTrading || days[end-1] != lastTrading || end-start != expected)
 		brokenChain := !sameChain
 		weekComplete := !openWeek && !brokenChain && !missingSessions
 		if truncatedFirstWeek || !weekComplete {
@@ -1521,20 +1504,19 @@ func weeklyDataQuality(source DataQuality, inputWeeks, sourceInputBars, sourceAc
 
 func weeklyGapsFromBars(weekly []Bar) []DataGap {
 	gaps := []DataGap{}
-	location := newYorkLocation()
 	for index := 1; index < len(weekly); index++ {
-		previous, errPrevious := time.ParseInLocation(time.DateOnly, weekly[index-1].Date, location)
-		current, errCurrent := time.ParseInLocation(time.DateOnly, weekly[index].Date, location)
-		if errPrevious != nil || errCurrent != nil {
+		previous, previousOK := marketcalendar.ParseDateOnly(weekly[index-1].Date)
+		current, currentOK := marketcalendar.ParseDateOnly(weekly[index].Date)
+		if !previousOK || !currentOK {
 			continue
 		}
-		monday := previous.AddDate(0, 0, -(int(previous.Weekday())+6)%7).AddDate(0, 0, 7)
-		lastTrading := monday.AddDate(0, 0, 4)
-		for !marketcalendar.IsTradingDay(lastTrading) && !lastTrading.Before(monday) {
-			lastTrading = lastTrading.AddDate(0, 0, -1)
+		monday := previous - (marketcalendar.WeekdayOrdinal(previous)+6)%7 + 7
+		lastTrading := monday + 4
+		for !marketcalendar.IsTradingDayOrdinal(lastTrading) && lastTrading >= monday {
+			lastTrading--
 		}
-		if current.After(lastTrading) {
-			gaps = append(gaps, DataGap{ExpectedDate: lastTrading.Format(time.DateOnly), NextDate: current.Format(time.DateOnly)})
+		if current > lastTrading {
+			gaps = append(gaps, DataGap{ExpectedDate: marketcalendar.FormatDateOnly(lastTrading), NextDate: weekly[index].Date})
 		}
 	}
 	return gaps
@@ -1582,7 +1564,7 @@ func mergeBars(bars []Bar) []mergedBar {
 }
 
 func findFractals(bars []Bar, merged []mergedBar) []Fractal {
-	fractals := []Fractal{}
+	fractals := make([]Fractal, 0, len(merged)/2+1)
 	// The right neighbour must itself be finalized by a non-containing
 	// candle. Otherwise a later inclusion can erase an apparently confirmed
 	// fractal. This conservative delay is part of the public rule version.
@@ -1639,9 +1621,9 @@ func buildStrokes(fractals []Fractal, merged []mergedBar, bars []Bar) ([]Stroke,
 }
 
 func buildStrokesWithHistogram(fractals []Fractal, merged []mergedBar, histogram []float64) ([]Stroke, string) {
-	points := []Fractal{}
-	confirmed := []string{}
-	strokes := []Stroke{}
+	points := make([]Fractal, 0, len(fractals)+1)
+	confirmed := make([]string, 0, len(fractals))
+	strokes := make([]Stroke, 0, len(fractals))
 	chain, sourceChain, restartCount := 0, -1, 0
 	restartedAt := ""
 	flush := func(includeForming bool) {
@@ -1679,7 +1661,7 @@ func buildStrokesWithHistogram(fractals []Fractal, merged []mergedBar, histogram
 		flush(false)
 		restartCount++
 		chain = -restartCount
-		points, confirmed = []Fractal{fractal}, nil
+		points, confirmed = append(points[:0], fractal), confirmed[:0]
 		restartedAt = fractal.Date
 	}
 	for _, fractal := range fractals {
@@ -1692,7 +1674,7 @@ func buildStrokesWithHistogram(fractals []Fractal, merged []mergedBar, histogram
 		if fractal.Chain != sourceChain {
 			flush(false)
 			sourceChain, chain = fractal.Chain, fractal.Chain
-			points, confirmed = []Fractal{fractal}, nil
+			points, confirmed = append(points[:0], fractal), confirmed[:0]
 			restartedAt = fractal.Date
 			continue
 		}
@@ -1985,8 +1967,13 @@ func invalidateSignals(signals []Signal, bars []Bar, spot *float64) {
 		if signal.ObservedAt != "" {
 			since = signal.ObservedAt
 		}
-		for _, bar := range bars {
-			if bar.Date > since && broken(bar.Low, bar.High) {
+		// bars are chronological, so binary search the first stamp after the
+		// signal became visible instead of rescanning the full history per signal.
+		start := sort.Search(len(bars), func(index int) bool {
+			return bars[index].Date > since
+		})
+		for _, bar := range bars[start:] {
+			if broken(bar.Low, bar.High) {
 				invalid = true
 				break
 			}

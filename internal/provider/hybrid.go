@@ -247,6 +247,24 @@ func (h *Hybrid) Expirations(ctx context.Context, symbol string) ([]string, erro
 	return h.Regular.Expirations(ctx, symbol)
 }
 
+// NearestChain keeps the regular/delayed selection used by Expirations and
+// returns the nearest chain from the same upstream payload.
+func (h *Hybrid) NearestChain(ctx context.Context, symbol string) ([]string, []model.OptionRow, *time.Time, error) {
+	if h == nil {
+		return nil, nil, nil, errors.New("hybrid provider is unavailable")
+	}
+	if h.usesDelayedOptions() {
+		if h.Delayed == nil {
+			return nil, nil, nil, errors.New("Cboe delayed options provider is unavailable")
+		}
+		return h.Delayed.NearestChain(ctx, symbol)
+	}
+	if h.Regular == nil {
+		return nil, nil, nil, errors.New("Yahoo options provider is unavailable")
+	}
+	return h.Regular.NearestChain(ctx, symbol)
+}
+
 func (h *Hybrid) Chain(ctx context.Context, symbol, expiration string) ([]model.OptionRow, *time.Time, error) {
 	if h == nil {
 		return nil, nil, errors.New("hybrid provider is unavailable")

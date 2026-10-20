@@ -127,6 +127,7 @@ const state = {
   },
   chanLoading: false,
   chanPayload: null,
+  chanStale: false,
   chanRequestId: 0,
   chanInFlightSymbol: "",
   chanLastRequestedAt: 0,
@@ -136,6 +137,7 @@ const state = {
   chanMarketRetryAttempts: 0,
   chanMarketInFlight: false,
   chanMarketLastRequestedAt: 0,
+  chanMarketLastKey: "",
   chanMarketPayload: null,
   chanMarketRefreshPending: false,
   chanRefreshPending: false,
@@ -493,7 +495,7 @@ function restoreClientSnapshot(symbol, expiration = "", allowStale = false) {
   state.expiration = cached.expiration;
   state.expirationOptions = cloneClientSnapshot(cached.expirationOptions || []);
   state.lastQuote = quote;
-  state.chainRows = payload.data;
+  state.chainRows = Object.freeze(payload.data);
   state.chainSpot = cached.chainSpot ?? quote.price ?? null;
   state.chainFetchedAt = cached.chainFetchedAt || payload.fetched_at || null;
   state.chainFetchedSymbol = cached.chainFetchedSymbol || symbol;
@@ -1148,11 +1150,26 @@ function closePushStream() {
   state.pushSymbol = "";
 }
 
-function queuePushedAnalyticsRefresh(symbol, loadId, eventId) {
+function queuePushedAnalyticsRefresh(symbol, loadId, eventId, historyFetchedAt = null) {
   if (symbol !== state.symbol || loadId !== state.loadId) return;
   if (eventId && eventId === state.analyticsRefreshEventId) return;
   if (eventId) state.analyticsRefreshEventId = eventId;
-  refreshChanAnalysis(true);
+  const adjustedCurrent = Boolean(historyFetchedAt)
+    && state.chanPayload?.symbol === symbol
+    && state.chanPayload?.history?.fetched_at === historyFetchedAt;
+  if (!state.chanExpanded) {
+    // Chart structures are lazy-loaded on expand; only the derived cards need
+    // this event. Mark the chart stale so expanding fetches the new history.
+    state.chanStale = true;
+    refreshChanMarketAnalysis(true);
+  } else if (adjustedCurrent) {
+    // The adjusted structures for this history batch are already rendered;
+    // refresh only the derived market cards/levels instead of downloading the
+    // 1.5 MiB adjusted payload again.
+    refreshChanMarketAnalysis(true);
+  } else {
+    refreshChanAnalysis(true);
+  }
   state.pendingAnalyticsRefresh = { symbol, loadId, eventId, attempts: 0 };
   schedulePushedAnalyticsRefresh();
 }
@@ -1255,7 +1272,7 @@ function connectPushStream(symbol = state.symbol) {
       return;
     }
     if (message.kind === "analytics") {
-      queuePushedAnalyticsRefresh(symbol, state.loadId, event.lastEventId || message.created_at || "");
+      queuePushedAnalyticsRefresh(symbol, state.loadId, event.lastEventId || message.created_at || "", message.payload?.history_fetched_at || null);
       return;
     }
     if (message.kind !== "snapshot") return;
@@ -1327,7 +1344,18 @@ function scheduleAutoRefresh() {
     if (state.pendingGammaRefresh) setTimeout(applyPushedGammaUpdate, 0);
   }
 }
-function formatNumber(value, digits = 0) { if (value === null || value === undefined || value === "") return "--"; return Number(value).toLocaleString("en-US", { maximumFractionDigits: digits }); }
+// Intl.NumberFormat 构造开销远高于 format；期权链一次渲染会调用数千次，
+// 按小数位数复用实例，避免每行都新建格式化器。
+const numberFormatters = new Map();
+function formatNumber(value, digits = 0) {
+  if (value === null || value === undefined || value === "") return "--";
+  let formatter = numberFormatters.get(digits);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: digits });
+    numberFormatters.set(digits, formatter);
+  }
+  return formatter.format(Number(value));
+}
 function moneyDecimals(value) {
   const number = Math.abs(Number(value));
   if (!Number.isFinite(number)) return 2;
@@ -1413,6 +1441,9 @@ function setBusy(busy) { state.loading = busy; }
 
 function aggregateByStrike(rows, spot) {
   const grouped = new Map();
+  const spotValue = Number(spot) || 0;
+  const spotSquared = spotValue * spotValue;
+  const spotKey = gammaSpotBucket(spotValue);
   for (const row of rows) {
     const strike = Number(row.strike);
     if (!Number.isFinite(strike)) continue;
@@ -1420,9 +1451,9 @@ function aggregateByStrike(rows, spot) {
     const item = grouped.get(strike);
     const volume = Number(row.volume) || 0;
     const oi = Number(row.open_interest) || 0;
-    const recalculatedGamma = gammaAtSpot(spot, row);
+    const recalculatedGamma = gammaAtSpot(spotValue, row, undefined, spotKey);
     const gamma = recalculatedGamma == null ? (Number(row.gamma) || 0) : recalculatedGamma;
-    const gex = gamma * oi * 100 * (Number(spot) || 0) ** 2 * 0.01 / 1000000;
+    const gex = gamma * oi * 100 * spotSquared * 0.01 / 1000000;
     if (row.contract_type === "call") { item.callVolume += volume; item.callOi += oi; item.callGex += gex; }
     else { item.putVolume += volume; item.putOi += oi; item.putGex -= gex; }
   }
@@ -1453,7 +1484,22 @@ function rememberGammaValue(cacheKey, value) {
   return value;
 }
 
-function gammaAtSpot(spot, row, expiration) {
+// Gamma 只需按细粒度现价档位复用：行情每跳动一分钱就重算整条链会让主线程持续繁忙。
+// 0.05% 的档位对热力图和 GEX 列不可见，却能把同一轮渲染的重复计算全部命中缓存。
+let gammaBucketSpot = NaN;
+let gammaBucketKey = "";
+function gammaSpotBucket(value) {
+  const price = Number(value);
+  if (!Number.isFinite(price) || price <= 0) return "";
+  if (price === gammaBucketSpot) return gammaBucketKey;
+  const magnitude = 10 ** Math.floor(Math.log10(price));
+  const step = magnitude / 2000;
+  gammaBucketSpot = price;
+  gammaBucketKey = String(Math.round(price / step));
+  return gammaBucketKey;
+}
+
+function gammaAtSpot(spot, row, expiration, spotKey) {
   const spotValue = Number(spot);
   const strike = Number(row.strike);
   // 模型 IV 由后端按合约价格反解，优先于数据源里常为占位值的 implied_volatility。
@@ -1465,7 +1511,8 @@ function gammaAtSpot(spot, row, expiration) {
   if (!expiry) return null;
   // 30 秒一档：同一次渲染里的柱状图和期权链表共用结果，刷新时也不把同一批合约再算一遍。
   const timeBucket = Math.floor(Date.now() / 30000);
-  const cacheKey = `${expiryKey}|${strike}|${row.contract_type || ""}|${volatility}|${spotValue}|${timeBucket}`;
+  const bucket = spotKey !== undefined ? spotKey : gammaSpotBucket(spotValue);
+  const cacheKey = `${expiryKey}|${strike}|${row.contract_type || ""}|${volatility}|${bucket}|${timeBucket}`;
   if (gammaValueCache.has(cacheKey)) return gammaValueCache.get(cacheKey);
   const timeYears = Math.max((expiry.getTime() - Date.now()) / (365 * 24 * 60 * 60 * 1000), GAMMA_MIN_MINUTES / (365 * 24 * 60));
   const volatilityTime = volatility * Math.sqrt(timeYears);
@@ -1635,7 +1682,8 @@ function applyBasisMode(mode) {
   if (!last || !state.lastQuote) return;
   const basis = activeBasis(state.lastQuote);
   state.levelBasisLabel = basis.label;
-  last.basis = basis;
+  // 图表输入整体替换、不原地修改；冻结顶层避免 Vue 深观测几十兆的行情数组。
+  state.lastAnalysis = Object.freeze({ ...last, basis });
   loadFactorLevels(last.points || [], basis.price);
 }
 
@@ -1643,17 +1691,24 @@ function applyBasisMode(mode) {
 // 与 Gamma 敞口图同口径：有未平仓量时按 GEX 排序，盘前整链无持仓量时退回成交量分布。
 function pickLevels(points, spot, side, valueOf, count = LEVEL_COUNT) {
   const minGap = spot * 0.005;
-  const candidates = points
-    .filter((point) => valueOf(point) > 0 && (side === "above" ? point.strike >= spot : point.strike <= spot))
-    .sort((a, b) => valueOf(b) - valueOf(a));
+  // 先算一次权重再排序；原实现把 valueOf 放进比较器，排序时会重复调用。
+  const candidates = [];
+  for (const point of points) {
+    const value = valueOf(point);
+    if (!(value > 0)) continue;
+    if (side === "above" ? point.strike < spot : point.strike > spot) continue;
+    candidates.push({ point, value });
+  }
+  candidates.sort((left, right) => right.value - left.value);
   const picked = [];
-  for (const point of candidates) {
+  for (const candidate of candidates) {
     if (picked.length >= count) break;
     // 与已选价位过近的行权价跳过，避免 5 条挤在同一段价位上。
-    if (picked.some((item) => Math.abs(item.strike - point.strike) < minGap)) continue;
-    picked.push(point);
+    if (picked.some((item) => Math.abs(item.point.strike - candidate.point.strike) < minGap)) continue;
+    picked.push(candidate);
   }
-  return picked.sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot));
+  picked.sort((left, right) => Math.abs(left.point.strike - spot) - Math.abs(right.point.strike - spot));
+  return picked.map((item) => item.point);
 }
 
 // 把单因子价位转换为 Vue 行数据（行权价 / 距现价 / 排序口径数值），离现价近的排在前面。
@@ -3240,7 +3295,8 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   // 期权链聚合结果：Gamma 敞口、分布图与压力位/支撑位共用；切换基准价开关时直接复用，不重新聚合。
   const points = aggregateByStrike(expirationRows, spot);
   // 记录本次分析输入，窗口尺寸变化（含手机横竖屏切换）与基准价切换后都按这些输入重绘。
-  state.lastAnalysis = { rows, spot, analysisPayload, expirationRows, ivModel, basis, points };
+  // 顶层冻结：这些数组只读，Vue 2 无需为每一行行情对象建立响应式观察器。
+  state.lastAnalysis = Object.freeze({ rows, spot, analysisPayload, expirationRows, ivModel, basis, points });
   // 压力位/支撑位用「基准价」（默认实时价，可切盘后价），图表仍用常规价。
   const levelSpot = Number(basis?.price) > 0 ? Number(basis.price) : spot;
   state.levelBasisLabel = basis?.label || "常规";
@@ -3572,9 +3628,11 @@ function resetChanAnalysis() {
   state.chanMarketRetryAttempts = 0;
   state.chanMarketInFlight = false;
   state.chanMarketLastRequestedAt = 0;
+  state.chanMarketLastKey = "";
   state.chanLoading = false;
   state.chanSpotGuideVisible = false;
   state.chanPayload = null;
+  state.chanStale = false;
   state.chanMarketPayload = null;
   state.chanViewports = { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } };
   state.chanRefreshPending = false;
@@ -3774,11 +3832,16 @@ function refreshChanMarketAnalysis(force = false) {
     return;
   }
   if (!force && Date.now() - state.chanMarketLastRequestedAt < 60000) return;
-  state.chanMarketInFlight = true;
-  state.chanMarketLastRequestedAt = Date.now();
   const quote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
   const spot = finitePrice(activeSessionQuote(quote)?.price ?? quote?.price);
-  const query = spot != null ? "?spot=" + encodeURIComponent(spot) : "";
+  // 首屏同一瞬间会有 quote/chain/analytics 多个回调强制刷新市场分析。
+  // 相同快照与现价档位下 1 秒内只发一次，避免连续重复请求。
+  const marketKey = `${symbol}|${spotCacheBucket(spot)}|${state.chainFetchedAt || ""}`;
+  if (force && marketKey === state.chanMarketLastKey && Date.now() - state.chanMarketLastRequestedAt < 1000) return;
+  state.chanMarketInFlight = true;
+  state.chanMarketLastRequestedAt = Date.now();
+  state.chanMarketLastKey = marketKey;
+  const query = spot != null ? `?light=true&spot=${encodeURIComponent(spot)}` : "?light=true";
   request("/api/chan/" + encodeURIComponent(symbol) + query).then((payload) => {
     if (symbol !== state.symbol || loadId !== state.loadId) return;
     if (payload?.symbol !== symbol) {
@@ -3812,6 +3875,16 @@ function refreshChanMarketAnalysis(force = false) {
 function refreshChanAnalysis(force = false) {
   const symbol = state.symbol;
   if (!symbol) return;
+  if (!state.chanExpanded) {
+    // The adjusted response is ~1.5 MiB and only feeds the collapsed chart.
+    // Keep the trend/support cards fresh with the lightweight market endpoint
+    // and fetch the chart structures when the user expands the panel.
+    state.chanStale = true;
+    state.chanLoading = false;
+    refreshChanMarketAnalysis(true);
+    return;
+  }
+  state.chanStale = false;
   if (state.chanInFlightSymbol === symbol) {
     if (force) state.chanRefreshPending = true;
     return;
@@ -3825,20 +3898,27 @@ function refreshChanAnalysis(force = false) {
   state.chanRetryTimer = null;
   const currentQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
   const currentSpot = finitePrice(activeSessionQuote(currentQuote)?.price ?? currentQuote?.price);
-  const spotQuery = currentSpot != null ? `?spot=${encodeURIComponent(currentSpot)}` : "";
-  request(`/api/chan/${encodeURIComponent(symbol)}/adjusted${spotQuery}`, { timeout: 60000, retry: false }).then((payload) => {
+  const adjustedParams = new URLSearchParams({ compact: "true" });
+  if (currentSpot != null) adjustedParams.set("spot", currentSpot);
+  request(`/api/chan/${encodeURIComponent(symbol)}/adjusted?${adjustedParams}`, { timeout: 60000, retry: false }).then((payload) => {
     if (state.symbol !== symbol || state.chanRequestId !== token || payload?.symbol !== symbol) return;
     if (payload?.ready === false) {
       state.chanLoading = false;
-      state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), ...(payload.warnings || [])])];
-      refreshChanMarketAnalysis();
+      state.view.chan = Object.freeze({ ...state.view.chan, warnings: [...new Set([...(state.view.chan.warnings || []), ...(payload.warnings || [])])] });
+      // An analytics event means the history prefetch just finished; bypass the
+      // market-analysis throttle so the 0-bar trend/support cards refresh now
+      // instead of waiting up to a minute or for the next retry backoff.
+      refreshChanMarketAnalysis(force);
       scheduleChanAnalysisRetry(symbol, token, Number(payload.retry_after_ms) || 15000);
       return;
     }
-    refreshChanMarketAnalysis();
+    refreshChanMarketAnalysis(force);
     const liveQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
     const liveSpot = finitePrice(activeSessionQuote(liveQuote)?.price ?? liveQuote?.price);
-    state.chanPayload = OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload);
+    // Freeze the raw payload before it enters Vue's reactive tree: it holds
+    // thousands of candles/segments that are only ever read, and the view is
+    // rebuilt wholesale whenever anything changes.
+    state.chanPayload = Object.freeze(OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload));
     state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers);
     // Adjusted Chan results intentionally omit market_analysis. The separate
     // /api/chan request feeds the trend and price-level cards above the chart.
@@ -3848,12 +3928,12 @@ function refreshChanAnalysis(force = false) {
     else state.chanRetryAttempts = 0;
   }).catch((error) => {
     if (state.symbol !== symbol || state.chanRequestId !== token) return;
-    refreshChanMarketAnalysis();
+    refreshChanMarketAnalysis(force);
     if (!state.view.chan.available) state.view.chan = OptionScopeChan.empty("缠论分析暂不可用，等待历史行情或下次刷新");
     const retrying = isTransientChanRequestError(error);
-    state.view.chan.warnings = [...new Set([...(state.view.chan.warnings || []), retrying
+    state.view.chan = Object.freeze({ ...state.view.chan, warnings: [...new Set([...(state.view.chan.warnings || []), retrying
       ? `结构行情暂时获取失败（${error.message}），正在自动重试`
-      : `结构更新失败：${error.message}`])];
+      : `结构更新失败：${error.message}`])] });
     if (isTransientChanRequestError(error)) scheduleChanAnalysisRetry(symbol, token, error?.retryAfterMs || 0);
   }).finally(() => {
     if (state.chanRequestId !== token) return;
@@ -3928,8 +4008,19 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
   scheduleQuoteRecovery(state.lastQuote);
+  // 行情可能晚于期权链到达。现价档位变化后重新触发一次价位计算，否则
+  // 触达概率、强化色、最佳买卖点和止损会一直停在无 IV 的客户端回退结果，
+  // 只能等下一次快照或 analytics 事件。
+  if (state.lastAnalysis?.points?.length && state.expiration) {
+    const basis = activeBasis(quote);
+    const levelSpot = finitePrice(basis?.price ?? quote?.price);
+    if (levelSpot != null) {
+      const levelsKey = `${state.symbol}|${state.expiration}|${state.chainFetchedAt || ""}|${spotCacheBucket(levelSpot)}|${state.levelBasisMode}`;
+      if (state.levelsKey !== levelsKey) loadFactorLevels(state.lastAnalysis.points, levelSpot);
+    }
+  }
   if (state.chanPayload?.symbol === state.symbol) {
-    state.chanPayload = OptionScopeChan.withSpot(state.chanPayload, finitePrice(price));
+    state.chanPayload = Object.freeze(OptionScopeChan.withSpot(state.chanPayload, finitePrice(price)));
     state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers);
   }
   if (CHAN_INTRADAY_PERIODS.some((period) => state.chanIntradayPayload[period])) {
@@ -4241,14 +4332,13 @@ function heatCellModel(value, peak, label, hotLevel) {
 
 // 单张合约的 GEX（美元 / 现价每变动 1%）：与 Gamma 敞口图同口径（模型 Gamma × 未平仓 × 100 × 现价² × 0.01），
 // 方向也沿用图表约定——看涨为正、看跌为负，这样整列之和就是 Gamma 敞口面板上的「净 Gamma」。
-function contractGex(row, spot) {
-  const price = Number(spot);
+function contractGex(row, price, priceSquared, spotKey) {
   if (!Number.isFinite(price) || price <= 0) return null;
-  const gamma = gammaAtSpot(price, row);
+  const gamma = gammaAtSpot(price, row, undefined, spotKey);
   const value = gamma == null ? Number(row.gamma) : Number(gamma);
   if (!Number.isFinite(value)) return null;
   const sign = row.contract_type === "call" ? 1 : -1;
-  return sign * value * (Number(row.open_interest) || 0) * 100 * price ** 2 * 0.01;
+  return sign * value * (Number(row.open_interest) || 0) * 100 * priceSquared * 0.01;
 }
 
 // 图例：说明底色口径，并给出两列的归一基准（本屏最强值）。
@@ -4260,18 +4350,20 @@ function chainHeatNote(volumePeak, interestPeak) {
 // 期权链表格：行权价在最左，文字颜色即类型（看涨绿 / 看跌红，原先单独的「类型」列已并入行权价）；
 // 成交量与未平仓在报价前展示并按本屏强弱铺底色，买价/卖价直接展示当前期权报价，另给出 GEX 估值列（与 Gamma 敞口图同口径）。
 function chainRowsFingerprint(rows, spot, emptyLabel) {
-  let checksum = rows.length;
-  const quoteSignature = [];
+  // 32 位滚动哈希，避免为上千行构造 quoteSignature 字符串数组再 join。
+  // bid/ask 的 null 用独立哨兵，保留与 0.00 的区别。
+  let hash = rows.length >>> 0;
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
-    checksum = (checksum + (Number(row.volume) || 0) + (Number(row.open_interest) || 0)
+    const bid = row.bid == null ? 0x7fffffff : Math.round((Number(row.bid) || 0) * 100);
+    const ask = row.ask == null ? 0x7fffffff : Math.round((Number(row.ask) || 0) * 100);
+    hash = (Math.imul(hash, 31)
+      + (Number(row.volume) || 0)
+      + (Number(row.open_interest) || 0)
       + Math.round((Number(row.strike) || 0) * 100)
-      + Math.round((Number(row.bid) || 0) * 100)
-      + Math.round((Number(row.ask) || 0) * 100)) % 1000000007;
-    // 保留空值与 0.00 的区别，避免报价补抓后因数值校验同为 0 而跳过重绘。
-    quoteSignature.push(`${row.bid ?? ""}/${row.ask ?? ""}`);
+      + bid + ask) >>> 0;
   }
-  return `${state.chainFetchedAt}|${spot}|${state.chainFilter}|${emptyLabel}|${checksum}|${quoteSignature.join(",")}`;
+  return `${state.chainFetchedAt}|${spot}|${state.chainFilter}|${emptyLabel}|${hash}`;
 }
 
 function renderChainRows(rows, spot, emptyLabel = "没有期权数据") {
@@ -4285,13 +4377,23 @@ function renderChainRows(rows, spot, emptyLabel = "没有期权数据") {
     state.view.chainHeatNote = chainHeatNote(0, 0);
     return;
   }
-  const volumePeak = Math.max(0, ...rows.map((row) => Number(row.volume) || 0));
-  const interestPeak = Math.max(0, ...rows.map((row) => Number(row.open_interest) || 0));
+  let volumePeak = 0;
+  let interestPeak = 0;
+  for (const row of rows) {
+    const volume = Number(row.volume) || 0;
+    const interest = Number(row.open_interest) || 0;
+    if (volume > volumePeak) volumePeak = volume;
+    if (interest > interestPeak) interestPeak = interest;
+  }
+  const spotValue = Number(spot);
+  const spotSquared = Number.isFinite(spotValue) && spotValue > 0 ? spotValue * spotValue : 0;
+  const spotKey = gammaSpotBucket(spotValue);
   state.view.chainHeatNote = chainHeatNote(volumePeak, interestPeak);
   state.view.chainEmpty = emptyLabel;
-  state.view.chainRows = rows.map((row, index) => {
+  // 表格数据整体替换、从不原地修改；冻结数组可让 Vue 2 跳过上千行对象的深度观测。
+  state.view.chainRows = Object.freeze(rows.map((row, index) => {
     const isCall = row.contract_type === "call";
-    const gex = contractGex(row, spot);
+    const gex = contractGex(row, spotValue, spotSquared, spotKey);
     const volume = heatCellModel(row.volume, volumePeak, "成交量", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put);
     const interest = heatCellModel(row.open_interest, interestPeak, "未平仓", isCall ? HEAT_HOT_LEVEL.call : HEAT_HOT_LEVEL.put);
     return {
@@ -4316,7 +4418,7 @@ function renderChainRows(rows, spot, emptyLabel = "没有期权数据") {
       itm: row.in_the_money ? "价内" : "价外",
       itmClass: row.in_the_money ? "itm" : "",
     };
-  });
+  }));
 }
 
 // 期权链筛选（全部 / 看涨 / 看跌）：切换筛选只重绘表格，不重新请求数据；
@@ -4400,11 +4502,17 @@ function renderChain(payload, quote, analysisPayload) {
   state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < SNAPSHOT_FRESH_SECONDS ? "上游新快照" : "本地缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
   state.view.fetchedAt = `快照时间 ${formatTime(payload.fetched_at)}`;
   state.view.totalCount = formatNumber(rows.length);
-  const calls = rows.filter((row) => row.contract_type === "call"); const puts = rows.filter((row) => row.contract_type === "put");
-  state.view.callVolume = formatCount(calls.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
-  state.view.putVolume = formatCount(puts.reduce((sum, row) => sum + (Number(row.volume) || 0), 0));
-  state.view.callInterest = `未平仓 ${formatCount(calls.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
-  state.view.putInterest = `未平仓 ${formatCount(puts.reduce((sum, row) => sum + (Number(row.open_interest) || 0), 0))}`;
+  let callVolume = 0, putVolume = 0, callInterest = 0, putInterest = 0;
+  for (const row of rows) {
+    const volume = Number(row.volume) || 0;
+    const interest = Number(row.open_interest) || 0;
+    if (row.contract_type === "call") { callVolume += volume; callInterest += interest; }
+    else if (row.contract_type === "put") { putVolume += volume; putInterest += interest; }
+  }
+  state.view.callVolume = formatCount(callVolume);
+  state.view.putVolume = formatCount(putVolume);
+  state.view.callInterest = `未平仓 ${formatCount(callInterest)}`;
+  state.view.putInterest = `未平仓 ${formatCount(putInterest)}`;
   const analysisRows = analysisPayload?.data?.length ? analysisPayload.data : rows;
   // 记录本次快照时间：压力位/支撑位的合成接口按「标的 + 到期日 + 快照时间」去重请求。
   state.chainFetchedAt = payload.fetched_at || null;
@@ -4415,7 +4523,7 @@ function renderChain(payload, quote, analysisPayload) {
   state.displayedChainFetchedAt = payload.fetched_at || null;
   renderAnalysis(analysisRows, quote?.price, analysisPayload, rows, payload.iv_model || {}, activeBasis(quote));
   if (state.pendingAnalyticsRefresh && state.lastAnalysis?.points?.length) schedulePushedAnalyticsRefresh();
-  state.chainRows = rows; state.chainSpot = quote?.price ?? null;
+  state.chainRows = Object.freeze(rows); state.chainSpot = quote?.price ?? null;
   renderChainTable();
   chainRenderSignature = signature;
   rememberClientSnapshot();
@@ -5357,7 +5465,7 @@ async function loadSymbol() {
   state.analysisBlockUntil = 0;
   state.analysisReady = false;
   const loadId = ++state.loadId;
-  if (window.optionScopeApp) window.optionScopeApp.ensureChanIntraday(state.chanPeriod);
+  if (window.optionScopeApp && state.chanExpanded) window.optionScopeApp.ensureChanIntraday(state.chanPeriod);
   clearQuoteRetry();
   state.quoteRetryInFlightKey = "";
   setError("");
@@ -5373,7 +5481,8 @@ async function loadSymbol() {
   // SSE subscription and snapshot refresh then publish a live session quote.
   connectPushStream(symbol);
   fetchQuoteForDisplay(symbol, loadId);
-  refreshChanAnalysis();
+  if (state.chanExpanded) refreshChanAnalysis();
+  else refreshChanMarketAnalysis(true);
   // Opening the stream starts the server-side snapshot worker immediately;
   // loadChain owns any follow-up read after expiry discovery.
   try {
@@ -5473,7 +5582,13 @@ const optionScopeApp = new Vue({
       return this.view.chan[this.chanPeriod] || this.view.chan.daily;
     },
     chanChartInteraction() {
-      return { chart: this.chanFrame?.chart, onPan: (bars) => this.panChanChart(bars), onZoom: (factor, anchor, ratio, baseVisible) => this.zoomChanChart(factor, anchor, ratio, baseVisible) };
+      return {
+        chart: this.chanFrame?.chart,
+        scenariosVisible: this.chanScenariosVisible,
+        onPan: (bars) => this.panChanChart(bars),
+        onZoom: (factor, anchor, ratio, baseVisible) => this.zoomChanChart(factor, anchor, ratio, baseVisible),
+        onScenarioClick: (key, event) => this.toggleChanScenario(key, event),
+      };
     },
     chanLoadStatus() {
       if (!CHAN_INTRADAY_PERIODS.includes(this.chanPeriod) && this.chanLoading) return "缠论行情加载中…";
@@ -5492,7 +5607,15 @@ const optionScopeApp = new Vue({
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) return !this.chanIntradayLoading[this.chanPeriod] && !this.chanIntradayRetryTimers[this.chanPeriod] && (this.chanIntradayRetryAttempts[this.chanPeriod] || 0) >= CHAN_INTRADAY_RETRY_LIMIT;
       return !this.chanLoading && !this.chanRetryTimer && this.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT;
     },
-    chanCanvasBinding() { return { chart: this.chanFrame?.chart, layers: this.chanChartLayers }; },
+    chanCanvasBinding() { return { chart: this.chanFrame?.chart, layers: this.chanChartLayers, scenariosVisible: this.chanScenariosVisible }; },
+    chanHoverBinding() {
+      return {
+        chart: this.chanFrame?.chart,
+        scenariosVisible: this.chanScenariosVisible,
+        onScenarioHover: (key, event) => this.showChanScenario(key, event),
+        onScenarioLeave: (event) => this.hideChanScenario(event),
+      };
+    },
     chanLayerLevels() {
       return this.chanFrame?.chart?.layerLevels || [];
     },
@@ -5570,7 +5693,7 @@ const optionScopeApp = new Vue({
           const endOffset = Math.max(0, Math.min(maxOffset, (viewport.endOffset || 0) + (viewport.endOffset > 0 ? addedBars : 0)));
           state.chanViewports = { ...state.chanViewports, [period]: { ...viewport, endOffset } };
         }
-        this.chanIntradayPayload = { ...this.chanIntradayPayload, [period]: payload };
+        this.chanIntradayPayload = { ...this.chanIntradayPayload, [period]: Object.freeze(payload) };
         const boundaryPrefix = `${symbol}:`;
         const expectedCandleDate = period === "15m" && chanIntradayLastBoundaryAttempt.startsWith(boundaryPrefix)
           ? chanIntradayLastBoundaryAttempt.slice(boundaryPrefix.length)
@@ -5779,6 +5902,9 @@ const optionScopeApp = new Vue({
     toggleChanPanel() {
       this.chanExpanded = !this.chanExpanded;
       rememberFoldState(CHAN_FOLD_KEYS.panel, this.chanExpanded);
+      if (!this.chanExpanded) return;
+      if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) this.ensureChanIntraday(this.chanPeriod);
+      if (state.chanStale || state.chanPayload?.symbol !== state.symbol) refreshChanAnalysis(true);
     },
     rememberChanFold(name, event) {
       if (!Object.prototype.hasOwnProperty.call(this.chanFolds, name)) return;
@@ -5805,9 +5931,10 @@ initOptionAnalysisGroup();
 // 时钟是独立的高频显示，不进入 Vue 响应式树，避免每秒遍历整张期权链的虚拟 DOM。
 function updateClock() {
   const clock = byId("clock");
-  if (clock) clock.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  if (clock) clock.textContent = clockFormatter.format(new Date());
   // 状态跟随时钟更新，不写 Vue 数据。
 }
+const clockFormatter = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 updateClock();
 setInterval(updateClock, 1000);
 // 容器尺寸与上次绘制不一致时按新尺寸重绘图表：窗口缩放、图表折叠组展开后都走这里。

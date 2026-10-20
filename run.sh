@@ -227,7 +227,7 @@ DATABASE_PATH=data/options.db
 DATABASE_MAX_MB=256M
 RAW_RETENTION_DAYS=30
 SCHEDULER_ENABLED=true
-GO_MEMORY_LIMIT=auto
+RESOURCE_MODE=auto
 ENVEOF
       ok "已生成默认 $ENV_FILE"
     fi
@@ -1489,10 +1489,7 @@ CONFIG_ROWS=(
   'HISTORY_MAX_AGE_SECONDS|3600|plain|日线历史回源间隔（秒）'
   'EXTREMES_MAX_AGE_SECONDS|86400|plain|历史极值回源间隔（秒）'
   'SCHEDULER_ENABLED|true|plain|是否启用定时历史清理和数据库维护（true/false）'
-  'UPSTREAM_CONCURRENCY|auto|plain|单进程上游并发上限（auto 或正整数）'
-  'UPSTREAM_WAIT_SECONDS|20|plain|等待上游并发槽位的最长秒数'
-  'LOW_MEMORY|auto|plain|低内存保护（auto:内存≤4GiB或可用≤2GiB时开启）'
-  'GO_MEMORY_LIMIT|auto|plain|Go GC 软内存上限（auto / 96MiB / 1GiB / off）'
+  'RESOURCE_MODE|auto|plain|资源模式（auto 启动时按内存/CPU 自动分配；off 不限制）'
   'ALPACA_API_KEY||secret|Alpaca API Key（夜盘股票行情）'
   'ALPACA_API_SECRET||secret|Alpaca API Secret（夜盘股票行情）'
 )
@@ -1512,7 +1509,7 @@ show_config_summary() {
 }
 
 validate_config_values() {
-  local port limit concurrency wait_seconds low_memory go_memory_limit
+  local port limit resource_mode
   port="$(read_env_value PORT 8000)"
   case "$port" in
     '' | *[!0-9]*)
@@ -1527,31 +1524,10 @@ validate_config_values() {
   case "$(printf '%s' "$limit" | tr '[:lower:]' '[:upper:]')" in
     '' | *[!0-9MG]*) warn "DATABASE_MAX_MB=$limit 写法可能不合法，应用启动时会报错" ;;
   esac
-  concurrency="$(read_env_value UPSTREAM_CONCURRENCY auto)"
-  wait_seconds="$(read_env_value UPSTREAM_WAIT_SECONDS 20)"
-  case "$(printf '%s' "$concurrency" | tr '[:upper:]' '[:lower:]')" in
-    auto) ;;
-    '' | *[!0-9]*) fail "UPSTREAM_CONCURRENCY 必须是 auto 或正整数"; return 1 ;;
-  esac
-  case "$wait_seconds" in '' | *[!0-9]*) fail "UPSTREAM_WAIT_SECONDS 必须是正整数"; return 1 ;; esac
-  if [ "$(printf '%s' "$concurrency" | tr '[:upper:]' '[:lower:]')" != auto ]; then
-    [ "$concurrency" -ge 1 ] || { fail "UPSTREAM_CONCURRENCY 必须大于等于 1"; return 1; }
-  fi
-  [ "$wait_seconds" -ge 1 ] || { fail "UPSTREAM_WAIT_SECONDS 必须大于等于 1"; return 1; }
-  low_memory="$(read_env_value LOW_MEMORY auto)"
-  case "$(printf '%s' "$low_memory" | tr '[:upper:]' '[:lower:]')" in
-    '' | auto | true | false | 1 | 0 | yes | no | on | off) ;;
-    *) fail "LOW_MEMORY 只能是 auto、true 或 false"; return 1 ;;
-  esac
-  go_memory_limit="$(read_env_value GO_MEMORY_LIMIT auto)"
-  case "$go_memory_limit" in
-    '' | [Aa][Uu][Tt][Oo] | off) ;;
-    *)
-      if [[ ! "$go_memory_limit" =~ ^[0-9]+(B|KiB|MiB|GiB|TiB)?$ ]] || [[ ! "$go_memory_limit" =~ [1-9] ]]; then
-        fail "GO_MEMORY_LIMIT 必须是 auto、off 或正整数容量，例如 96MiB、1GiB（纯数字按字节）"
-        return 1
-      fi
-      ;;
+  resource_mode="$(read_env_value RESOURCE_MODE auto)"
+  case "$(printf '%s' "$resource_mode" | tr '[:upper:]' '[:lower:]')" in
+    '' | auto | off) ;;
+    *) fail "RESOURCE_MODE 只能是 auto 或 off"; return 1 ;;
   esac
   return 0
 }

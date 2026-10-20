@@ -328,6 +328,34 @@ func (c *CboeOptionsClient) Expirations(ctx context.Context, rawSymbol string) (
 	if err != nil {
 		return nil, err
 	}
+	return cboeExpirationsFromPayload(symbol, payload)
+}
+
+// NearestChain returns the expiration catalogue and the nearest active chain
+// from one delayed-options payload. The catalogue keeps historical dates, like
+// Expirations; the rows belong to the first date at or after today.
+func (c *CboeOptionsClient) NearestChain(ctx context.Context, rawSymbol string) ([]string, []model.OptionRow, *time.Time, error) {
+	symbol, payload, err := c.fetch(ctx, rawSymbol)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	expirations, err := cboeExpirationsFromPayload(symbol, payload)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	expiration := cboeNearestActiveExpiration(expirations)
+	if expiration == "" {
+		return expirations, nil, nil, nil
+	}
+	rows := cboeChainRowsFromPayload(symbol, expiration, payload)
+	if len(rows) == 0 {
+		return expirations, nil, nil, nil
+	}
+	fetched := time.Now().UTC()
+	return expirations, rows, &fetched, nil
+}
+
+func cboeExpirationsFromPayload(symbol string, payload CboeOptionsPayloadDTO) ([]string, error) {
 	values := make(map[string]struct{})
 	for _, raw := range payload.Data.Options {
 		row, ok := decodeCboeOption(raw)
@@ -351,6 +379,20 @@ func (c *CboeOptionsClient) Expirations(ctx context.Context, rawSymbol string) (
 	return result, nil
 }
 
+func cboeNearestActiveExpiration(expirations []string) string {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	today := time.Now().In(location).Format(time.DateOnly)
+	for _, expiration := range expirations {
+		if expiration >= today {
+			return expiration
+		}
+	}
+	return ""
+}
+
 // Chain maps the selected expiration to the shared OptionRow model. Cboe
 // values are delayed snapshots and the returned timestamp marks local fetch
 // time, not an exchange-provided quote timestamp.
@@ -367,6 +409,15 @@ func (c *CboeOptionsClient) Chain(ctx context.Context, rawSymbol, rawExpiration 
 	if err != nil {
 		return nil, nil, err
 	}
+	rows := cboeChainRowsFromPayload(symbol, expiration, payload)
+	if len(rows) == 0 {
+		return nil, nil, fmt.Errorf("Cboe has no option data for %s %s", symbol, expiration)
+	}
+	fetched := time.Now().UTC()
+	return rows, &fetched, nil
+}
+
+func cboeChainRowsFromPayload(symbol, expiration string, payload CboeOptionsPayloadDTO) []model.OptionRow {
 	spot := cboeNumber(payload.Data.CurrentPrice)
 	rows := make([]model.OptionRow, 0)
 	for _, raw := range payload.Data.Options {
@@ -396,11 +447,7 @@ func (c *CboeOptionsClient) Chain(ctx context.Context, rawSymbol, rawExpiration 
 			ChangePercent: cboeNumber(row.PercentChange), InTheMoney: itm, InTheMoneyKnown: itmKnown, Expiration: expiration,
 		})
 	}
-	if len(rows) == 0 {
-		return nil, nil, fmt.Errorf("Cboe has no option data for %s %s", symbol, expiration)
-	}
-	fetched := time.Now().UTC()
-	return rows, &fetched, nil
+	return rows
 }
 
 func decodeCboeOption(raw json.RawMessage) (CboeOptionDTO, bool) {

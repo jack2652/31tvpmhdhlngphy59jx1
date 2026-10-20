@@ -3,6 +3,7 @@ const fs = require("node:fs");
 
 const template = fs.readFileSync("web/static/index.html", "utf8");
 const client = fs.readFileSync("web/static/common/js/chan-client.js", "utf8");
+const charts = fs.readFileSync("web/static/common/js/charts.js", "utf8");
 const readme = fs.readFileSync("README.md", "utf8");
 const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
 
@@ -21,7 +22,7 @@ assert.ok(client.includes("待满足："), "signal evidence must list pending co
 assert.ok(client.includes("失效边界 "), "signal evidence must expose its invalidation price");
 assert.match(client, /市场环境：/, "signal evidence must expose market filter state");
 assert.match(client, /跨级别确认：/, "signal evidence must expose lower-level confirmation state");
-assert.match(template, /条件情景 · 非预测/, "Chan chart scenarios must be identified as conditional, not predictive");
+assert.ok(charts.includes("条件情景 · 非预测"), "Chan chart scenarios must be identified as conditional, not predictive");
 assert.match(template, /倾向分为规则估算，非统计概率/, "Chan chart tilt scores must not be presented as win probabilities");
 assert.match(template, /倾向分是规则估算，不代表胜率/, "Chan spot guidance must state tilt scores are not win rates");
 assert.match(template, /本项目尚无对应胜率统计/, "Chan candidates must disclose when win-rate evidence is unavailable");
@@ -30,7 +31,11 @@ assert.match(template, /倾向分是规则估算，不代表胜率/, "spot guida
 assert.match(template, /综合日周位置、确认笔与有效信号的规则倾向分 · 非历史胜率/, "scenario tilt must be labeled as a rule estimate, not historical win rate");
 assert.match(template, /不等同于完整一类、二类买卖点[\s\S]*?本项目尚无对应胜率统计/, "legacy structure observations must not imply complete signals or a measured win rate");
 assert.match(readme, /项目尚无经过成本和样本外验证的 v4 收益报告，不报告未经验证的胜率/, "documentation must not claim unvalidated backtest returns or win rates");
-assert.match(template, /key="chan-projections" v-if="chanScenariosVisible"/, "scenario projection lines must follow the scenario visibility state");
+assert.match(charts, /scenariosVisible && model\.projections\?\.length/, "scenario projection lanes and routes must be painted by the canvas");
+assert.match(app, /chanCanvasBinding\(\) \{ return \{ chart: this\.chanFrame\?\.chart, layers: this\.chanChartLayers, scenariosVisible: this\.chanScenariosVisible \}; \}/, "canvas rendering must follow the scenario visibility state");
+assert.match(template, /class="chan-scenario-toggle-canvas"/, "the scenario toggle must be an HTML button above the canvas");
+assert.doesNotMatch(template, /chan-scenario-toggle-svg/, "the scenario toggle must no longer be rendered as an SVG group");
+assert.match(charts, /fillText\("\\ue7b3"/, "the scenario toggle icon must be painted by the canvas");
 assert.match(template, /@click.stop="toggleChanScenarios"/, "scenario visibility control must remain connected to its toggle");
 const scenarioToggle = app.indexOf("toggleChanScenarios() {");
 assert.ok(scenarioToggle >= 0, "scenario toggle method must exist");

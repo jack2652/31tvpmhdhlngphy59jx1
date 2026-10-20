@@ -26,6 +26,7 @@ import (
 	_ "time/tzdata"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/singleflight"
 	"option-scope-go/internal/config"
 	"option-scope-go/internal/gamma"
 	"option-scope-go/internal/marketcalendar"
@@ -181,6 +182,12 @@ type MarketProvider interface {
 	Chain(context.Context, string, string) ([]model.OptionRow, *time.Time, error)
 }
 
+// NearestChainProvider collapses the cold-start expiration catalogue and
+// nearest-chain requests into one upstream payload.
+type NearestChainProvider interface {
+	NearestChain(context.Context, string) ([]string, []model.OptionRow, *time.Time, error)
+}
+
 type snapshotQuoteProvider interface {
 	SnapshotQuote(context.Context, string) (model.Quote, error)
 }
@@ -216,6 +223,7 @@ type Service struct {
 	historyRefreshJobs     map[string]bool
 	historyRefreshAfter    map[string]time.Time
 	levelsFlights          map[string]*levelsCacheFlight
+	chainReads             singleflight.Group
 	analyticsPrefetch      map[string]bool
 	chanHistoryJobs        map[string]bool
 	chanAdjustedMu         sync.Mutex
@@ -348,6 +356,30 @@ func boundedAdjustedHistoryCacheEntries(lowMemory bool) int {
 	return 3
 }
 
+const (
+	quoteCacheLimit      = 512
+	chainCacheLimit      = 256
+	lowMemoryCacheDivide = 4
+)
+
+// trimSymbolCachesLocked bounds the per-symbol quote and option-chain caches.
+// Both are pure caches backed by SQLite, so dropping the oldest entries keeps a
+// long-running instance that sees many tickers from growing without limit. The
+// caller must hold s.mu.
+func (s *Service) trimSymbolCachesLocked() {
+	quoteLimit, chainLimit := quoteCacheLimit, chainCacheLimit
+	if s.cfg.LowMemory {
+		quoteLimit, chainLimit = quoteLimit/lowMemoryCacheDivide, chainLimit/lowMemoryCacheDivide
+	}
+	// Evict a slice below the limit so the O(n) scan runs once per batch.
+	if len(s.quotes) > quoteLimit {
+		evictOldestHistoryCacheEntry(s.quotes, "", quoteLimit*9/10, func(entry cachedQuote) time.Time { return entry.at })
+	}
+	if len(s.chains) > chainLimit {
+		evictOldestHistoryCacheEntry(s.chains, "", chainLimit*9/10, func(entry cachedChain) time.Time { return entry.at })
+	}
+}
+
 func evictOldestHistoryCacheEntry[T any](cache map[string]T, keyToKeep string, limit int, lastAccess func(T) time.Time) {
 	if limit < 1 {
 		limit = 1
@@ -377,7 +409,7 @@ func (s *Service) Router() *gin.Engine {
 	}
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
-	router.Use(normalizeJSONContentType(), requestAdmissionLimit(s.cfg.InboundConcurrency), gin.Logger(), gin.Recovery(), s.accessGuard(), noStore(), responseCompression(s.cfg.LowMemory))
+	router.Use(normalizeJSONContentType(), requestAdmissionLimit(s.cfg.InboundConcurrency), gin.Logger(), gin.Recovery(), s.accessGuard(), noStore(), staticCacheHeaders(), responseCompression(s.cfg.LowMemory))
 	router.HandleMethodNotAllowed = true
 	router.NoRoute(func(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "Not Found"})
@@ -434,6 +466,20 @@ func noStore() gin.HandlerFunc {
 	}
 }
 
+// staticCacheHeaders makes the embedded assets immutable for a year. Every
+// project asset URL carries ?v=<content hash> and the vendor directories are
+// versioned by name, so a rebuild naturally changes the URL. Without this the
+// browser revalidates Vue, Element UI, jQuery and app.js on every navigation.
+func staticCacheHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method == http.MethodGet && strings.HasPrefix(c.Request.URL.Path, "/static/") {
+			c.Header("Cache-Control", "public, max-age=31536000, immutable")
+			c.Header("Vary", "Accept-Encoding")
+		}
+		c.Next()
+	}
+}
+
 // normalizeJSONContentTypeResponseWriter removes Gin's implicit charset suffix
 // from JSON responses. FastAPI/Starlette returns application/json for the same
 // responses, including validation errors and access-guard rejections.
@@ -473,8 +519,13 @@ func normalizeJSONContentType() gin.HandlerFunc {
 const gzipMinimumSize = 1024
 
 func responseCompression(lowMemory bool) gin.HandlerFunc {
+	// Compression stays enabled in low-memory mode: the payloads on the first
+	// render path are 0.5-1.5 MiB JSON, and removing 75-90% of the transfer
+	// costs far less CPU than waiting for the network. BestSpeed keeps the
+	// compressor's 32 KiB window and hash tables cheap on small machines.
+	level := gzip.DefaultCompression
 	if lowMemory {
-		return func(c *gin.Context) { c.Next() }
+		level = gzip.BestSpeed
 	}
 	return func(c *gin.Context) {
 		if !acceptsGzip(c.Request.Header.Values("Accept-Encoding")) {
@@ -485,6 +536,7 @@ func responseCompression(lowMemory bool) gin.HandlerFunc {
 			ResponseWriter: c.Writer,
 			accepted:       true,
 			method:         c.Request.Method,
+			level:          level,
 			buffer:         make([]byte, 0, gzipMinimumSize-1),
 		}
 		c.Writer = writer
@@ -497,6 +549,7 @@ type gzipResponseWriter struct {
 	gin.ResponseWriter
 	accepted  bool
 	method    string
+	level     int
 	buffer    []byte
 	gzip      *gzip.Writer
 	bytes     int
@@ -636,7 +689,11 @@ func (w *gzipResponseWriter) startCompression() error {
 	header.Set("Content-Encoding", "gzip")
 	w.ResponseWriter.WriteHeaderNow()
 	w.finalized = true
-	w.gzip = gzip.NewWriter(w.ResponseWriter)
+	writer, err := gzip.NewWriterLevel(w.ResponseWriter, w.level)
+	if err != nil {
+		return err
+	}
+	w.gzip = writer
 	if len(w.buffer) > 0 {
 		if _, err := w.gzip.Write(w.buffer); err != nil {
 			return err
@@ -808,13 +865,13 @@ func (s *Service) quote(c *gin.Context) {
 			// refresh. Python-authoritative values are never replaced by this worker.
 			if quote.FairValue == nil || (isGoFairValueSource(quote.FairValueSource) && quote.FairValueSource != goFairValueSource) ||
 				(quote.FairValueSource == goFairValueSource && s.goValuationCacheExpired(symbol)) {
-				s.scheduleValuation(symbol)
+				s.scheduleValuationAfterSnapshot(symbol, nil, false)
 			}
 			quote.Source = "sqlite"
 			// Cache reads stay on the critical path for a new symbol. Use only durable
 			// SQLite inputs here and refresh stale history in the background.
 			quote = s.decorateCachedQuote(quote)
-			s.prefetchSymbolAnalytics(symbol)
+			s.prefetchSymbolAnalytics(symbol, false)
 			c.JSON(http.StatusOK, quoteAPIValue(quote))
 			return
 		}
@@ -863,7 +920,7 @@ func (s *Service) pendingQuoteWithCachedValuation(symbol string) map[string]any 
 	s.mergeCachedValuation(symbol, &quote)
 	if quote.FairValue == nil || (isGoFairValueSource(quote.FairValueSource) && quote.FairValueSource != goFairValueSource) ||
 		(quote.FairValueSource == goFairValueSource && s.goValuationCacheExpired(symbol)) {
-		s.scheduleValuation(symbol)
+		s.scheduleValuationAfterSnapshot(symbol, nil, false)
 	}
 	// A first-time quote request must not start history or benchmark
 	// lookups before the snapshot refresh has fetched expirations and the option
@@ -887,6 +944,7 @@ func (s *Service) latestQuoteSnapshot(symbol string) (cachedQuote, bool, error) 
 		cached := cachedQuote{value: persisted, at: quoteTime(persisted)}
 		s.mu.Lock()
 		s.quotes[symbol] = cached
+		s.trimSymbolCachesLocked()
 		s.mu.Unlock()
 		return cached, true, nil
 	}
@@ -894,6 +952,20 @@ func (s *Service) latestQuoteSnapshot(symbol string) (cachedQuote, bool, error) 
 	delete(s.quotes, symbol)
 	s.mu.Unlock()
 	return cachedQuote{}, false, nil
+}
+
+// latestChains collapses concurrent cache-miss reads for the same symbol and
+// horizon. Callers share the returned map, so they must copy before appending
+// to its slices.
+func (s *Service) latestChains(symbol string, horizon int) (map[string]any, error) {
+	value, err, _ := s.chainReads.Do(fmt.Sprintf("%s|%d", symbol, horizon), func() (any, error) {
+		return s.store.LatestChains(symbol, horizon)
+	})
+	if err != nil {
+		return nil, err
+	}
+	profile, _ := value.(map[string]any)
+	return profile, nil
 }
 
 func (s *Service) fetchQuote(ctx context.Context, symbol string) (model.Quote, error) {
@@ -1018,8 +1090,8 @@ func (s *Service) cacheQuote(symbol string, quote model.Quote) {
 	}
 	s.mu.Lock()
 	s.quotes[symbol] = cachedQuote{value: quote, at: time.Now()}
+	s.trimSymbolCachesLocked()
 	s.mu.Unlock()
-	s.scheduleValuation(symbol)
 }
 
 func (s *Service) publishQuoteEvent(symbol string) {
@@ -1772,31 +1844,58 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	var err error
 	var expires []string
 	var expireErr error
-	// Quote and the expiration catalog are independent and use bounded
-	// upstream slots. This remains safe in LOW_MEMORY mode, where config
-	// caps the shared provider gate at two; heavier background work keeps its
-	// separate low-memory serialization rules.
-	parallelQuoteAndCatalog := quoteOverride == nil && expirationsOverride == nil && s.cfg.UpstreamConcurrency > 1
+	var preloadedRows []model.OptionRow
+	var preloadedFetched *time.Time
+	var preloadedExpiration string
+	nearestProvider, supportsNearest := s.provider.(NearestChainProvider)
+	preloadChain := supportsNearest && quoteOverride == nil && expirationsOverride == nil && requestedExpiration == ""
+	// Quote and the expiration catalog are independent and use the provider's
+	// dedicated first-render lane, which stays available even when the shared
+	// upstream gate is a single slot. Run them together in low-memory mode too:
+	// the price card should never wait behind the catalog, and the heavy chain
+	// fetch still serializes on the shared gate.
+	parallelQuoteAndCatalog := quoteOverride == nil && expirationsOverride == nil
+	upstreamCtx := ctx
+	cancelUpstream := func() {}
+	if parallelQuoteAndCatalog {
+		upstreamCtx, cancelUpstream = context.WithCancel(ctx)
+		defer cancelUpstream()
+	}
 	var upstreamRequests sync.WaitGroup
 	if parallelQuoteAndCatalog {
 		upstreamRequests.Add(2)
 		go func() {
 			defer upstreamRequests.Done()
 			started := time.Now()
-			quote, err = s.fetchSnapshotQuoteForExpirationMode(ctx, symbol, requestedExpiration, false)
+			quote, err = s.fetchSnapshotQuoteForExpirationMode(upstreamCtx, symbol, requestedExpiration, false)
 			quoteDuration = time.Since(started)
 			if err == nil {
 				publishStarted := time.Now()
 				s.cacheQuote(symbol, quote)
 				s.publishQuoteEvent(symbol)
 				earlyQuotePublishDuration = time.Since(publishStarted)
+			} else {
+				// A failed quote aborts this refresh; stop the sibling catalogue
+				// request instead of waiting for its full upstream timeout.
+				cancelUpstream()
 			}
 		}()
 		go func() {
 			defer upstreamRequests.Done()
 			started := time.Now()
-			expires, expireErr = s.provider.Expirations(ctx, symbol)
+			if preloadChain {
+				// One no-date options response carries both the catalogue and the
+				// nearest chain, removing a round trip from every cold symbol.
+				expires, preloadedRows, preloadedFetched, expireErr = nearestProvider.NearestChain(upstreamCtx, symbol)
+			} else {
+				expires, expireErr = s.provider.Expirations(upstreamCtx, symbol)
+			}
 			expirationsDuration = time.Since(started)
+			if expireErr == nil && len(preloadedRows) > 0 {
+				if active := activeExpirations(expires); len(active) > 0 {
+					preloadedExpiration = active[0]
+				}
+			}
 		}()
 	} else {
 		// In constrained mode, publish the live quote before asking the provider
@@ -1833,6 +1932,10 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 			resultErr = fallbackErr
 			return model.RefreshResponse{}, fallbackErr
 		}
+		// The option catalogue is unavailable but daily analysis is independent;
+		// let the history prefetch start instead of waiting for a durable quote
+		// that this failed refresh will never write.
+		s.prefetchSymbolAnalytics(symbol, true)
 		if used {
 			result = fallback
 			return result, nil
@@ -1858,6 +1961,7 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 			resultErr = fallbackErr
 			return model.RefreshResponse{}, fallbackErr
 		}
+		s.prefetchSymbolAnalytics(symbol, true)
 		if used {
 			result = fallback
 			return result, nil
@@ -1872,6 +1976,7 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 			resultErr = fallbackErr
 			return model.RefreshResponse{}, fallbackErr
 		}
+		s.prefetchSymbolAnalytics(symbol, true)
 		if used {
 			result = fallback
 			return result, nil
@@ -1880,7 +1985,7 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 		return model.RefreshResponse{}, resultErr
 	}
 	// In normal mode valuation can use the shared gate while the chain is being
-	// fetched. LOW_MEMORY keeps the first chain request ahead of background work.
+	// fetched. Low-memory mode keeps the first chain request ahead of background work.
 	if !s.cfg.LowMemory {
 		s.scheduleValuationWithQuote(symbol, &quote)
 	}
@@ -1899,9 +2004,6 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	}
 	response.Expirations = expires
 	if len(expires) == 0 {
-		if s.cfg.LowMemory {
-			s.scheduleValuationWithQuote(symbol, &quote)
-		}
 		if probeErr := s.store.SaveExpirationProbe(symbol, true); probeErr != nil {
 			response.Warning = probeErr.Error()
 		}
@@ -1917,19 +2019,21 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 		response.Quote = &persisted
 		response.FetchedAt = persisted.FetchedAt
 		s.publishSnapshotEvent(symbol, "")
+		s.prefetchSymbolAnalytics(symbol, true)
+		if s.cfg.LowMemory {
+			s.scheduleValuationAfterSnapshot(symbol, &quote, true)
+		}
 		return response, nil
 	}
 	selectedExpiration := requestedExpiration
 	if selectedExpiration != "" && !containsExpiration(expires, selectedExpiration) {
+		s.prefetchSymbolAnalytics(symbol, true)
 		return response, ExpirationUnavailableError{Symbol: symbol, Expiration: selectedExpiration}
 	}
 	if selectedExpiration == "" && len(expires) > 0 {
 		selectedExpiration = expires[0]
 	}
 	if selectedExpiration == "" {
-		if s.cfg.LowMemory {
-			s.scheduleValuationWithQuote(symbol, &quote)
-		}
 		response.QuoteOnly = true
 		persisted, persistErr := s.persistQuoteSnapshot(symbol, quote)
 		if persistErr != nil {
@@ -1937,17 +2041,22 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 			return model.RefreshResponse{}, persistErr
 		}
 		response.Quote = &persisted
+		s.prefetchSymbolAnalytics(symbol, true)
+		if s.cfg.LowMemory {
+			s.scheduleValuationAfterSnapshot(symbol, &quote, true)
+		}
 		return response, nil
 	}
 	response.Expiration = selectedExpiration
-	if s.cfg.LowMemory {
-		// Fundamentals are independent of the option-chain response. Start the
-		// bounded valuation worker once the quote and expiry catalog are ready;
-		// its provider gate still serializes upstream work under LOW_MEMORY.
-		s.scheduleValuationWithQuote(symbol, &quote)
-	}
 	chainStarted := time.Now()
-	rows, fetched, chainErr := s.provider.Chain(ctx, symbol, selectedExpiration)
+	var rows []model.OptionRow
+	var fetched *time.Time
+	var chainErr error
+	if preloadedExpiration != "" && preloadedExpiration == selectedExpiration && len(preloadedRows) > 0 {
+		rows, fetched = preloadedRows, preloadedFetched
+	} else {
+		rows, fetched, chainErr = s.provider.Chain(ctx, symbol, selectedExpiration)
+	}
 	chainDuration = time.Since(chainStarted)
 	if chainErr != nil {
 		fallback, used, fallbackErr := s.staleRefreshResponse(ctx, symbol, requestedExpiration, chainErr.Error())
@@ -1955,6 +2064,7 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 			resultErr = fallbackErr
 			return model.RefreshResponse{}, fallbackErr
 		}
+		s.prefetchSymbolAnalytics(symbol, true)
 		if used {
 			result = fallback
 			return result, nil
@@ -2003,11 +2113,17 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	s.mu.Lock()
 	s.quotes[symbol] = cachedQuote{value: persisted, at: time.Now()}
 	s.chains[key] = cachedChain{value: chain, at: time.Now()}
+	s.trimSymbolCachesLocked()
 	s.mu.Unlock()
 	s.publishQuoteEvent(symbol)
 	s.publishSnapshotEvent(symbol, selectedExpiration)
 	response.Rows = len(rows)
-	s.prefetchSymbolAnalytics(symbol)
+	s.prefetchSymbolAnalytics(symbol, true)
+	if s.cfg.LowMemory {
+		// Fundamentals stay behind the chain and adjusted history: the delayed
+		// worker re-checks the refresh gate before it can take the shared slot.
+		s.scheduleValuationAfterSnapshot(symbol, &quote, true)
+	}
 	return response, nil
 }
 
@@ -2161,11 +2277,62 @@ func (s *Service) snapshotRefreshKeyInProgress(symbol, requestedExpiration strin
 	return false
 }
 
+// snapshotRefreshActive reports whether any local snapshot refresh currently
+// owns the symbol. Background prefetches call it without holding the gate, so
+// unlike snapshotRefreshKeyInProgress a lone in-flight refresh already counts.
+func (s *Service) snapshotRefreshActive(symbol string) bool {
+	if s == nil {
+		return false
+	}
+	prefix := "snapshot|" + symbol + "|"
+	s.mu.RLock()
+	active := false
+	for key, gate := range s.refreshGates {
+		if strings.HasPrefix(key, prefix) && gate != nil && gate.refs > 0 {
+			active = true
+			break
+		}
+	}
+	if !active {
+		for key := range s.snapshotRefreshJobs {
+			if strings.HasPrefix(key, prefix) {
+				active = true
+				break
+			}
+		}
+	}
+	s.mu.RUnlock()
+	if active {
+		return true
+	}
+	if leased, err := s.store.ServiceLeaseActive("snapshot-refresh:"+symbol+":nearest", durableRefreshLease); err == nil && leased {
+		return true
+	}
+	return false
+}
+
+// hasDurableQuote reports whether SQLite already holds a usable quote. A cold
+// symbol has none until the snapshot commit, so history prefetches wait for it
+// instead of racing the quote/expiry/chain requests for the shared slot.
+func (s *Service) hasDurableQuote(symbol string) bool {
+	if s == nil || s.store == nil {
+		return false
+	}
+	quote, found, err := s.store.LatestQuote(symbol)
+	return err == nil && found && validMarketPrice(quote.Price)
+}
+
 // prefetchSymbolAnalytics warms the durable inputs consumed by levels. It runs
 // after a snapshot is committed, so the browser can render the quote and chain
 // immediately while Go fetches the slower history-derived signals in parallel.
-func (s *Service) prefetchSymbolAnalytics(symbol string) {
+// HTTP readers call it with force=false: while a snapshot refresh owns the
+// symbol they leave the upstream slot to the quote and chain instead of
+// starting a multi-year history request that would delay the first paint.
+func (s *Service) prefetchSymbolAnalytics(symbol string, force bool) {
 	if s == nil || s.store == nil || strings.TrimSpace(symbol) == "" {
+		return
+	}
+	if !force && (s.snapshotRefreshActive(symbol) || !s.hasDurableQuote(symbol)) {
 		return
 	}
 	s.mu.Lock()
@@ -2185,6 +2352,14 @@ func (s *Service) prefetchSymbolAnalytics(symbol string) {
 		}()
 		ctx, cancel := context.WithTimeout(s.background, 120*time.Second)
 		defer cancel()
+		// The adjusted Chan job is the single history source on a cold symbol:
+		// it fetches raw OHLC together with the split/dividend factors and
+		// writes both caches. Starting a raw two-year request here as well would
+		// queue a duplicate upstream fetch behind the same single slot.
+		s.ensureChanAdjustedHistory(symbol)
+		if s.chanAdjustedJobActive(symbol) {
+			return
+		}
 		history := s.loadHistory(ctx, symbol, "2y")
 		for _, delay := range []time.Duration{time.Second, 3 * time.Second} {
 			if ctx.Err() != nil {
@@ -2222,20 +2397,25 @@ func (s *Service) prefetchSymbolAnalytics(symbol string) {
 				analyticsChanged = true
 			}
 		}
-		// LOW_MEMORY derives extrema from the 2y cache instead of fetching a
+		// Low-memory mode derives extrema from the 2y cache instead of fetching a
 		// second, much larger max-history window. Surface that newly persisted
 		// result to clients even though its source is SQLite.
 		if warning, _ := extremes["warning"].(string); strings.HasPrefix(warning, "低内存保护：历史极值按两年日线计算") {
 			analyticsChanged = true
 		}
 		if analyticsChanged {
-			s.publishAnalyticsEvent(symbol)
+			s.publishAnalyticsEvent(symbol, history["fetched_at"])
 		}
 	}()
 }
 
-func (s *Service) publishAnalyticsEvent(symbol string) {
+func (s *Service) publishAnalyticsEvent(symbol string, historyFetchedAt any) {
 	event := model.Event{Symbol: symbol, Kind: "analytics", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	if historyFetchedAt != nil {
+		// Clients compare this with the adjusted payload they already hold so a
+		// derived-data event does not trigger another 1.5 MiB structure download.
+		event.Payload = map[string]any{"history_fetched_at": historyFetchedAt}
+	}
 	if id, err := s.store.AddEvent(event); err == nil {
 		event.ID = id
 	}
@@ -3037,7 +3217,7 @@ func (s *Service) gamma(c *gin.Context) {
 			return
 		}
 	}
-	profile, err := s.store.LatestChains(symbol, horizon)
+	profile, err := s.latestChains(symbol, horizon)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
 		return
@@ -3068,7 +3248,7 @@ func (s *Service) gamma(c *gin.Context) {
 			"iv_model": ivModel, "zero_gamma": zero, "data": data,
 			"contract_count": len(rows),
 		}
-		// Python avoids retaining bulky full-window Gamma payloads in LOW_MEMORY;
+		// Python avoids retaining bulky full-window Gamma payloads in low-memory mode;
 		// summary-only requests remain durable and reusable across workers.
 		if !s.cfg.LowMemory || !includeRows {
 			cacheEntries := s.cfg.AnalysisCacheEntries
@@ -3150,7 +3330,7 @@ func (s *Service) levels(c *gin.Context) {
 		var extremes, beta map[string]any
 		var extremesErr, betaErr error
 		if s.cfg.LowMemory || s.cfg.UpstreamConcurrency <= 1 {
-			profile, profileErr = s.store.LatestChains(symbol, 45)
+			profile, profileErr = s.latestChains(symbol, 45)
 			chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration)
 			quote, quoteFound, quoteErr = s.store.LatestQuote(symbol)
 			history, historyErr = s.store.LatestHistory(symbol, 3000)
@@ -3159,7 +3339,7 @@ func (s *Service) levels(c *gin.Context) {
 		} else {
 			var reads sync.WaitGroup
 			reads.Add(6)
-			go func() { defer reads.Done(); profile, profileErr = s.store.LatestChains(symbol, 45) }()
+			go func() { defer reads.Done(); profile, profileErr = s.latestChains(symbol, 45) }()
 			go func() { defer reads.Done(); chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration) }()
 			go func() { defer reads.Done(); quote, quoteFound, quoteErr = s.store.LatestQuote(symbol) }()
 			go func() { defer reads.Done(); history, historyErr = s.store.LatestHistory(symbol, 3000) }()
@@ -3181,7 +3361,7 @@ func (s *Service) levels(c *gin.Context) {
 			return
 		}
 		if chainFound && !containsExpiration(profile["expirations"], expiration) && len(activeExpirations([]string{expiration})) > 0 {
-			allRows = append(allRows, chain.Data...)
+			allRows = append(append([]model.OptionRow(nil), allRows...), chain.Data...)
 		}
 		if !quoteFound {
 			quote = model.Quote{Symbol: symbol, Sessions: map[string]any{}}
@@ -3258,27 +3438,19 @@ func (s *Service) levels(c *gin.Context) {
 			}
 		}
 		sort.Strings(rawExpirations)
-		ivModel := gamma.Annotate(rawRows, candidateSpot)
-		rawOptions := make([]map[string]any, 0, len(rawRows))
-		for _, row := range rawRows {
-			item := map[string]any{
-				"contract_symbol": row.ContractSymbol, "expiration": row.Expiration,
-				"contract_type": row.ContractType, "strike": row.Strike,
-				"last_price": row.LastPrice, "bid": row.Bid, "ask": row.Ask,
-				"volume": row.Volume, "open_interest": row.OpenInterest,
-				"implied_volatility": row.ImpliedVolatility, "gamma": row.Gamma,
-			}
-			if candidateSpot != nil && *candidateSpot > 0 {
-				item["model_iv"] = row.ModelIV
-				item["model_gamma"] = row.ModelGamma
-			}
-			if details, ok := ivModel[row.Expiration].(map[string]any); ok {
-				if source, _ := details["source"].(string); source != "" {
-					item["model_iv_source"] = source
+		// The first raw paint often happens before the expiration dropdown is
+		// populated. Use the nearest active expiry for IV/touch probability so
+		// the cards do not stay at "--" until the next request.
+		levelsExpiration := expiration
+		if levelsExpiration == "" {
+			for _, candidate := range availableExpirations {
+				if len(activeExpirations([]string{candidate})) > 0 {
+					levelsExpiration = candidate
+					break
 				}
 			}
-			rawOptions = append(rawOptions, item)
 		}
+		ivModel := gamma.Annotate(rawRows, candidateSpot)
 		fetchedAt := levelsOptionsTimestamp(profile, chain, expiration)
 		extremesValue := extremes["extremes"]
 		historySource := "none"
@@ -3304,9 +3476,36 @@ func (s *Service) levels(c *gin.Context) {
 		// by the Go levels pipeline are already loaded above, so calculate the
 		// lightweight decision payload here instead of making the browser recreate
 		// trend, support/resistance, trade points, and buyer structures in JavaScript.
-		fastLevels := buildCachedLevelsAt(symbol, expiration, bars, allRows, quote, spotValue, candidateSpot, history["fetched_at"], extremes, beta, nil, time.Now(), ivModel)
+		fastLevels := buildCachedLevelsAt(symbol, levelsExpiration, bars, allRows, quote, spotValue, candidateSpot, history["fetched_at"], extremes, beta, nil, time.Now(), ivModel)
 		if fastLevels != nil {
 			fastLevels = fastLevelsPayload(fastLevels)
+		}
+		// Once history and the server-side decision payload are available the
+		// browser never reads the raw option rows: it renders fast_levels and
+		// keeps the chain table from the snapshot. Skip ~0.5 MiB of row maps on
+		// that common path; symbols without history still get the option fallback.
+		rawOptions := make([]map[string]any, 0)
+		if len(bars) == 0 || fastLevels == nil {
+			rawOptions = make([]map[string]any, 0, len(rawRows))
+			for _, row := range rawRows {
+				item := map[string]any{
+					"contract_symbol": row.ContractSymbol, "expiration": row.Expiration,
+					"contract_type": row.ContractType, "strike": row.Strike,
+					"last_price": row.LastPrice, "bid": row.Bid, "ask": row.Ask,
+					"volume": row.Volume, "open_interest": row.OpenInterest,
+					"implied_volatility": row.ImpliedVolatility, "gamma": row.Gamma,
+				}
+				if candidateSpot != nil && *candidateSpot > 0 {
+					item["model_iv"] = row.ModelIV
+					item["model_gamma"] = row.ModelGamma
+				}
+				if details, ok := ivModel[row.Expiration].(map[string]any); ok {
+					if source, _ := details["source"].(string); source != "" {
+						item["model_iv_source"] = source
+					}
+				}
+				rawOptions = append(rawOptions, item)
+			}
 		}
 		c.JSON(http.StatusOK, gin.H{"raw": true, "symbol": symbol, "expiration": expiration,
 			"spot": spotResponse, "candidate_spot": candidateSpotResponse, "chain_fetched_at": fetchedAt, "options_fetched_at": fetchedAt,
@@ -3336,7 +3535,7 @@ func (s *Service) levels(c *gin.Context) {
 	var readStarted = time.Now()
 	var inputs sync.WaitGroup
 	inputs.Add(4)
-	go func() { defer inputs.Done(); profile, profileErr = s.store.LatestChains(symbol, 45) }()
+	go func() { defer inputs.Done(); profile, profileErr = s.latestChains(symbol, 45) }()
 	go func() { defer inputs.Done(); chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration) }()
 	go func() { defer inputs.Done(); quote, quoteFound, quoteErr = s.store.LatestQuote(symbol) }()
 	go func() {
@@ -3355,7 +3554,7 @@ func (s *Service) levels(c *gin.Context) {
 		return
 	}
 	if chainFound && !containsExpiration(profile["expirations"], expiration) && len(activeExpirations([]string{expiration})) > 0 {
-		rows = append(rows, chain.Data...)
+		rows = append(append([]model.OptionRow(nil), rows...), chain.Data...)
 	}
 	if quoteErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": quoteErr.Error()})
@@ -3430,7 +3629,7 @@ func (s *Service) levels(c *gin.Context) {
 	if !cachedPayloadAvailable(extremes["extremes"]) {
 		extremes["warning"] = "历史刷新正在进行，历史极值后台计算中"
 	}
-	s.prefetchSymbolAnalytics(symbol)
+	s.prefetchSymbolAnalytics(symbol, false)
 	var spotValue, candidateSpot *float64
 	if spotNumber, ok := spot.(float64); ok && spotNumber > 0 {
 		spotValue = &spotNumber

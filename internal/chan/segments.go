@@ -153,7 +153,7 @@ func segmentEnd(strokes []Stroke, start int) (candidate, evidence, mode int, ok 
 				}
 			}
 		}
-		appendFeatureWindow(&features, &featureDirection, stroke, index, 2)
+		features = appendFeatureWindow(features, &featureDirection, stroke, index, 2)
 	}
 	if bestEvidence < 0 {
 		return -1, -1, 0, false
@@ -190,14 +190,14 @@ func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRan
 		}
 		if stroke.Direction == counter.Direction {
 			if !rightPairFixed {
-				appendFeature(&right, &rightDirection, stroke, index)
+				right = appendFeature(right, &rightDirection, stroke, index)
 				if len(right) == 3 {
 					right = right[:2]
 					rightPairFixed = true
 				}
 			}
 		} else {
-			appendFeatureWindow(&second, &secondDirection, stroke, index, 3)
+			second = appendFeatureWindow(second, &secondDirection, stroke, index, 3)
 			if gap && len(right) >= 2 && hasFeatureFractal(second, featureFractalKind(up)) {
 				return candidate, index, 2, true
 			}
@@ -269,23 +269,21 @@ func segmentEndpoint(strokes []Stroke, start, end int, direction string) int {
 	return endpoint
 }
 
-func appendFeature(features *[]featureRange, sequenceDirection *int, stroke Stroke, index int) {
+func appendFeature(features []featureRange, sequenceDirection *int, stroke Stroke, index int) []featureRange {
 	current := featureRange{StartStroke: index, EndStroke: index, Low: stroke.Low, High: stroke.High, Start: stroke.Start.Date, End: stroke.End.Date}
-	if len(*features) == 0 {
-		*features = append(*features, current)
-		return
+	if len(features) == 0 {
+		return append(features, current)
 	}
-	last := &(*features)[len(*features)-1]
+	last := &features[len(features)-1]
 	contains := current.High >= last.High && current.Low <= last.Low || last.High >= current.High && last.Low <= current.Low
 	if !contains {
-		*features = append(*features, current)
-		return
+		return append(features, current)
 	}
 	// The feature sequence's inclusion direction is recalculated from its
 	// latest two standardized elements once that pair exists. A direction
 	// inferred from the first pair becomes stale after a later reversal.
-	if len(*features) > 1 {
-		previous := (*features)[len(*features)-2]
+	if len(features) > 1 {
+		previous := features[len(features)-2]
 		*sequenceDirection = -1
 		if last.High > previous.High {
 			*sequenceDirection = 1
@@ -302,17 +300,19 @@ func appendFeature(features *[]featureRange, sequenceDirection *int, stroke Stro
 		last.High = math.Max(last.High, current.High)
 	}
 	last.EndStroke, last.End = index, current.End
+	return features
 }
 
 // appendFeatureWindow retains only the recent elements read by its caller.
 // Its backing storage needs one extra slot because appendFeature can append
 // before the old prefix is discarded.
-func appendFeatureWindow(features *[]featureRange, sequenceDirection *int, stroke Stroke, index, window int) {
-	appendFeature(features, sequenceDirection, stroke, index)
-	if len(*features) > window {
-		copy(*features, (*features)[len(*features)-window:])
-		*features = (*features)[:window]
+func appendFeatureWindow(features []featureRange, sequenceDirection *int, stroke Stroke, index, window int) []featureRange {
+	features = appendFeature(features, sequenceDirection, stroke, index)
+	if len(features) > window {
+		copy(features, features[len(features)-window:])
+		features = features[:window]
 	}
+	return features
 }
 
 func segmentFeatures(strokes []Stroke, start, end int, direction string, chain int) []featureRange {
@@ -323,7 +323,7 @@ func segmentFeatures(strokes []Stroke, start, end int, direction string, chain i
 		if stroke.Chain != chain || stroke.Direction == direction {
 			continue
 		}
-		appendFeature(&features, &featureDirection, stroke, i)
+		features = appendFeature(features, &featureDirection, stroke, i)
 	}
 	return features
 }

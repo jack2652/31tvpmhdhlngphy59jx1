@@ -51,6 +51,22 @@ const zooms = [];
 const directive = window.OptionScopeCharts.chanChartInteraction;
 directive.inserted(element, { value: { chart: model, onPan: (bars) => pans.push(bars), onZoom: (...args) => zooms.push(args) } });
 
+// Projection routes are painted on the canvas, so taps are hit-tested by the
+// interaction controller instead of relying on per-route SVG click targets.
+const scenarioClicks = [];
+model.projections = [{ key: "up", tone: "up", points: [{ x: 252, y: 100 }, { x: 288, y: 100 }] }];
+directive.componentUpdated(element, { value: {
+  chart: model,
+  onPan: (bars) => pans.push(bars),
+  onZoom: (...args) => zooms.push(args),
+  scenariosVisible: true,
+  onScenarioClick: (key) => scenarioClicks.push(key),
+} });
+let scenarioStopped = false;
+listeners.get("click")({ clientX: 270, clientY: 100, preventDefault() {}, stopPropagation() { scenarioStopped = true; } });
+assert.deepEqual(scenarioClicks, ["up"], "clicking a canvas projection route must forward the scenario key");
+assert.equal(scenarioStopped, true, "scenario clicks must not fall through to the chart dismiss handler");
+
 // Dragging right pans toward older bars and produces whole-bar steps.
 listeners.get("pointerdown")(pointer("pointerdown", 1, 100, 80));
 listeners.get("pointermove")(pointer("pointermove", 1, 130, 80));

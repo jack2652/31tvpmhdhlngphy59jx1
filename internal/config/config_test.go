@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,7 +10,7 @@ import (
 )
 
 func TestLoadUsesDotEnvBelowProcessEnvironment(t *testing.T) {
-	keys := []string{"HOST", "PORT", "DEFAULT_SYMBOLS", "ACCESS_KEY", "DATABASE_PATH", "MARKET_PROXY", "RAW_RETENTION_DAYS", "DATABASE_MAX_MB", "SIZE_CLEANUP_TIME_BUDGET_SECONDS", "SCHEDULER_ENABLED", "HISTORY_MAX_AGE_SECONDS", "EXTREMES_MAX_AGE_SECONDS", "UPSTREAM_TIMEOUT_SECONDS", "CBOE_TIMEOUT_SECONDS", "UPSTREAM_WAIT_SECONDS", "UPSTREAM_CONCURRENCY", "LOW_MEMORY", "ANALYSIS_CACHE_ENTRIES", "ALPACA_API_KEY", "ALPACA_API_SECRET"}
+	keys := []string{"HOST", "PORT", "DEFAULT_SYMBOLS", "ACCESS_KEY", "DATABASE_PATH", "MARKET_PROXY", "RAW_RETENTION_DAYS", "DATABASE_MAX_MB", "SIZE_CLEANUP_TIME_BUDGET_SECONDS", "SCHEDULER_ENABLED", "HISTORY_MAX_AGE_SECONDS", "EXTREMES_MAX_AGE_SECONDS", "UPSTREAM_TIMEOUT_SECONDS", "CBOE_TIMEOUT_SECONDS", "RESOURCE_MODE", "ANALYSIS_CACHE_ENTRIES", "ALPACA_API_KEY", "ALPACA_API_SECRET"}
 	oldValues := make(map[string]string, len(keys))
 	oldPresent := make(map[string]bool, len(keys))
 	for _, key := range keys {
@@ -58,12 +59,10 @@ func TestLoadUsesPythonSizeCleanupBudgetDefault(t *testing.T) {
 }
 
 func TestInboundConcurrencyMatchesPythonLimits(t *testing.T) {
-	t.Setenv("LOW_MEMORY", "false")
-	if got := Load().InboundConcurrency; got != 64 {
+	if got := inboundConcurrency(false); got != 64 {
 		t.Fatalf("normal inbound concurrency=%d, want 64", got)
 	}
-	t.Setenv("LOW_MEMORY", "true")
-	if got := Load().InboundConcurrency; got != 12 {
+	if got := inboundConcurrency(true); got != 12 {
 		t.Fatalf("low-memory inbound concurrency=%d, want 12", got)
 	}
 }
@@ -78,8 +77,6 @@ func TestLoadDefaultsEmptyDatabasePathToRuntimeDataDirectory(t *testing.T) {
 			_ = os.Unsetenv("DATABASE_PATH")
 		}
 	})
-	t.Setenv("LOW_MEMORY", "true")
-
 	runtimeDir := t.TempDir()
 	if got := LoadFromDir(runtimeDir).DatabasePath; got != filepath.Join(runtimeDir, "data", "options.db") {
 		t.Fatalf("explicit empty DATABASE_PATH=%q, want runtime data path", got)
@@ -226,15 +223,15 @@ func TestLoadDotEnvPreservesEnvironmentAndParsesValues(t *testing.T) {
 func TestLoadRejectsInvalidPositiveIntegerSettings(t *testing.T) {
 	keys := []string{
 		"RAW_RETENTION_DAYS", "HISTORY_MAX_AGE_SECONDS", "EXTREMES_MAX_AGE_SECONDS",
-		"UPSTREAM_TIMEOUT_SECONDS", "CBOE_TIMEOUT_SECONDS", "UPSTREAM_WAIT_SECONDS", "ANALYSIS_CACHE_ENTRIES",
+		"UPSTREAM_TIMEOUT_SECONDS", "CBOE_TIMEOUT_SECONDS", "ANALYSIS_CACHE_ENTRIES",
 	}
-	oldValues := make(map[string]string, len(keys)+1)
-	oldPresent := make(map[string]bool, len(keys)+1)
-	for _, key := range append(keys, "LOW_MEMORY") {
+	oldValues := make(map[string]string, len(keys))
+	oldPresent := make(map[string]bool, len(keys))
+	for _, key := range keys {
 		oldValues[key], oldPresent[key] = os.LookupEnv(key)
 	}
 	t.Cleanup(func() {
-		for _, key := range append(keys, "LOW_MEMORY") {
+		for _, key := range keys {
 			if oldPresent[key] {
 				_ = os.Setenv(key, oldValues[key])
 			} else {
@@ -242,11 +239,9 @@ func TestLoadRejectsInvalidPositiveIntegerSettings(t *testing.T) {
 			}
 		}
 	})
-	// Keep all positive-int paths active even on hosts whose automatic memory
-	// detection would otherwise bypass concurrency/cache settings.
-	if err := os.Setenv("LOW_MEMORY", "false"); err != nil {
-		t.Fatal(err)
-	}
+	// Keep every positive-int path active regardless of the host's detected
+	// memory profile.
+	t.Setenv("RESOURCE_MODE", "off")
 	for _, key := range keys {
 		for _, raw := range []string{"", "0", "-1", "not-an-int"} {
 			if err := os.Setenv(key, raw); err != nil {
@@ -265,12 +260,12 @@ func TestLoadRejectsInvalidPositiveIntegerSettings(t *testing.T) {
 	}
 }
 
-func TestLoadParsesRuntimeControlsAndLowMemoryOverrides(t *testing.T) {
+func TestLoadParsesRuntimeControlsWithResourceModeOff(t *testing.T) {
 	keys := map[string]string{
 		"DEFAULT_SYMBOLS": " aapl, MSFT, aapl ", "SCHEDULER_ENABLED": "false",
 		"HISTORY_MAX_AGE_SECONDS": "7200", "EXTREMES_MAX_AGE_SECONDS": "172800",
-		"UPSTREAM_WAIT_SECONDS": "20", "UPSTREAM_CONCURRENCY": "4", "LOW_MEMORY": "true",
-		"ANALYSIS_CACHE_ENTRIES": "64", "ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret",
+		"RESOURCE_MODE": "off", "ANALYSIS_CACHE_ENTRIES": "64",
+		"ALPACA_API_KEY": "key", "ALPACA_API_SECRET": "secret",
 	}
 	old := map[string]string{}
 	had := map[string]bool{}
@@ -293,10 +288,44 @@ func TestLoadParsesRuntimeControlsAndLowMemoryOverrides(t *testing.T) {
 	if strings.Join(loaded.DefaultSymbols, ",") != "AAPL,MSFT" || loaded.DefaultSymbol != "AAPL" || loaded.SchedulerEnabled || loaded.HistoryMaxAge != 2*time.Hour || loaded.ExtremesMaxAge != 48*time.Hour {
 		t.Fatalf("runtime settings mismatch: %#v", loaded)
 	}
-	if !loaded.LowMemory || loaded.UpstreamConcurrency < 1 || loaded.UpstreamConcurrency > 4 || loaded.UpstreamWait != 5*time.Second || loaded.AnalysisCacheEntries != 8 {
-		t.Fatalf("low-memory controls mismatch: %#v", loaded)
+	if loaded.ResourceMode != "off" || loaded.LowMemory || loaded.UpstreamConcurrency != 6 || loaded.UpstreamWait != 20*time.Second || loaded.AnalysisCacheEntries != 64 {
+		t.Fatalf("resource mode controls mismatch: %#v", loaded)
+	}
+	if loaded.GoMemoryLimitBytes != math.MaxInt64 || loaded.GoMemoryLimitSource != "off" {
+		t.Fatalf("resource mode off should remove the Go soft limit: bytes=%d source=%q", loaded.GoMemoryLimitBytes, loaded.GoMemoryLimitSource)
 	}
 	if loaded.AlpacaAPIKey != "key" || loaded.AlpacaAPISecret != "secret" {
 		t.Fatalf("provider credentials mismatch: %#v", loaded)
+	}
+}
+
+func TestResourceModeRejectsUnknownValues(t *testing.T) {
+	t.Setenv("RESOURCE_MODE", "manual")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("RESOURCE_MODE=manual should be rejected")
+		}
+	}()
+	_ = Load()
+}
+
+func TestAutoResourceCalculationsFollowDetectedBudget(t *testing.T) {
+	if !autoLowMemoryEnabled(256<<20, 200<<20) {
+		t.Fatal("small cgroup limit should enable low-memory mode")
+	}
+	if autoLowMemoryEnabled(8<<30, 4<<30) {
+		t.Fatal("large host budget should stay in normal mode")
+	}
+	if got := upstreamConcurrencyForResources(110<<20, 2, defaultUpstreamConcurrency); got != 1 {
+		t.Fatalf("110 MiB budget concurrency=%d, want 1", got)
+	}
+	if got := upstreamConcurrencyForResources(4<<30, 8, defaultUpstreamConcurrency); got != defaultUpstreamConcurrency {
+		t.Fatalf("large host concurrency=%d, want cap %d", got, defaultUpstreamConcurrency)
+	}
+	if got := upstreamWaitDuration(true); got != 5*time.Second {
+		t.Fatalf("low-memory slot wait=%s, want 5s", got)
+	}
+	if got := upstreamWaitDuration(false); got != 20*time.Second {
+		t.Fatalf("normal slot wait=%s, want 20s", got)
 	}
 }
