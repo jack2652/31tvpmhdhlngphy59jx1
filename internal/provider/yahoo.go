@@ -402,6 +402,12 @@ func yahooQuoteSessions(quote *yahooQuoteModel, now time.Time) map[string]any {
 		}
 		if !at.IsZero() && at.Unix() > 0 {
 			summary["as_of"] = at.Format(time.RFC3339)
+			// Quote timestamps can arrive in the host's timezone. Keep a
+			// trading-day label in ET so clients do not render +08:00 times as
+			// the next calendar day.
+			if location, err := time.LoadLocation("America/New_York"); err == nil {
+				summary["date"] = at.In(location).Format(time.DateOnly)
+			}
 		}
 		sessions[name] = summary
 	}
@@ -417,6 +423,18 @@ func yahooQuoteSessions(quote *yahooQuoteModel, now time.Time) map[string]any {
 		postPrice, postTime = quote.PostMarketPrice, quote.PostMarketTime
 	}
 	add("post", postPrice, quote.RegularMarketPrice, postTime, quote.RegularMarketTime)
+	// During the overnight session Yahoo still carries the after-hours price of
+	// the trading day that just finished. It is deliberately kept out of
+	// sessions.post (which means "the current trading day's after-hours"), but
+	// the analysis panel needs it: with no overnight quote for the post-market
+	// basis it would otherwise fall back to the overnight price and label that
+	// as 盘后价. Cap the age so a symbol without any after-hours trade for days
+	// does not surface an ancient print as yesterday's close.
+	if state == "OVERNIGHT" && !yahooCurrentSessionTime(quote.PostMarketTime, now) &&
+		validYahooPrice(quote.PostMarketPrice) && !quote.PostMarketTime.IsZero() &&
+		!quote.PostMarketTime.After(now) && now.Sub(quote.PostMarketTime) <= 7*24*time.Hour {
+		add("previous_post", quote.PostMarketPrice, quote.RegularMarketPrice, quote.PostMarketTime, quote.RegularMarketTime)
+	}
 	return sessions
 }
 

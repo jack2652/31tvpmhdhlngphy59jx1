@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"sync"
 	"time"
 
 	"option-scope-go/internal/marketcalendar"
@@ -34,7 +35,26 @@ type Hybrid struct {
 	Overnight     *Alpaca
 	HistoryClient HistoryClient
 	now           func() time.Time
+
+	// previousPost caches the last completed after-hours summary per symbol.
+	// During pre-market and overnight the current quote has no after-hours
+	// price, so the previous trading day's post-market price has to come from
+	// Yahoo's 1-minute prepost chart. It cannot change until the next
+	// after-hours window closes, so one lookup is cached for the whole session.
+	postMu       sync.Mutex
+	previousPost map[string]previousPostEntry
 }
+
+type previousPostEntry struct {
+	session map[string]any
+	day     string
+	expires time.Time
+}
+
+const (
+	previousPostSessionRetry = 2 * time.Minute
+	previousPostCacheLimit   = 256
+)
 
 func NewHybrid(regular *Yahoo, delayed *CboeOptionsClient, overnight *Alpaca) *Hybrid {
 	var history HistoryClient
@@ -159,7 +179,9 @@ func (h *Hybrid) Quote(ctx context.Context, rawSymbol string) (model.Quote, erro
 			return model.Quote{}, err
 		}
 		if overnightErr == nil && overnight.Price != nil {
-			return overnightOnlyQuote(overnight), nil
+			quote := overnightOnlyQuote(overnight)
+			h.attachPreviousPostSession(ctx, symbol, &quote)
+			return quote, nil
 		}
 		base, baseErr := h.Regular.Quote(ctx, symbol)
 		if baseErr != nil {
@@ -168,9 +190,23 @@ func (h *Hybrid) Quote(ctx context.Context, rawSymbol string) (model.Quote, erro
 			}
 			return model.Quote{}, baseErr
 		}
+		if shouldAttachPreviousPost(&base) {
+			h.attachPreviousPostSession(ctx, symbol, &base)
+		}
 		return base, nil
 	}
-	return h.Regular.Quote(ctx, symbol)
+	quote, err := h.Regular.Quote(ctx, symbol)
+	if err != nil {
+		return quote, err
+	}
+	// Pre-market and closed quotes carry the prior regular close in
+	// sessions.post.reference_close but no after-hours price. Attach the last
+	// completed post-market session so the analysis basis never falls back to
+	// the pre-market (or overnight) price while it is labelled 盘后价.
+	if shouldAttachPreviousPost(&quote) {
+		h.attachPreviousPostSession(ctx, symbol, &quote)
+	}
+	return quote, nil
 }
 
 // overnightOnlyQuote presents the Alpaca overnight snapshot as the current
@@ -193,6 +229,115 @@ func overnightOnlyQuote(overnight model.Quote) model.Quote {
 	}
 	overnight.MarketState = "OVERNIGHT"
 	return overnight
+}
+
+// shouldAttachPreviousPost reports whether the current quote needs the last
+// completed post-market session. During POST/REGULAR the active session is
+// authoritative; during PRE/OVERNIGHT/CLOSED there is no current post price,
+// and sessions.post only carries a reference close.
+func shouldAttachPreviousPost(quote *model.Quote) bool {
+	if quote == nil {
+		return false
+	}
+	switch quote.MarketState {
+	case "PRE", "OVERNIGHT", "CLOSED":
+	default:
+		return false
+	}
+	if summary, ok := quote.Sessions["post"].(map[string]any); ok && flexiblePositiveFloat(summary["price"]) != nil {
+		return false
+	}
+	return true
+}
+
+// attachPreviousPostSession stores the last completed after-hours summary as
+// sessions.previous_post, leaving sessions.post free to describe the current
+// trading day. The analysis basis then shows yesterday's after-hours price
+// instead of mislabeling the pre-market/overnight price as 盘后价.
+// The lookup is best effort: on failure the quote is returned unchanged.
+func (h *Hybrid) attachPreviousPostSession(ctx context.Context, symbol string, quote *model.Quote) {
+	if h == nil || quote == nil {
+		return
+	}
+	if quote.Sessions == nil {
+		quote.Sessions = make(map[string]any)
+	}
+	if previousPostSummary(quote) != nil {
+		return
+	}
+	if session := h.previousPostSession(ctx, symbol, quote); session != nil {
+		quote.Sessions["previous_post"] = session
+	}
+}
+
+func previousPostSummary(quote *model.Quote) map[string]any {
+	if quote == nil {
+		return nil
+	}
+	summary, ok := quote.Sessions["previous_post"].(map[string]any)
+	if !ok || flexiblePositiveFloat(summary["price"]) == nil {
+		return nil
+	}
+	return summary
+}
+
+func (h *Hybrid) previousPostSession(ctx context.Context, symbol string, source *model.Quote) map[string]any {
+	if h == nil || h.Regular == nil {
+		return nil
+	}
+	now := h.marketNow()
+	_, _, day, windowOK := previousPostSessionWindow(now)
+	dayKey := ""
+	if windowOK {
+		dayKey = day.Format(time.DateOnly)
+	}
+	h.postMu.Lock()
+	entry, cached := h.previousPost[symbol]
+	h.postMu.Unlock()
+	if cached && entry.day == dayKey && now.Before(entry.expires) {
+		return entry.session
+	}
+
+	// A Yahoo quote fetched for this request already carries the previous
+	// post summary when the source still exposes it. Alpaca's overnight quote
+	// does not, so ask Yahoo once in that path; a Yahoo quote with no
+	// previous_post (pre-market) goes straight to the 1-minute chart.
+	session := previousPostSummary(source)
+	if session == nil && (source == nil || source.Provider != "yahoo-chart") {
+		if regular, err := h.Regular.Quote(ctx, symbol); err == nil {
+			session = previousPostSummary(&regular)
+		}
+	}
+	if session == nil {
+		if summary, ok := h.Regular.PreviousPostSession(ctx, symbol); ok {
+			session = summary
+		}
+	}
+
+	// A hit stays until the next after-hours window closes; a failed or empty
+	// lookup is retried soon instead of being cached for the whole session.
+	expires := nextPostSessionEnd(now).Add(time.Minute)
+	if session == nil {
+		expires = now.Add(previousPostSessionRetry)
+	}
+	h.postMu.Lock()
+	if h.previousPost == nil {
+		h.previousPost = make(map[string]previousPostEntry)
+	}
+	for key, value := range h.previousPost {
+		if !now.Before(value.expires) {
+			delete(h.previousPost, key)
+		}
+	}
+	if len(h.previousPost) >= previousPostCacheLimit {
+		for key := range h.previousPost {
+			delete(h.previousPost, key)
+			break
+		}
+	}
+	h.previousPost[symbol] = previousPostEntry{session: session, day: dayKey, expires: expires}
+	h.postMu.Unlock()
+	return session
 }
 
 // SnapshotQuote matches the Python snapshot fetch path: outside regular

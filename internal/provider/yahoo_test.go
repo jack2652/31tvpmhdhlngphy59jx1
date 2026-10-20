@@ -651,6 +651,14 @@ func TestYahooQuoteMapsPreRegularPostAndOvernightSessions(t *testing.T) {
 			} else if _, exists := post["price"]; exists {
 				t.Errorf("stale post price should be omitted: %#v", post)
 			}
+			previousPost, previousPostOK := quote.Sessions["previous_post"].(map[string]any)
+			if test.name == "overnight" {
+				if !previousPostOK || previousPost["price"] != test.post || previousPost["reference_close"] != test.regular {
+					t.Errorf("overnight previous_post differs: %#v", quote.Sessions["previous_post"])
+				}
+			} else if previousPostOK {
+				t.Errorf("previous_post should only be exposed during overnight: %#v", previousPost)
+			}
 		})
 	}
 }

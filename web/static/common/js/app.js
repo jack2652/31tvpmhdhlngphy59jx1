@@ -20,6 +20,7 @@ const FAIR_VALUE_RETRY_INTERVAL_MS = 2500;
 const TREND_SIGNAL_TITLE = "规则估算，不是下单指令";
 const CHAN_FOLD_KEYS = {
   panel: "option-scope-chan",
+  stats: "option-scope-chan-stats",
   plan: "option-scope-chan-plan",
   terms: "option-scope-chan-terms",
   evidence: "option-scope-chan-evidence",
@@ -120,6 +121,7 @@ const state = {
   chanSpotGuideSide: "up",
   chanExpanded: readFoldState(CHAN_FOLD_KEYS.panel, false),
   chanFolds: {
+    stats: readFoldState(CHAN_FOLD_KEYS.stats, false),
     plan: readFoldState(CHAN_FOLD_KEYS.plan, false),
     terms: readFoldState(CHAN_FOLD_KEYS.terms, false),
     evidence: readFoldState(CHAN_FOLD_KEYS.evidence, false),
@@ -1637,14 +1639,32 @@ function summarizeDistribution(rows, spot, key) {
   return summary;
 }
 // 压力位/支撑位的基准价：优先盘后价——盘后成交更接近当日结算价，盘前冲高与盘中回落常是「假突破」，
-// 用它们当基准会把关键位算偏；没有盘后数据时依次回退盘前价、常规价。
+// 用它们当基准会把关键位算偏。盘后价只用「当前盘后」或「上一交易日盘后」，绝不回退盘前价/夜盘价：
+// 后端在盘前、夜盘和休市时会从 Yahoo 1 分钟盘前盘后数据补出 sessions.previous_post；
+// 若上一交易日确实没有盘后数据，退回该交易日收盘价，也不能拿盘前价冒充盘后价。
 function levelBasis(quote, fallbackPrice) {
   const sessions = quote?.sessions || {};
-  for (const [key, label] of [["post", "盘后"], ["pre", "盘前"]]) {
+  for (const key of ["post", "previous_post"]) {
     const price = Number(sessions[key]?.price);
-    if (Number.isFinite(price) && price > 0) return { price, label };
+    if (Number.isFinite(price) && price > 0) {
+      const asOf = typeof sessions[key]?.date === "string"
+        ? sessions[key].date
+        : (typeof sessions[key]?.as_of === "string" ? sessions[key].as_of.slice(0, 10) : "");
+      return { price, label: "盘后", asOf };
+    }
   }
-  return { price: Number(fallbackPrice), label: "常规" };
+  // 盘中 sessions.post.reference_close 就是当前常规价，不能当成「昨收」；
+  // 盘中仍沿用旧口径回退实时价，非盘中才用最近一个已完成交易日的收盘价兜底。
+  if (quote?.market_state !== "REGULAR") {
+    const reference = Number(sessions.post?.reference_close ?? quote?.previous_close);
+    if (Number.isFinite(reference) && reference > 0) {
+      const asOf = typeof sessions.post?.date === "string"
+        ? sessions.post.date
+        : (typeof sessions.post?.as_of === "string" ? sessions.post.as_of.slice(0, 10) : "");
+      return { price: reference, label: "昨收", asOf };
+    }
+  }
+  return { price: Number(fallbackPrice), label: "常规", asOf: "" };
 }
 
 // 基准价开关的两个口径：live 实时价（默认）、close 盘后价（沿用旧口径）；常量用于遍历同步按钮状态。
@@ -2831,13 +2851,15 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const fallbackPrice = Number(spot);
   const displayedPrice = Number.isFinite(basisPrice) && basisPrice > 0 ? basisPrice : fallbackPrice;
   const validPrice = Number.isFinite(displayedPrice) && displayedPrice > 0;
-  const priceLabel = selectedBasis?.label === "夜盘价"
-    ? "夜盘价"
-    : (state.levelBasisMode === "live" && selectedBasis?.label === "收盘"
-      ? "收盘价"
-      : (BASIS_MODES[state.levelBasisMode] || BASIS_MODES.live));
+  // 标签跟随实际取到的口径：夜盘/盘后数据缺失而回退到常规价时不能再写成「盘后价」。
+  const priceLabel = state.levelBasisMode === "close"
+    ? (selectedBasis?.label === "盘后" ? "盘后价" : (selectedBasis?.label === "昨收" ? "盘后价·昨收" : (selectedBasis?.label === "盘前" ? "盘前价" : "常规价")))
+    : (selectedBasis?.label === "夜盘价"
+      ? "夜盘价"
+      : (selectedBasis?.label === "收盘" ? "收盘价" : "实时价"));
+  const basisAsOf = typeof selectedBasis?.asOf === "string" && selectedBasis.asOf.length >= 10 ? selectedBasis.asOf : "";
   const priceTitle = validPrice
-    ? `${priceLabel} ${formatMoney(displayedPrice)} · 数据来源：${selectedBasis?.label || "常规"}`
+    ? `${priceLabel} ${formatMoney(displayedPrice)} · 数据来源：${selectedBasis?.label || "常规"}${basisAsOf ? " " + basisAsOf : ""}`
     : `${priceLabel}暂无数据`;
   // 夜盘、盘前还没进入新的常规交易，开盘价属于上一交易日，文案用昨开；盘中和盘后仍是今开。
   const priorSessionOpen = trendMarket?.market_state === "PRE" || trendMarket?.market_state === "OVERNIGHT";
@@ -3574,9 +3596,25 @@ function hydrateTrendFromChan(payload, preferredSpot = null, preserveOptionLevel
     ?? finitePrice(activeSessionQuote(quote)?.price ?? quote?.price)
     ?? finitePrice(payload.spot);
   state.trendHistorySymbol = state.symbol;
+  // Chan market_analysis is built from daily bars without option-chain rows, so
+  // its stop loss, buy point and support list stay empty even when the levels
+  // payload already produced them. Keep those option-derived values instead of
+  // letting this faster response erase the trend card back to "--".
+  const levels = state.serverLevelsPayload;
+  const sameLevelsContext = serverLevelsHasCompleteFields(levels)
+    && state.serverLevelsContext === `${state.symbol}|${state.expiration}|${state.levelBasisMode}`;
+  const analysisBuy = Number(analysis.trade_points?.buy?.price);
+  const levelsBuy = Number(levels?.trade_points?.buy?.price);
+  const tradePoints = sameLevelsContext && levelsBuy > 0 && !(analysisBuy > 0)
+    ? levels.trade_points
+    : analysis.trade_points;
+  const stopLoss = analysis.stop_loss || (sameLevelsContext ? levels.stop_loss : null);
+  const stopSupports = Array.isArray(analysis.support) && analysis.support.length
+    ? analysis.support
+    : sameLevelsContext ? levels.support : analysis.support || [];
   renderTrend(analysis.trend || null, analysis.extremes || null, spot, payload.history || null,
-    analysis.recommendation || null, analysis.trade_points || null, analysis.trade_points_horizon || null,
-    analysis.trend_market || null, analysis.beta || null, analysis.stop_loss || null, analysis.support || []);
+    analysis.recommendation || null, tradePoints || null, analysis.trade_points_horizon || null,
+    analysis.trend_market || null, analysis.beta || null, stopLoss || null, stopSupports);
   if (!preserveOptionLevels) {
     const resistance = analysis.resistance || [];
     const support = analysis.support || [];
@@ -5905,6 +5943,10 @@ const optionScopeApp = new Vue({
       if (!this.chanExpanded) return;
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) this.ensureChanIntraday(this.chanPeriod);
       if (state.chanStale || state.chanPayload?.symbol !== state.symbol) refreshChanAnalysis(true);
+    },
+    toggleChanStats() {
+      this.chanFolds.stats = !this.chanFolds.stats;
+      rememberFoldState(CHAN_FOLD_KEYS.stats, this.chanFolds.stats);
     },
     rememberChanFold(name, event) {
       if (!Object.prototype.hasOwnProperty.call(this.chanFolds, name)) return;

@@ -139,8 +139,12 @@ function bindChanChartHover(target, initialBinding) {
   const initial = initialBinding?.chart ? initialBinding : { chart: initialBinding };
   const vertical = layer.querySelector(".chart-crosshair");
   const horizontal = layer.querySelector(".chart-crosshair-h");
+  const horizontalVolume = layer.querySelector(".chart-crosshair-volume");
+  const horizontalMacd = layer.querySelector(".chart-crosshair-macd");
   const tagX = layer.querySelector(".chart-tag-x");
   const tagY = layer.querySelector(".chart-tag-y");
+  const tagVolume = layer.querySelector(".chart-tag-volume");
+  const tagMacd = layer.querySelector(".chart-tag-macd");
   let model = initial.chart;
   let scenariosVisible = initial.scenariosVisible !== false;
   let onScenarioHover = initial.onScenarioHover;
@@ -149,6 +153,7 @@ function bindChanChartHover(target, initialBinding) {
   let activeIndex = null;
   let lastPointer = null;
   let shownCandle = null;
+  let shownHeaderCandle = null;
   const title = document.createElement("div");
   title.className = "chart-tooltip-title";
   const subtitle = document.createElement("div");
@@ -159,6 +164,12 @@ function bindChanChartHover(target, initialBinding) {
   changeLabel.textContent = "涨幅";
   const changeValue = document.createElement("strong");
   changeRow.append(changeLabel, changeValue);
+  const volumeRow = document.createElement("div");
+  volumeRow.className = "chart-tooltip-row chan-volume-row";
+  const volumeLabel = document.createElement("span");
+  volumeLabel.textContent = "成交量";
+  const volumeValue = document.createElement("strong");
+  volumeRow.append(volumeLabel, volumeValue);
   const structureDetail = document.createElement("section");
   structureDetail.className = "chan-structure-tooltip";
   structureDetail.hidden = true;
@@ -177,12 +188,18 @@ function bindChanChartHover(target, initialBinding) {
     tooltip.append(row);
   });
   tooltip.append(changeRow);
+  tooltip.append(volumeRow);
   tooltip.append(structureDetail);
   const hide = () => {
+    const wasActive = activeIndex != null;
     layer.setAttribute("visibility", "hidden");
     tooltip.hidden = true;
     activeIndex = null;
     lastPointer = null;
+    if (wasActive) {
+      drawChanIndicatorHeaders(target, model, latestIndicatorCandle(model));
+      shownHeaderCandle = null;
+    }
   };
   const hideScenarioHover = (event) => {
     if (hoveredScenario == null) return;
@@ -220,26 +237,66 @@ function bindChanChartHover(target, initialBinding) {
     const candle = model?.candles?.[index];
     if (!candle || !target.offsetWidth || !target.offsetHeight) { hide(); return; }
     activeIndex = index;
+    if (shownHeaderCandle !== candle) {
+      drawChanIndicatorHeaders(target, model, candle);
+      shownHeaderCandle = candle;
+    }
     const localX = Number.isFinite(localXOverride) ? localXOverride : candle.x;
+    const crosshairBottom = Number.isFinite(model.crosshairBottom) ? model.crosshairBottom : model.plotBottom;
+    const inPricePane = localY >= model.plotTop && localY <= model.plotBottom;
+    const inVolumePane = Number.isFinite(model.volumeTop) && Number.isFinite(model.volumeBottom)
+      && localY >= model.volumeTop && localY <= model.volumeBottom;
+    const inMacdPane = Number.isFinite(model.macdTop) && Number.isFinite(model.macdBottom)
+      && localY >= model.macdTop && localY <= model.macdBottom;
     const plotHeight = model.plotBottom - model.plotTop;
     const priceRange = model.maximum - model.minimum;
     const cursorY = Math.max(model.plotTop, Math.min(model.plotBottom, localY));
     const price = model.maximum - (cursorY - model.plotTop) / plotHeight * priceRange;
-    setLine(vertical, candle.x, model.plotTop, candle.x, model.plotBottom);
+    setLine(vertical, candle.x, model.plotTop, candle.x, crosshairBottom);
     // The Chan chart reserves its right side for scenario cards; keep the
     // historical crosshair inside the candle plot so it cannot strike text.
-    setLine(horizontal, model.plotLeft, cursorY, model.historyRight ?? model.plotRight, cursorY);
+    if (inPricePane) {
+      setLine(horizontal, model.plotLeft, cursorY, model.historyRight ?? model.plotRight, cursorY);
+      horizontal.removeAttribute("visibility");
+    } else {
+      horizontal.setAttribute("visibility", "hidden");
+    }
+    if (horizontalVolume) {
+      if (inVolumePane) {
+        setLine(horizontalVolume, model.plotLeft, localY, model.plotRight, localY);
+        horizontalVolume.removeAttribute("visibility");
+      } else horizontalVolume.setAttribute("visibility", "hidden");
+    }
+    if (horizontalMacd) {
+      if (inMacdPane) {
+        setLine(horizontalMacd, model.plotLeft, localY, model.plotRight, localY);
+        horizontalMacd.removeAttribute("visibility");
+      } else horizontalMacd.setAttribute("visibility", "hidden");
+    }
     const displayDate = candle.displayDate || candle.date;
     const axisDate = displayDate.includes(" ") ? displayDate.slice(5) : displayDate;
     const dateWidth = Math.max(84, axisDate.length * 7 + 12);
     setTag(tagX, axisDate, Math.max(2, Math.min(model.width - dateWidth - 2, candle.x - dateWidth / 2)), model.height - 22, dateWidth);
     const priceLabel = formatMoney(price), priceWidth = Math.min(model.plotLeft - 4, Math.max(42, priceLabel.length * 6 + 10));
     // Preserve the current-price badge when the cursor reaches the same price.
-    const overlapsSpot = model.spot && Math.abs(cursorY - model.spot.y) < model.spot.height / 2 + 10;
+    const overlapsSpot = inPricePane && model.spot && Math.abs(cursorY - model.spot.y) < model.spot.height / 2 + 10;
     const priceX = Math.max(2, model.plotLeft - priceWidth - 4);
     setTag(tagY, priceLabel, priceX, cursorY - 9, priceWidth);
-    if (overlapsSpot) tagY.setAttribute("visibility", "hidden");
+    if (!inPricePane || overlapsSpot) tagY.setAttribute("visibility", "hidden");
     else tagY.removeAttribute("visibility");
+    const setPaneTag = (tag, active, text, y) => {
+      if (!tag) return;
+      if (!active) { tag.setAttribute("visibility", "hidden"); return; }
+      const width = Math.min(model.plotLeft - 4, Math.max(42, text.length * 6 + 10));
+      setTag(tag, text, Math.max(2, model.plotLeft - width - 4), y - 9, width);
+      tag.removeAttribute("visibility");
+    };
+    const volumeAtCursor = inVolumePane && model.volumeMax > 0
+      ? model.volumeMax * (model.volumeBottom - localY) / Math.max(1, model.volumeBottom - model.volumeTop) : null;
+    const macdAtCursor = inMacdPane
+      ? model.macdMax - (localY - model.macdTop) / Math.max(1, model.macdBottom - model.macdTop) * (model.macdMax - model.macdMin) : null;
+    setPaneTag(tagVolume, inVolumePane, volumeAtCursor == null ? "" : formatVolume(Math.max(0, volumeAtCursor)), localY);
+    setPaneTag(tagMacd, inMacdPane, macdAtCursor == null ? "" : formatIndicator(macdAtCursor), localY);
     if (shownCandle !== candle) {
       title.textContent = displayDate;
       subtitle.textContent = `${model.periodLabel} · 已收盘 K 线`;
@@ -253,6 +310,7 @@ function bindChanChartHover(target, initialBinding) {
       changeValue.textContent = Number.isFinite(change)
         ? `${change > 0 ? "+" : ""}${change.toFixed(2)}%` : "未知";
       changeValue.className = `chan-ohlc-value ${!Number.isFinite(change) ? "chan-ohlc-flat" : change > 0 ? "chan-ohlc-up" : change < 0 ? "chan-ohlc-down" : "chan-ohlc-flat"}`;
+      volumeValue.textContent = formatVolume(candle.volume);
       shownCandle = candle;
     }
     const distanceToSegment = (item) => {
@@ -311,7 +369,7 @@ function bindChanChartHover(target, initialBinding) {
       scenariosVisible && event.pointerType === "mouse" && !event.buttons ? chanProjectionKeyAt(model, point) : null,
       event,
     );
-    if (point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > model.plotBottom) { hide(); return; }
+    if (point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > (model.crosshairBottom ?? model.plotBottom)) { hide(); return; }
     lastPointer = event;
     const slot = ((model.historyRight ?? model.plotRight) - model.plotLeft) / model.candles.length;
     const index = Math.max(0, Math.min(model.candles.length - 1, Math.floor((point.x - model.plotLeft) / slot)));
@@ -353,6 +411,7 @@ function bindChanChartHover(target, initialBinding) {
       if (!scenariosVisible) hideScenarioHover();
       const activeDate = activeIndex == null ? null : model?.candles?.[activeIndex]?.date;
       model = next.chart;
+      shownHeaderCandle = null;
       if (lastPointer) onMove(lastPointer);
       else if (activeDate) {
         const nextIndex = model?.candles?.findIndex((candle) => candle.date === activeDate) ?? -1;
@@ -435,6 +494,64 @@ function ensureElementIconFont(render) {
     elementIconFontReady = document.fonts.check("11px element-icons");
     render();
   }).catch(() => { /* Keep the plain question-mark fallback. */ });
+}
+
+// Chart-local volume shorthand: keeps the indicator header and tooltip compact
+// without pulling the page-level formatters into this module.
+function formatVolume(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  const abs = Math.abs(number);
+  if (abs >= 1e8) return (number / 1e8).toFixed(2) + "亿";
+  if (abs >= 1e4) return (number / 1e4).toFixed(2) + "万";
+  return String(Math.round(number));
+}
+
+function formatIndicator(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return `${number > 0 ? "+" : ""}${number.toFixed(2)}`;
+}
+
+function latestIndicatorCandle(model) {
+  const candles = model?.candles || [];
+  return candles.length ? candles[candles.length - 1] : null;
+}
+
+function indicatorHeaderText(candle) {
+  const volume = candle && Number.isFinite(Number(candle.volume)) ? formatVolume(candle.volume) : "--";
+  const macd = candle?.macd;
+  return {
+    volume: `成交量  ${volume}`,
+    macd: macd
+      ? `MACD  DIF ${formatIndicator(macd.dif)} · DEA ${formatIndicator(macd.dea)} · 柱 ${formatIndicator(macd.hist)}`
+      : "MACD",
+  };
+}
+
+function indicatorHeaderFont(model) {
+  return `${model?.mobileChart ? 10 : 9}px Inter, ui-sans-serif, system-ui, sans-serif`;
+}
+
+// Repaint only the two header strips while hovering. Clearing the whole chart
+// on every pointer move would defeat the canvas hover fast path.
+function drawChanIndicatorHeaders(target, model, candle) {
+  const canvas = target.querySelector("canvas.chan-chart-canvas");
+  const context = canvas?.getContext("2d");
+  if (!context || !model || !(canvas.width > 0) || !(canvas.height > 0)
+    || !Number.isFinite(model.volumeTop) || !Number.isFinite(model.macdTop)) return;
+  context.setTransform(canvas.width / model.width, 0, 0, canvas.height / model.height, 0, 0);
+  const color = chanThemeColor(target, "--muted", "#81909c");
+  const width = Math.max(1, model.plotRight - model.plotLeft + 4);
+  context.clearRect(model.plotLeft - 2, model.volumeTop - 18, width, 16);
+  context.clearRect(model.plotLeft - 2, model.macdTop - 18, width, 16);
+  context.font = indicatorHeaderFont(model);
+  context.fillStyle = color;
+  context.textAlign = "left";
+  context.textBaseline = "alphabetic";
+  const header = indicatorHeaderText(candle);
+  context.fillText(header.volume, model.plotLeft, model.volumeTop - 6);
+  context.fillText(header.macd, model.plotLeft, model.macdTop - 6);
 }
 
 function drawChanCanvas(target, binding) {
@@ -586,6 +703,65 @@ function drawChanCanvas(target, binding) {
     context.fillStyle = color; context.fillText(signalLabel, signal.x, labelY);
   }
   if (model.spot) line(model.plotLeft, model.spot.y, model.historyRight, model.spot.y, colors.spot, [3, 4], 1);
+  // Volume pane: same time axis and candle slot width as the price pane.
+  if (Number.isFinite(model.volumeTop) && Number.isFinite(model.volumeBottom)) {
+    const volumeHeight = model.volumeBottom - model.volumeTop;
+    line(model.plotLeft, model.volumeTop, model.plotRight, model.volumeTop, colors.grid, [2, 4], 1);
+    context.save();
+    context.globalAlpha = 0.72;
+    for (const candle of model.candles || []) {
+      const volume = Number(candle.volume) || 0;
+      if (volume <= 0) continue;
+      const barHeight = Math.max(1, Math.min(volumeHeight - 4, volume / model.volumeMax * (volumeHeight - 4)));
+      context.fillStyle = candle.direction === "up" ? colors.up : colors.down;
+      context.fillRect(candle.x - candle.bodyWidth / 2, model.volumeBottom - barHeight, Math.max(1, candle.bodyWidth), barHeight);
+    }
+    context.restore();
+    const indicatorFont = indicatorHeaderFont(model);
+    label(indicatorHeaderText(latestIndicatorCandle(model)).volume, model.plotLeft, model.volumeTop - 6,
+      { font: indicatorFont, color: colors.text });
+    line(model.plotLeft, model.volumeBottom, model.plotRight, model.volumeBottom, colors.axis, [], 1);
+  }
+  // MACD pane: histogram around zero plus DIF/DEA lines.
+  if (Number.isFinite(model.macdTop) && Number.isFinite(model.macdBottom)) {
+    const macdHeight = model.macdBottom - model.macdTop;
+    const macdY = (value) => model.macdTop + (model.macdMax - value) / (model.macdMax - model.macdMin) * macdHeight;
+    const zeroY = Number.isFinite(model.macdZeroY) ? model.macdZeroY : macdY(0);
+    line(model.plotLeft, model.macdTop, model.plotRight, model.macdTop, colors.grid, [2, 4], 1);
+    context.save();
+    for (const candle of model.candles || []) {
+      const item = candle.macd;
+      if (!item || !Number.isFinite(item.hist)) continue;
+      const valueY = macdY(item.hist);
+      context.globalAlpha = 0.62;
+      context.fillStyle = item.hist >= 0 ? colors.up : colors.down;
+      context.fillRect(candle.x - candle.bodyWidth / 2, Math.min(zeroY, valueY), Math.max(1, candle.bodyWidth), Math.max(1, Math.abs(valueY - zeroY)));
+    }
+    context.restore();
+    line(model.plotLeft, zeroY, model.plotRight, zeroY, colors.axis, [3, 3], 1);
+    const drawMacdLine = (key, color) => {
+      context.beginPath();
+      let started = false;
+      for (const candle of model.candles || []) {
+        const item = candle.macd;
+        if (!item || !Number.isFinite(item[key])) { started = false; continue; }
+        const valueY = macdY(item[key]);
+        if (started) context.lineTo(candle.x, valueY);
+        else { context.moveTo(candle.x, valueY); started = true; }
+      }
+      context.strokeStyle = color;
+      context.lineWidth = 1.4;
+      context.setLineDash([]);
+      context.stroke();
+    };
+    drawMacdLine("dif", colors.amber);
+    drawMacdLine("dea", colors.blue);
+    const indicatorFont = indicatorHeaderFont(model);
+    label(indicatorHeaderText(latestIndicatorCandle(model)).macd, model.plotLeft, model.macdTop - 6,
+      { font: indicatorFont, color: colors.text });
+    line(model.plotLeft, model.macdBottom, model.plotRight, model.macdBottom, colors.axis, [], 1);
+    line(model.plotLeft, model.macdBottom, model.plotRight, model.macdBottom, colors.axis, [], 1);
+  }
   // Bottom axis and the three visible date anchors.
   line(model.plotLeft, model.plotBottom, model.plotRight, model.plotBottom, colors.axis, [], 1);
   for (const date of model.dates || []) {
@@ -753,10 +929,10 @@ function bindChanChartInteraction(element, binding) {
     if (event.pointerType !== "touch" && event.pointerType !== "mouse" && event.pointerType !== "pen") return;
     // SVG controls and the scenario toggle own their click/touch gestures. Taking
     // pointer capture here retargets their click to the chart container.
-    if (event.target.closest?.(".chan-scenario-toggle-canvas, .chan-projection-up, .chan-projection-down, .chan-projection-range")) return;
+    if (event.target.closest?.(".chan-scenario-toggle-canvas, .chan-projection-backdrop, .chan-projection-up, .chan-projection-down, .chan-projection-range")) return;
     const point = localPoint(event);
     const model = state.model;
-    if (!point || !model || point.x < model.plotLeft || point.x > model.historyRight || point.y < model.plotTop || point.y > model.plotBottom) return;
+    if (!point || !model || point.x < model.plotLeft || point.x > model.historyRight || point.y < model.plotTop || point.y > (model.interactionBottom ?? model.plotBottom)) return;
     state.pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY, pointerType: event.pointerType });
     try { element.setPointerCapture(event.pointerId); } catch (_) { /* Capture is not available in older browsers. */ }
     if (event.pointerType === "touch" && touchPointers().length >= 2) {
@@ -828,6 +1004,7 @@ function bindChanChartInteraction(element, binding) {
       return;
     }
     if (!state.scenariosVisible || !state.onScenarioClick || !state.model) return;
+    if (event.target?.closest?.(".chan-projection-backdrop, .chan-projection-float-card")) return;
     const point = localPoint(event);
     const key = point ? chanProjectionKeyAt(state.model, point, 16) : null;
     if (!key) return;

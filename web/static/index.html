@@ -50,7 +50,7 @@
         <div class="detail-modes" id="detail-modes" hidden>
           <div class="detail-segmented" role="group" aria-label="压力位/支撑位的计算基准">
             <button class="detail-seg" id="basis-live" type="button" data-basis="live" aria-pressed="true" title="按当前时段的实时价（盘中为最新成交价）重算压力位与支撑位">实时价</button>
-            <button class="detail-seg" id="basis-close" type="button" data-basis="close" aria-pressed="false" title="按盘后价重算（沿用原口径，盘后数据缺失时回退盘前价）">盘后价</button>
+            <button class="detail-seg" id="basis-close" type="button" data-basis="close" aria-pressed="false" title="按盘后价重算（夜盘取上一个交易日的盘后价；盘后数据缺失时回退盘前价、常规价）">盘后价</button>
           </div>
         </div>
         <span class="detail-action" id="detail-action">收起</span>
@@ -161,7 +161,13 @@
           <div class="chan-meta"><strong class="chan-summary-spot">现价 {{ view.chan.spot }}</strong><span class="chan-status-line" role="status">{{ chanLoading ? '正在计算…' : (view.chan.refreshing ? '行情正在后台更新' : '行情已更新至 ' + chanFrame.asOf) }}</span><span class="chan-summary-quality chan-quality" :class="'chan-quality-' + chanFrame.recursive.qualityClass">行情{{ chanFrame.recursive.quality }}</span></div>
         </div>
         <section class="chan-recursive" aria-labelledby="chan-recursive-title">
-          <header class="chan-recursive-header"><span class="chan-section-label" id="chan-recursive-title">当前周期结构统计</span></header>
+          <header class="chan-recursive-header">
+            <button class="chan-recursive-toggle" type="button" :aria-expanded="chanFolds.stats ? 'true' : 'false'" aria-controls="chan-recursive-body" @click="toggleChanStats">
+              <span class="chan-section-label" id="chan-recursive-title">当前周期结构统计</span>
+              <span class="chan-recursive-toggle-action">{{ chanFolds.stats ? '收起' : '展开' }}</span>
+            </button>
+          </header>
+          <div class="chan-recursive-body" id="chan-recursive-body" v-show="chanFolds.stats">
           <dl class="chan-recursive-stats">
             <div><dt>已确认线段</dt><dd>{{ chanFrame.recursive.confirmedSegments }}</dd><small v-if="chanFrame.recursive.formingSegments">另有 {{ chanFrame.recursive.formingSegments }} 条形成中</small></div>
             <div><dt>已闭合中枢</dt><dd>{{ chanFrame.recursive.closedCenters }}</dd><small v-if="chanFrame.recursive.formingCenters">另有 {{ chanFrame.recursive.formingCenters }} 个形成中</small></div>
@@ -195,6 +201,7 @@
             </div>
           </details>
           <details class="chan-recursive-detail"><summary>数据与识别说明</summary><p>{{ chanFrame.recursive.priceBasis }} · {{ chanFrame.recursive.mapping }} · {{ chanFrame.recursive.acceptedBars }}/{{ chanFrame.recursive.inputBars }} 根有效行情 · 缺口 {{ chanFrame.recursive.gaps }} 处 · {{ chanFrame.recursive.market }}</p></details>
+          </div>
         </section>
         <div class="chan-controls">
           <div class="chan-chart-controls"><h3>价格图表</h3><div class="chan-control-options">
@@ -242,15 +249,20 @@
             <desc id="chan-chart-description">{{ chanFrame.chart.description }}</desc>
             <!-- 交互层只负责十字线，历史图元与条件情景由 Canvas 一次性绘制。 -->
             <g v-pre class="chan-crosshair-layer" aria-hidden="true" visibility="hidden">
-              <line class="chart-crosshair"></line><line class="chart-crosshair-h"></line>
+              <line class="chart-crosshair"></line>
+              <line class="chart-crosshair-h chart-crosshair-price"></line>
+              <line class="chart-crosshair-h chart-crosshair-volume"></line>
+              <line class="chart-crosshair-h chart-crosshair-macd"></line>
               <g class="chart-tag chart-tag-x"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-y"><rect rx="2" height="18"></rect><text></text></g>
+              <g class="chart-tag chart-tag-volume"><rect rx="2" height="18"></rect><text></text></g>
+              <g class="chart-tag chart-tag-macd"><rect rx="2" height="18"></rect><text></text></g>
             </g>
           </svg>
           <div v-if="chanFrame.chart.spot" class="chan-spot-mobile-badge" :style="{ left: (chanFrame.chart.plotLeft / chanFrame.chart.width * 100) + '%', top: (chanFrame.chart.spot.y / chanFrame.chart.height * 100) + '%' }" role="button" tabindex="0" aria-label="现价，点击切换结构观察" :aria-expanded="chanSpotGuideVisible ? 'true' : 'false'" :aria-describedby="chanSpotGuideVisible ? 'chan-spot-guide-card' : null" @click.stop="toggleChanSpotGuide($event)" @keydown.esc.stop.prevent="dismissChanSpotGuide" @keydown.enter.stop.prevent="toggleChanSpotGuide($event)" @keydown.space.stop.prevent="toggleChanSpotGuide($event)">{{ chanFrame.chart.spot.label }}</div>
           <div v-else-if="chanFrame.chart.spot" class="chan-spot-mobile-badge chan-spot-mobile-badge-static" :style="{ left: (chanFrame.chart.plotLeft / chanFrame.chart.width * 100) + '%', top: (chanFrame.chart.spot.y / chanFrame.chart.height * 100) + '%' }" aria-label="现价">{{ chanFrame.chart.spot.label }}</div>
           <div v-pre class="chart-tooltip chan-chart-tooltip" id="chan-chart-readout" hidden></div>
-          <template v-if="chanFrame.chart && chanFrame.chart.projections && chanScenariosVisible"><article v-for="route in chanFrame.chart.projections" v-if="chanHoveredScenario === route.key" :id="'chan-scenario-card-' + route.key" :key="route.key + '-card'" class="chan-projection-float-card" :class="'chan-projection-' + route.tone" :style="{ left: chanScenarioCardX + 'px' }" @mouseenter="showChanScenario(route.key, $event)" @mouseleave="hideChanScenario($event)" @click.stop><h4><span class="chan-scenario-title">{{ route.label }}</span><span class="chan-route-meta"><strong>倾向 {{ route.tiltScore }}/100</strong><span>{{ route.status }}</span></span></h4><p class="chan-tilt-note">综合日周位置、确认笔与有效信号的规则倾向分 · 非历史胜率</p><dl><div><dt>观察</dt><dd>{{ route.expectation }}</dd></div><div><dt>条件</dt><dd>{{ route.condition }}</dd></div><div><dt>失效</dt><dd>{{ route.invalidation }}</dd></div></dl></article></template>
+          <template v-if="chanFrame.chart && chanFrame.chart.projections && chanScenariosVisible"><article v-for="route in chanFrame.chart.projections" v-if="chanHoveredScenario === route.key" :id="'chan-scenario-card-' + route.key" :key="route.key + '-card'" class="chan-projection-float-card" :class="'chan-projection-' + route.tone" :style="{ left: chanScenarioCardX + 'px' }" @mouseenter="showChanScenario(route.key, $event)" @mouseleave="hideChanScenario($event)" @click.stop><header><h4><span class="chan-scenario-title">{{ route.label }}</span><span class="chan-route-meta"><strong>倾向 {{ route.tiltScore }}/100</strong><span>{{ route.status }}</span></span></h4><button v-if="isChanTouchInput()" type="button" class="chan-projection-close" aria-label="关闭条件情景" @click.stop="hideChanScenario($event)">×</button></header><p class="chan-tilt-note">综合日周位置、确认笔与有效信号的规则倾向分 · 非历史胜率</p><dl><div><dt>观察</dt><dd>{{ route.expectation }}</dd></div><div><dt>条件</dt><dd>{{ route.condition }}</dd></div><div><dt>失效</dt><dd>{{ route.invalidation }}</dd></div></dl></article></template>
         </div>
         <div v-if="chanFrame.chart" class="chan-chart-navigation" role="group" aria-label="K 线图缩放与移动">
           <span class="chan-chart-navigation-spacer"></span>
@@ -264,6 +276,7 @@
         </div>
         <div v-if="!chanFrame.chart" class="levels-empty">历史行情到达后展示 K 线与多级结构</div>
         <button v-if="chanSpotGuideVisible && isChanTouchInput()" type="button" class="chan-spot-guide-backdrop" aria-label="关闭现价结构观察" @click.stop="dismissChanSpotGuide"></button>
+        <button v-if="chanHoveredScenario && isChanTouchInput()" type="button" class="chan-projection-backdrop" aria-label="关闭条件情景" @click.stop="hideChanScenario($event)"></button>
         <article v-if="chanSpotGuideVisible && chanFrame.spotGuide" id="chan-spot-guide-card" class="chan-spot-float-card" :class="{ 'chan-spot-float-card-mobile': isChanTouchInput() }" role="region" aria-label="现价结构观察" @keydown.esc.stop.prevent="dismissChanSpotGuide" :style="{ left: chanSpotGuideX + 'px', top: chanSpotGuideY == null ? null : chanSpotGuideY + 'px' }">
             <header><div><h4>现价结构观察</h4><span>实时行情 · 条件推演</span></div><button type="button" class="chan-spot-guide-close" aria-label="关闭现价结构观察" @click.stop="dismissChanSpotGuide">×</button></header>
             <p class="chan-spot-guide-position">{{ chanFrame.spotGuide.position }}</p>
@@ -353,6 +366,10 @@
               <article v-for="scenario in chanFrame.guidance.scenarios" :key="scenario.direction">
                 <header><h4>{{ scenario.label }}</h4><p class="chan-scenario-status">{{ scenario.status }}</p></header>
                 <dl><div><dt>确认条件</dt><dd>{{ scenario.condition }}</dd></div><div><dt>下一观察位</dt><dd>{{ scenario.expectation }}</dd></div><div><dt>重新评估条件</dt><dd>{{ scenario.invalidation }}</dd></div></dl>
+              </article>
+              <article v-if="chanFrame.guidance.riskNotice" class="chan-scenario-risk-note">
+                <header><h4>{{ chanFrame.guidance.riskNotice.label }}</h4><p class="chan-scenario-status">{{ chanFrame.guidance.riskNotice.status }}</p></header>
+                <dl><div><dt>当前状态</dt><dd>{{ chanFrame.guidance.riskNotice.detail }}</dd></div><div><dt>下一观察位</dt><dd>{{ chanFrame.guidance.riskNotice.expectation }}</dd></div><div><dt>重新评估条件</dt><dd>{{ chanFrame.guidance.riskNotice.invalidation }}</dd></div></dl>
               </article>
             </div>
             <p v-if="!chanFrame.guidance.scenarios.length" class="chan-explanation">尚未形成可配对的笔高低点，等待结构形成后列出具体观察路径。</p>

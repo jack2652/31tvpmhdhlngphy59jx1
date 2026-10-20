@@ -210,7 +210,7 @@
 
   function emptyGuidance() {
     return { title: "等待已收盘行情", focus: "载入行情后列出近期高低点与确认条件。",
-      evidence: [], levels: [], scenarios: [], signalReason: "等待历史行情。",
+      evidence: [], levels: [], scenarios: [], riskNotice: null, signalReason: "等待历史行情。",
       note: "近期高低点是已识别笔端点的价格观察位；形成中的端点会更新。价格越过观察位和确认缠论买卖点是两个步骤，后者还需要后续笔结构。" };
   }
 
@@ -323,6 +323,30 @@
     return Number.isFinite(live) && live > 0 ? live : null;
   }
 
+  // MACD (12, 26, 9) over the full frame so the visible window inherits the
+  // correct EMA state. The result is cached per candle array and sliced for
+  // the viewport, keeping pan/zoom cheap.
+  const macdSeriesCache = new WeakMap();
+  function macdSeries(candles) {
+    if (!candles?.length) return [];
+    const cached = macdSeriesCache.get(candles);
+    if (cached) return cached;
+    const result = new Array(candles.length);
+    const fastWeight = 2 / 13, slowWeight = 2 / 27, signalWeight = 2 / 10;
+    let emaFast = null, emaSlow = null, dea = null;
+    for (let index = 0; index < candles.length; index += 1) {
+      const close = Number(candles[index]?.close);
+      if (!Number.isFinite(close)) { result[index] = null; continue; }
+      emaFast = emaFast == null ? close : close * fastWeight + emaFast * (1 - fastWeight);
+      emaSlow = emaSlow == null ? close : close * slowWeight + emaSlow * (1 - slowWeight);
+      const dif = emaFast - emaSlow;
+      dea = dea == null ? dif : dif * signalWeight + dea * (1 - signalWeight);
+      result[index] = { dif, dea, hist: (dif - dea) * 2 };
+    }
+    macdSeriesCache.set(candles, result);
+    return result;
+  }
+
   function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null) {
     const cachedLayouts = chartCache.get(frame.candles);
     const totalBars = frame.candles?.length || 0;
@@ -358,11 +382,25 @@
     }
     const bars = (frame.candles || []).slice(startIndex, endIndex);
     if (!bars.length) return null;
-    const width = mobile ? 420 : 960, height = mobile ? 520 : 340;
+    const macd = macdSeries(frame.candles || []).slice(startIndex, endIndex);
+    const width = mobile ? 420 : 960;
     // Desktop retains room for the left price labels and current-price badge
     // without carrying the oversized axis gutter from the former right axis.
     const left = mobile ? 94 : 52, right = 20, top = mobile ? 24 : 18, bottom = 38;
-    const plotWidth = width - left - right, plotHeight = height - top - bottom;
+    // Keep the price pane at its original height and append volume/MACD panes
+    // below it; all panes share the same time axis and horizontal geometry.
+    const priceHeight = mobile ? 458 : 284;
+    const plotHeight = priceHeight;
+    const priceBottom = top + plotHeight;
+    const panelGap = mobile ? 22 : 20;
+    const volumeHeight = mobile ? 84 : 72;
+    const macdHeight = mobile ? 112 : 96;
+    const volumeTop = priceBottom + panelGap;
+    const volumeBottom = volumeTop + volumeHeight;
+    const macdTop = volumeBottom + panelGap;
+    const macdBottom = macdTop + macdHeight;
+    const height = macdBottom + bottom;
+    const plotWidth = width - left - right;
     // Keep the scenario lane separate from historical bars when it is shown.
     const scenarioBoundary = left + plotWidth * (mobile ? 0.78 : 0.88);
     const historyRight = showScenarios ? scenarioBoundary : width - right;
@@ -414,6 +452,21 @@
     maximum += padding;
     const y = (price) => top + (maximum - price) / (maximum - minimum) * plotHeight;
     const x = (index) => left + (index + 0.5) / bars.length * historyWidth;
+    let volumeMax = 0;
+    for (const bar of bars) volumeMax = Math.max(volumeMax, Number(bar.volume) || 0);
+    if (!(volumeMax > 0)) volumeMax = 1;
+    let macdMin = 0, macdMax = 0;
+    for (const item of macd) {
+      if (!item) continue;
+      macdMin = Math.min(macdMin, item.dif, item.dea, item.hist);
+      macdMax = Math.max(macdMax, item.dif, item.dea, item.hist);
+    }
+    if (macdMax - macdMin < 1e-9) { macdMin = -1; macdMax = 1; }
+    const macdPadding = (macdMax - macdMin) * 0.08;
+    macdMin -= macdPadding;
+    macdMax += macdPadding;
+    const macdY = (value) => macdTop + (macdMax - value) / (macdMax - macdMin) * macdHeight;
+    const macdZeroY = macdY(0);
     const chanCandles = bars.map((bar, index) => ({
       candleIndex: index, high: y(bar.high), low: y(bar.low),
       direction: bar.close >= bar.open ? "up" : "down",
@@ -515,7 +568,10 @@
       return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelY, hitLabelWidth: (labelText + status).length * 5.2 + 8, side, status: signal.status, invalidated, label: invalidated ? labelText + " · 已失效" : labelText, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, start: date, end: date, startPrice: price, endPrice: price, confirmed: signal.status === "confirmed", formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || signal.phase_at, composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
     });
     const chart = {
-      width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: height - bottom,
+      width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: priceBottom,
+      priceBottom, volumeTop, volumeBottom, volumeMax,
+      macdTop, macdBottom, macdMin, macdMax, macdZeroY,
+      crosshairBottom: macdBottom, interactionBottom: macdBottom, axisBottom: macdBottom,
       totalBars, visibleBars: bars.length, windowStart: startIndex, windowEnd: endIndex, endOffset,
       canZoomIn: bars.length > Math.min(12, totalBars), canZoomOut: bars.length < totalBars,
       canPanLeft: endOffset < maxOffset, canPanRight: endOffset > 0,
@@ -524,7 +580,7 @@
       historyRight, scenarioBoundary, lastClose: frame.last_close,
       title: `${frame.label} K 线与结构观察，${firstDisplayDate} 至 ${lastDisplayDate}`,
       ruleVersion: recursiveRule,
-      description: "实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔和顶底观察均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测。移动鼠标或触摸图表可查看 K 线日期和 OHLC；使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。",
+      description: "实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔和顶底观察均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。价格图下方依次为成交量和 MACD（12、26、9），它们与 K 线共用同一时间轴。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；下方副图显示 MACD。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。",
       points,
       chanCandles,
       structures: [
@@ -616,6 +672,7 @@
         const displayDate = displayBarTime(bar.date, frame.period);
         return { key: bar.date, index, date: bar.date, displayDate, x: x(index),
         prices: { open: bar.open, high: bar.high, low: bar.low, close: bar.close }, previousClose, closeChangePercent,
+        volume: Number(bar.volume) || 0, macd: macd[index] || null,
         high: y(bar.high), low: y(bar.low), body: Math.min(y(bar.open), y(bar.close)),
         bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, historyWidth / bars.length * 0.56),
         direction: bar.close >= bar.open ? "up" : "down",
@@ -798,6 +855,14 @@
     // A downside path may be intentionally omitted when price is already
     // below the recent low and no lower confirmed endpoint exists. Keep its
     // rule-based tilt available for the live risk summary even without a path.
+    const hasDownsidePath = scenarioPrice > low.price || (lower && scenarioPrice > lower.price);
+    guide.riskNotice = hasDownsidePath ? null : {
+      label: "下行风险已发生",
+      status: "下方暂无更低的已确认目标",
+      detail: `现价 ${money(scenarioPrice)} ${scenarioPrice < low.price ? "低于" : "位于"}近期低点 ${money(low.price)}，下方没有更低的已确认笔端点，因此不绘制红色目标路径。`,
+      expectation: "等待止跌结构和新低后的确认笔；普通反弹不视为风险解除。",
+      invalidation: `收盘重新站回 ${money(low.price)} 上方并形成止跌反向笔后，再重新评估下行路径。`,
+    };
     guide.downsideTilt = scenarioTiltScores(frame, weekly, [{ direction: "down" }])[0]?.tilt_score;
     return guide;
   }

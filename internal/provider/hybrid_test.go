@@ -229,7 +229,7 @@ func TestHybridOvernightQuoteFallsBackToYahooWhenAlpacaFails(t *testing.T) {
 	}
 }
 
-func TestHybridOvernightQuoteSkipsYahooDuringOvernightSession(t *testing.T) {
+func TestHybridOvernightQuoteMergesPreviousPostSessionAndCachesIt(t *testing.T) {
 	var yahooRequests atomic.Int64
 	alpacaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -237,27 +237,123 @@ func TestHybridOvernightQuoteSkipsYahooDuringOvernightSession(t *testing.T) {
 	}))
 	defer alpacaServer.Close()
 
-	yahoo := NewYahoo(time.Second, 2)
-	yahoo.tickerFactory = func(string) (yahooTicker, error) {
-		yahooRequests.Add(1)
-		return &yahooSDKTestTicker{quoteFunc: func() (*models.Quote, error) {
-			return &models.Quote{Symbol: "QQQ", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"}, nil
-		}}, nil
-	}
-	alpaca := NewAlpaca("key", "secret", alpacaServer.URL, alpacaServer.Client())
-	hybrid := NewHybrid(yahoo, nil, alpaca)
 	newYork, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		t.Fatal(err)
 	}
-	hybrid.now = func() time.Time { return time.Date(2026, time.October, 7, 20, 0, 0, 0, newYork) }
+	frozen := time.Date(2026, time.October, 7, 20, 0, 0, 0, newYork)
+
+	yahoo := NewYahoo(time.Second, 2)
+	yahoo.now = func() time.Time { return frozen }
+	yahoo.tickerFactory = func(string) (yahooTicker, error) {
+		yahooRequests.Add(1)
+		return &yahooSDKTestTicker{quoteFunc: func() (*models.Quote, error) {
+			return &models.Quote{
+				Symbol: "QQQ", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99,
+				RegularMarketTime: time.Date(2026, time.October, 7, 16, 0, 0, 0, newYork),
+				PostMarketPrice:   102, PostMarketTime: time.Date(2026, time.October, 7, 19, 58, 0, 0, newYork),
+			}, nil
+		}}, nil
+	}
+	alpaca := NewAlpaca("key", "secret", alpacaServer.URL, alpacaServer.Client())
+	hybrid := NewHybrid(yahoo, nil, alpaca)
+	hybrid.now = func() time.Time { return frozen }
 
 	quote, err := hybrid.Quote(context.Background(), "QQQ")
 	if err != nil || quote.Price == nil || *quote.Price != 101 {
 		t.Fatalf("overnight Quote() = %#v, %v; want the Alpaca overnight price", quote, err)
 	}
-	if got := yahooRequests.Load(); got != 0 {
-		t.Fatalf("Yahoo requests = %d, want none during the overnight session", got)
+	post, ok := quote.Sessions["previous_post"].(map[string]any)
+	if !ok || post["price"] != 102.0 {
+		t.Fatalf("overnight sessions.previous_post = %#v, want the previous after-hours price 102", quote.Sessions["previous_post"])
+	}
+	if post["reference_close"] != 100.0 || post["as_of"] != "2026-10-07T19:58:00-04:00" {
+		t.Fatalf("previous post summary differs: %#v", post)
+	}
+	if overnight, ok := quote.Sessions["overnight"].(map[string]any); !ok || overnight["price"] != 101.0 {
+		t.Fatalf("overnight summary was replaced: %#v", quote.Sessions["overnight"])
+	}
+	if got := yahooRequests.Load(); got != 1 {
+		t.Fatalf("Yahoo requests = %d, want exactly one lookup for the previous post session", got)
+	}
+
+	// The after-hours price is fixed until the next 16:00 ET window, so a
+	// refresh within the TTL must not hit Yahoo again.
+	if _, err := hybrid.Quote(context.Background(), "QQQ"); err != nil {
+		t.Fatal(err)
+	}
+	if got := yahooRequests.Load(); got != 1 {
+		t.Fatalf("Yahoo requests = %d after a cached refresh, want 1", got)
+	}
+}
+
+func TestHybridPreMarketQuoteAttachesPreviousPostSessionFromChart(t *testing.T) {
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := time.Date(2026, time.October, 20, 4, 16, 0, 0, newYork)
+	var oneMinuteRequests atomic.Int64
+
+	yahoo := NewYahoo(time.Second, 2)
+	yahoo.now = func() time.Time { return frozen }
+	yahoo.tickerFactory = func(string) (yahooTicker, error) {
+		return &yahooSDKTestTicker{
+			quote: &models.Quote{
+				Symbol: "QQQ", Currency: "USD",
+				RegularMarketPrice:         120.66,
+				RegularMarketPreviousClose: 127.21,
+				RegularMarketTime:          time.Date(2026, time.October, 19, 16, 0, 0, 0, newYork),
+				PreMarketPrice:             118.2,
+				PreMarketTime:              time.Date(2026, time.October, 20, 4, 15, 0, 0, newYork),
+			},
+			historyFunc: func(params models.HistoryParams) ([]models.Bar, error) {
+				if params.Interval != "1m" || !params.PrePost {
+					return nil, nil
+				}
+				oneMinuteRequests.Add(1)
+				start := params.Start.In(newYork)
+				end := params.End.In(newYork)
+				if start.Format(time.DateOnly) != "2026-10-19" || start.Hour() != 16 || end.Hour() != 20 {
+					t.Errorf("previous post window = %s -> %s, want 2026-10-19 16:00 -> 20:00", start, end)
+				}
+				return []models.Bar{
+					{Date: time.Date(2026, time.October, 19, 16, 0, 0, 0, newYork), Close: 120.66, Volume: 94730},
+					{Date: time.Date(2026, time.October, 19, 19, 58, 0, 0, newYork), Close: 120.47},
+					{Date: time.Date(2026, time.October, 19, 19, 59, 0, 0, newYork), Close: 120.45},
+				}, nil
+			},
+		}, nil
+	}
+	hybrid := NewHybrid(yahoo, nil, nil)
+	hybrid.now = func() time.Time { return frozen }
+
+	quote, err := hybrid.Quote(context.Background(), "QQQ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.MarketState != "PRE" || quote.Price == nil || *quote.Price != 118.2 {
+		t.Fatalf("pre-market quote = %#v, want PRE at the pre-market price 118.2", quote)
+	}
+	if post, ok := quote.Sessions["post"].(map[string]any); !ok || post["price"] != nil {
+		t.Fatalf("pre-market sessions.post = %#v, want reference close only", quote.Sessions["post"])
+	}
+	previous, ok := quote.Sessions["previous_post"].(map[string]any)
+	if !ok || previous["price"] != 120.45 {
+		t.Fatalf("pre-market sessions.previous_post = %#v, want yesterday's after-hours price 120.45", quote.Sessions["previous_post"])
+	}
+	if previous["reference_close"] != 120.66 || previous["as_of"] != "2026-10-19T19:59:00-04:00" {
+		t.Fatalf("previous post summary differs: %#v", previous)
+	}
+	if got := oneMinuteRequests.Load(); got != 1 {
+		t.Fatalf("1m chart requests = %d, want exactly one", got)
+	}
+
+	if _, err := hybrid.Quote(context.Background(), "QQQ"); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneMinuteRequests.Load(); got != 1 {
+		t.Fatalf("1m chart requests = %d after a cached refresh, want 1", got)
 	}
 }
 

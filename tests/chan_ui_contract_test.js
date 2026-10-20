@@ -6,6 +6,7 @@ const client = fs.readFileSync("web/static/common/js/chan-client.js", "utf8");
 const charts = fs.readFileSync("web/static/common/js/charts.js", "utf8");
 const readme = fs.readFileSync("README.md", "utf8");
 const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
+const styles = fs.readFileSync("web/static/common/css/styles.css", "utf8");
 
 assert.match(template, /class="chan-meta"[^>]*>[\s\S]*?chanFrame.dataSummary/, "Chan summary must be rendered in the quote metadata row");
 assert.match(template, /chanChartLayers\.recursiveCenters && chanChartLayers\.recursiveCenters\[level\] === true/, "recursive layer controls must tolerate missing persisted layer state");
@@ -36,6 +37,16 @@ assert.match(app, /chanCanvasBinding\(\) \{ return \{ chart: this\.chanFrame\?\.
 assert.match(template, /class="chan-scenario-toggle-canvas"/, "the scenario toggle must be an HTML button above the canvas");
 assert.doesNotMatch(template, /chan-scenario-toggle-svg/, "the scenario toggle must no longer be rendered as an SVG group");
 assert.match(charts, /fillText\("\\ue7b3"/, "the scenario toggle icon must be painted by the canvas");
+assert.match(template, /class="chan-projection-backdrop"/, "touch scenario cards must offer a backdrop to dismiss the popup");
+assert.match(template, /class="chan-projection-close"/, "touch scenario cards must expose a close button");
+assert.match(styles, /\.chan-projection-float-card\{position:fixed;top:auto!important/, "touch scenario cards must dock to the bottom like the spot guide card");
+assert.match(styles, /\.chan-projection-backdrop\{position:fixed;inset:0;z-index:19/, "the scenario backdrop must cover the viewport below the card");
+assert.match(template, /class="chan-scenario-risk-note"/, "realized downside without a target must render a gray scenario card");
+assert.match(client, /guide\.riskNotice = hasDownsidePath/, "the gray card must be driven by the realized-downside state");
+assert.match(styles, /article\.chan-scenario-risk-note\{border-left:3px solid var\(--muted\)\}/, "the realized-downside card must use the muted gray accent");
+assert.match(client, /function macdSeries\(candles\)/, "the chart must compute MACD from the full candle history");
+assert.match(client, /volumeTop, volumeBottom, volumeMax/, "the chart model must expose volume pane geometry");
+assert.match(client, /macdTop, macdBottom, macdMin, macdMax, macdZeroY/, "the chart model must expose MACD pane geometry");
 assert.match(template, /@click.stop="toggleChanScenarios"/, "scenario visibility control must remain connected to its toggle");
 const scenarioToggle = app.indexOf("toggleChanScenarios() {");
 assert.ok(scenarioToggle >= 0, "scenario toggle method must exist");
