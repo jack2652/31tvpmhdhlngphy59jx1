@@ -15,6 +15,7 @@
 #   ./run.sh config               修改 .env（保存后可自动重启）
 #   ./run.sh doctor               环境自检
 #   ./run.sh trim-logs            立即把日志裁剪到 200 行
+#   ./run.sh memory [数量]        查看内存使用情况与占用最高的进程（默认前 10）
 #   ./run.sh kill-port [端口]     交互确认后结束监听该 TCP 端口的进程
 #   ./run.sh install-service      安装并启用 systemd 常驻服务（需要 systemd）
 #   ./run.sh remove-service       移除 systemd 服务
@@ -506,8 +507,14 @@ port_listener_pids() {
   } | sort -u
 }
 
+process_name() {
+  local name
+  name="$(ps -p "$1" -o comm= 2>/dev/null | tr -d '\r\n')"
+  printf '%s' "$name"
+}
+
 action_kill_port() {
-  local port="${1:-}" answer="" pid="" owns_app=false
+  local port="${1:-}" answer="" pid="" owns_app=false name=""
   local -a pids=() remaining=()
   if [ -z "$port" ]; then
     printf '  输入要释放的 TCP 端口：'
@@ -535,12 +542,17 @@ action_kill_port() {
   printf '  TCP 端口 %s 的监听进程：\n' "$port"
   for pid in "${pids[@]}"; do
     case "$pid" in '' | *[!0-9]*) continue ;; esac
-    ps -p "$pid" -o pid=,comm= 2>/dev/null || printf '    PID %s（进程详情不可读）\n' "$pid"
+    name="$(process_name "$pid")"
+    if [ -n "$name" ]; then
+      printf '    PID %-7s %s\n' "$pid" "$name"
+    else
+      printf '    PID %s（进程详情不可读）\n' "$pid"
+    fi
     if [ -n "$APP_BINARY" ] && proc_matches "$pid" "$APP_BINARY"; then
       owns_app=true
     fi
   done
-  printf '  确认向以上进程发送 SIGTERM 并释放端口？[y/N]：'
+  printf '  确认结束以上进程并释放端口（先 SIGTERM，未退出则 SIGKILL）？[y/N]：'
   read -r answer || answer=""
   case "$answer" in y | Y | yes | YES) ;; *) info "已取消，未结束任何进程"; return 0 ;; esac
 
@@ -560,6 +572,8 @@ action_kill_port() {
         warn "拒绝结束 PID 1（系统初始化进程）"
         continue
       fi
+      name="$(process_name "$pid")"
+      printf '  正在结束 %s（PID %s，SIGTERM）\n' "${name:-未知进程}" "$pid"
       kill -TERM "$pid" 2>/dev/null || run_root kill -TERM "$pid" || signal_status=1
     done
     [ "$signal_status" -eq 0 ] || warn "部分进程未能发送 SIGTERM；可能需要更高权限"
@@ -575,20 +589,20 @@ action_kill_port() {
       [ "$pid" = 1 ] || force_pids+=("$pid")
     done
     if [ "${#force_pids[@]}" -gt 0 ]; then
-      printf '  仍存活的 PID：%s\n' "${force_pids[*]}"
-      printf '  是否对这些进程发送 SIGKILL 强制结束？[y/N]：'
-      read -r answer || answer=""
-      case "$answer" in
-        y | Y | yes | YES)
-          local force_status=0 force_pid
-          for force_pid in "${force_pids[@]}"; do
-            kill -KILL "$force_pid" 2>/dev/null || run_root kill -KILL "$force_pid" || force_status=1
-          done
-          [ "$force_status" -eq 0 ] || return 1
-          ok "已发送 SIGKILL"
-          ;;
-        *) warn "未强制结束；进程可能仍占用端口"; return 1 ;;
-      esac
+      local force_status=0 force_pid force_name
+      for force_pid in "${force_pids[@]}"; do
+        force_name="$(process_name "$force_pid")"
+        printf '  %s（PID %s）未响应 SIGTERM，发送 SIGKILL\n' "${force_name:-未知进程}" "$force_pid"
+        kill -KILL "$force_pid" 2>/dev/null || run_root kill -KILL "$force_pid" || force_status=1
+      done
+      [ "$force_status" -eq 0 ] || return 1
+      ok "已发送 SIGKILL"
+      # The kernel needs a moment to drop the listener after SIGKILL.
+      local settled=0
+      while [ "$settled" -lt 3 ] && port_in_use "$port"; do
+        sleep 1
+        settled=$((settled + 1))
+      done
     else
       ok "监听进程已退出"
     fi
@@ -837,6 +851,116 @@ memory_summary() {
   text="可用 ${avail:-未知}M / 总 ${total:-未知}M，Swap ${swap:-未知}M"
   [ -n "$limit" ] && text="$text，容器内存上限 ${limit}M"
   printf '%s' "$text"
+}
+
+cgroup_mem_current_mb() {
+  local value=""
+  if [ -r /sys/fs/cgroup/memory.current ]; then
+    value="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"
+  elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then
+    value="$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null)"
+  fi
+  case "$value" in
+    '' | *[!0-9]*) printf '' ;;
+    *) printf '%d' $((value / 1048576)) ;;
+  esac
+}
+
+process_rss_mb() {
+  local pid="$1" kb
+  [ -n "$pid" ] || return 0
+  kb="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  case "$kb" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  printf '%d' $((kb / 1024))
+}
+
+# Print the top memory consumers as "PID|USER|RSS_KB|COMMAND" so the caller can
+# format sizes without depending on awk's locale.
+top_memory_rows() {
+  local limit="$1"
+  if ps -eo pid=,user=,rss=,args= >/dev/null 2>&1; then
+    ps -eo pid=,user=,rss=,args= 2>/dev/null | sort -k3,3 -nr | head -n "$limit" |
+      awk '{ cmd = $4; for (i = 5; i <= NF; i++) cmd = cmd " " $i; if (length(cmd) > 60) cmd = substr(cmd, 1, 57) "..."; printf "%s|%s|%s|%s\n", $1, $2, $3, cmd }'
+  elif ps aux >/dev/null 2>&1; then
+    ps aux 2>/dev/null | awk 'NR > 1 {
+      cmd = "";
+      for (i = 11; i <= NF; i++) cmd = cmd (i > 11 ? " " : "") $i;
+      if (length(cmd) > 60) cmd = substr(cmd, 1, 57) "...";
+      printf "%10d|%s|%s|%s\n", $6, $2, $1, cmd;
+    }' | sort -t'|' -k1,1 -nr | head -n "$limit" |
+      awk -F'|' '{ printf "%s|%s|%s|%s\n", $2, $3, $1 + 0, $4 }'
+  fi
+}
+
+action_memory() {
+  local limit_count total avail swap cap current used pid rss rows pid_value user rss_kb cmd
+  limit_count="${1:-10}"
+  case "$limit_count" in
+    '' | *[!0-9]*) limit_count=10 ;;
+  esac
+  total="$(mem_total_mb)"; avail="$(mem_available_mb)"; swap="$(mem_swap_mb)"
+  cap="$(cgroup_mem_limit_mb)"; current="$(cgroup_mem_current_mb)"
+  section "内存使用"
+  case "$total" in
+    '' | *[!0-9]*)
+      printf '  物理内存：未知（读取 /proc/meminfo 失败）\n'
+      ;;
+    *)
+      used=""
+      [ -n "$avail" ] && used=$((total - avail))
+      printf '  物理内存：总 %sM，已用 %sM，可用 %sM' "$total" "${used:-未知}" "${avail:-未知}"
+      [ -n "$used" ] && [ "$total" -gt 0 ] && printf '（使用率 %s%%）' $((used * 100 / total))
+      printf '\n'
+      ;;
+  esac
+  case "$swap" in
+    '' | *[!0-9]*) ;;
+    0) printf '  Swap：未配置\n' ;;
+    *) printf '  Swap：总 %sM\n' "$swap" ;;
+  esac
+  if [ -n "$cap" ]; then
+    printf '  容器内存上限：%sM' "$cap"
+    [ -n "$current" ] && printf '，当前用量 %sM（%s%%）' "$current" $((cap > 0 ? current * 100 / cap : 0))
+    printf '\n'
+  fi
+  pid_value="$(app_pid 2>/dev/null || true)"
+  if [ -n "$pid_value" ]; then
+    rss="$(process_rss_mb "$pid_value")"
+    if [ -n "$rss" ]; then
+      printf '  本应用：PID %s，常驻内存 %sM' "$pid_value" "$rss"
+      case "$total" in
+        '' | *[!0-9]*) ;;
+        *) [ "$total" -gt 0 ] && printf '，占物理内存 %s%%' $((rss * 100 / total)) ;;
+      esac
+      printf '\n'
+    else
+      printf '  本应用：运行中（PID %s），但读取 RSS 失败\n' "$pid_value"
+    fi
+  else
+    printf '  本应用：未运行\n'
+  fi
+  printf '\n  内存占用排行（按 RSS，前 %s 名）：\n' "$limit_count"
+  rows="$(top_memory_rows "$limit_count")"
+  if [ -z "$rows" ]; then
+    printf '  无法读取进程列表（ps 不可用）\n'
+  else
+    printf '  %-8s %-10s %9s %6s  %s\n' "PID" "USER" "RSS" "MEM%" "COMMAND"
+    while IFS='|' read -r pid user rss_kb cmd; do
+      case "$rss_kb" in
+        '' | *[!0-9]*) continue ;;
+      esac
+      printf '  %-8s %-10s %9s' "$pid" "$user" "$(human_size $((rss_kb * 1024)))"
+      case "$total" in
+        '' | *[!0-9]*) printf ' %6s  ' "--" ;;
+        *) printf ' %5s%%  ' $((total > 0 ? rss_kb / 1024 * 100 / total : 0)) ;;
+      esac
+      printf '%s\n' "$cmd"
+    done <<<"$rows"
+    printf '\n  说明：常驻内存为 RSS（含共享页，未按去重折算），容器内只统计本容器的进程。\n'
+  fi
+  return 0
 }
 
 database_size_bytes() {
@@ -1884,6 +2008,7 @@ Option Scope 运维脚本用法：
   ./run.sh logs [行数]          查看应用日志（默认末尾 80 行）
   ./run.sh config               修改 .env 配置（保存后可自动重启）
   ./run.sh trim-logs            立即把日志裁剪到上限（默认 200 行）
+  ./run.sh memory [数量]        查看内存使用情况与占用最高的进程（默认前 10）
   ./run.sh doctor               环境自检
   ./run.sh kill-port [端口]     交互确认后结束监听该 TCP 端口的进程
   ./run.sh install-service      安装并启用 systemd 常驻服务（需要 systemd）
@@ -1917,6 +2042,7 @@ MAIN_MENU_ROWS=(
   '8|结束占用指定 TCP 端口的程序|action_kill_port'
   '9|环境自检|action_doctor'
   '10|立即裁剪日志|action_trim_logs'
+  '11|查看内存使用与占用排行|action_memory'
   '0|退出|quit'
 )
 
@@ -1943,6 +2069,7 @@ main() {
     logs | log) action_logs "${2:-80}" ;;
     config) action_config ;;
     trim-logs | trim) action_trim_logs ;;
+    memory | mem) action_memory "${2:-10}" ;;
     doctor | check) action_doctor ;;
     install | install-runtime) ensure_runtime && ok "运行环境已就绪，可在主菜单选择 2) 启动应用" ;;
     kill-port) action_kill_port "${2:-}" ;;
