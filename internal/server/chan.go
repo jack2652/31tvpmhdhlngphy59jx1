@@ -303,43 +303,69 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 			adjustedSpot = &adjusted
 		}
 	}
-	result := chananalysis.AnalyzeAdjusted(symbol, bars, adjustedSpot, time.Now())
+	cutoff := time.Now()
 	// Daily signals use the directly mapped 4-hour structures. Reuse the
 	// cached 15-minute history, but move it into the same adjusted price
 	// coordinate as the daily frame before aggregating it. Bars without a
-	// matching, validated daily adjustment factor are excluded.
+	// matching, validated daily adjustment factor are excluded. These inputs
+	// determine the structural cache key; the live quote is deliberately not
+	// part of it because RebaseSpot handles that cheap, quote-dependent step.
 	intradayEntry, _, _, _ := s.intradayFrame(symbol)
+	var adjustedIntraday []chananalysis.Bar
+	skippedIntraday := 0
 	if len(intradayEntry.frame) > 0 {
-		adjustedIntraday, skipped := adjustedIntradayBars(intradayBars(intradayEntry), bars)
+		adjustedIntraday, skippedIntraday = adjustedIntradayBars(intradayBars(intradayEntry), bars)
+	}
+	marketHistory, marketSource, marketWarning, marketRefreshing := s.chanMarketHistory()
+	marketBars := adjustedAnalysisBars(marketHistory.bars, cutoff)
+	marketSeries := chananalysis.ClassifyMarketEnvironment(marketBars)
+	keyDailyBars := completedChanDailyBarsForCache(bars, cutoff)
+	keyIntradayBars := adjustedIntraday
+	if len(adjustedIntraday) > 0 {
+		if completed, _, aggregateErr := chananalysis.AggregateIntradayBars(adjustedIntraday, "4h", cutoff); aggregateErr == nil {
+			// The lower timeframe attached to the daily result only consumes
+			// complete 4-hour intervals. Excluding a still-forming interval keeps
+			// quote ticks from invalidating the structural cache every request.
+			keyIntradayBars = completed
+		}
+	}
+	cacheKey := chanAnalysisCacheKey(symbol, keyDailyBars, keyIntradayBars, marketBars, cutoff)
+	result, analysisCache, analysisErr := s.getOrBuildChanAnalysis(cacheKey, func() (chananalysis.Result, error) {
+		result := chananalysis.AnalyzeAdjustedStructure(symbol, bars, cutoff)
 		if len(adjustedIntraday) > 0 {
-			lowerResult, lowerErr := chananalysis.AnalyzeIntraday(symbol, adjustedIntraday, "4h", adjustedSpot, time.Now())
+			lowerResult, lowerErr := chananalysis.AnalyzeIntraday(symbol, adjustedIntraday, "4h", nil, cutoff)
 			if lowerErr == nil {
 				lowerResult.Daily.Quality.PriceBasis = "split_dividend_adjusted"
 				chananalysis.AttachMappedTimeframe(&result.Daily, lowerResult.Daily)
-				if skipped > 0 {
-					result.Daily.Warnings = append(result.Daily.Warnings, fmt.Sprintf("%d 根 15 分钟 K 线因缺少对应日线复权因子未参与跨周期确认", skipped))
+				if skippedIntraday > 0 {
+					result.Daily.Warnings = append(result.Daily.Warnings, fmt.Sprintf("%d 根 15 分钟 K 线因缺少对应日线复权因子未参与跨周期确认", skippedIntraday))
 				}
 			}
 		}
+		attachMarketEnvironment(&result.Daily, marketSeries)
+		attachMarketEnvironment(&result.Weekly, marketSeries)
+		if s.store != nil {
+			recordChanStructureFrame(s.store, symbol, "1d", result.RuleVersion, bars, &result.Daily)
+			recordChanStructureFrame(s.store, symbol, "1wk", result.RuleVersion, result.Weekly.Candles, &result.Weekly)
+		}
+		for index := range result.Daily.SignalsV4 {
+			result.Daily.SignalsV4[index].Symbol = symbol
+		}
+		for index := range result.Weekly.SignalsV4 {
+			result.Weekly.SignalsV4[index].Symbol = symbol
+		}
+		return result, nil
+	})
+	if analysisErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": analysisErr.Error()})
+		return
 	}
-	marketHistory, marketSource, marketWarning, marketRefreshing := s.chanMarketHistory()
-	marketBars := adjustedAnalysisBars(marketHistory.bars, time.Now())
-	marketSeries := chananalysis.ClassifyMarketEnvironment(marketBars)
-	attachMarketEnvironment(&result.Daily, marketSeries)
-	attachMarketEnvironment(&result.Weekly, marketSeries)
-	if s.store != nil {
-		recordChanStructureFrame(s.store, symbol, "1d", result.RuleVersion, bars, &result.Daily)
-		recordChanStructureFrame(s.store, symbol, "1wk", result.RuleVersion, result.Weekly.Candles, &result.Weekly)
-	}
-	if adjustedSpot == nil {
-		result.Spot = nil
-	}
-	for index := range result.Daily.SignalsV4 {
-		result.Daily.SignalsV4[index].Symbol = symbol
-	}
-	for index := range result.Weekly.SignalsV4 {
-		result.Weekly.SignalsV4[index].Symbol = symbol
-	}
+	// RebaseSpot mutates only the returned value. Clone warning slices first so
+	// request-specific quality warnings never change the shared cache entry.
+	result.Warnings = append([]string(nil), result.Warnings...)
+	result.Daily.Warnings = append([]string(nil), result.Daily.Warnings...)
+	result.Weekly.Warnings = append([]string(nil), result.Weekly.Warnings...)
+	chananalysis.RebaseSpot(&result, adjustedSpot)
 	if warning != "" {
 		result.Warnings = append(result.Warnings, warning)
 	}
@@ -359,7 +385,8 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	if marketWarning != "" {
 		result.Warnings = append(result.Warnings, marketWarning)
 	}
-	response := gin.H{"symbol": symbol, "ready": true, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": "^GSPC", "source": marketSource, "fetched_at": marketHistory.fetchedAt, "refreshing": marketRefreshing}, "price_coordinate": priceCoordinate, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}}
+	c.Header("X-Chan-Analysis-Cache", analysisCache)
+	response := gin.H{"symbol": symbol, "ready": true, "analysis_cache": analysisCache, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": "^GSPC", "source": marketSource, "fetched_at": marketHistory.fetchedAt, "refreshing": marketRefreshing}, "price_coordinate": priceCoordinate, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}}
 	if compact {
 		response["daily"] = compactChanFrame{Frame: result.Daily}
 		response["weekly"] = compactChanFrame{Frame: result.Weekly}
@@ -379,6 +406,149 @@ type compactChanFrame struct {
 	Strengths    []chananalysis.Strength    `json:"strengths_v4,omitempty"`
 	TrendContext *chananalysis.TrendContext `json:"trend_context_v4,omitempty"`
 	MACD         []chananalysis.MACDPoint   `json:"macd_v4,omitempty"`
+}
+
+// chanAnalysisCacheKey fingerprints every input that can affect the expensive
+// structural pass. The live quote is intentionally excluded: quote-dependent
+// positions and invalidation are refreshed by chananalysis.RebaseSpot.
+func chanAnalysisCacheKey(symbol string, daily, intraday, market []chananalysis.Bar, cutoff time.Time) string {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	local := cutoff.In(location)
+	bucketMinute := (local.Minute() / 15) * 15
+	bucket := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), bucketMinute, 0, 0, location).Format(time.RFC3339)
+	payload := struct {
+		Version  string             `json:"version"`
+		Symbol   string             `json:"symbol"`
+		Bucket   string             `json:"bucket"`
+		Daily    []chananalysis.Bar `json:"daily"`
+		Intraday []chananalysis.Bar `json:"intraday"`
+		Market   []chananalysis.Bar `json:"market"`
+	}{
+		Version:  chananalysis.RecursivePreviewVersion + "|" + chananalysis.MarketEnvironmentRuleVersion,
+		Symbol:   symbol,
+		Bucket:   bucket,
+		Daily:    daily,
+		Intraday: intraday,
+		Market:   market,
+	}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	return "chan-adjusted-v2:" + hex.EncodeToString(digest[:])
+}
+
+func completedChanDailyBarsForCache(input []chananalysis.Bar, cutoff time.Time) []chananalysis.Bar {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	local := cutoff.In(location)
+	cutoffDay := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+	result := make([]chananalysis.Bar, 0, len(input))
+	for _, bar := range input {
+		day, parseErr := time.ParseInLocation(time.DateOnly, bar.Date, location)
+		if parseErr != nil || day.After(cutoffDay) {
+			continue
+		}
+		if day.Equal(cutoffDay) && local.Hour()*60+local.Minute() < marketcalendar.RegularCloseMinute(day) {
+			continue
+		}
+		result = append(result, bar)
+	}
+	return result
+}
+
+func (s *Service) getOrBuildChanAnalysis(cacheKey string, build func() (chananalysis.Result, error)) (chananalysis.Result, string, error) {
+	if s == nil {
+		return chananalysis.Result{}, "miss", errors.New("Chan analysis service unavailable")
+	}
+	if cached, ok := s.chanAnalysisMemory(cacheKey); ok {
+		return cached, "memory", nil
+	}
+	value, err, _ := s.chanAnalysisFlights.Do(cacheKey, func() (any, error) {
+		if cached, ok := s.chanAnalysisMemory(cacheKey); ok {
+			return chanAnalysisFlightValue{result: cached, source: "memory"}, nil
+		}
+		if s.store != nil {
+			if encoded, found, readErr := s.store.GetChanAnalysisCache(cacheKey); readErr != nil {
+				log.Printf("Chan analysis cache read failed key=%s: %v", cacheKey, readErr)
+			} else if found {
+				var cached chananalysis.Result
+				if json.Unmarshal(encoded, &cached) == nil && cached.RuleVersion != "" {
+					s.rememberChanAnalysis(cacheKey, cached)
+					return chanAnalysisFlightValue{result: cached, source: "sqlite"}, nil
+				}
+			}
+		}
+		built, buildErr := build()
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		s.rememberChanAnalysis(cacheKey, built)
+		s.persistChanAnalysis(cacheKey, built)
+		return chanAnalysisFlightValue{result: built, source: "miss"}, nil
+	})
+	if err != nil {
+		return chananalysis.Result{}, "miss", err
+	}
+	flight, ok := value.(chanAnalysisFlightValue)
+	if !ok {
+		return chananalysis.Result{}, "miss", errors.New("invalid Chan analysis cache result")
+	}
+	return flight.result, flight.source, nil
+}
+
+type chanAnalysisFlightValue struct {
+	result chananalysis.Result
+	source string
+}
+
+func (s *Service) chanAnalysisMemory(cacheKey string) (chananalysis.Result, bool) {
+	s.chanAnalysisMu.Lock()
+	defer s.chanAnalysisMu.Unlock()
+	entry, ok := s.chanAnalysisCache[cacheKey]
+	if !ok {
+		return chananalysis.Result{}, false
+	}
+	entry.lastAccess = time.Now()
+	s.chanAnalysisCache[cacheKey] = entry
+	return entry.result, true
+}
+
+func (s *Service) rememberChanAnalysis(cacheKey string, result chananalysis.Result) {
+	s.chanAnalysisMu.Lock()
+	if s.chanAnalysisCache == nil {
+		s.chanAnalysisCache = make(map[string]chanAnalysisCacheEntry)
+	}
+	s.chanAnalysisCache[cacheKey] = chanAnalysisCacheEntry{result: result, lastAccess: time.Now()}
+	evictOldestHistoryCacheEntry(s.chanAnalysisCache, cacheKey, boundedChanAnalysisCacheEntries(s.cfg.LowMemory), func(entry chanAnalysisCacheEntry) time.Time { return entry.lastAccess })
+	s.chanAnalysisMu.Unlock()
+}
+
+func (s *Service) persistChanAnalysis(cacheKey string, result chananalysis.Result) {
+	if s.store == nil || s.background == nil {
+		return
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		log.Printf("Chan analysis cache encode failed key=%s: %v", cacheKey, err)
+		return
+	}
+	s.mu.Lock()
+	if s.background.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
+	s.backgroundWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.backgroundWG.Done()
+		if err := s.store.PutChanAnalysisCache(cacheKey, encoded, boundedChanAnalysisDurableCacheEntries(s.cfg.LowMemory)); err != nil {
+			log.Printf("Chan analysis cache write failed key=%s: %v", cacheKey, err)
+		}
+	}()
 }
 
 func adjustedIntradayBars(input, daily []chananalysis.Bar) ([]chananalysis.Bar, int) {

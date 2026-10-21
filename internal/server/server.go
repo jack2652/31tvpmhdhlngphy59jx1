@@ -27,6 +27,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/sync/singleflight"
+	chananalysis "option-scope-go/internal/chan"
 	"option-scope-go/internal/config"
 	"option-scope-go/internal/gamma"
 	"option-scope-go/internal/marketcalendar"
@@ -57,6 +58,11 @@ type chanAdjustedHistoryCacheEntry struct {
 	bars       []map[string]any
 	fetchedAt  time.Time
 	source     string
+	lastAccess time.Time
+}
+
+type chanAnalysisCacheEntry struct {
+	result     chananalysis.Result
 	lastAccess time.Time
 }
 
@@ -230,6 +236,9 @@ type Service struct {
 	chanAdjustedCache      map[string]chanAdjustedHistoryCacheEntry
 	chanAdjustedJobs       map[string]bool
 	chanAdjustedRetryAfter map[string]time.Time
+	chanAnalysisMu         sync.Mutex
+	chanAnalysisCache      map[string]chanAnalysisCacheEntry
+	chanAnalysisFlights    singleflight.Group
 	intradayMu             sync.Mutex
 	intradayHistoryCache   map[string]intradayCacheEntry
 	intradayRefreshJobs    map[string]bool
@@ -319,6 +328,7 @@ func NewWithProvider(cfg config.Config, repository *store.SQLite, marketProvider
 		intradayRefreshJobs:    make(map[string]bool),
 		intradayRefreshAfter:   make(map[string]time.Time),
 		chanAdjustedCache:      make(map[string]chanAdjustedHistoryCacheEntry),
+		chanAnalysisCache:      make(map[string]chanAnalysisCacheEntry),
 		chanAdjustedJobs:       make(map[string]bool),
 		chanAdjustedRetryAfter: make(map[string]time.Time),
 		gammaHeavyGate:         make(chan struct{}, gateLimit),
@@ -354,6 +364,20 @@ func boundedAdjustedHistoryCacheEntries(lowMemory bool) int {
 		return 1
 	}
 	return 3
+}
+
+func boundedChanAnalysisCacheEntries(lowMemory bool) int {
+	if lowMemory {
+		return 1
+	}
+	return 4
+}
+
+func boundedChanAnalysisDurableCacheEntries(lowMemory bool) int {
+	if lowMemory {
+		return 4
+	}
+	return 24
 }
 
 const (

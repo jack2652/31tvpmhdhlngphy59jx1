@@ -31,8 +31,8 @@ function markerLabelWidth(text, weight = 700) {
   return markerLabelContext.measureText(text).width;
 }
 
-// Track the chart container, not just the SVG: the HTML spot-price badge sits
-// above it and leaving the plot for that badge must also clear the readout.
+// Track the chart container, not just the SVG: the spot-price hit target sits
+// above it and leaving the plot for that target must also clear the readout.
 // Mouse movement can exceed the display refresh rate, so process one point per frame.
 function scheduleChartPointerMove(chartTarget, onMove, hideTooltip) {
   let frameId = null;
@@ -361,7 +361,7 @@ function bindChanChartHover(target, initialBinding) {
     tooltip.style.bottom = `${bounds.height + 4}px`;
   };
   const onMove = (event) => {
-    if (event.target?.closest?.(".chan-spot-mobile-badge, .chan-scenario-toggle-canvas")) { hide(); hideScenarioHover(event); return; }
+    if (event.target?.closest?.(".chan-spot-canvas-hitbox, .chan-scenario-toggle-canvas")) { hide(); hideScenarioHover(event); return; }
     if (!model?.candles?.length || (event.buttons & 2)) { hide(); hideScenarioHover(event); return; }
     const point = localPoint(event.clientX, event.clientY);
     if (!point) { hide(); return; }
@@ -542,7 +542,12 @@ function drawChanIndicatorHeaders(target, model, candle) {
   const context = canvas?.getContext("2d");
   if (!context || !model || !(canvas.width > 0) || !(canvas.height > 0)
     || !Number.isFinite(model.volumeTop) || !Number.isFinite(model.macdTop)) return;
-  context.setTransform(canvas.width / model.width, 0, 0, canvas.height / model.height, 0, 0);
+  const svg = target.querySelector("svg");
+  const chartWidth = svg?.getBoundingClientRect().width || 0;
+  const leftBleed = Number(canvas.dataset.leftBleed) || 0;
+  const pixelScale = canvas.width / (chartWidth + leftBleed);
+  context.setTransform(pixelScale * chartWidth / model.width, 0, 0, canvas.height / model.height,
+    pixelScale * leftBleed, 0);
   const color = chanThemeColor(target, "--muted", "#81909c");
   const width = Math.max(1, model.plotRight - model.plotLeft + 4);
   context.clearRect(model.plotLeft - 2, model.volumeTop - 18, width, 16);
@@ -568,15 +573,22 @@ function drawChanCanvas(target, binding) {
   const width = bounds.width, height = bounds.height;
   if (!width || !height || !model.width || !model.height) return;
   const ratio = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
-  const pixelWidth = Math.round(width * ratio), pixelHeight = Math.round(height * ratio);
+  const leftBleed = model.mobileChart ? 80 : 0;
+  const canvasWidth = width + leftBleed;
+  const pixelWidth = Math.round(canvasWidth * ratio), pixelHeight = Math.round(height * ratio);
   if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
     canvas.width = pixelWidth; canvas.height = pixelHeight;
   }
   const context = canvas.getContext("2d");
   if (!context) return;
-  canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
-  context.setTransform(pixelWidth / model.width, 0, 0, pixelHeight / model.height, 0, 0);
-  context.clearRect(0, 0, model.width, model.height);
+  canvas.dataset.leftBleed = String(leftBleed);
+  canvas.style.left = `${-leftBleed}px`; canvas.style.top = "0";
+  canvas.style.width = `${canvasWidth}px`; canvas.style.height = `${height}px`;
+  const pixelScale = pixelWidth / canvasWidth;
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.clearRect(0, 0, pixelWidth, pixelHeight);
+  context.setTransform(pixelScale * width / model.width, 0, 0, pixelHeight / model.height,
+    pixelScale * leftBleed, 0);
   ensureElementIconFont(() => drawChanCanvas(target, binding));
   const colors = {
     grid: chanThemeColor(target, "--grid", "#344654"), axis: chanThemeColor(target, "--axis", "#81909c"),
@@ -670,7 +682,7 @@ function drawChanCanvas(target, binding) {
     context.beginPath(); context.arc(marker.x, marker.y, 5, 0, Math.PI * 2);
     const markerColor = marker.invalidated ? colors.text : colors.blue;
     context.fillStyle = colors.panel; context.strokeStyle = markerColor; context.lineWidth = 1.5; context.setLineDash(marker.watch || marker.invalidated ? [2, 2] : []); context.fill(); context.stroke(); context.setLineDash([]);
-    context.font = "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center";
+    context.font = model.mobileChart ? "550 12px Inter, ui-sans-serif, system-ui, sans-serif" : "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center";
     context.lineWidth = 3; context.strokeStyle = colors.panel; context.strokeText(marker.label, marker.labelX, marker.labelY);
     context.fillStyle = markerColor; context.fillText(marker.label, marker.labelX, marker.labelY);
   }
@@ -700,11 +712,53 @@ function drawChanCanvas(target, binding) {
     const status = signal.invalidated ? "" : signal.status === "confirmed" ? "✓" : "?";
     const signalLabel = signal.label + status;
     const labelY = Number.isFinite(signal.labelY) ? signal.labelY : signal.y + (signal.side === "buy" ? 16 : -10);
-    context.font = "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center"; context.textBaseline = "alphabetic";
+    context.font = model.mobileChart ? "550 12px Inter, ui-sans-serif, system-ui, sans-serif" : "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center"; context.textBaseline = "alphabetic";
     context.lineWidth = 3; context.lineJoin = "round"; context.strokeStyle = colors.panel; context.strokeText(signalLabel, signal.x, labelY);
     context.fillStyle = color; context.fillText(signalLabel, signal.x, labelY);
   }
-  if (model.spot) line(model.plotLeft, model.spot.y, model.historyRight, model.spot.y, colors.spot, [3, 4], 1);
+  if (model.spot) {
+    line(model.plotLeft, model.spot.y, model.historyRight, model.spot.y, colors.spot, [3, 4], 1);
+    // Badge geometry is expressed in CSS pixels here. The hitbox and the former
+    // DOM badge both use fixed CSS dimensions, so only the chart coordinates
+    // above need the model-to-screen scale.
+    context.save();
+    context.setTransform(pixelScale, 0, 0, pixelHeight / height, pixelScale * leftBleed, 0);
+    const spotPadding = model.mobileChart ? 3 : 4;
+    const spotHeight = model.spot.height || 22;
+    const spotY = model.spot.y * height / model.height - spotHeight / 2;
+    const spotRight = model.plotLeft * width / model.width - 4;
+    const spotFontSize = 13;
+    context.font = `750 ${spotFontSize}px Inter, ui-sans-serif, system-ui, sans-serif`;
+    const spotWidth = context.measureText(model.spot.label).width + spotPadding * 2 + 2;
+    const spotHitbox = target.querySelector(".chan-spot-canvas-hitbox");
+    if (spotHitbox) {
+      spotHitbox.style.width = `${spotWidth}px`;
+      spotHitbox.style.height = `${spotHeight}px`;
+    }
+    const spotX = spotRight - spotWidth;
+    const radius = 3;
+    context.beginPath();
+    context.moveTo(spotX + radius, spotY);
+    context.lineTo(spotX + spotWidth - radius, spotY);
+    context.arcTo(spotX + spotWidth, spotY, spotX + spotWidth, spotY + radius, radius);
+    context.lineTo(spotX + spotWidth, spotY + spotHeight - radius);
+    context.arcTo(spotX + spotWidth, spotY + spotHeight, spotX + spotWidth - radius, spotY + spotHeight, radius);
+    context.lineTo(spotX + radius, spotY + spotHeight);
+    context.arcTo(spotX, spotY + spotHeight, spotX, spotY + spotHeight - radius, radius);
+    context.lineTo(spotX, spotY + radius);
+    context.arcTo(spotX, spotY, spotX + radius, spotY, radius);
+    context.closePath();
+    context.fillStyle = colors.panel;
+    context.fill();
+    context.strokeStyle = colors.blue;
+    context.lineWidth = 1;
+    context.stroke();
+    context.fillStyle = colors.blue;
+    context.textAlign = "left";
+    context.textBaseline = "middle";
+    context.fillText(model.spot.label, spotX + spotPadding + 1, spotY + spotHeight / 2);
+    context.restore();
+  }
   // Volume pane: same time axis and candle slot width as the price pane.
   if (Number.isFinite(model.volumeTop) && Number.isFinite(model.volumeBottom)) {
     const volumeHeight = model.volumeBottom - model.volumeTop;
@@ -837,23 +891,25 @@ function drawChanCanvas(target, binding) {
   // HTML button above the canvas keeps focus, keyboard and tooltip behavior.
   const toggle = target.querySelector(".chan-scenario-toggle-canvas");
   const toggleActive = Boolean(toggle?.matches?.(":hover, :focus-visible"));
-  const toggleX = model.historyRight - 19, toggleY = model.plotBottom - 19;
+  const toggleSize = model.mobileChart ? 22 : 16;
+  const toggleInset = toggleSize + 3;
+  const toggleX = model.historyRight - toggleInset, toggleY = model.plotBottom - toggleInset;
   context.save();
   context.globalAlpha = 1;
   context.fillStyle = colors.panel;
-  context.fillRect(toggleX, toggleY, 16, 16);
+  context.fillRect(toggleX, toggleY, toggleSize, toggleSize);
   context.strokeStyle = toggleActive ? colors.blue : colors.fieldLine;
   context.lineWidth = 0.8;
-  context.strokeRect(toggleX, toggleY, 16, 16);
+  context.strokeRect(toggleX, toggleY, toggleSize, toggleSize);
   context.fillStyle = toggleActive ? colors.blue : colors.text;
   context.textAlign = "center";
   context.textBaseline = "middle";
   if (elementIconFontReady) {
-    context.font = "11px element-icons";
-    context.fillText("\ue7b3", toggleX + 8, toggleY + 8);
+    context.font = `${model.mobileChart ? 13 : 11}px element-icons`;
+    context.fillText("\ue7b3", toggleX + toggleSize / 2, toggleY + toggleSize / 2);
   } else {
-    context.font = "700 10px Inter, ui-sans-serif, system-ui, sans-serif";
-    context.fillText("?", toggleX + 8, toggleY + 8.5);
+    context.font = `700 ${model.mobileChart ? 12 : 10}px Inter, ui-sans-serif, system-ui, sans-serif`;
+    context.fillText("?", toggleX + toggleSize / 2, toggleY + toggleSize / 2 + 0.5);
   }
   context.restore();
 }

@@ -242,6 +242,10 @@ CREATE TABLE IF NOT EXISTS api_analysis_cache (
  cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_api_analysis_cache_time ON api_analysis_cache(created_at ASC);
+CREATE TABLE IF NOT EXISTS chan_analysis_cache (
+ cache_key TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_chan_analysis_cache_time ON chan_analysis_cache(created_at ASC);
 CREATE TABLE IF NOT EXISTS service_leases (
  name TEXT PRIMARY KEY, owner TEXT NOT NULL, acquired_at TEXT NOT NULL
 );
@@ -1948,6 +1952,65 @@ ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, created_at=exclud
 	if _, err := conn.ExecContext(context.Background(), `DELETE FROM api_analysis_cache
 WHERE cache_key IN (
  SELECT cache_key FROM api_analysis_cache
+ ORDER BY created_at DESC, cache_key DESC
+ LIMIT -1 OFFSET ?
+)`, maxEntries); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// GetChanAnalysisCache reads one durable Chan analysis result. The table is
+// separate from api_analysis_cache because Chan payloads are substantially
+// larger and use a different retention limit.
+func (s *SQLite) GetChanAnalysisCache(cacheKey string) ([]byte, bool, error) {
+	var payload string
+	err := s.db.QueryRow(`SELECT payload FROM chan_analysis_cache WHERE cache_key=?`, cacheKey).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return []byte(payload), true, nil
+}
+
+// PutChanAnalysisCache stores a complete Chan result and bounds this dedicated
+// cache independently from the smaller shared API analysis entries.
+func (s *SQLite) PutChanAnalysisCache(cacheKey string, payload []byte, maxEntries int) error {
+	if strings.TrimSpace(cacheKey) == "" || !json.Valid(payload) {
+		return errors.New("Chan analysis cache key and JSON payload must be valid")
+	}
+	if maxEntries < 1 {
+		maxEntries = 1
+	}
+	conn, err := s.db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	createdAt := storedTimestamp(time.Now().UTC())
+	if _, err := conn.ExecContext(context.Background(), `INSERT INTO chan_analysis_cache(cache_key, payload, created_at)
+VALUES (?, ?, ?)
+ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, created_at=excluded.created_at`, cacheKey, string(payload), createdAt); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(context.Background(), `DELETE FROM chan_analysis_cache
+WHERE cache_key IN (
+ SELECT cache_key FROM chan_analysis_cache
  ORDER BY created_at DESC, cache_key DESC
  LIMIT -1 OFFSET ?
 )`, maxEntries); err != nil {

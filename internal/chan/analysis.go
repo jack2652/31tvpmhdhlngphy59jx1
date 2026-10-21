@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"option-scope-go/internal/marketcalendar"
@@ -60,6 +61,14 @@ func analyzeWithComponents(symbol string, input []Bar, spot *float64, cutoff tim
 // caller already has a validated, chronological bar slice. The input slice is
 // retained for quality counters; bars contains only accepted completed bars.
 func analyzeValidatedWithComponents(symbol string, input, bars []Bar, rejected, openBars, duplicates, reordered int, exclusions ExclusionCounts, spot *float64, cutoff time.Time, cached *incrementalComponents) Result {
+	return analyzeValidatedWithSpotMode(symbol, input, bars, rejected, openBars, duplicates, reordered, exclusions, spot, cutoff, cached, true)
+}
+
+func analyzeValidatedWithoutSpot(symbol string, input, bars []Bar, rejected, openBars, duplicates, reordered int, exclusions ExclusionCounts, cutoff time.Time) Result {
+	return analyzeValidatedWithSpotMode(symbol, input, bars, rejected, openBars, duplicates, reordered, exclusions, nil, cutoff, nil, false)
+}
+
+func analyzeValidatedWithSpotMode(symbol string, input, bars []Bar, rejected, openBars, duplicates, reordered int, exclusions ExclusionCounts, spot *float64, cutoff time.Time, cached *incrementalComponents, fallbackToClose bool) Result {
 	validatedBars := bars
 	result := Result{
 		Symbol: symbol, Spot: spot, GeneratedAt: cutoff.UTC(), RuleVersion: RuleVersion,
@@ -86,7 +95,7 @@ func analyzeValidatedWithComponents(symbol string, input, bars []Bar, rejected, 
 	result.Warnings = append(result.Warnings, chainWarnings...)
 	if spot == nil || !finitePositive(*spot) {
 		spot = nil
-		if len(bars) > 0 {
+		if fallbackToClose && len(bars) > 0 {
 			spot = ptr(bars[len(bars)-1].Close)
 		}
 		result.Spot = spot
@@ -127,6 +136,61 @@ func AnalyzeAdjusted(symbol string, input []Bar, adjustedSpot *float64, cutoff t
 	return analyzeAdjustedWithComponents(symbol, input, adjustedSpot, cutoff, recursiveDivergenceRatio, nil)
 }
 
+// AnalyzeAdjustedStructure computes the history-derived structure without
+// binding it to a live quote. Call RebaseSpot before serving the result when a
+// caller needs current-price position and invalidation fields. This makes the
+// expensive structural result reusable while prices move.
+func AnalyzeAdjustedStructure(symbol string, input []Bar, cutoff time.Time) Result {
+	validated, adjustedRejected, adjustedIncomplete, adjustedDuplicates, adjustedReordered, adjustedExclusions := validatedAdjustedBars(input, cutoff)
+	return analyzeAdjustedValidatedWithSpotMode(symbol, input, validated, adjustedRejected, adjustedIncomplete, adjustedDuplicates, adjustedReordered, adjustedExclusions, nil, cutoff, recursiveDivergenceRatio, nil, false)
+}
+
+// RebaseSpot updates the quote-dependent position, legacy signal invalidation,
+// scenarios, and summary while leaving the history-derived structures intact.
+func RebaseSpot(result *Result, spot *float64) {
+	if result == nil {
+		return
+	}
+	if spot != nil && !finitePositive(*spot) {
+		spot = nil
+	}
+	result.Spot = spot
+	effectiveSpot := spot
+	if effectiveSpot == nil {
+		if result.Daily.LastClose != nil && finitePositive(*result.Daily.LastClose) {
+			effectiveSpot = result.Daily.LastClose
+		} else if count := len(result.Daily.Candles); count > 0 && finitePositive(result.Daily.Candles[count-1].Close) {
+			effectiveSpot = ptr(result.Daily.Candles[count-1].Close)
+		}
+	}
+	result.Daily = rebaseFrameSpot(result.Daily, effectiveSpot)
+	result.Weekly = rebaseFrameSpot(result.Weekly, effectiveSpot)
+	result.Summary = frameSummary(result.Daily, result.Weekly)
+}
+
+func rebaseFrameSpot(frame Frame, spot *float64) Frame {
+	latestChain := 0
+	if count := len(frame.Candles); count > 0 {
+		latestChain = frame.Candles[count-1].Chain
+	}
+	if count := len(frame.Strokes); count > 0 {
+		latestChain = frame.Strokes[count-1].Chain
+	}
+	currentCenters := make([]Center, 0, len(frame.Centers))
+	for _, center := range frame.Centers {
+		if center.Chain == latestChain {
+			currentCenters = append(currentCenters, center)
+		}
+	}
+	frame.Position = locate(currentCenters, spot)
+	frame.Signals = append([]Signal(nil), frame.Signals...)
+	frame.PenSignals = append([]Signal(nil), frame.PenSignals...)
+	invalidateSignals(frame.Signals, frame.Candles, spot)
+	invalidateSignals(frame.PenSignals, frame.Candles, spot)
+	frame.Scenarios = scenarios(frame.Position)
+	return frame
+}
+
 // analyzeAdjustedWithDivergenceRatio is used by historical calibration tools.
 // Production APIs always call AnalyzeAdjusted and therefore use the versioned
 // default parameter.
@@ -147,7 +211,16 @@ func analyzeAdjustedPrevalidatedWithComponents(symbol string, bars []Bar, adjust
 }
 
 func analyzeAdjustedValidatedWithComponents(symbol string, input, validated []Bar, adjustedRejected, adjustedIncomplete, adjustedDuplicates, adjustedReordered int, adjustedExclusions ExclusionCounts, adjustedSpot *float64, cutoff time.Time, divergenceRatio float64, cached *incrementalComponents) Result {
-	legacyResult := analyzeValidatedWithComponents(symbol, validated, validated, 0, 0, 0, 0, ExclusionCounts{}, adjustedSpot, cutoff, cached)
+	return analyzeAdjustedValidatedWithSpotMode(symbol, input, validated, adjustedRejected, adjustedIncomplete, adjustedDuplicates, adjustedReordered, adjustedExclusions, adjustedSpot, cutoff, divergenceRatio, cached, true)
+}
+
+func analyzeAdjustedValidatedWithSpotMode(symbol string, input, validated []Bar, adjustedRejected, adjustedIncomplete, adjustedDuplicates, adjustedReordered int, adjustedExclusions ExclusionCounts, adjustedSpot *float64, cutoff time.Time, divergenceRatio float64, cached *incrementalComponents, fallbackToClose bool) Result {
+	var legacyResult Result
+	if fallbackToClose {
+		legacyResult = analyzeValidatedWithComponents(symbol, validated, validated, 0, 0, 0, 0, ExclusionCounts{}, adjustedSpot, cutoff, cached)
+	} else {
+		legacyResult = analyzeValidatedWithoutSpot(symbol, validated, validated, 0, 0, 0, 0, ExclusionCounts{}, cutoff)
+	}
 	result := legacyResult
 	result.LegacyRuleVersion = RuleVersion
 	result.RuleVersion = RecursivePreviewVersion
@@ -1980,7 +2053,9 @@ func invalidateSignals(signals []Signal, bars []Bar, spot *float64) {
 		}
 		if invalid {
 			signal.Status = "invalidated"
-			signal.Detail += "；识别后已触及失效边界"
+			if !strings.Contains(signal.Detail, "识别后已触及失效边界") {
+				signal.Detail += "；识别后已触及失效边界"
+			}
 		}
 	}
 }

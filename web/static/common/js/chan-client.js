@@ -351,9 +351,9 @@
   function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null) {
     const cachedLayouts = chartCache.get(frame.candles);
     const totalBars = frame.candles?.length || 0;
-    // Keep daily and 15-minute candles readable on first render while making
-    // the rest of their loaded history reachable through zoom and pan.
-    const defaultBars = ["1d", "15m"].includes(frame.period) ? Math.min(160, totalBars) : totalBars;
+    // Start daily and 15-minute charts at the same readable 32-bar window on
+    // desktop and mobile; keep the rest of their history reachable by zooming.
+    const defaultBars = ["1d", "15m"].includes(frame.period) ? Math.min(32, totalBars) : totalBars;
     const requestedBars = Number(viewport?.visibleBars);
     const visibleCount = Math.max(1, Math.min(totalBars, Number.isFinite(requestedBars) && requestedBars > 0 ? Math.floor(requestedBars) : (defaultBars || mobileBars || 30)));
     const maxOffset = Math.max(0, totalBars - visibleCount);

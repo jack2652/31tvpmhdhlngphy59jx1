@@ -1678,7 +1678,7 @@ function activeBasis(quote) {
   if (quote?.market_state === "OVERNIGHT") {
     const close = overnightCloseQuote(quote);
     if (close) {
-      const label = quote?.sessions?.overnight?.provider === "alpaca-overnight" ? "夜盘价" : "收盘";
+      const label = quote?.sessions?.overnight?.provider === "alpaca-overnight" ? "夜盘" : "收盘";
       return { price: close.price, label };
     }
   }
@@ -2854,8 +2854,8 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   // 标签跟随实际取到的口径：夜盘/盘后数据缺失而回退到常规价时不能再写成「盘后价」。
   const priceLabel = state.levelBasisMode === "close"
     ? (selectedBasis?.label === "盘后" ? "盘后价" : (selectedBasis?.label === "昨收" ? "盘后价·昨收" : (selectedBasis?.label === "盘前" ? "盘前价" : "常规价")))
-    : (selectedBasis?.label === "夜盘价"
-      ? "夜盘价"
+    : (selectedBasis?.label === "夜盘"
+      ? "夜盘"
       : (selectedBasis?.label === "收盘" ? "收盘价" : "实时价"));
   const basisAsOf = typeof selectedBasis?.asOf === "string" && selectedBasis.asOf.length >= 10 ? selectedBasis.asOf : "";
   const priceTitle = validPrice
@@ -4330,7 +4330,7 @@ function marketStateLabel(value, fallback = "快照") {
 // Alpaca 夜盘价可用时明确标注；没有夜盘价时沿用旧的收盘价回退标签。
 function quoteMarketLabel(quote) {
   if (quote?.market_state !== "OVERNIGHT") return marketStateLabel(quote?.market_state);
-  if (quote?.sessions?.overnight?.provider === "alpaca-overnight") return "夜盘价";
+  if (quote?.sessions?.overnight?.provider === "alpaca-overnight") return "夜盘";
   return state.levelBasisMode === "close" ? "盘后" : "收盘";
 }
 
@@ -5802,7 +5802,7 @@ const optionScopeApp = new Vue({
       if (this.chanHoveredScenario) this.positionChanScenarioCard(key, event);
     },
     dismissChanScenarioOnTouch(event) {
-      if (!this.isChanTouchInput() || event.target.closest(".chan-projection-up, .chan-projection-down, .chan-projection-range, .chan-projection-float-card, .chan-spot-mobile-badge, .chan-spot-float-card")) return;
+      if (!this.isChanTouchInput() || event.target.closest(".chan-projection-up, .chan-projection-down, .chan-projection-range, .chan-projection-float-card, .chan-spot-canvas-hitbox, .chan-spot-float-card")) return;
       this.chanHoveredScenario = null;
       this.chanSpotGuideVisible = false;
     },
@@ -5825,8 +5825,8 @@ const optionScopeApp = new Vue({
         const viewportHeight = window.visualViewport?.height || document.documentElement.clientHeight || window.innerHeight;
         const margin = viewportWidth <= 600 ? 8 : 16;
         const maxLeft = Math.max(margin, viewportWidth - card.offsetWidth - margin);
-        const spotBadge = document.querySelector(".chan-chart .chan-spot-mobile-badge");
-        const badgeRect = spotBadge?.getBoundingClientRect();
+        const spotHitbox = document.querySelector(".chan-chart .chan-spot-canvas-hitbox");
+        const hitboxRect = spotHitbox?.getBoundingClientRect();
         const mobileViewport = viewportWidth <= 600;
         if (mobileViewport) {
           this.chanSpotGuideX = viewportWidth / 2;
@@ -5834,10 +5834,10 @@ const optionScopeApp = new Vue({
           return;
         }
         card.style.maxHeight = Math.max(120, viewportHeight - 32) + "px";
-        // Anchor the popup just to the right of the left-side live-price badge;
+        // Anchor the popup just to the right of the canvas live-price label;
         // keep it fixed there instead of following the pointer along the line.
-        const preferredLeft = badgeRect
-          ? badgeRect.right + 12
+        const preferredLeft = hitboxRect
+          ? hitboxRect.right + 12
           : (viewportWidth - card.offsetWidth) / 2;
         this.chanSpotGuideX = Math.max(margin, Math.min(maxLeft, preferredLeft));
         this.chanSpotGuideY = Math.max(16, Math.min(viewportHeight - card.offsetHeight - 16, (viewportHeight - card.offsetHeight) / 2));

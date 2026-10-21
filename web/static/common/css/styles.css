@@ -279,9 +279,9 @@
 .chan-endpoint{fill:var(--blue);stroke:var(--panel);stroke-width:1.2}
 .chan-endpoint-pending{fill:var(--panel);stroke:var(--blue);stroke-width:1.5}
 .chan-endpoint-label{fill:var(--text);font-size:9px;font-weight:400;font-variant-numeric:tabular-nums;paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
-.chan-spot-mobile-badge{position:absolute;z-index:2;display:block;padding:2px 4px;border:1px solid color-mix(in srgb,var(--blue) 55%,var(--line));border-radius:3px;background:var(--panel);color:var(--blue);font-size:13px;font-weight:750;line-height:1.25;font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right;transform:translate(-100%,-50%);margin-left:-4px;cursor:pointer;pointer-events:auto}
-.chan-spot-mobile-badge:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
-.chan-spot-mobile-badge-static{cursor:default;pointer-events:none}
+.chan-spot-canvas-hitbox{position:absolute;z-index:3;width:76px;height:28px;margin-left:-4px;padding:0;border:0;background:transparent;transform:translate(-100%,-50%);cursor:pointer;pointer-events:auto}
+.chan-spot-canvas-hitbox:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+@media(max-width:600px){.chan-spot-canvas-hitbox{width:64px;height:26px}}
 .chan-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;margin:0;padding:16px 18px;background:var(--field);border:1px solid var(--line)}
 .chan-facts>div{min-width:0}
 .chan-facts dt{color:var(--muted);font-size:12px}
@@ -477,7 +477,6 @@
   .chan-chart-range{font-size:10px}
   .chan-chart-mobile .chan-chart-label{font-size:14px}
   .chan-chart-mobile .chan-endpoint-label{font-size:12px;font-weight:550}
-  .chan-spot-mobile-badge{padding:2px 3px}
   .chan-evidence{display:block}
   .chan-evidence li+li{margin-top:10px}
   .chan-guidance,.chan-scenarios{padding-block:22px}
