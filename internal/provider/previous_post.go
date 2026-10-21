@@ -58,6 +58,59 @@ func nextPostSessionEnd(now time.Time) time.Time {
 	return now.Add(24 * time.Hour)
 }
 
+func yahooPreMarketHistoryParams(now time.Time) (models.HistoryParams, bool) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	now = now.In(location)
+	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+	if !marketcalendar.IsTradingDay(day) {
+		return models.HistoryParams{}, false
+	}
+	start := day.Add(4 * time.Hour)
+	if now.Before(start) {
+		return models.HistoryParams{}, false
+	}
+	return models.HistoryParams{
+		Interval: "1m", Start: &start, End: &now, PrePost: true,
+		AutoAdjust: false, Actions: false, KeepNA: false,
+	}, true
+}
+
+func yahooPreMarketSession(bars []models.Bar, now time.Time, referenceClose float64) (float64, map[string]any, bool) {
+	params, ok := yahooPreMarketHistoryParams(now)
+	if !ok || len(bars) == 0 {
+		return 0, nil, false
+	}
+	location := params.Start.Location()
+	dayKey := params.Start.Format(time.DateOnly)
+	regularOpen := time.Date(params.Start.Year(), params.Start.Month(), params.Start.Day(), 9, 30, 0, 0, location)
+	latest := time.Time{}
+	price := float64(0)
+	for _, bar := range bars {
+		at := bar.Date.In(location)
+		if at.Format(time.DateOnly) != dayKey || at.Before(*params.Start) || at.After(*params.End) || !at.Before(regularOpen) || !validYahooPrice(bar.Close) {
+			continue
+		}
+		if !at.Before(latest) {
+			latest, price = at, bar.Close
+		}
+	}
+	if !validYahooPrice(price) {
+		return 0, nil, false
+	}
+	session := map[string]any{
+		"price": price,
+		"as_of": latest.Format(time.RFC3339),
+		"date":  dayKey,
+	}
+	if validYahooPrice(referenceClose) {
+		session["reference_close"] = referenceClose
+	}
+	return price, session, true
+}
+
 // PreviousPostSession returns the last extended-hours price of the most recent
 // completed post-market session. Yahoo clears PostMarketPrice from the quote
 // payload as soon as pre-market starts, so after 04:00 ET the 1-minute chart

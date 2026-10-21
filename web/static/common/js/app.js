@@ -1674,6 +1674,21 @@ const BASIS_MODES = { live: "实时价", close: "盘后价" };
 // 夜盘没有可用的 Yahoo 夜盘价时改用最近一次正常交易日收盘价，避免把常规价误标成夜盘实时价。
 function activeBasis(quote) {
   if (state.levelBasisMode === "close") return levelBasis(quote, quote?.price);
+  if (quote?.market_state === "PRE") {
+    const sessions = quote?.sessions || {};
+    const prePrice = finitePrice(sessions.pre?.price);
+    if (prePrice != null) {
+      const asOf = typeof sessions.pre?.date === "string"
+        ? sessions.pre.date
+        : (typeof sessions.pre?.as_of === "string" ? sessions.pre.as_of.slice(0, 10) : "");
+      return { price: prePrice, label: "盘前", asOf };
+    }
+    const close = finitePrice(sessions.post?.reference_close ?? quote?.previous_close ?? quote?.price);
+    const asOf = typeof sessions.post?.date === "string"
+      ? sessions.post.date
+      : (typeof sessions.post?.as_of === "string" ? sessions.post.as_of.slice(0, 10) : "");
+    return { price: close, label: "昨收", asOf };
+  }
   // Alpaca 夜盘价是当前有效的夜盘参考；没有 Alpaca 时才回退最近一次正式收盘。
   if (quote?.market_state === "OVERNIGHT") {
     const close = overnightCloseQuote(quote);
@@ -2856,7 +2871,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
     ? (selectedBasis?.label === "盘后" ? "盘后价" : (selectedBasis?.label === "昨收" ? "盘后价·昨收" : (selectedBasis?.label === "盘前" ? "盘前价" : "常规价")))
     : (selectedBasis?.label === "夜盘"
       ? "夜盘"
-      : (selectedBasis?.label === "收盘" ? "收盘价" : "实时价"));
+      : (selectedBasis?.label === "收盘" ? "收盘价" : (selectedBasis?.label === "昨收" ? "昨收" : (selectedBasis?.label === "盘前" ? "盘前价" : "实时价"))));
   const basisAsOf = typeof selectedBasis?.asOf === "string" && selectedBasis.asOf.length >= 10 ? selectedBasis.asOf : "";
   const priceTitle = validPrice
     ? `${priceLabel} ${formatMoney(displayedPrice)} · 数据来源：${selectedBasis?.label || "常规"}${basisAsOf ? " " + basisAsOf : ""}`
@@ -3458,7 +3473,7 @@ function overnightCloseQuote(quote) {
 function activeSessionQuote(quote) {
   const sessions = quote?.sessions || {};
   const marketState = quote?.market_state;
-  if (marketState === "PRE" && sessions.pre?.price != null) return sessions.pre;
+  if (marketState === "PRE" && finitePrice(sessions.pre?.price) != null) return sessions.pre;
   if (marketState === "POST" && sessions.post?.price != null) return sessions.post;
   if (marketState === "OVERNIGHT") {
     // 配置 Alpaca 后，夜盘价优先级高于分析面板的盘后价基准开关；未配置时保留旧口径。
@@ -4028,12 +4043,15 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   quote = mergedQuote;
   clearQuoteRetry();
   const active = activeSessionQuote(quote);
-  const price = active?.price ?? quote?.price;
+  const missingPremarketPrice = quote?.market_state === "PRE" && finitePrice(quote?.sessions?.pre?.price) == null;
+  const price = missingPremarketPrice ? null : (active?.price ?? quote?.price);
   const reference = quoteReference(quote);
   const referencePrice = finitePrice(reference.price);
-  const change = referencePrice != null && finitePrice(price) != null
+  const change = missingPremarketPrice
+    ? null
+    : (referencePrice != null && finitePrice(price) != null
     ? (Number(price) - referencePrice) / referencePrice * 100
-    : (active?.change_percent ?? quote?.change_percent);
+    : (active?.change_percent ?? quote?.change_percent));
   state.view.quoteSymbol = quote?.symbol || state.symbol;
   state.view.quotePrice = formatMoney(price);
   state.view.quoteChange = change == null ? "涨跌 --" : `涨跌 ${change >= 0 ? "+" : ""}${Number(change).toFixed(2)}%`;
@@ -4329,6 +4347,7 @@ function marketStateLabel(value, fallback = "快照") {
 
 // Alpaca 夜盘价可用时明确标注；没有夜盘价时沿用旧的收盘价回退标签。
 function quoteMarketLabel(quote) {
+  if (quote?.market_state === "PRE" && finitePrice(quote?.sessions?.pre?.price) == null) return "盘前无报价";
   if (quote?.market_state !== "OVERNIGHT") return marketStateLabel(quote?.market_state);
   if (quote?.sessions?.overnight?.provider === "alpaca-overnight") return "夜盘";
   return state.levelBasisMode === "close" ? "盘后" : "收盘";

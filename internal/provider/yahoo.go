@@ -411,7 +411,7 @@ func yahooQuoteSessions(quote *yahooQuoteModel, now time.Time) map[string]any {
 		}
 		sessions[name] = summary
 	}
-	if state == "PRE" && yahooCurrentSessionTime(quote.PreMarketTime, now) {
+	if state == "PRE" && yahooHasCurrentPreMarketPrice(quote, now) {
 		// Before the open, RegularMarketPrice is the last completed session close;
 		// RegularMarketPreviousClose is one session older.
 		add("pre", quote.PreMarketPrice, quote.RegularMarketPrice, quote.PreMarketTime, quote.RegularMarketTime)
@@ -456,20 +456,30 @@ func yahooQuoteHasCurrentPrice(quote *yahooQuoteModel, now time.Time) bool {
 	}
 }
 
+func yahooHasCurrentPreMarketPrice(quote *yahooQuoteModel, now time.Time) bool {
+	if quote == nil || !validYahooPrice(quote.PreMarketPrice) {
+		return false
+	}
+	params, ok := yahooPreMarketHistoryParams(now)
+	return ok && !quote.PreMarketTime.Before(*params.Start) && !quote.PreMarketTime.After(*params.End)
+}
+
 func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 	symbol, err := NormalizeSymbol(symbol)
 	if err != nil {
 		return model.Quote{}, err
 	}
 	now := y.marketNow()
+	state := yahooSessionState(now, nil)
 	type quoteSnapshot struct {
-		quote    *yahooQuoteModel
-		quoteErr error
-		daily    []yahooBarModel
-		dailyErr error
+		quote     *yahooQuoteModel
+		quoteErr  error
+		daily     []yahooBarModel
+		dailyErr  error
+		preMarket []yahooBarModel
 	}
 	type quotePhaseTimes struct {
-		quote, daily time.Duration
+		quote, daily, preMarket time.Duration
 	}
 	var phases quotePhaseTimes
 	startedAt := time.Now()
@@ -480,6 +490,13 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 		quote, quoteErr := ticker.Quote()
 		phases.quote = time.Since(started)
 		snapshot := quoteSnapshot{quote: quote, quoteErr: quoteErr}
+		if state == "PRE" && !yahooHasCurrentPreMarketPrice(quote, now) {
+			if params, ok := yahooPreMarketHistoryParams(now); ok {
+				started = time.Now()
+				snapshot.preMarket, _ = ticker.History(params)
+				phases.preMarket = time.Since(started)
+			}
+		}
 		needsDaily := quoteErr != nil || !yahooQuoteHasCurrentPrice(quote, now) || quote == nil || !validYahooPrice(quote.RegularMarketPreviousClose)
 		if needsDaily {
 			started = time.Now()
@@ -489,7 +506,7 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 		return snapshot, nil
 	})
 	if elapsed := time.Since(startedAt); elapsed >= time.Second {
-		log.Printf("slow Yahoo quote symbol=%s total=%s quote=%s daily_fallback=%s", symbol, elapsed.Round(time.Millisecond), phases.quote.Round(time.Millisecond), phases.daily.Round(time.Millisecond))
+		log.Printf("slow Yahoo quote symbol=%s total=%s quote=%s premarket_fallback=%s daily_fallback=%s", symbol, elapsed.Round(time.Millisecond), phases.quote.Round(time.Millisecond), phases.preMarket.Round(time.Millisecond), phases.daily.Round(time.Millisecond))
 	}
 	if fetchErr != nil {
 		return model.Quote{}, fetchErr
@@ -498,7 +515,6 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 	sessions := yahooQuoteSessions(metaQuote, now)
 	// The exchange calendar determines the active session, avoiding stale
 	// marketState values returned by Yahoo after regular or early closes.
-	state := yahooSessionState(now, nil)
 	price := float64(0)
 	previous := float64(0)
 	regularOpen := (*float64)(nil)
@@ -513,7 +529,7 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 		currency = metaQuote.Currency
 		switch state {
 		case "PRE":
-			if validYahooPrice(metaQuote.PreMarketPrice) && yahooCurrentSessionTime(metaQuote.PreMarketTime, now) {
+			if yahooHasCurrentPreMarketPrice(metaQuote, now) {
 				price = metaQuote.PreMarketPrice
 			}
 		case "POST":
@@ -528,15 +544,35 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 		if !validYahooPrice(price) {
 			price = last.Close
 		}
-		if len(snapshot.daily) > 1 && !validYahooPrice(previous) {
+		if state == "PRE" && (metaQuote == nil || !validYahooPrice(metaQuote.RegularMarketPrice)) {
+			previous = last.Close
+		} else if len(snapshot.daily) > 1 && !validYahooPrice(previous) {
 			previous = snapshot.daily[len(snapshot.daily)-2].Close
 		}
 		dailyOpen = last.Open
 	}
-	if snapshot.quoteErr != nil && len(snapshot.daily) == 0 {
+	preMarketPrice := float64(0)
+	if state == "PRE" && !yahooHasCurrentPreMarketPrice(metaQuote, now) {
+		referenceClose := float64(0)
+		if metaQuote != nil {
+			referenceClose = metaQuote.RegularMarketPrice
+		}
+		if !validYahooPrice(referenceClose) && len(snapshot.daily) > 0 {
+			referenceClose = snapshot.daily[len(snapshot.daily)-1].Close
+		}
+		if fallbackPrice, session, ok := yahooPreMarketSession(snapshot.preMarket, now, referenceClose); ok {
+			preMarketPrice = fallbackPrice
+			price = fallbackPrice
+			if validYahooPrice(referenceClose) {
+				previous = referenceClose
+			}
+			sessions["pre"] = session
+		}
+	}
+	if snapshot.quoteErr != nil && len(snapshot.daily) == 0 && !validYahooPrice(preMarketPrice) {
 		return model.Quote{}, snapshot.quoteErr
 	}
-	if snapshot.dailyErr != nil && (!validYahooPrice(price) || !validYahooPrice(previous)) {
+	if snapshot.dailyErr != nil && (!validYahooPrice(price) || !validYahooPrice(previous)) && !validYahooPrice(preMarketPrice) {
 		if snapshot.quoteErr != nil {
 			return model.Quote{}, snapshot.quoteErr
 		}
