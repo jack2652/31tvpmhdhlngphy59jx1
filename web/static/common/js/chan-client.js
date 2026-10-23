@@ -348,6 +348,71 @@
     return result;
   }
 
+  // Calculate DMI (14, 6) over the full frame so viewport changes retain the
+  // same warm-up and smoothing state as the source candle sequence.
+  const dmiSeriesCache = new WeakMap();
+  function dmiSeries(candles) {
+    if (!candles?.length) return [];
+    const cached = dmiSeriesCache.get(candles);
+    if (cached) return cached;
+    const result = new Array(candles.length).fill(null);
+    const movementWindow = [];
+    const dxWindow = [];
+    let trueRangeSum = 0, plusSum = 0, minusSum = 0, dxSum = 0;
+    for (let index = 0; index < candles.length; index += 1) {
+      const candle = candles[index];
+      const high = Number(candle?.high), low = Number(candle?.low);
+      if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) {
+        movementWindow.length = 0;
+        dxWindow.length = 0;
+        trueRangeSum = 0; plusSum = 0; minusSum = 0; dxSum = 0;
+        continue;
+      }
+      let trueRange = high - low, plusMove = 0, minusMove = 0;
+      if (index > 0) {
+        const previous = candles[index - 1];
+        const previousHigh = Number(previous?.high), previousLow = Number(previous?.low);
+        const previousClose = Number(previous?.close);
+        if (Number.isFinite(previousHigh) && Number.isFinite(previousLow) && Number.isFinite(previousClose)) {
+          trueRange = Math.max(high - low, Math.abs(high - previousClose), Math.abs(previousClose - low));
+          const highMove = high - previousHigh;
+          const lowMove = previousLow - low;
+          plusMove = highMove > 0 && highMove > lowMove ? highMove : 0;
+          minusMove = lowMove > 0 && lowMove > highMove ? lowMove : 0;
+        } else {
+          movementWindow.length = 0;
+          dxWindow.length = 0;
+          trueRangeSum = 0; plusSum = 0; minusSum = 0; dxSum = 0;
+        }
+      }
+      const movement = { trueRange, plusMove, minusMove };
+      movementWindow.push(movement);
+      trueRangeSum += trueRange;
+      plusSum += plusMove;
+      minusSum += minusMove;
+      if (movementWindow.length > 14) {
+        const expired = movementWindow.shift();
+        trueRangeSum -= expired.trueRange;
+        plusSum -= expired.plusMove;
+        minusSum -= expired.minusMove;
+      }
+      if (movementWindow.length < 14) continue;
+      const pdi = trueRangeSum > 0 ? plusSum * 100 / trueRangeSum : 0;
+      const mdi = trueRangeSum > 0 ? minusSum * 100 / trueRangeSum : 0;
+      const directionSum = pdi + mdi;
+      const dx = directionSum > 0 ? Math.abs(pdi - mdi) * 100 / directionSum : 0;
+      dxWindow.push(dx);
+      dxSum += dx;
+      if (dxWindow.length > 6) dxSum -= dxWindow.shift();
+      result[index] = {
+        pdi, mdi, dx, adx: dxWindow.length === 6 ? dxSum / 6 : null,
+        difference: pdi - mdi,
+      };
+    }
+    dmiSeriesCache.set(candles, result);
+    return result;
+  }
+
   function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null) {
     const cachedLayouts = chartCache.get(frame.candles);
     const totalBars = frame.candles?.length || 0;
@@ -395,6 +460,7 @@
     const bars = (frame.candles || []).slice(startIndex, endIndex);
     if (!bars.length) return null;
     const macd = macdSeries(frame.candles || []).slice(startIndex, endIndex);
+    const dmi = dmiSeries(frame.candles || []).slice(startIndex, endIndex);
     const width = mobile ? 420 : 960;
     // Desktop retains room for the left price labels and current-price badge
     // without carrying the oversized axis gutter from the former right axis.
@@ -410,12 +476,16 @@
     const indicatorGap = mobile ? 36 : 34;
     const volumeHeight = mobile ? 84 : 72;
     const macdHeight = mobile ? 112 : 96;
+    const dmiHeight = mobile ? 112 : 96;
     const volumeTop = priceBottom + panelGap;
     const volumeBottom = volumeTop + volumeHeight;
     const macdTop = volumeBottom + indicatorGap;
     const macdBottom = macdTop + macdHeight;
+    const dmiTop = macdBottom + indicatorGap;
+    const dmiBottom = dmiTop + dmiHeight;
     const indicatorDividerY = volumeBottom + Math.round(indicatorGap / 3);
-    const height = macdBottom + bottom;
+    const dmiDividerY = macdBottom + Math.round(indicatorGap / 3);
+    const height = dmiBottom + bottom;
     const plotWidth = width - left - right;
     // Keep the scenario lane independent from historical bars. Mobile uses a
     // slightly wider lane than desktop so the projection stays readable.
@@ -601,7 +671,8 @@
       width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: priceBottom,
       priceBottom, volumeTop, volumeBottom, volumeMax, indicatorDividerY,
       macdTop, macdBottom, macdMin, macdMax, macdZeroY,
-      crosshairBottom: macdBottom, interactionBottom: macdBottom, axisBottom: macdBottom,
+      dmiTop, dmiBottom, dmiDividerY,
+      crosshairBottom: dmiBottom, interactionBottom: dmiBottom, axisBottom: dmiBottom,
       totalBars, visibleBars: bars.length, windowStart: startIndex, windowEnd: endIndex, endOffset,
       canZoomIn: bars.length > Math.min(12, totalBars), canZoomOut: bars.length < totalBars,
       canPanLeft: endOffset < maxOffset, canPanRight: endOffset > 0,
@@ -610,7 +681,7 @@
       historyRight, scenarioBoundary, scenarioLaneLeft, lastClose: frame.last_close,
       title: `${frame.label} K 线与结构观察，${firstDisplayDate} 至 ${lastDisplayDate}`,
       ruleVersion: recursiveRule,
-      description: "实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔和顶底观察均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。价格图下方依次为成交量和 MACD（12、26、9），它们与 K 线共用同一时间轴。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；下方副图显示 MACD。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。",
+      description: "实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔和顶底观察均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。价格图下方依次为成交量、MACD（12、26、9）和 DMI（14、6），它们与 K 线共用同一时间轴。按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。",
       points,
       chanCandles,
       structures: [
@@ -702,7 +773,7 @@
         const displayDate = displayBarTime(bar.date, frame.period);
         return { key: bar.date, index, date: bar.date, displayDate, x: x(index),
         prices: { open: bar.open, high: bar.high, low: bar.low, close: bar.close }, previousClose, closeChangePercent,
-        volume: Number(bar.volume) || 0, macd: macd[index] || null,
+        volume: Number(bar.volume) || 0, macd: macd[index] || null, dmi: dmi[index] || null,
         high: y(bar.high), low: y(bar.low), body: Math.min(y(bar.open), y(bar.close)),
         bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, historyWidth / bars.length * 0.56),
         direction: bar.close >= bar.open ? "up" : "down",

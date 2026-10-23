@@ -253,10 +253,12 @@
               <line class="chart-crosshair-h chart-crosshair-price"></line>
               <line class="chart-crosshair-h chart-crosshair-volume"></line>
               <line class="chart-crosshair-h chart-crosshair-macd"></line>
+              <line class="chart-crosshair-h chart-crosshair-dmi"></line>
               <g class="chart-tag chart-tag-x"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-y"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-volume"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-macd"><rect rx="2" height="18"></rect><text></text></g>
+              <g class="chart-tag chart-tag-dmi"><rect rx="2" height="18"></rect><text></text></g>
             </g>
           </svg>
           <button v-if="chanFrame.chart.spot" type="button" class="chan-spot-canvas-hitbox" :style="{ left: (chanFrame.chart.plotLeft / chanFrame.chart.width * 100) + '%', top: (chanFrame.chart.spot.y / chanFrame.chart.height * 100) + '%' }" aria-label="现价，点击切换结构观察" :aria-expanded="chanSpotGuideVisible ? 'true' : 'false'" :aria-describedby="chanSpotGuideVisible ? 'chan-spot-guide-card' : null" @click.stop="toggleChanSpotGuide($event)" @keydown.esc.stop.prevent="dismissChanSpotGuide"></button>

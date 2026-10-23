@@ -141,10 +141,12 @@ function bindChanChartHover(target, initialBinding) {
   const horizontal = layer.querySelector(".chart-crosshair-h");
   const horizontalVolume = layer.querySelector(".chart-crosshair-volume");
   const horizontalMacd = layer.querySelector(".chart-crosshair-macd");
+  const horizontalDmi = layer.querySelector(".chart-crosshair-dmi");
   const tagX = layer.querySelector(".chart-tag-x");
   const tagY = layer.querySelector(".chart-tag-y");
   const tagVolume = layer.querySelector(".chart-tag-volume");
   const tagMacd = layer.querySelector(".chart-tag-macd");
+  const tagDmi = layer.querySelector(".chart-tag-dmi");
   let model = initial.chart;
   let scenariosVisible = initial.scenariosVisible !== false;
   let onScenarioHover = initial.onScenarioHover;
@@ -248,6 +250,8 @@ function bindChanChartHover(target, initialBinding) {
       && localY >= model.volumeTop && localY <= model.volumeBottom;
     const inMacdPane = Number.isFinite(model.macdTop) && Number.isFinite(model.macdBottom)
       && localY >= model.macdTop && localY <= model.macdBottom;
+    const inDmiPane = Number.isFinite(model.dmiTop) && Number.isFinite(model.dmiBottom)
+      && localY >= model.dmiTop && localY <= model.dmiBottom;
     const plotHeight = model.plotBottom - model.plotTop;
     const priceRange = model.maximum - model.minimum;
     const cursorY = Math.max(model.plotTop, Math.min(model.plotBottom, localY));
@@ -273,6 +277,12 @@ function bindChanChartHover(target, initialBinding) {
         horizontalMacd.removeAttribute("visibility");
       } else horizontalMacd.setAttribute("visibility", "hidden");
     }
+    if (horizontalDmi) {
+      if (inDmiPane) {
+        setLine(horizontalDmi, model.plotLeft, localY, model.plotRight, localY);
+        horizontalDmi.removeAttribute("visibility");
+      } else horizontalDmi.setAttribute("visibility", "hidden");
+    }
     const displayDate = candle.displayDate || candle.date;
     const axisDate = displayDate.includes(" ") ? displayDate.slice(5) : displayDate;
     const dateWidth = Math.max(84, axisDate.length * 7 + 12);
@@ -295,8 +305,11 @@ function bindChanChartHover(target, initialBinding) {
       ? model.volumeMax * (model.volumeBottom - localY) / Math.max(1, model.volumeBottom - model.volumeTop) : null;
     const macdAtCursor = inMacdPane
       ? model.macdMax - (localY - model.macdTop) / Math.max(1, model.macdBottom - model.macdTop) * (model.macdMax - model.macdMin) : null;
+    const dmiAtCursor = inDmiPane
+      ? 100 * (model.dmiBottom - localY) / Math.max(1, model.dmiBottom - model.dmiTop) : null;
     setPaneTag(tagVolume, inVolumePane, volumeAtCursor == null ? "" : formatVolume(Math.max(0, volumeAtCursor)), localY);
     setPaneTag(tagMacd, inMacdPane, macdAtCursor == null ? "" : formatIndicator(macdAtCursor), localY);
+    setPaneTag(tagDmi, inDmiPane, dmiAtCursor == null ? "" : formatIndicator(dmiAtCursor), localY);
     if (shownCandle !== candle) {
       title.textContent = displayDate;
       subtitle.textContent = `${model.periodLabel} · 已收盘 K 线`;
@@ -519,15 +532,104 @@ function latestIndicatorCandle(model) {
   return candles.length ? candles[candles.length - 1] : null;
 }
 
+function compactIndicatorValue(value) {
+  if (value == null || value === "") return "--";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return `${number > 0 ? "+" : ""}${number.toFixed(1)}`;
+}
+
+function macdInterpretation(macd) {
+  if (!macd || !Number.isFinite(macd.hist)) return "指标预热中";
+  if (Math.abs(macd.hist) < 0.005) return "DIF≈DEA，动能趋平";
+  if (macd.hist > 0 && macd.dif < 0 && macd.dea < 0) return "DIF>DEA，零轴下多头动能回升";
+  if (macd.hist < 0 && macd.dif > 0 && macd.dea > 0) return "DIF<DEA，零轴上空头动能转强";
+  return macd.hist > 0
+    ? "DIF>DEA，柱为正，多头动能占优"
+    : "DIF<DEA，柱为负，空头动能占优";
+}
+
+function compactMacdInterpretation(macd) {
+  if (!macd || !Number.isFinite(macd.hist) || Math.abs(macd.hist) < 0.005) return "动能趋平";
+  if (macd.hist > 0 && macd.dif < 0 && macd.dea < 0) return "零轴下多头回升";
+  if (macd.hist < 0 && macd.dif > 0 && macd.dea > 0) return "零轴上空头转强";
+  return macd.hist > 0 ? "动能偏多" : "动能偏空";
+}
+
 function indicatorHeaderText(candle) {
   const volume = candle && Number.isFinite(Number(candle.volume)) ? formatVolume(candle.volume) : "--";
   const macd = candle?.macd;
+  const dmi = candle?.dmi;
+  const balanced = dmi && Math.abs(dmi.difference) < 0.01;
+  const dmiLeader = !dmi ? "" : balanced
+    ? "多空均衡" : dmi.difference > 0 ? "多头" : "空头";
+  const adx = Number.isFinite(dmi?.adx) ? formatIndicator(dmi.adx) : "预热中";
+  const dmiStatus = !dmi ? "预热中"
+    : balanced ? "方向胶着"
+      : !Number.isFinite(dmi.adx) ? `${dmiLeader}占优`
+        : dmi.adx > 25 ? `${dmiLeader}趋势强` : `${dmiLeader}占优`;
+  const dmiInterpretation = !dmi ? "DMI指标预热中"
+    : !Number.isFinite(dmi.adx) ? `${balanced ? "PDI≈MDI，方向胶着" : dmi.difference > 0 ? "PDI>MDI，多头占优" : "MDI>PDI，空头占优"}，ADX预热中`
+      : balanced ? dmi.adx > 25 ? "PDI≈MDI，方向胶着；ADX>25，趋势强" : "PDI≈MDI，方向不明；ADX≤25，趋势偏弱"
+        : `${dmi.difference > 0 ? "PDI>MDI，多头" : "MDI>PDI，空头"}主导；ADX${dmi.adx > 25 ? ">25，趋势强" : "≤25，趋势偏弱"}`;
   return {
     volume: `成交量  ${volume}`,
     macd: macd
       ? `MACD  DIF ${formatIndicator(macd.dif)} · DEA ${formatIndicator(macd.dea)} · 柱 ${formatIndicator(macd.hist)}`
       : "MACD",
+    macdCompact: macd
+      ? `MACD DIF ${compactIndicatorValue(macd.dif)} · DEA ${compactIndicatorValue(macd.dea)} · 柱 ${compactIndicatorValue(macd.hist)}`
+      : "MACD",
+    macdInterpretation: macdInterpretation(macd),
+    macdCompactInterpretation: compactMacdInterpretation(macd),
+    dmi: dmi
+      ? `DMI  PDI ${formatIndicator(dmi.pdi)} · MDI ${formatIndicator(dmi.mdi)} · ADX ${adx}`
+      : "DMI(14,6) 预热中",
+    dmiCompact: dmi
+      ? `DMI PDI ${compactIndicatorValue(dmi.pdi)} · MDI ${compactIndicatorValue(dmi.mdi)} · ADX ${compactIndicatorValue(dmi.adx)}`
+      : "DMI(14,6) 预热中",
+    dmiStatus,
+    dmiInterpretation,
   };
+}
+
+function drawInlineIndicatorHeader(context, model, x, y, width, text, insight, compactText, compactInsight, textColor, insightColor) {
+  const mobile = Boolean(model?.mobileChart);
+  const candidates = mobile
+    ? [
+      { font: "14px Inter, ui-sans-serif, system-ui, sans-serif", text, insight },
+      { font: "12px Inter, ui-sans-serif, system-ui, sans-serif", text: compactText, insight: compactInsight },
+    ]
+    : [
+      { font: "9px Inter, ui-sans-serif, system-ui, sans-serif", text, insight },
+      { font: "8px Inter, ui-sans-serif, system-ui, sans-serif", text: compactText, insight: compactInsight },
+    ];
+  context.textAlign = "left";
+  context.textBaseline = "alphabetic";
+  if (typeof context.measureText !== "function") {
+    context.font = indicatorHeaderFont(model);
+    context.fillStyle = textColor;
+    context.fillText(text, x, y, width);
+    return;
+  }
+  const gap = mobile ? 8 : 10;
+  for (const candidate of candidates) {
+    context.font = candidate.font;
+    const textWidth = context.measureText(candidate.text).width;
+    const insightWidth = candidate.insight ? context.measureText(candidate.insight).width : 0;
+    if (textWidth + (insightWidth ? gap + insightWidth : 0) > width) continue;
+    context.fillStyle = textColor;
+    context.fillText(candidate.text, x, y);
+    if (insightWidth) {
+      context.fillStyle = insightColor;
+      context.fillText(candidate.insight, x + textWidth + gap, y);
+    }
+    return;
+  }
+  const fallback = candidates[candidates.length - 1];
+  context.font = fallback.font;
+  context.fillStyle = textColor;
+  context.fillText(fallback.text, x, y, width);
 }
 
 function indicatorHeaderFont(model) {
@@ -559,7 +661,19 @@ function drawChanIndicatorHeaders(target, model, candle) {
   context.textBaseline = "alphabetic";
   const header = indicatorHeaderText(candle);
   context.fillText(header.volume, model.plotLeft, model.volumeTop - 6);
-  context.fillText(header.macd, model.plotLeft, model.macdTop - 6);
+  const bullishColor = chanThemeColor(target, "--up", "#19bd83");
+  const bearishColor = chanThemeColor(target, "--down", "#f04d68");
+  const macdColor = candle?.macd?.hist > 0 ? bullishColor : candle?.macd?.hist < 0 ? bearishColor : color;
+  drawInlineIndicatorHeader(context, model, model.plotLeft, model.macdTop - 6, width,
+    header.macd, header.macdInterpretation, header.macdCompact, header.macdCompactInterpretation, color, macdColor);
+  if (!Number.isFinite(model.dmiTop)) return;
+  context.clearRect(model.plotLeft - 2, model.dmiTop - 18, width, 16);
+  // 美股图表使用绿色表示上涨、红色表示下跌。
+  const dmiDifference = Number(candle?.dmi?.difference);
+  const dmiColor = !Number.isFinite(dmiDifference) || Math.abs(dmiDifference) < 0.01
+    ? color : dmiDifference > 0 ? bullishColor : bearishColor;
+  drawInlineIndicatorHeader(context, model, model.plotLeft, model.dmiTop - 6, width,
+    header.dmi, header.dmiInterpretation, header.dmiCompact, header.dmiStatus, color, dmiColor);
 }
 
 function drawChanCanvas(target, binding) {
@@ -828,10 +942,109 @@ function drawChanCanvas(target, binding) {
     };
     drawMacdLine("dif", colors.amber);
     drawMacdLine("dea", colors.blue);
-    const indicatorFont = indicatorHeaderFont(model);
-    label(indicatorHeaderText(latestIndicatorCandle(model)).macd, model.plotLeft, model.macdTop - 6,
-      { font: indicatorFont, color: colors.text });
+    const latestCandle = latestIndicatorCandle(model);
+    const header = indicatorHeaderText(latestCandle);
+    const macdColor = latestCandle?.macd?.hist > 0 ? colors.up : latestCandle?.macd?.hist < 0 ? colors.down : colors.text;
+    drawInlineIndicatorHeader(context, model, model.plotLeft, model.macdTop - 6,
+      Math.max(1, model.plotRight - model.plotLeft), header.macd, header.macdInterpretation,
+      header.macdCompact, header.macdCompactInterpretation, colors.text, macdColor);
     line(model.plotLeft, model.macdBottom, model.plotRight, model.macdBottom, colors.axis, [], 1);
+  }
+  if (Number.isFinite(model.macdBottom) && Number.isFinite(model.dmiTop)) {
+    const dividerY = Number.isFinite(model.dmiDividerY)
+      ? model.dmiDividerY
+      : model.macdBottom + (model.dmiTop - model.macdBottom) / 3;
+    line(model.plotLeft, dividerY, model.plotRight, dividerY, colors.fieldLine, [], 1.5);
+  }
+  // DMI uses a fixed 0-100 range so PDI, MDI, ADX, and the 25 threshold remain comparable.
+  if (Number.isFinite(model.dmiTop) && Number.isFinite(model.dmiBottom)) {
+    const dmiHeight = model.dmiBottom - model.dmiTop;
+    const dmiY = (value) => model.dmiTop + (100 - value) / 100 * dmiHeight;
+    // 美股图表使用绿色表示上涨、红色表示下跌。
+    const bullishColor = colors.up;
+    const bearishColor = colors.down;
+    line(model.plotLeft, model.dmiTop, model.plotRight, model.dmiTop, colors.grid, [2, 4], 1);
+    for (const value of [0, 25, 50, 75, 100]) {
+      const y = dmiY(value);
+      if (value !== 25) line(model.plotLeft, y, model.plotRight, y, colors.grid, [2, 4], 1);
+      label(String(value), model.plotLeft - 8, value === 0 ? y - 2 : y + 3, {
+        align: "right", font: `${model.mobileChart ? 11 : 9}px Inter, ui-sans-serif, system-ui, sans-serif`,
+        color: value === 25 ? colors.amber : colors.text,
+      });
+    }
+    context.save();
+    context.globalAlpha = 0.16;
+    const candles = model.candles || [];
+    for (let index = 1; index < candles.length; index += 1) {
+      const previous = candles[index - 1]?.dmi, current = candles[index]?.dmi;
+      if (!previous || !current) continue;
+      context.beginPath();
+      context.moveTo(candles[index - 1].x, dmiY(previous.pdi));
+      context.lineTo(candles[index].x, dmiY(current.pdi));
+      context.lineTo(candles[index].x, dmiY(current.mdi));
+      context.lineTo(candles[index - 1].x, dmiY(previous.mdi));
+      context.closePath();
+      context.fillStyle = current.difference >= 0 ? bullishColor : bearishColor;
+      context.fill();
+    }
+    context.restore();
+    const drawDmiLine = (key, color, lineWidth) => {
+      context.beginPath();
+      let started = false;
+      for (const candle of candles) {
+        const value = candle.dmi?.[key];
+        if (!Number.isFinite(value)) { started = false; continue; }
+        const y = dmiY(value);
+        if (started) context.lineTo(candle.x, y);
+        else { context.moveTo(candle.x, y); started = true; }
+      }
+      context.strokeStyle = color;
+      context.lineWidth = lineWidth;
+      context.setLineDash([]);
+      context.stroke();
+    };
+    drawDmiLine("pdi", bullishColor, 1.5);
+    drawDmiLine("mdi", bearishColor, 1.5);
+    const drawAdxLine = () => {
+      let previous = null;
+      for (const candle of candles) {
+        const value = candle.dmi?.adx;
+        if (!Number.isFinite(value)) { previous = null; continue; }
+        const current = { x: candle.x, value, y: dmiY(value) };
+        if (previous) {
+          const previousAbove = previous.value > 25, currentAbove = current.value > 25;
+          context.beginPath();
+          context.moveTo(previous.x, previous.y);
+          if (previousAbove !== currentAbove) {
+            const ratio = (25 - previous.value) / (current.value - previous.value);
+            const crossing = { x: previous.x + (current.x - previous.x) * ratio, y: dmiY(25) };
+            context.lineTo(crossing.x, crossing.y);
+            context.strokeStyle = previousAbove ? colors.amber : colors.text;
+            context.lineWidth = 1.8;
+            context.stroke();
+            context.beginPath();
+            context.moveTo(crossing.x, crossing.y);
+          }
+          context.lineTo(current.x, current.y);
+          context.strokeStyle = currentAbove ? colors.amber : colors.text;
+          context.lineWidth = 1.8;
+          context.setLineDash([]);
+          context.stroke();
+        }
+        previous = current;
+      }
+    };
+    drawAdxLine();
+    line(model.plotLeft, dmiY(25), model.plotRight, dmiY(25), colors.amber, [4, 3], 1.2);
+    const latestCandle = latestIndicatorCandle(model);
+    const header = indicatorHeaderText(latestCandle);
+    const difference = Number(latestCandle?.dmi?.difference);
+    const dmiColor = !Number.isFinite(difference) || Math.abs(difference) < 0.01
+      ? colors.text : difference > 0 ? bullishColor : bearishColor;
+    drawInlineIndicatorHeader(context, model, model.plotLeft, model.dmiTop - 6,
+      Math.max(1, model.plotRight - model.plotLeft), header.dmi, header.dmiInterpretation,
+      header.dmiCompact, header.dmiStatus, colors.text, dmiColor);
+    line(model.plotLeft, model.dmiBottom, model.plotRight, model.dmiBottom, colors.axis, [], 1);
   }
   // Bottom axis and the three visible date anchors.
   line(model.plotLeft, model.plotBottom, model.plotRight, model.plotBottom, colors.axis, [], 1);
