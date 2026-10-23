@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"math"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,9 +17,6 @@ import (
 	"option-scope-go/internal/outboundhttp"
 )
 
-// Hybrid routes option chains to Cboe outside regular NYSE hours and optionally
-// overlays Alpaca Basic overnight stock snapshots on Yahoo quotes.
-// It does not request or consume Alpaca options feeds.
 type HistoryClient interface {
 	Fetch(context.Context, string, string) (HistoryResult, error)
 	FetchAdjusted(context.Context, string, string) (HistoryResult, error)
@@ -29,6 +30,7 @@ type ChanAdjustedHistoryClient interface {
 	FetchChanAdjusted(context.Context, string, string) (ChanAdjustedHistoryResult, error)
 }
 
+// Hybrid 负责期权链路选择，并合并 Yahoo 近期历史与 Alpaca 15 分钟补数。
 type Hybrid struct {
 	Regular       *Yahoo
 	Delayed       *CboeOptionsClient
@@ -520,7 +522,86 @@ func (h *Hybrid) IntradayHistory(ctx context.Context, symbol, interval string) (
 	if !ok {
 		return HistoryResult{}, errors.New("Yahoo history client does not support intraday history")
 	}
-	return client.FetchIntraday(ctx, symbol, interval)
+	if h.Overnight == nil || !h.Overnight.CanRequest() {
+		return client.FetchIntraday(ctx, symbol, interval)
+	}
+	type intradayFetch struct {
+		result HistoryResult
+		err    error
+	}
+	yahooChannel := make(chan intradayFetch, 1)
+	alpacaChannel := make(chan intradayFetch, 1)
+	go func() {
+		result, err := client.FetchIntraday(ctx, symbol, interval)
+		yahooChannel <- intradayFetch{result: result, err: err}
+	}()
+	go func() {
+		result, err := h.Overnight.FetchIntraday(ctx, symbol, interval)
+		alpacaChannel <- intradayFetch{result: result, err: err}
+	}()
+	yahooFetch := <-yahooChannel
+	alpacaFetch := <-alpacaChannel
+	if err := ctx.Err(); err != nil {
+		return HistoryResult{}, err
+	}
+	yahooResult, yahooErr := yahooFetch.result, yahooFetch.err
+	alpacaResult, alpacaErr := alpacaFetch.result, alpacaFetch.err
+	if yahooErr != nil {
+		if alpacaErr == nil {
+			log.Printf("Yahoo intraday history unavailable symbol=%s; using Alpaca history: %v", symbol, yahooErr)
+			return alpacaResult, nil
+		}
+		return HistoryResult{}, fmt.Errorf("intraday history unavailable from Yahoo and Alpaca: %w", errors.Join(yahooErr, alpacaErr))
+	}
+	if alpacaErr != nil {
+		log.Printf("Alpaca intraday history backfill unavailable symbol=%s: %v", symbol, alpacaErr)
+		return yahooResult, nil
+	}
+	return mergeIntradayHistory(alpacaResult, yahooResult), nil
+}
+
+func mergeIntradayHistory(alpaca, yahoo HistoryResult) HistoryResult {
+	barsByTime := make(map[string]map[string]any, len(alpaca.Bars)+len(yahoo.Bars))
+	addBars := func(bars []map[string]any) {
+		for _, bar := range bars {
+			at, ok := bar["date"].(string)
+			if !ok || strings.TrimSpace(at) == "" {
+				continue
+			}
+			copyBar := make(map[string]any, len(bar))
+			for key, value := range bar {
+				copyBar[key] = value
+			}
+			barsByTime[at] = copyBar
+		}
+	}
+	addBars(alpaca.Bars)
+	addBars(yahoo.Bars)
+
+	times := make([]string, 0, len(barsByTime))
+	for at := range barsByTime {
+		times = append(times, at)
+	}
+	sort.Strings(times)
+	bars := make([]map[string]any, 0, len(times))
+	for _, at := range times {
+		bars = append(bars, barsByTime[at])
+	}
+	fetchedAt := yahoo.FetchedAt
+	if alpaca.FetchedAt.After(fetchedAt) {
+		fetchedAt = alpaca.FetchedAt
+	}
+	symbol := yahoo.Symbol
+	if symbol == "" {
+		symbol = alpaca.Symbol
+	}
+	source := yahoo.Source
+	if source == "" {
+		source = "go-yfinance"
+	}
+	return HistoryResult{
+		Symbol: symbol, Bars: bars, FetchedAt: fetchedAt, Source: source + "+alpaca-iex",
+	}
 }
 
 // EarningsDates remains available for explicit callers; the service no longer invokes it.

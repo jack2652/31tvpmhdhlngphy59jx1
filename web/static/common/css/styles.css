@@ -79,7 +79,10 @@
 .chan-layer-menu>summary::after{content:"";width:7px;height:7px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg) translateY(-2px);opacity:.7}
 .chan-layer-menu[open]>summary{border-color:var(--blue);color:var(--blue)}
 .chan-layer-menu[open]>summary::after{transform:rotate(225deg) translate(-1px,-1px)}
-.chan-layer-menu-panel{position:absolute;top:calc(100% + 8px);left:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;width:min(740px,calc(100vw - 40px));padding:16px;border:1px solid var(--line);border-radius:6px;background:var(--panel);box-shadow:0 12px 32px rgba(0,0,0,.18)}
+.chan-layer-menu-panel{position:absolute;top:calc(100% + 8px);left:0;display:grid;grid-template-areas:"display recursive pens";grid-template-columns:minmax(150px,.85fr) minmax(270px,1.4fr) minmax(180px,1fr);gap:16px;width:min(740px,calc(100vw - 40px));padding:16px;border:1px solid var(--line);border-radius:6px;background:var(--panel);box-shadow:0 12px 32px rgba(0,0,0,.18)}
+.chan-layer-menu-display{grid-area:display}
+.chan-layer-menu-recursive{grid-area:recursive}
+.chan-layer-menu-pens{grid-area:pens}
 .chan-layer-menu-panel>.chan-layer-menu-close{position:absolute;top:8px;right:8px;z-index:1;display:grid;width:28px;height:28px;place-items:center;padding:0;border:1px solid var(--line);border-radius:4px;background:var(--field);color:var(--muted);font:inherit;font-size:20px;line-height:1;cursor:pointer}
 .chan-layer-menu-panel>.chan-layer-menu-close:hover{border-color:var(--blue);color:var(--blue)}
 .chan-layer-menu-panel>.chan-layer-menu-close:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
@@ -90,7 +93,8 @@
 .chan-layer-menu-panel .detail-seg+.detail-seg{border-left:1px solid var(--line)}
 .chan-layer-menu-panel .detail-seg[aria-pressed="true"]{border-color:color-mix(in srgb,var(--blue) 48%,var(--line));background:color-mix(in srgb,var(--blue) 10%,var(--field));color:var(--blue);font-weight:600}
 .chan-layer-menu-panel .detail-seg:focus-visible{position:relative;z-index:1;outline:2px solid var(--blue);outline-offset:2px}
-.chan-layer-menu-panel .chan-layer-divider{display:block;width:100%;height:1px;margin:3px 0;background:var(--row-line)}
+.chan-layer-menu-panel .chan-layer-divider{display:block;flex:0 0 100%;width:100%;height:1px;margin:3px 0;background:var(--row-line)}
+.chan-layer-menu-panel .chan-recursive-layer-switches .chan-layer-divider{flex:0 0 100%;align-self:auto;margin:3px 0;background:var(--row-line)}
 .chan-layer-menu-panel .chan-layer-empty{padding:5px 0}
 .chan-compatibility{margin-top:24px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 .chan-compatibility>summary{padding:12px 2px;font-size:13px;font-weight:600}
@@ -428,7 +432,7 @@
 }
 @media(max-width:600px){
   .chan-layer-menu{position:static}
-  .chan-layer-menu-panel{position:fixed;top:auto;right:12px;left:12px;bottom:max(12px,env(safe-area-inset-bottom));grid-template-columns:1fr;gap:12px;width:auto;max-height:min(72vh,620px);overflow:auto;padding:14px;box-shadow:0 16px 42px rgba(0,0,0,.24)}
+  .chan-layer-menu-panel{position:fixed;top:auto;right:12px;left:12px;bottom:max(12px,env(safe-area-inset-bottom));grid-template-areas:"display" "recursive" "pens";grid-template-columns:1fr;gap:12px;width:auto;max-height:min(72vh,620px);overflow:auto;padding:14px;box-shadow:0 16px 42px rgba(0,0,0,.24)}
   .chan-controls .chan-layer-menu-panel .chan-layer-switches.detail-segmented{display:flex;flex:initial;width:auto;max-width:none;min-width:0;gap:6px;overflow:visible;border:0;border-radius:0;background:transparent;}
   .chan-layer-menu-panel .detail-seg{min-height:38px}
   .chan-analysis-more>summary{padding:12px 0}
@@ -487,14 +491,21 @@
   .chan-scenario-grid dl>div+div{border-top:1px solid var(--row-line)}
   .chan-legend{justify-content:flex-start;gap:10px 16px}
 }
-@media(min-width:601px) and (max-width:1100px){
-  .chan-layer-menu-panel{position:fixed;top:auto;right:16px;left:16px;bottom:max(16px,env(safe-area-inset-bottom));grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;width:auto;max-height:min(72vh,620px);overflow:auto;padding:16px;box-shadow:0 16px 42px rgba(0,0,0,.24)}
+@media(min-width:761px) and (max-width:1100px){
+  .chan-layer-menu-panel{position:fixed;top:auto;right:16px;left:16px;bottom:max(16px,env(safe-area-inset-bottom));grid-template-areas:"display recursive pens";grid-template-columns:minmax(150px,.85fr) minmax(270px,1.4fr) minmax(180px,1fr);gap:12px;width:auto;max-height:min(72vh,620px);overflow:auto;padding:16px;box-shadow:0 16px 42px rgba(0,0,0,.24)}
+}
+@media(min-width:601px) and (max-width:760px){
+  .chan-layer-menu-panel{position:fixed;top:auto;right:16px;left:16px;bottom:max(16px,env(safe-area-inset-bottom));grid-template-areas:"display pens" "recursive recursive";grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 16px;width:auto;max-height:min(72vh,620px);overflow:auto;padding:16px;box-shadow:0 16px 42px rgba(0,0,0,.24)}
 }
 /* The single layer menu groups independent toggles without the former long segmented strip. */
 .chan-controls .chan-layer-menu-panel .chan-layer-switches.detail-segmented{display:flex;flex:initial;min-width:0;max-width:none;gap:5px;overflow:visible;border:0;border-radius:0;background:transparent;}
 .chan-controls .chan-layer-menu-panel .chan-layer-switches .detail-seg{flex:0 0 auto;min-width:0;min-height:34px;padding:6px 9px;border:1px solid var(--line);border-radius:4px;background:var(--field);color:var(--muted);font-size:11px;white-space:nowrap;}
 .chan-controls .chan-layer-menu-panel .chan-layer-switches .detail-seg+.detail-seg{border-left:1px solid var(--line);}
 .chan-controls .chan-layer-menu-panel .chan-layer-switches .detail-seg[aria-pressed="true"]{border-color:color-mix(in srgb,var(--blue) 48%,var(--line));background:color-mix(in srgb,var(--blue) 10%,var(--field));color:var(--blue);}
+.chan-controls .chan-layer-menu-panel .chan-recursive-layer-switches.detail-segmented{display:grid;grid-template-columns:repeat(3,max-content);gap:5px;}
+.chan-controls .chan-layer-menu-panel .chan-recursive-layer-switches .detail-seg{width:100%;}
+.chan-controls .chan-layer-menu-panel .chan-recursive-layer-switches .chan-layer-divider,
+.chan-controls .chan-layer-menu-panel .chan-recursive-layer-switches .chan-layer-empty{grid-column:1/-1;}
 @media(max-width:500px){
   .chan-chart{overflow:visible}
   .chan-chart>svg{width:100%;min-width:0;min-height:0;height:auto}

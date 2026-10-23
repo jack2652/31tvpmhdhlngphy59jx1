@@ -322,7 +322,8 @@ function bindChanChartHover(target, initialBinding) {
     const signalHit = (model.signals || []).map((signal) => {
       const markerDistance = Math.hypot(localX - signal.x, localY - (Number.isFinite(signal.markerY) ? signal.markerY : signal.y));
       const halfLabel = (signal.hitLabelWidth || 48) / 2;
-      const labelDistance = localY >= signal.labelY - 12 && localY <= signal.labelY + 4 && Math.abs(localX - signal.x) <= halfLabel ? 0 : Infinity;
+      const labelX = Number.isFinite(signal.labelX) ? signal.labelX : signal.x;
+      const labelDistance = localY >= signal.labelY - 12 && localY <= signal.labelY + 4 && Math.abs(localX - labelX) <= halfLabel ? 0 : Infinity;
       return { signal, distance: Math.min(markerDistance, labelDistance) };
     }).filter(({ signal, distance }) => model.layers?.signals === true && distance <= 12)
       .sort((left, right) => left.distance - right.distance)[0]?.signal;
@@ -713,8 +714,15 @@ function drawChanCanvas(target, binding) {
     const signalLabel = signal.label + status;
     const labelY = Number.isFinite(signal.labelY) ? signal.labelY : signal.y + (signal.side === "buy" ? 16 : -10);
     context.font = model.mobileChart ? "550 12px Inter, ui-sans-serif, system-ui, sans-serif" : "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center"; context.textBaseline = "alphabetic";
-    context.lineWidth = 3; context.lineJoin = "round"; context.strokeStyle = colors.panel; context.strokeText(signalLabel, signal.x, labelY);
-    context.fillStyle = color; context.fillText(signalLabel, signal.x, labelY);
+    const labelWidth = context.measureText(signalLabel).width;
+    const labelMinX = model.plotLeft + labelWidth / 2 + 2;
+    const labelMaxX = model.historyRight - labelWidth / 2 - 2;
+    const preferredLabelX = Number.isFinite(signal.labelX) ? signal.labelX : signal.x;
+    const labelX = labelMinX <= labelMaxX
+      ? Math.max(labelMinX, Math.min(labelMaxX, preferredLabelX))
+      : (model.plotLeft + model.historyRight) / 2;
+    context.lineWidth = 3; context.lineJoin = "round"; context.strokeStyle = colors.panel; context.strokeText(signalLabel, labelX, labelY);
+    context.fillStyle = color; context.fillText(signalLabel, labelX, labelY);
   }
   if (model.spot) {
     line(model.plotLeft, model.spot.y, model.historyRight, model.spot.y, colors.spot, [3, 4], 1);

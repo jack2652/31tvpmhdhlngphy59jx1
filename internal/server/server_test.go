@@ -4050,7 +4050,7 @@ func TestChanLegacyEndpointKeepsStrictOldStrokeAndCenterSemantics(t *testing.T) 
 	}
 }
 
-func TestChanAdjustedEndpointReportsVerifiedActionsAndDegradesUnexplainedJump(t *testing.T) {
+func TestChanAdjustedEndpointReportsVerifiedActionsAndLargePriceMove(t *testing.T) {
 	service, ts := testService(t, "")
 	fetched := time.Now().UTC()
 	writeBars := func(symbol string, bars []map[string]any) {
@@ -4098,11 +4098,15 @@ func TestChanAdjustedEndpointReportsVerifiedActionsAndDegradesUnexplainedJump(t 
 
 	jumpDaily := request("JUMP")
 	jumpQuality := jumpDaily["quality"].(map[string]any)
-	if jumpQuality["corporate_action_suspected"] != true || jumpQuality["status"] != "degraded" {
-		t.Fatalf("unexplained adjusted jump should degrade quality: %#v", jumpQuality)
+	if jumpQuality["corporate_action_suspected"] != false || jumpQuality["status"] != "ok" {
+		t.Fatalf("valid adjusted price move should not degrade quality: %#v", jumpQuality)
+	}
+	jumpEvents, ok := jumpQuality["corporate_action_events"].([]any)
+	if !ok || len(jumpEvents) != 1 || jumpEvents[0].(map[string]any)["kind"] != "large_price_move" || jumpEvents[0].(map[string]any)["status"] != "observed" {
+		t.Fatalf("large adjusted price move event=%#v", jumpQuality["corporate_action_events"])
 	}
 	if chains, ok := jumpQuality["chains"].([]any); !ok || len(chains) != 2 {
-		t.Fatalf("unexplained jump should split structure chains: %#v", jumpQuality["chains"])
+		t.Fatalf("large price move should split structure chains: %#v", jumpQuality["chains"])
 	}
 }
 

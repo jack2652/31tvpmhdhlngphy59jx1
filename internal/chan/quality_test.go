@@ -205,14 +205,14 @@ func TestCompletedBarsRejectsMalformedDatesAndNonFinitePrices(t *testing.T) {
 	}
 }
 
-func TestDailyQualityMarksUnexplainedLargeCloseJump(t *testing.T) {
+func TestDailyQualityReportsLargeCloseJumpWithoutDegrading(t *testing.T) {
 	bars := []Bar{
 		{Date: "2026-01-05", Close: 100},
 		{Date: "2026-01-06", Close: 150},
 	}
 	quality := dailyQuality(bars, bars, 0, 0, 0, 0)
-	if !quality.CorporateActionSuspected || quality.Status != "degraded" {
-		t.Fatalf("quality = %+v, want suspected corporate action and degraded status", quality)
+	if quality.CorporateActionSuspected || quality.Status != "ok" || len(quality.CorporateActionEvents) != 1 || quality.CorporateActionEvents[0].Kind != "large_price_move" || quality.CorporateActionEvents[0].Status != "observed" {
+		t.Fatalf("quality = %+v, want an informational price move without data degradation", quality)
 	}
 }
 
@@ -274,7 +274,7 @@ func TestCompletedBarsExcludesUnclosedDailyBarAtCutoff(t *testing.T) {
 	}
 }
 
-func TestDailyQualityClassifiesDividendFactorAndDegradesUnexplainedJumps(t *testing.T) {
+func TestDailyQualityClassifiesDividendFactorAndReportsLargePriceMoves(t *testing.T) {
 	dividend := []Bar{
 		{Date: "2026-01-05", Close: 99, RawClose: 100, AdjustmentFactor: .99},
 		{Date: "2026-01-06", Close: 99, RawClose: 99, AdjustmentFactor: 1},
@@ -289,8 +289,8 @@ func TestDailyQualityClassifiesDividendFactorAndDegradesUnexplainedJumps(t *test
 		{Date: "2026-01-06", Close: 150, RawClose: 150, AdjustmentFactor: 1},
 	}
 	quality = dailyQuality(unexplained, unexplained, 0, 0, 0, 0)
-	if !quality.CorporateActionSuspected || quality.Status != "degraded" || len(quality.CorporateActionEvents) != 1 || quality.CorporateActionEvents[0].Status != "degraded" {
-		t.Fatalf("unexplained raw/adjusted jump quality=%+v, want explicit degraded event", quality)
+	if quality.CorporateActionSuspected || quality.Status != "ok" || len(quality.CorporateActionEvents) != 1 || quality.CorporateActionEvents[0].Kind != "large_price_move" || quality.CorporateActionEvents[0].Status != "observed" {
+		t.Fatalf("large raw/adjusted price move quality=%+v, want an informational event", quality)
 	}
 	chained, warnings := chainDailyBars(unexplained)
 	if chained[0].Chain == chained[1].Chain || len(warnings) != 1 {

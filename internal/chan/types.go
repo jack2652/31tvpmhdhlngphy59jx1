@@ -6,7 +6,7 @@ import "time"
 
 const RuleVersion = "strict-old-bi-v3"
 const RecursiveRuleVersion = "chan-recursive-v4.0.0"
-const RecursivePreviewVersion = "chan-recursive-v4-preview.9"
+const RecursivePreviewVersion = "chan-recursive-v4-preview.11"
 
 type Bar struct {
 	// CapturedAt keeps a daily candle fetched before its session close from
@@ -75,9 +75,7 @@ type WeeklyExclusionCounts struct {
 	TruncatedStart  int `json:"truncated_start"`
 }
 
-// CorporateActionEvent records a raw-price discontinuity or a provider factor
-// change. Kind is an inferred candidate; it is not a substitute for issuer
-// corporate-action records.
+// CorporateActionEvent 记录原始价格跳变或供应商复权因子变化。Kind 为行情推断结果，不能替代发行方公司行动记录。
 type CorporateActionEvent struct {
 	Date                       string  `json:"date"`
 	Kind                       string  `json:"kind"`

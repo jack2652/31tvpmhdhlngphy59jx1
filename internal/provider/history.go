@@ -2,9 +2,7 @@ package provider
 
 import "time"
 
-// HistoryResult contains daily Yahoo bars normalized to the API's raw or
-// adjusted OHLC representation. Extremes are populated only for max-period
-// requests.
+// HistoryResult 保存日线或盘中历史行情的标准化 OHLC 结果。
 type HistoryResult struct {
 	Symbol           string           `json:"symbol"`
 	Bars             []map[string]any `json:"bars"`

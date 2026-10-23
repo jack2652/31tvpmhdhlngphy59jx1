@@ -119,12 +119,14 @@ Gamma 敞口使用 Black-Scholes 根据标的价格、执行价、隐含波动�
 
 ### 缠论递归算法升级预览
 
-新算法的目标规则版本为 `chan-recursive-v4.0.0`，当前 API 标记为 `chan-recursive-v4-preview.9`。`preview` 表示实现仍在升级与验收，不能将其称为正式 v4。旧字段 `strokes` / `centers` 继续使用 `strict-old-bi-v3` 语义；递归结构使用 `segments`、`recursive_centers`、`recursive_levels`、`strengths_v4` 和 `signals_v4`。较宽松的笔级历史观察单独位于 `pen_signals`，不可当作递归买卖点或混入阈值统计。
+新算法的目标规则版本为 `chan-recursive-v4.0.0`，当前 API 标记为 `chan-recursive-v4-preview.11`。`preview` 表示实现仍在升级与验收，不能将其称为正式 v4。旧字段 `strokes` / `centers` 继续使用 `strict-old-bi-v3` 语义；递归结构使用 `segments`、`recursive_centers`、`recursive_levels`、`strengths_v4` 和 `signals_v4`。较宽松的笔级历史观察单独位于 `pen_signals`，不可当作递归买卖点或混入阈值统计。
 
 - `GET /api/chan/{symbol}/adjusted` 使用拆股与分红自动复权的日线历史计算日线、完整周线结构；图表结构与现价需使用响应中的同一复权坐标。历史复权数据缺失或现价换算因子无效时，响应会降级并停止不兼容的现价比较，不静默回退到未复权价格。
 - `GET /api/chan/{symbol}/intraday?period=15m|4h` 只处理已收盘的盘中 bars，并复用 v4 递归结构 schema；这些盘中输入仍在原始价格基准内计算，响应会标出该基准。盘中信号只用于同一原始价格坐标内的结构分析，不直接与复权日线价格比较。`/adjusted` 会按逐日有效复权因子转换 15 分钟历史，再生成 4 小时结构供日线信号进行直接下级确认；因子缺失时对应 bars 不参与确认。
 - 预览结构包括方向性包含处理、严格分型和旧笔、特征序列线段、同级递归中枢与相邻关系、MACD 力度，以及需要中枢背景、价格创新极值和力度减弱条件的候选观察。返回对象带有级别、来源范围、形成／确认状态和时间；数据缺口、异常跳变及结构修订会进入质量或修订信息。
 - `chan-recursive-v4-preview.9` 将分型日期锚定到包含合并组的末根 K 线，同时保留实际极值的原始行情索引；三类位置只从与中枢相交后离开的走势开始判断，标记落在回试端点。结构信号图层在当前窗口无标记时，会区分历史窗口外的信号、尚无绘图位置的候选和全周期无信号。
+- `chan-recursive-v4-preview.10` 将稳定复权因子下的大幅价格变动标记为信息事件，不再将其误报为行情数据降级；结构仍在该处开启新链。版本变化会令 SQLite 中旧算法结果缓存失效并重新计算。
+- `chan-recursive-v4-preview.11` 停止输出未能合并下级单元的递归层，避免断链分别退化成相同走势并重复显示到更高层级。
 - `signals_v4` 目前是候选分析输出，不是收益预测。跨级别信号确认、市场过滤和完整一／二／三类买卖点仍以各结构的状态和缺失条件为准；缺少必要数据时不会把状态默认为通过。
 - 灰度回退方式：停止客户端对 `/adjusted` 与 `/intraday` 的请求，恢复到 `/api/chan/{symbol}` 和旧版 `strokes`／`centers` 消费路径即可；复权行情、结构快照和原始历史不需要重写或删除。
 
@@ -199,7 +201,7 @@ go run cmd/go-server/main.go
 | `PORT` | `8000` | 服务监听端口 |
 | `ACCESS_KEY` | 空 | 页面与 API 访问密钥；`run.sh` 首次启动自动生成 16 位小写字母 + 数字 |
 | `MARKET_PROXY` | 空 | 出站行情与期权请求使用的代理地址，支持 `http`、`https`、`socks5` 和 `socks5h`，例如 `http://127.0.0.1:10808` |
-| `ALPACA_API_KEY` | 空 | Alpaca Basic API Key；配置后仅在美东夜盘补充股票现货行情，未配置时沿用原行情源 |
+| `ALPACA_API_KEY` | 空 | Alpaca API Key；配置后用于美东夜盘股票快照及缠论 15 分钟历史补数（IEX），重叠区间仍以 Yahoo 最新行情为准；未配置时沿用 Yahoo |
 | `ALPACA_API_SECRET` | 空 | Alpaca Basic API Secret；`run.sh config` 菜单中隐藏输入，摘要不会显示原文 |
 | `DEFAULT_SYMBOLS` | `QQQ` | 页面未带 `?symbol=` 时使用的默认标的（兼容逗号分隔配置，取第一项）；不再触发后台刷新 |
 | `RAW_RETENTION_DAYS` | `30` | 历史快照保留天数；后台维护任务每天检查并清理超过保留期限的数据 |

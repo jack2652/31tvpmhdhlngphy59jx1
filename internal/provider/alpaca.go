@@ -25,8 +25,7 @@ const (
 	AlpacaAuthCooldownDuration  = 5 * time.Minute
 )
 
-// Alpaca fetches Basic stock snapshots from Alpaca's overnight feed. It is
-// intentionally limited to stock quotes; it does not request options data.
+// Alpaca 获取股票夜盘快照和历史行情，不请求期权数据。
 type Alpaca struct {
 	apiKey  string
 	secret  string
@@ -41,6 +40,9 @@ type Alpaca struct {
 	authMu      sync.Mutex
 	authRetryAt time.Time
 	now         func() time.Time
+
+	historyMu    sync.Mutex
+	historyCache map[string]alpacaIntradayCacheEntry
 }
 
 // NewAlpaca creates an Alpaca overnight quote client. baseURL is the data API

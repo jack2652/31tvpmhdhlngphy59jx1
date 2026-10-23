@@ -438,7 +438,7 @@
     const selectedRecursiveCenters = visibleRecursiveCenters.filter((center) => isRecursiveCenterLevelVisible(layers, center.level));
     const selectedV4Signals = layers?.signals === false ? [] : visibleV4Signals;
     const legacyRule = "strict-old-bi-v3";
-    const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.9";
+    const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.11";
     let minimum = Infinity, maximum = -Infinity;
     bars.forEach((bar) => { minimum = Math.min(minimum, bar.low); maximum = Math.max(maximum, bar.high); });
     selectedStrokes.forEach((stroke) => {
@@ -580,10 +580,22 @@
       const endpointKind = endpoint?.kind || (side === "buy" ? "bottom" : "top");
       const markerY = yPosition + (endpointKind === "top" ? -8 : 8);
       const labelOffset = endpointKind === "top" ? -30 : 35;
-      let labelY = yPosition + labelOffset;
-      if (labelY < top + 14 || labelY > height - bottom - 4) labelY = Math.min(height - bottom - 4, Math.max(top + 14, yPosition - labelOffset));
       const status = invalidated ? "" : signal.status === "confirmed" ? "✓" : "?";
-      return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelY, hitLabelWidth: (labelText + status).length * 5.2 + 8, side, status: signal.status, invalidated, label: invalidated ? labelText + " · 已失效" : labelText, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, start: date, end: date, startPrice: price, endPrice: price, confirmed: signal.status === "confirmed", formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || signal.phase_at, composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
+      const label = invalidated ? labelText + " · 已失效" : labelText;
+      const visibleLabel = label + status;
+      const labelFontSize = mobile ? 12 : 9;
+      const labelHalfWidth = Array.from(visibleLabel).length * labelFontSize / 2 + 4;
+      const labelLeft = left + labelHalfWidth;
+      const labelRight = historyRight - labelHalfWidth;
+      const labelX = labelLeft <= labelRight
+        ? Math.max(labelLeft, Math.min(labelRight, xPosition))
+        : left + historyWidth / 2;
+      const labelTop = top + labelFontSize + 3;
+      const labelBottom = priceBottom - Math.max(4, labelFontSize * 0.35);
+      let labelY = yPosition + labelOffset;
+      if (labelY < labelTop || labelY > labelBottom) labelY = yPosition - labelOffset;
+      labelY = Math.max(labelTop, Math.min(labelBottom, labelY));
+      return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, side, status: signal.status, invalidated, label, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, start: date, end: date, startPrice: price, endPrice: price, confirmed: signal.status === "confirmed", formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || signal.phase_at, composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
     });
     const chart = {
       width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: priceBottom,
@@ -647,8 +659,8 @@
         x1: x(dateIndex(segment.start)), y1: y(segment.start_price), x2: x(dateIndex(segment.end)), y2: y(segment.end_price),
         title: (Number(segment.level) === 0 ? "基础线段" : "第" + (Number(segment.level) + 1) + "层走势类型") + (segment.trend_kind ? " · " + segment.trend_kind : segment.direction ? (segment.direction === "up" ? "向上" : "向下") : "") + " · " + displayBarTime(segment.start, frame.period) + " " + money(segment.start_price) + " → " + displayBarTime(segment.end, frame.period) + " " + money(segment.end_price) + " · " + (segment.confirmed ? "确认于 " + displayBarTime(segment.confirmed_at, frame.period) : "形成中"),
       })),
-      signals: signalLayouts.map(({ signal: _signal, key, type, x: signalX, y: signalY, markerY, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice }) => ({
-        key, type, x: signalX, y: signalY, markerY, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice,
+      signals: signalLayouts.map(({ signal: _signal, key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice }) => ({
+        key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice,
       })),
       // Count only signals that can actually be drawn. The visible signal list
       // is intentionally limited to the current chart window so panning does
@@ -1111,7 +1123,15 @@
     const basisLabel = quality.price_basis === "split_dividend_adjusted" ? "拆股/分红复权" : quality.price_basis === "raw" ? "未复权" : "价格基准未知";
     const basisDate = dataContext?.priceCoordinate?.factor_date || frame.as_of || "未知";
     const gapCount = Array.isArray(quality.gaps) ? quality.gaps.length : 0;
-    const dataSummary = `${basisLabel} · 基准日 ${basisDate} · 输入质量 ${quality.status || "未知"}（${quality.accepted_bars ?? frame.bar_count}/${quality.input_bars ?? frame.bar_count} 根） · 缺口 ${gapCount} 处 · ${timeframeMappingLabel(frame.timeframe_mapping)}${quality.corporate_action_suspected ? " · 公司行动待核验" : ""}`;
+    const priceEvents = Array.isArray(quality.corporate_action_events) ? quality.corporate_action_events : [];
+    const largePriceMoves = priceEvents.filter((event) => event.kind === "large_price_move");
+    const latestLargePriceMove = largePriceMoves[largePriceMoves.length - 1];
+    const movePercent = Number(latestLargePriceMove?.adjusted_close_change_percent);
+    const largeMoveSummary = latestLargePriceMove && Number.isFinite(movePercent)
+      ? ` · 大幅价格波动 ${latestLargePriceMove.date} ${movePercent >= 0 ? "+" : ""}${movePercent.toFixed(1)}%`
+      : "";
+    const qualityEventSummary = quality.corporate_action_suspected ? " · 异常复权或价格跳变待核验" : largeMoveSummary;
+    const dataSummary = `${basisLabel} · 基准日 ${basisDate} · 输入质量 ${quality.status || "未知"}（${quality.accepted_bars ?? frame.bar_count}/${quality.input_bars ?? frame.bar_count} 根） · 缺口 ${gapCount} 处 · ${timeframeMappingLabel(frame.timeframe_mapping)}${qualityEventSummary}`;
     const marketSummary = marketEnvironmentLabel(frame.market_environment);
     const legacySignals = observationSignals.map((signal, index) => ({ ...signal, key: `legacy-${signal.kind}-${index}`,
       dateLabel: `结构位置 ${signal.date} · 识别于 ${signal.confirmed_at || signal.observed_at || "未知"}`,

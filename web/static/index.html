@@ -215,18 +215,18 @@
               <summary aria-label="图层设置">图层</summary>
               <div class="chan-layer-menu-panel">
                 <button class="chan-layer-menu-close" type="button" aria-label="关闭图层面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
-                <section><h4>图表显示</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="主要图层">
+                <section class="chan-layer-menu-display"><h4>图表显示</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="主要图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.signals ? 'true' : 'false'" @click="toggleChanChartLayer('signals')">结构信号</button>
                   <span v-if="chanChartLayers.signals && chanFrame.chart && !chanFrame.chart.signals.length" class="chan-layer-empty" role="status" :title="chanFrame.chart.totalSignalCount ? '打开结构信号详情查看候选状态' : '笔级顶部与底部观察请使用“顶底观察”图层'">{{ chanFrame.chart.totalPlottableSignalCount ? '当前窗口无标记 · 全周期 ' + chanFrame.chart.totalPlottableSignalCount + ' 处，拖动查看' : chanFrame.chart.totalSignalCount ? '有 ' + chanFrame.chart.totalSignalCount + ' 条候选待确认，查看结构信号详情' : '当前周期暂无递归买卖点' }}</span>
                 </div></section>
-                <section><h4>线段与中枢</h4><div class="detail-segmented chan-layer-switches chan-recursive-layer-switches" role="group" aria-label="各层线段和中枢">
+                <section class="chan-layer-menu-recursive"><h4>线段与中枢</h4><div class="detail-segmented chan-layer-switches chan-recursive-layer-switches" role="group" aria-label="各层线段和中枢">
                   <button v-for="level in chanSegmentLevels" :key="'segment-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanSegmentLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层结构'" @click="toggleChanSegmentLevel(level)">{{ level === 0 ? '第1层线段' : '第' + (level + 1) + '层走势' }}</button>
                   <span v-if="chanSegmentLevels.length && chanLayerLevels.length" class="chan-layer-divider" aria-hidden="true"></span>
                   <button v-for="level in chanLayerLevels" :key="'center-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanRecursiveCenterLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层中枢'" @click="toggleChanChartLayer(level)">第{{ level + 1 }}层中枢</button>
                   <span v-if="!chanSegmentLevels.length && !chanLayerLevels.length" class="chan-layer-empty">等待结构形成</span>
                 </div></section>
-                <section><h4>笔级结构</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="笔级结构图层">
+                <section class="chan-layer-menu-pens"><h4>笔级结构</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="笔级结构图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.pens ? 'true' : 'false'" @click="toggleChanChartLayer('pens')">笔</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.penCenters ? 'true' : 'false'" @click="toggleChanChartLayer('penCenters')">笔中枢</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.legacySignals ? 'true' : 'false'" @click="toggleChanChartLayer('legacySignals')">顶底观察</button>

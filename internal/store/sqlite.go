@@ -2123,10 +2123,8 @@ func (s *SQLite) cleanupBefore(cutoff string) (map[string]int64, error) {
 			}
 		}
 	}
-	// Yahoo only serves a recent rolling window of 15-minute bars. Retain a
-	// little longer than that window while bounding storage independently of
-	// the daily-history retention setting.
-	intradayCutoff := time.Now().UTC().AddDate(0, 0, -90).Format("2006-01-02 15:04")
+	// 保留 Alpaca 回补的半年盘中历史，并留出清理任务的执行余量。
+	intradayCutoff := time.Now().UTC().AddDate(0, 0, -210).Format("2006-01-02 15:04")
 	for {
 		result, execErr := tx.Exec(`DELETE FROM intraday_history WHERE rowid IN (
 SELECT rowid FROM intraday_history WHERE bar_time < ? LIMIT 5000)`, intradayCutoff)

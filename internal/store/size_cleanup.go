@@ -136,7 +136,7 @@ func (s *SQLite) CleanupBySize(maxBytes int64, batchSize int, budget time.Durati
 		// Intraday bars are all distinct observations, so they cannot be thinned
 		// like superseded snapshots. If snapshots are still too large, discard
 		// progressively older 15-minute history while retaining recent candles.
-		for _, keepDays := range []int{30, 7, 1} {
+		for _, keepDays := range []int{210, 180, 90, 30, 7, 1} {
 			live, err = s.databaseLiveBytesContext(cleanupCtx)
 			if err != nil && cleanupCtx.Err() == nil {
 				return nil, err

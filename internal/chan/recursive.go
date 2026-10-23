@@ -74,6 +74,10 @@ func buildRecursiveLevels(baseStrokes []Stroke, baseSegments []Segment) []LevelA
 	lower := baseSegments
 	for level := 1; level < 8; level++ {
 		trends, centers, inputCount := recursiveLevelUp(lower, level)
+		if len(lower) > 0 && len(trends) >= len(lower) {
+			// 未减少下级单元时没有形成更高层级，避免断链各自退化为同一条走势。
+			break
+		}
 		segments := recursiveTrendSegments(trends)
 		levelStatus, waiting := "ready", ""
 		closedCenters := 0

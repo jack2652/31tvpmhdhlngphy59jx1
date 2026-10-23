@@ -1143,7 +1143,7 @@ func classifyCorporateAction(previous, current Bar) (*CorporateActionEvent, bool
 	hasRawPair := finitePositive(previousRaw) && finitePositive(currentRaw) && finitePositive(previousFactor) && finitePositive(currentFactor)
 	if !hasRawPair {
 		if math.Abs(adjustedReturn) > .20 {
-			return &CorporateActionEvent{Date: current.Date, Kind: "unexplained_price_jump", Status: "degraded", RawCloseChangePercent: adjustedReturn * 100, AdjustedCloseChangePercent: adjustedReturn * 100}, true
+			return &CorporateActionEvent{Date: current.Date, Kind: "large_price_move", Status: "observed", RawCloseChangePercent: adjustedReturn * 100, AdjustedCloseChangePercent: adjustedReturn * 100}, false
 		}
 		return nil, false
 	}
@@ -1159,14 +1159,14 @@ func classifyCorporateAction(previous, current Bar) (*CorporateActionEvent, bool
 	if math.Abs(factorReturn) >= .001 && rawReturn < 0 && factorReturn > 0 && math.Abs(adjustedReturn) < .20 && verified {
 		return &CorporateActionEvent{Date: current.Date, Kind: "dividend_or_cash_adjustment_candidate", Status: "factor_adjusted", RawCloseChangePercent: rawReturn * 100, AdjustedCloseChangePercent: adjustedReturn * 100, FactorChangePercent: factorReturn * 100, FactorVerified: true}, false
 	}
-	if math.Abs(rawReturn) > .20 || math.Abs(adjustedReturn) > .20 || math.Abs(factorReturn) > .15 {
+	if math.Abs(factorReturn) >= .15 || !verified && (math.Abs(rawReturn) > .20 || math.Abs(adjustedReturn) > .20) {
 		return &CorporateActionEvent{Date: current.Date, Kind: "unexplained_price_or_factor_jump", Status: "degraded", RawCloseChangePercent: rawReturn * 100, AdjustedCloseChangePercent: adjustedReturn * 100, FactorChangePercent: factorReturn * 100}, true
+	}
+	if math.Abs(adjustedReturn) > .20 {
+		return &CorporateActionEvent{Date: current.Date, Kind: "large_price_move", Status: "observed", RawCloseChangePercent: rawReturn * 100, AdjustedCloseChangePercent: adjustedReturn * 100, FactorChangePercent: factorReturn * 100, FactorVerified: verified}, false
 	}
 	if math.Abs(factorReturn) >= .001 {
 		return &CorporateActionEvent{Date: current.Date, Kind: "provider_factor_change", Status: "factor_adjusted", RawCloseChangePercent: rawReturn * 100, AdjustedCloseChangePercent: adjustedReturn * 100, FactorChangePercent: factorReturn * 100, FactorVerified: verified}, false
-	}
-	if math.Abs(adjustedReturn) > .20 {
-		return &CorporateActionEvent{Date: current.Date, Kind: "unexplained_price_jump", Status: "degraded", RawCloseChangePercent: rawReturn * 100, AdjustedCloseChangePercent: adjustedReturn * 100, FactorChangePercent: factorReturn * 100}, true
 	}
 	return nil, false
 }
@@ -1331,7 +1331,7 @@ func summarizeDataChains(bars []Bar, gaps []DataGap) []DataChain {
 		if math.Abs(bars[index].Close/bars[index-1].Close-1) > 0.20 {
 			for chainIndex := range chains {
 				if chains[chainIndex].ID == bars[index].Chain {
-					chains[chainIndex].StartReason = "unexplained_price_jump"
+					chains[chainIndex].StartReason = "large_price_move"
 					chains[chainIndex].ExpectedDate = bars[index].Date
 					break
 				}
@@ -1429,8 +1429,7 @@ func chainIntradayBars(bars []Bar, interval time.Duration) ([]Bar, []DataGap) {
 	return bars, gaps
 }
 
-// chainDailyBars preserves valid historical ranges but starts a new structure
-// chain at each missing session or unexplained large price discontinuity.
+// chainDailyBars 保留有效历史区间，并在交易日缺口或大幅价格波动处开启新结构链。
 func chainDailyBars(bars []Bar) ([]Bar, []string) {
 	warnings := []string{}
 	if len(bars) == 0 {
@@ -1454,7 +1453,7 @@ func chainDailyBars(bars []Bar) ([]Bar, []string) {
 		bars[i].Chain = chain
 	}
 	if chain > 0 {
-		warnings = append(warnings, fmt.Sprintf("历史存在 %d 处交易日缺口或超过 20%% 的未解释价格跳变（最近断点为 %s）；保留历史结构并分链，当前位置仅按最新链判断", chain, missing))
+		warnings = append(warnings, fmt.Sprintf("历史存在 %d 处交易日缺口或超过 20%% 的大幅价格波动（最近结构断点为 %s）；保留历史结构并分链，当前位置仅按最新链判断", chain, missing))
 	}
 	return bars, warnings
 }
