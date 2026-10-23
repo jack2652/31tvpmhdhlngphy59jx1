@@ -467,6 +467,233 @@ func TestCalculateSpecializedClassificationMatchesPythonKeywordOrder(t *testing.
 	}
 }
 
+func TestBloomEnergyEquipmentCompanyDoesNotUseEnergyMiningOrUtilityModel(t *testing.T) {
+	result := Calculate(Fundamentals{
+		Symbol:              "BE",
+		Sector:              "Industrials",
+		Industry:            "Specialty Industrial Machinery",
+		IndustryKey:         "specialty-industrial-machinery",
+		LongBusinessSummary: "Bloom Energy Corporation designs and manufactures solid oxide fuel cell systems for on-site power generation. Its customers include utilities and commercial operators.",
+		CurrentPrice:        ptr(195.51),
+		SharesOutstanding:   ptr(230e6),
+		Revenue:             ptr(1.5e9),
+		EBITDA:              ptr(100e6),
+		FreeCashFlow:        ptr(-150e6),
+		ForwardEPS:          ptr(2.31),
+		ForwardEPSObserved:  true,
+		NormalizedEPS:       ptr(.77),
+		GrowthRate:          ptr(.50),
+	})
+
+	if result.Status != StatusReady || result.DecisionTree == nil {
+		t.Fatalf("BE valuation status/tree = %q/%#v, want ready result with classification", result.Status, result.DecisionTree)
+	}
+	if result.Method != "重资产转型：核心业务 PE + 制造/云业务 P/S" {
+		t.Fatalf("BE model=%q, want asset-heavy manufacturer model", result.Method)
+	}
+	if result.DecisionTree.IndustryFilter == "energy_mining" || result.DecisionTree.Lifecycle == "energy_mining" ||
+		result.DecisionTree.IndustryFilter == "utility" || result.DecisionTree.Lifecycle == "utility" {
+		t.Fatalf("BE classification=%#v, must not be energy mining or regulated utility", result.DecisionTree)
+	}
+}
+
+func TestHighGrowthInfrastructureWithConfirmedRevenueExpansionUsesDualTracks(t *testing.T) {
+	result := Calculate(Fundamentals{
+		Symbol:                  "BE",
+		Sector:                  "Industrials",
+		Industry:                "Specialty Industrial Machinery",
+		IndustryKey:             "specialty-industrial-machinery",
+		LongBusinessSummary:     "Manufactures solid oxide fuel cell systems for on-site power generation and utility customers.",
+		CurrentPrice:            ptr(195.51),
+		SharesOutstanding:       ptr(230e6),
+		Revenue:                 ptr(1.5e9),
+		NextYearRevenueEstimate: ptr(1.86e9),
+		NextYearRevenueAnalysts: 5,
+		EBITDA:                  ptr(100e6),
+		FreeCashFlow:            ptr(-150e6),
+		OperatingCashflow:       ptr(100e6),
+		CapitalExpenditure:      ptr(-250e6),
+		ForwardEPS:              ptr(2.31),
+		ForwardEPSObserved:      true,
+		NormalizedEPS:           ptr(.77),
+		RevenueGrowth:           ptr(.30),
+		GrowthRate:              ptr(.30),
+	})
+
+	if result.Method != "高增长 AI/新能源基础设施：远期 P/S + PE" {
+		t.Fatalf("BE model=%q, want high-growth infrastructure model", result.Method)
+	}
+	if result.DecisionTree == nil || result.DecisionTree.Lifecycle != "高增长基础设施" {
+		t.Fatalf("BE decision tree=%#v, want high-growth infrastructure lifecycle", result.DecisionTree)
+	}
+	if result.Defensive == nil || result.Optimistic == nil {
+		t.Fatalf("BE scenarios defensive/optimistic = %#v/%#v, want both valuation tracks", result.Defensive, result.Optimistic)
+	}
+	if got := result.Methods["高增长基础设施远期 P/S"]; got <= 0 {
+		t.Fatalf("BE forward P/S candidate=%v, want positive 10-15x sales candidate", got)
+	}
+	if got := result.Methods["高增长基础设施远期 PE"]; got <= 0 {
+		t.Fatalf("BE forward PE candidate=%v, want positive growth PE candidate", got)
+	}
+	if got := result.Optimistic["forward_revenue_estimate"]; got != float64(1_860_000_000) {
+		t.Fatalf("BE forward revenue estimate=%v, want analyst estimate of $1.86B", got)
+	}
+	if result.Defensive["low"].(float64) < result.Defensive["value"].(float64)*.70 ||
+		result.Defensive["high"].(float64) <= result.Defensive["low"].(float64) {
+		t.Fatalf("BE defensive range=%#v, want a positive 15-20x EPS range", result.Defensive)
+	}
+	if result.Optimistic["high"].(float64) <= result.Defensive["high"].(float64) {
+		t.Fatalf("BE optimistic range=%#v does not exceed defensive range=%#v", result.Optimistic, result.Defensive)
+	}
+	if !strings.Contains(strings.Join(result.Warnings, " "), highGrowthInfrastructureWarning) {
+		t.Fatalf("BE warnings=%#v, want high-growth infrastructure warning", result.Warnings)
+	}
+}
+
+func TestHighGrowthInfrastructureUsesRevenueDefensiveScenarioWhenEPSUnavailable(t *testing.T) {
+	result := Calculate(Fundamentals{
+		Symbol:                     "CRWV",
+		Sector:                     "Technology",
+		Industry:                   "Data Center Infrastructure",
+		CurrentPrice:               ptr(100),
+		SharesOutstanding:          ptr(100),
+		Revenue:                    ptr(1_000),
+		CurrentYearRevenueEstimate: ptr(1_100),
+		NextYearRevenueEstimate:    ptr(1_300),
+		NextYearRevenueAnalysts:    5,
+		Debt:                       ptr(200),
+		Cash:                       ptr(50),
+		FreeCashFlow:               ptr(-100),
+		OperatingCashflow:          ptr(50),
+		CapitalExpenditure:         ptr(-200),
+		RevenueGrowth:              ptr(.30),
+		GrowthRate:                 ptr(.30),
+	})
+
+	if result.Defensive == nil || result.Optimistic == nil {
+		t.Fatalf("CRWV scenarios defensive/optimistic = %#v/%#v, want both tracks without EPS", result.Defensive, result.Optimistic)
+	}
+	if result.Defensive["model"] != "高增长基础设施：本年收入 EV/Revenue 4–6 倍防守区间" {
+		t.Fatalf("CRWV defensive model=%v, want explicitly labeled EV/Revenue fallback", result.Defensive["model"])
+	}
+	if result.Defensive["low"] != 42.5 || result.Defensive["high"] != 64.5 || result.Defensive["revenue_estimate"] != 1_100.0 {
+		t.Fatalf("CRWV defensive scenario=%#v, want 4–6x sales after $150 net debt", result.Defensive)
+	}
+	if result.Optimistic["low"].(float64) < result.Defensive["high"].(float64) ||
+		result.Optimistic["high"].(float64) <= result.Defensive["high"].(float64) {
+		t.Fatalf("CRWV optimistic range=%#v does not follow defensive range=%#v", result.Optimistic, result.Defensive)
+	}
+	if !strings.Contains(strings.Join(result.Warnings, " "), "保守场景改用本年收入 EV/Revenue 4–6 倍") {
+		t.Fatalf("CRWV warnings=%#v, want EPS fallback disclosure", result.Warnings)
+	}
+}
+
+func TestHighGrowthAICloudUsesInfrastructureModelAndAnalystRevenue(t *testing.T) {
+	result := Calculate(Fundamentals{
+		Sector:                  "Technology",
+		Industry:                "AI Cloud Infrastructure",
+		LongBusinessSummary:     "Provides GPU cloud clusters and AI compute infrastructure for data centers.",
+		CurrentPrice:            ptr(50),
+		SharesOutstanding:       ptr(10e6),
+		Revenue:                 ptr(100e6),
+		NextYearRevenueEstimate: ptr(124e6),
+		NextYearRevenueAnalysts: 5,
+		RevenueGrowth:           ptr(.30),
+		GrowthRate:              ptr(.30),
+		FreeCashFlow:            ptr(-2e6),
+		OperatingCashflow:       ptr(10e6),
+		CapitalExpenditure:      ptr(-20e6),
+		ForwardEPS:              ptr(2),
+		ForwardEPSObserved:      true,
+		NormalizedEPS:           ptr(1),
+	})
+
+	if result.Method != "高增长 AI/新能源基础设施：远期 P/S + PE" {
+		t.Fatalf("AI cloud model=%q, want high-growth infrastructure model", result.Method)
+	}
+	if got := result.Methods["高增长基础设施远期 P/S"]; got != 155 {
+		t.Fatalf("AI cloud forward P/S candidate=%v, want $155 using analyst revenue", got)
+	}
+	if got := result.Optimistic["forward_revenue_estimate"]; got != float64(124e6) {
+		t.Fatalf("AI cloud forward revenue estimate=%v, want analyst estimate of $124M", got)
+	}
+}
+
+func TestAICloudRevenueScenariosKeepOptimisticAboveDefensive(t *testing.T) {
+	result := Calculate(Fundamentals{
+		Sector:                     "Technology",
+		Industry:                   "AI Cloud Infrastructure",
+		LongBusinessSummary:        "Provides GPU cloud clusters for AI compute workloads.",
+		CurrentPrice:               ptr(50),
+		SharesOutstanding:          ptr(10e6),
+		Revenue:                    ptr(100e6),
+		CurrentYearRevenueEstimate: ptr(120e6),
+		CurrentYearRevenueAnalysts: 5,
+		NextYearRevenueEstimate:    ptr(150e6),
+		NextYearRevenueAnalysts:    5,
+		RevenueGrowth:              ptr(.10),
+		GrowthRate:                 ptr(.10),
+		FreeCashFlow:               ptr(-2e6),
+		OperatingCashflow:          ptr(10e6),
+		CapitalExpenditure:         ptr(-20e6),
+		Debt:                       ptr(20e6),
+	})
+
+	if result.Method != "AI 云基础设施：前瞻 EV/Revenue 情景" {
+		t.Fatalf("AI cloud model=%q, want the lower-growth AI cloud model", result.Method)
+	}
+	defensiveLow, defensiveHigh := result.Defensive["low"].(float64), result.Defensive["high"].(float64)
+	optimisticLow, optimisticHigh := result.Optimistic["low"].(float64), result.Optimistic["high"].(float64)
+	if defensiveLow >= optimisticLow || defensiveHigh >= optimisticHigh {
+		t.Fatalf("AI cloud scenarios are not ordered: defensive=%#v optimistic=%#v", result.Defensive, result.Optimistic)
+	}
+}
+
+func TestHighGrowthInfrastructureForwardRevenueClampsAnalystEstimate(t *testing.T) {
+	fundamentals := Fundamentals{
+		Revenue: ptr(100), RevenueGrowth: ptr(.50),
+		NextYearRevenueEstimate: ptr(200), NextYearRevenueAnalysts: 3,
+	}
+	if got := highGrowthInfrastructureForwardRevenue(fundamentals); got != 130 {
+		t.Fatalf("bounded forward revenue=%v, want 130 (1.3x current revenue)", got)
+	}
+}
+
+func TestHighGrowthInfrastructureDoesNotCaptureTraditionalEnergyOrUtilities(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		fundamentals  Fundamentals
+		wantLifecycle string
+	}{
+		{
+			name: "oil and gas producer",
+			fundamentals: Fundamentals{
+				Sector: "Energy", Industry: "Oil & Gas E&P", IndustryKey: "oil-gas-e-p",
+				LongBusinessSummary: "Oil and gas producer with exploration operations", RevenueGrowth: ptr(.30),
+			},
+			wantLifecycle: "energy_mining",
+		},
+		{
+			name: "regulated utility",
+			fundamentals: Fundamentals{
+				Sector: "Utilities", Industry: "Regulated Electric", IndustryKey: "utilities-regulated-electric",
+				LongBusinessSummary: "Operates regulated electric utility services", RevenueGrowth: ptr(.30),
+			},
+			wantLifecycle: "utility",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := Calculate(test.fundamentals)
+			if result.DecisionTree == nil || result.DecisionTree.Lifecycle != test.wantLifecycle {
+				t.Fatalf("decision tree=%#v, want lifecycle %q", result.DecisionTree, test.wantLifecycle)
+			}
+			if result.Method == "高增长 AI/新能源基础设施：远期 P/S + PE" {
+				t.Fatalf("traditional business entered high-growth infrastructure model: %#v", result)
+			}
+		})
+	}
+}
+
 func TestDefenseTransitionKeepsPythonSemiconductorEPSCap(t *testing.T) {
 	result := Calculate(Fundamentals{
 		Sector: "Technology", Industry: "Semiconductors", GrowthRate: ptr(.30),
@@ -735,6 +962,53 @@ func TestV39CrossValidationBuildsPerShareCandidatesAndMedian(t *testing.T) {
 		t.Fatalf("validation methods=%#v, missing DCF", result.Validation.Methods)
 	}
 	assertFloat(t, result.Validation.Median, 144)
+}
+
+func TestCrossValidationOmitsCandidatesBelowFivePercentOfCurrentPrice(t *testing.T) {
+	result := crossValidate(Fundamentals{
+		CurrentPrice: ptr(100), SharesOutstanding: ptr(1e6), FreeCashFlow: ptr(-1e6),
+		OperatingIncome: ptr(56_666.67),
+	})
+	if _, ok := result.Methods["EV/EBIT"]; ok {
+		t.Fatalf("cross-validation methods=%#v, want the $0.85 EV/EBIT candidate omitted", result.Methods)
+	}
+	if result.Median != nil {
+		t.Fatalf("cross-validation median=%v, want nil after all candidates below the 5%% price floor", *result.Median)
+	}
+
+	smallCashFlow := crossValidate(Fundamentals{
+		CurrentPrice: ptr(100), SharesOutstanding: ptr(1e6), FreeCashFlow: ptr(1),
+		RequiredReturn: ptr(.10),
+	})
+	for _, name := range []string{"所有者收益", "FCF收益率", "DCF"} {
+		if _, ok := smallCashFlow.Methods[name]; ok {
+			t.Errorf("cross-validation methods=%#v, want tiny %s candidate omitted", smallCashFlow.Methods, name)
+		}
+	}
+	if smallCashFlow.Median != nil {
+		t.Fatalf("small-cash-flow median=%v, want nil after tiny candidates are omitted", *smallCashFlow.Median)
+	}
+
+	valid := crossValidate(Fundamentals{
+		CurrentPrice: ptr(100), SharesOutstanding: ptr(1e6), OperatingIncome: ptr(1e6),
+	})
+	if got := valid.Methods["EV/EBIT"]; got != 15 || valid.Median == nil || *valid.Median != 15 {
+		t.Fatalf("reasonable cross-validation candidate=%#v, want $15 retained in the median", valid)
+	}
+}
+
+func TestHighGrowthInfrastructureCrossValidationUsesThirtyPercentDCFRate(t *testing.T) {
+	fundamentals := Fundamentals{
+		CurrentPrice: ptr(100), SharesOutstanding: ptr(100), Revenue: ptr(1_000),
+		RevenueGrowth: ptr(.50), GrowthRate: ptr(.50), FreeCashFlow: ptr(100),
+		RequiredReturn: ptr(.10), Sector: "Technology", Industry: "Data Center Infrastructure",
+		ForwardEPS: ptr(2), ForwardEPSObserved: true, NormalizedEPS: ptr(1),
+	}
+	result := Calculate(fundamentals)
+	want := roundCurrency(dcfPerShare(1, .30, .10, .015))
+	if got := result.Validation.Methods["DCF"]; got != want {
+		t.Fatalf("high-growth infrastructure DCF=%v, want 30%% revenue-growth DCF %v", got, want)
+	}
 }
 
 func TestCalculateGenericHighGrowthUsesPythonPEGAndScenarios(t *testing.T) {

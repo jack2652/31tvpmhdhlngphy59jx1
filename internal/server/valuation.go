@@ -19,9 +19,9 @@ import (
 // Go's generic valuation is not yet numerically equivalent to Python v39's
 // specialized decision tree. Keep a distinct source/version so Go cannot make
 // a Python cache entry look authoritative or silently overwrite it.
-const goFairValueSource = "valuation_go_v4"
+const goFairValueSource = "valuation_go_v10"
 
-const goFairValueCacheVersion = "go_v4"
+const goFairValueCacheVersion = "go_v10"
 
 type fundamentalsProvider interface {
 	Fundamentals(context.Context, string) (provider.YahooFundamentals, error)

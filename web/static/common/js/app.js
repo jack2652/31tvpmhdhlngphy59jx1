@@ -4104,8 +4104,11 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   const fairValueWarning = quote?.fair_value_warning || "公开财务数据不足，暂不输出估值";
   const defensiveModel = defensive?.model || "保守情景估值";
   const optimisticModel = optimistic?.model || "乐观情景估值";
-  const formatRange = (item) => item && Number.isFinite(Number(item.low)) && Number.isFinite(Number(item.high))
+  const hasRange = (item) => item && item.low != null && item.high != null
+    && Number.isFinite(Number(item.low)) && Number.isFinite(Number(item.high));
+  const formatRange = (item) => hasRange(item)
     ? `${formatMoney(item.low)}-${formatMoney(item.high)}` : "--";
+  const hasDefensiveScenario = Boolean(hasRange(defensive));
   const formatRevenue = (value) => {
     const amount = Number(value);
     if (!Number.isFinite(amount)) return null;
@@ -4130,7 +4133,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     return parts.length ? `${parts.join("；")}。` : "";
   };
   state.view.fairValue = hasConservativeValue
-    ? `保守 ${formatRange(defensive || { low, high })} · 乐观 ${formatRange(optimistic)}`
+    ? `保守 ${formatRange(defensive)} · 乐观 ${formatRange(optimistic)}`
     : "--";
   const defensiveBuy = defensive ? formatRange({ low: defensive.buy_low, high: defensive.buy_high }) : "--";
   const optimisticBuy = optimistic ? formatRange({ low: optimistic.buy_low, high: optimistic.buy_high }) : "--";
@@ -4140,13 +4143,13 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.view.fairValueTitle = hasConservativeValue
     ? `模型 A：${defensiveModel}，防守区间 ${formatRange(defensive)}；模型 B：${optimisticModel}，进攻区间 ${formatRange(optimistic)}。远期 EPS 来源：${quote?.fair_value_forward_eps_source || "暂无"}。确定性：${quote?.fair_value_confidence_score != null ? `${quote.fair_value_confidence_score}%（${quote.fair_value_confidence || "中"}）` : (quote?.fair_value_confidence || "暂无")}。市场状态：${quote?.fair_value_regime || "NORMAL"}`
      : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : "公开财务数据不足，暂不输出保守估值"));
-  state.view.fairDefensive = hasConservativeValue ? formatRange(defensive || { low, high }) : "--";
-  state.view.fairDefensiveSource = hasConservativeValue && defensive
+  state.view.fairDefensive = hasDefensiveScenario ? formatRange(defensive) : "--";
+  state.view.fairDefensiveSource = hasDefensiveScenario
     ? `买入 ${defensiveBuy} · 安全边际 ${(Number(defensive.safety_margin || 0) * 100).toFixed(0)}%`
      : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "模型 A 数据不足" : "等待估值计算")));
-  state.view.fairDefensiveTitle = hasConservativeValue
+  state.view.fairDefensiveTitle = hasDefensiveScenario
     ? `保守估值：${defensiveModel}。${scenarioInputs(defensive)}估值 ${state.view.fairDefensive}，${state.view.fairDefensiveSource}。确定性 ${quote?.fair_value_confidence_score != null ? `${quote.fair_value_confidence_score}%` : (quote?.fair_value_confidence || "暂无")}。${quote?.fair_value_regime === "WINTER" ? "AI 寒冬：禁止仅凭远期 EPS 抄底" : ""}`
-    : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : "等待保守情景估值"));
+    : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "模型 A 数据不足" : "等待估值计算")));
   state.view.fairOptimistic = optimistic ? formatRange(optimistic) : "--";
   state.view.fairOptimisticSource = optimistic
     ? `买入 ${optimisticBuy} · 安全边际 ${(Number(optimistic.safety_margin || 0) * 100).toFixed(0)}%`

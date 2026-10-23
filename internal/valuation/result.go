@@ -43,6 +43,8 @@ const (
 	valueRangeSpread = 0.20
 )
 
+const highGrowthInfrastructureWarning = "该标的属于高增长 AI/新能源基础设施赛道，传统 DCF 模型不适用，当前市场定价包含极高的远期预期，模型分歧较大。"
+
 // industryKeyCategoryMap mirrors the stable Yahoo industry_key map used by
 // Python v39. The category is deliberately separate from the specialized
 // model dispatcher: software, automotive, computer-hardware, and ordinary
@@ -585,7 +587,7 @@ func Calculate(f Fundamentals) Result {
 	if growth := valuationGrowthRate(f); growth != nil {
 		f.GrowthRate = growth
 	}
-	if isAICloudInfrastructure(f) {
+	if isAICloudInfrastructure(f) && !isHighGrowthInfrastructure(f) {
 		return calculateAICloudInfrastructure(f)
 	}
 	var result Result
@@ -657,37 +659,37 @@ func calculateAICloudInfrastructure(f Fundamentals) Result {
 	if f.CurrentYearRevenueAnalysts < 3 && nextYear > 0 {
 		defensiveRevenue = spotRevenue + (currentYear-spotRevenue)*.75
 	}
-	defensiveLowEV, defensiveHighEV := defensiveRevenue*14, defensiveRevenue*18
+	defensiveLowEV, defensiveHighEV := defensiveRevenue*8, defensiveRevenue*12
 	defensiveLow := math.Max(0, (defensiveLowEV-debt+cash)/shares)
 	defensiveHigh := math.Max(defensiveLow, (defensiveHighEV-debt+cash)/shares)
 	defensiveMid := (defensiveLow + defensiveHigh) / 2
-	optimisticLowEV, optimisticHighEV := nextYear*5, nextYear*8
+	optimisticLowEV, optimisticHighEV := nextYear*10, nextYear*15
 	optimisticLow := math.Max(defensiveLow, math.Max(0, (optimisticLowEV-debt+cash)/shares))
 	optimisticHigh := math.Max(optimisticLow, (optimisticHighEV-debt+cash)/shares)
 	optimisticMid := (optimisticLow + optimisticHigh) / 2
 	// The market price and analyst targets are not model inputs. The conservative
-	// case uses this year's estimates; the optimistic case uses next year's
-	// estimate with lower multiples to reflect execution, financing and dilution.
+	// case uses this year's estimate and lower multiples; the optimistic case
+	// uses next year's estimate and higher multiples.
 	defensiveMargin, optimisticMargin := .40, .45
 	defensive := map[string]any{
 		"value": roundCurrency(defensiveMid), "low": roundCurrency(defensiveLow), "high": roundCurrency(defensiveHigh),
 		"buy_low": roundCurrency(defensiveLow * (1 - defensiveMargin)), "buy_high": roundCurrency(defensiveHigh * (1 - defensiveMargin)),
-		"model": "AI 云基础设施：本年收入 EV/Revenue 14–18x（扣除净债务）", "safety_margin": defensiveMargin,
+		"model": "AI 云基础设施：本年收入 EV/Revenue 8–12x（扣除净债务）", "safety_margin": defensiveMargin,
 		"revenue": roundCurrency(spotRevenue), "current_year_revenue_estimate": roundCurrency(currentYear),
 		"analyst_count": f.CurrentYearRevenueAnalysts,
 	}
 	optimistic := map[string]any{
 		"value": roundCurrency(optimisticMid), "low": roundCurrency(optimisticLow), "high": roundCurrency(optimisticHigh),
 		"buy_low": roundCurrency(optimisticLow * (1 - optimisticMargin)), "buy_high": roundCurrency(optimisticHigh * (1 - optimisticMargin)),
-		"model": "AI 云基础设施：下一年收入 EV/Revenue 5–8x（扣除净债务）", "safety_margin": optimisticMargin,
+		"model": "AI 云基础设施：下一年收入 EV/Revenue 10–15x（扣除净债务）", "safety_margin": optimisticMargin,
 		"current_year_revenue_estimate": roundCurrency(currentYear), "next_year_revenue_estimate": roundCurrency(nextYear),
 		"analyst_count": f.NextYearRevenueAnalysts,
 	}
 	methods := map[string]float64{
-		"本年收入 EV/Revenue 16x":   roundCurrency((defensiveRevenue*16 - debt + cash) / shares),
-		"下一年收入 EV/Revenue 6.5x": roundCurrency((nextYear*6.5 - debt + cash) / shares),
+		"本年收入 EV/Revenue 10x":    roundCurrency((defensiveRevenue*10 - debt + cash) / shares),
+		"下一年收入 EV/Revenue 12.5x": roundCurrency((nextYear*12.5 - debt + cash) / shares),
 	}
-	value := methods["本年收入 EV/Revenue 16x"]
+	value := methods["本年收入 EV/Revenue 10x"]
 	result := Result{
 		Method: "AI 云基础设施：前瞻 EV/Revenue 情景", Methods: methods,
 		FairValue: floatPointer(roundCurrency(value)), FairValueLow: floatPointer(roundCurrency(defensiveLow)), FairValueHigh: floatPointer(roundCurrency(defensiveHigh)),
@@ -863,6 +865,8 @@ func valuationDecisionTree(result Result, f Fundamentals) *DecisionTree {
 	industryContext := strings.ToLower(strings.ReplaceAll(f.Sector+" "+f.Industry+" "+industryKeyText, "_", " "))
 	if result.IndustryModel {
 		switch {
+		case strings.Contains(model, "高增长 AI/新能源基础设施") || strings.Contains(model, "高增长基础设施"):
+			filter, lifecycle = "high_growth_infrastructure", "高增长基础设施"
 		case strings.Contains(model, "银行"):
 			filter, lifecycle = "banking", "banking"
 		case strings.Contains(model, "医疗保险计划"):
@@ -988,31 +992,41 @@ func crossValidate(f Fundamentals) CrossValidation {
 	if f.Cash == nil && len(f.AnnualCash) > 0 {
 		cash = f.AnnualCash[0]
 	}
+	priceAnchor := valueOr(f.CurrentPrice, 0)
+	if priceAnchor <= 0 && f.MarketCap != nil && *f.MarketCap > 0 {
+		priceAnchor = *f.MarketCap / *shares
+	}
+	addMethod := func(name string, candidate float64) {
+		if !isPositiveFinite(candidate) || (priceAnchor > 0 && candidate < priceAnchor*valuationPriceFloorRatio) {
+			return
+		}
+		methods[name] = roundCurrency(candidate)
+	}
 	if fcf != nil {
 		ownerEarnings := *fcf
 		if supplied := positivePointer(f.OwnerEarnings); supplied != nil {
 			ownerEarnings = *supplied
 		}
-		methods["所有者收益"] = roundCurrency(ownerEarnings * 18 / *shares)
-		methods["FCF收益率"] = roundCurrency(*fcf / .06 / *shares)
+		addMethod("所有者收益", ownerEarnings*18 / *shares)
+		addMethod("FCF收益率", *fcf/.06 / *shares)
 	}
 	operatingIncome := positivePointer(f.OperatingIncome)
 	if operatingIncome == nil && len(f.AnnualOperatingIncome) > 0 {
 		operatingIncome = positivePointer(&f.AnnualOperatingIncome[0])
 	}
 	if operatingIncome != nil {
-		methods["EV/EBIT"] = roundCurrency((*operatingIncome*15 - debt + cash) / *shares)
+		addMethod("EV/EBIT", (*operatingIncome*15-debt+cash) / *shares)
 	}
 	if fcf != nil && debt >= 0 {
 		discount := valueOr(f.RequiredReturn, .10)
 		growth := .02
-		pv := 0.0
-		for year := 1; year <= 5; year++ {
-			pv += *fcf * math.Pow(1+growth, float64(year)) / math.Pow(1+discount, float64(year))
+		if isHighGrowthInfrastructure(f) {
+			growth = valuationDCFRate(f, valueOr(f.RevenueGrowth, valueOr(f.GrowthRate, growth)))
 		}
 		if discount > .015 {
-			terminal := *fcf * math.Pow(1+growth, 5) * 1.015 / (discount - .015) / math.Pow(1+discount, 5)
-			methods["DCF"] = roundCurrency((pv + terminal - debt + cash) / *shares)
+			fcfPerShare := *fcf / *shares
+			candidate := dcfPerShare(fcfPerShare, growth, discount, .015) + (cash-debt) / *shares
+			addMethod("DCF", candidate)
 		}
 	}
 	valid := make([]float64, 0, len(methods))
@@ -1034,23 +1048,33 @@ func applyInformationPagePSFallback(f Fundamentals, result Result) Result {
 		f.SharesOutstanding == nil || !isPositiveFinite(*f.SharesOutstanding) {
 		return result
 	}
-	priceToSales := valueOr(f.PriceToSales, 2)
-	if !isPositiveFinite(priceToSales) {
-		priceToSales = 2
+	highGrowthInfrastructure := isHighGrowthInfrastructure(f)
+	var value, spread float64
+	if highGrowthInfrastructure {
+		forwardRevenue := highGrowthInfrastructureForwardRevenue(f)
+		low := (forwardRevenue*10 - valueOr(f.Debt, 0) + valueOr(f.Cash, 0)) / *f.SharesOutstanding
+		high := (forwardRevenue*15 - valueOr(f.Debt, 0) + valueOr(f.Cash, 0)) / *f.SharesOutstanding
+		if !isPositiveFinite(low) || !isPositiveFinite(high) {
+			return result
+		}
+		value = (low + high) / 2
+		spread = (high - low) / math.Max(high+low, 1)
+	} else {
+		priceToSales := valueOr(f.PriceToSales, 2)
+		if !isPositiveFinite(priceToSales) {
+			priceToSales = 2
+		}
+		priceToSales = clamp(priceToSales*.65, .75, 4)
+		value = (*f.Revenue*priceToSales - valueOr(f.Debt, 0) + valueOr(f.Cash, 0)) / *f.SharesOutstanding
+		spread = .22
+		text := strings.ToLower(strings.ReplaceAll(f.Sector+" "+f.Industry+" "+f.IndustryKey, "_", " "))
+		if containsAny(text,
+			"consumer defensive", "consumer staples", "restaurant", "retail", "food", "beverage", "discount stores") {
+			spread = .15
+		}
 	}
-	priceToSales = clamp(priceToSales*.65, .75, 4)
-	value := (*f.Revenue*priceToSales - valueOr(f.Debt, 0) + valueOr(f.Cash, 0)) / *f.SharesOutstanding
 	if !isPositiveFinite(value) {
 		return result
-	}
-
-	// The Python fallback is a single candidate, so its default spread is 22%;
-	// consumer-staples/retail businesses use the stable-company 15% spread.
-	spread := .22
-	text := strings.ToLower(strings.ReplaceAll(f.Sector+" "+f.Industry+" "+f.IndustryKey, "_", " "))
-	if containsAny(text,
-		"consumer defensive", "consumer staples", "restaurant", "retail", "food", "beverage", "discount stores") {
-		spread = .15
 	}
 	candidateValue := roundCurrency(value)
 	priceAnchor := valueOr(f.CurrentPrice, 0)
@@ -1069,6 +1093,9 @@ func applyInformationPagePSFallback(f Fundamentals, result Result) Result {
 		result.Methods = make(map[string]float64)
 	}
 	result.Method = "信息页 P/S 低置信度兜底"
+	if highGrowthInfrastructure {
+		result.Method = "高增长基础设施：前瞻 P/S 10–15 倍低置信度兜底"
+	}
 	result.Methods[result.Method] = candidateValue
 	result.FairValue = floatPointer(value)
 	result.FairValueLow, result.FairValueHigh = floatPointer(low), floatPointer(high)
@@ -1080,6 +1107,11 @@ func applyInformationPagePSFallback(f Fundamentals, result Result) Result {
 	result.SafetyMargin = margin
 	result.Defensive = scenario(value, spread, result.Method, margin)
 	result.Optimistic = scenario(value, spread, result.Method, margin)
+	if highGrowthInfrastructure {
+		result.Defensive = nil
+		result.Optimistic = specializedScenario(low, high, result.Method, margin)
+		result.IndustryModel = true
+	}
 	if result.Warning != "" {
 		filtered := result.Warnings[:0]
 		for _, existing := range result.Warnings {
@@ -1091,10 +1123,85 @@ func applyInformationPagePSFallback(f Fundamentals, result Result) Result {
 	}
 	result.Warning = ""
 	result.Warnings = append(result.Warnings, warning)
+	if highGrowthInfrastructure {
+		result.Warnings = append(result.Warnings, highGrowthInfrastructureWarning)
+		result.Warning = warning + "; " + highGrowthInfrastructureWarning
+	}
 	return result
 }
 
+// 有限寿命 NAV 仅适用于资源企业，不用泛化的 energy 标签推断。
+func isEnergyMiningBusiness(f Fundamentals) bool {
+	keyText := strings.ReplaceAll(normalizedIndustryKey(f.IndustryKey), "-", " ")
+	industryContext := strings.ToLower(strings.ReplaceAll(
+		strings.TrimSpace(f.Sector+" "+f.Industry+" "+keyText), "_", " "))
+	classificationText := strings.ToLower(strings.ReplaceAll(
+		strings.TrimSpace(industryContext+" "+f.LongBusinessSummary), "_", " "))
+
+	if containsAny(classificationText,
+		"energy producer", "energy exploration", "oil producer", "oil exploration", "oil and gas", "oil & gas",
+		"natural gas producer", "natural gas exploration", "coal mining", "uranium mining", "uranium producer",
+		"gold mining", "gold producer", "silver mining", "silver producer", "copper mining", "copper producer",
+		"mining company", "mineral exploration", "metal mining") {
+		return true
+	}
+	if containsAny(industryContext, "utility", "utilities", "regulated electric", "water utilities", "gas utilities") {
+		return false
+	}
+	return containsAny(industryContext, "oil", "gas", "coal", "uranium", "mining", "gold", "silver", "copper")
+}
+
+func isRegulatedUtilityBusiness(f Fundamentals) bool {
+	key := normalizedIndustryKey(f.IndustryKey)
+	switch key {
+	case "utilities-regulated-electric", "utilities-regulated-gas", "utilities-regulated-water", "utility":
+		return true
+	}
+	keyText := strings.ReplaceAll(key, "-", " ")
+	industryContext := strings.ToLower(strings.ReplaceAll(
+		strings.TrimSpace(f.Sector+" "+f.Industry+" "+keyText), "_", " "))
+	if containsAny(industryContext,
+		"regulated electric", "regulated gas", "regulated water", "electric utility", "water utility", "gas utility") {
+		return true
+	}
+	summary := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(f.LongBusinessSummary), "_", " "))
+	return containsAny(summary,
+		"regulated utility operator", "regulated electric utility", "regulated gas utility", "regulated water utility",
+		"operates regulated utilities", "operates a regulated utility", "owns and operates regulated utilities")
+}
+
+func isHighGrowthInfrastructure(f Fundamentals) bool {
+	if f.RevenueGrowth == nil || !isFinite(*f.RevenueGrowth) || *f.RevenueGrowth < .20 ||
+		isEnergyMiningBusiness(f) || isRegulatedUtilityBusiness(f) {
+		return false
+	}
+	keyText := strings.ReplaceAll(normalizedIndustryKey(f.IndustryKey), "-", " ")
+	text := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(
+		f.Sector+" "+f.Industry+" "+keyText+" "+f.LongBusinessSummary), "_", " "))
+	return containsAny(text,
+		"fuel cell", "fuel-cell", "solid oxide", "new energy", "clean energy", "renewable energy",
+		"energy storage", "battery storage", "grid storage", "data center", "data-centre", "data centre",
+		"data-center", "data-centre infrastructure", "data center infrastructure", "ai infrastructure", "ai computing", "ai compute",
+		"ai cloud", "gpu cloud", "gpu clusters", "gpu infrastructure", "compute infrastructure", "power infrastructure", "hydrogen infrastructure",
+		"electrolyzer", "新能源", "燃料电池", "数据中心", "算力基础设施", "储能")
+}
+
+func highGrowthInfrastructureForwardRevenue(f Fundamentals) float64 {
+	revenue := positivePtr(f.Revenue)
+	if revenue == nil {
+		return 0
+	}
+	minimum, maximum := *revenue*1.20, *revenue*1.30
+	if estimate := positivePtr(f.NextYearRevenueEstimate); estimate != nil && f.NextYearRevenueAnalysts >= 3 {
+		return clamp(*estimate, minimum, maximum)
+	}
+	return *revenue * (1 + clamp(valueOr(f.RevenueGrowth, 0), .20, .30))
+}
+
 func informationFallbackSafetyMargin(f Fundamentals) float64 {
+	if isHighGrowthInfrastructure(f) {
+		return math.Max(valueOr(f.SafetyMargin, defaultSafetyMargin), .50)
+	}
 	normalize := func(value string) string {
 		return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), "_", " "))
 	}
@@ -1114,9 +1221,7 @@ func informationFallbackSafetyMargin(f Fundamentals) float64 {
 		containsAny(classificationText, "reit", "real estate investment trust")
 	biotech := key == "biotechnology" || key == "drug-manufacturers-general" || key == "pharmaceutical-retailers" ||
 		containsAny(classificationText, "biotech", "biotechnology", "drug manufacturer", "pharmaceutical", "drug manufacturers")
-	utility := key == "utilities-regulated-electric" || key == "utilities-regulated-gas" ||
-		key == "utilities-regulated-water" || key == "utility" ||
-		containsAny(classificationText, "utilities", "utility", "regulated electric", "electric utilities", "water utilities", "gas utilities")
+	utility := isRegulatedUtilityBusiness(f)
 	internet := key == "internet-content-information" || key == "internet-retail" || key == "internet-services" ||
 		containsAny(classificationText, "internet content", "internet retail", "interactive media", "social media", "online platform", "internet services", "e commerce", "e-commerce") ||
 		(strings.Contains(normalize(f.Sector), "communication services") && containsAny(classificationText, "internet", "media", "interactive", "social"))
@@ -1124,8 +1229,7 @@ func informationFallbackSafetyMargin(f Fundamentals) float64 {
 	mobilityTechnology := isMobilityTechnology(f, classificationText, industryContext)
 	financialOrRealEstate := f.IsREIT || containsAny(industryContext,
 		"financial", "bank", "insurance", "capital markets", "credit", "real estate", "reit", "property")
-	energyMining := !defenseTag && !mobilityTechnology && containsAny(classificationText,
-		"energy", "oil", "gas", "coal", "uranium", "mining", "gold", "silver", "copper")
+	energyMining := !defenseTag && !mobilityTechnology && isEnergyMiningBusiness(f)
 	if mobilityTechnology {
 		banking, healthcarePlans, insurance, reit, biotech, utility, internet, energyMining = false, false, false, false, false, false, false, false
 	}
@@ -1379,6 +1483,7 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 	}
 	text := normalizeClassificationText(f.Sector + " " + f.Industry + " " + industryKeyText + " " + f.LongBusinessSummary)
 	industryContext := normalizeClassificationText(f.Sector + " " + f.Industry + " " + industryKeyText)
+	highGrowthInfrastructure := isHighGrowthInfrastructure(f)
 	healthcarePlans := key == "healthcare-plans" || containsAny(industryContext, "healthcare plans", "health care plans", "health plan", "managed care", "managed healthcare")
 	lifecycleText := industryContext
 	category := map[string]string{
@@ -1433,10 +1538,16 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 		modelClass = "reit"
 	case keyModelClass == "biotech" || containsAny(text, "biotech", "biotechnology", "pharmaceutical", "drug manufacturer"):
 		modelClass = "biotech"
-	case keyModelClass == "energy" || containsAny(text, "oil", "gas", "energy", "coal", "uranium", "mining", "gold", "silver", "copper"):
-		modelClass = "energy"
-	case keyModelClass == "utility" || containsAny(text, "utility", "utilities", "regulated electric", "water utilities", "gas utilities"):
+	case keyModelClass == "utility" || isRegulatedUtilityBusiness(f):
 		modelClass = "utility"
+	case keyModelClass == "energy" || isEnergyMiningBusiness(f):
+		if highGrowthInfrastructure {
+			modelClass = "high-growth-infrastructure"
+		} else {
+			modelClass = "energy"
+		}
+	case highGrowthInfrastructure:
+		modelClass = "high-growth-infrastructure"
 	case keyModelClass == "internet" || containsAny(text, "internet content", "internet retail", "interactive media", "social media", "online platform", "internet services", "e commerce", "e-commerce") ||
 		(strings.Contains(strings.ToLower(f.Sector), "communication services") && containsAny(text, "internet", "media", "interactive", "social")):
 		modelClass = "internet"
@@ -1519,7 +1630,7 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 	digitalRetail := stableBusiness && marketCap >= 1e11 && containsAny(lifecycleText, "retail", "discount stores", "consumer defensive", "consumer staples")
 	aiStorageGrowth := aiStorageCycle && storageHardware && !memoryText && structuralStorage && freeCashFlowMargin >= .15 &&
 		(classGrowth >= .30 || valueOr(f.RevenueGrowth, 0) >= .30)
-	assetHeavyTransition := !financial && !defenseTransition && !aiStorageCycle && !memoryText && modelClass != "cruise" &&
+	assetHeavyTransition := !financial && !defenseTransition && !aiStorageCycle && !memoryText && !highGrowthInfrastructure && modelClass != "cruise" &&
 		((f.FreeCashFlow != nil && *f.FreeCashFlow < 0) ||
 			(f.CapitalExpenditure != nil && f.OperatingCashflow != nil && math.Abs(*f.CapitalExpenditure) >= math.Abs(*f.OperatingCashflow)*.70))
 	highGrowthChipSignal := !financial && !mobilityTechnology && !defenseIndustryTag && !memoryText &&
@@ -1541,7 +1652,7 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 		}
 	}
 	specializedIndustry := !mobilityTechnology && (modelClass == "banking" || modelClass == "healthcare-plans" || modelClass == "insurance" || modelClass == "reit" ||
-		modelClass == "biotech" || modelClass == "energy" || modelClass == "utility" || modelClass == "internet")
+		modelClass == "biotech" || modelClass == "energy" || modelClass == "utility" || modelClass == "internet" || modelClass == "high-growth-infrastructure")
 	internetAIPlatform := modelClass == "internet" && marketCap >= 1e12 && containsAny(text,
 		"artificial intelligence", "generative ai", "large language model", "machine learning", "ai infrastructure",
 		"ai recommendation", "recommendation engine", "ad ranking", "personalized ads", "ai-powered", "ai powered",
@@ -1727,6 +1838,9 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 	}
 	methods := map[string]float64{}
 	var low, high float64
+	var infrastructurePSLow, infrastructurePSHigh float64
+	var infrastructurePELow, infrastructurePEHigh float64
+	var infrastructureForwardRevenue float64
 	var mobilityUpsideLow, mobilityUpsideHigh float64
 	var mobilityForwardRevenue, mobilitySharesValue, mobilityOptimisticEPS float64
 	var mobilityHasRevenueAnchor bool
@@ -1879,6 +1993,32 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 		if internetAIPlatform {
 			model = "AI 互联网平台：广告/推荐基础设施 + P/S"
 		}
+	case "high-growth-infrastructure":
+		// 前瞻销售额与前瞻 EPS 分别形成乐观区间的低端和高端锚点。
+		infrastructureGrowth := clamp(valueOr(f.RevenueGrowth, classGrowth), .20, .30)
+		infrastructureForwardRevenue = highGrowthInfrastructureForwardRevenue(f)
+		if shares != nil && f.Revenue != nil && isPositiveFinite(*f.Revenue) {
+			infrastructurePSLow = (infrastructureForwardRevenue*10 - debt + cash) / *shares
+			infrastructurePSHigh = (infrastructureForwardRevenue*15 - debt + cash) / *shares
+			if isPositiveFinite(infrastructurePSLow) && isPositiveFinite(infrastructurePSHigh) {
+				methods["高增长基础设施远期 P/S"] = roundCurrency((infrastructurePSLow + infrastructurePSHigh) / 2)
+				low, high = infrastructurePSLow, infrastructurePSHigh
+			}
+		}
+		if forwardEPS := positivePtr(forward); forwardEPS != nil {
+			peLow := clamp(20+infrastructureGrowth*20, 24, 30)
+			peHigh := clamp(35+infrastructureGrowth*30, 40, 50)
+			infrastructurePELow = *forwardEPS * peLow
+			infrastructurePEHigh = *forwardEPS * peHigh
+			if isPositiveFinite(infrastructurePELow) && isPositiveFinite(infrastructurePEHigh) {
+				methods["高增长基础设施远期 PE"] = roundCurrency((infrastructurePELow + infrastructurePEHigh) / 2)
+				if low <= 0 || infrastructurePELow < low {
+					low = infrastructurePELow
+				}
+				high = math.Max(high, infrastructurePEHigh)
+			}
+		}
+		model = "高增长 AI/新能源基础设施：远期 P/S + PE"
 	case "digital-retail":
 		if retailEPS > 0 && shares != nil {
 			methods["传统零售远期 PE"] = roundCurrency(retailEPS * 18)
@@ -2202,7 +2342,7 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 		priceAnchor = *f.MarketCap / *f.SharesOutstanding
 	}
 	epsAnchor := valueOr(reportedForward, valueOr(normalizedEPS, 0))
-	valid = filterUnitAnomalyCandidates(valid, epsAnchor, priceAnchor, defenseTransition)
+	valid = filterUnitAnomalyCandidates(valid, epsAnchor, priceAnchor, defenseTransition || highGrowthInfrastructure)
 	sort.Float64s(valid)
 	value := valid[len(valid)/2]
 	anchorWarning := ""
@@ -2232,6 +2372,9 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 	}
 	if modelClass == "high-growth" {
 		low, high = value*.78, value*1.22
+	}
+	if modelClass == "high-growth-infrastructure" && (low <= 0 || high < low) {
+		low, high = value*.80, value*1.20
 	}
 	if modelClass == "mature" {
 		spread := .22
@@ -2292,6 +2435,8 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 		margin = math.Max(margin, .40)
 	case "high-growth-chip":
 		margin = math.Max(margin, .30)
+	case "high-growth-infrastructure":
+		margin = math.Max(margin, .50)
 	case "high-growth":
 		margin = math.Max(margin, .45)
 	case "digital-retail":
@@ -2354,6 +2499,14 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 		}
 		warnings = append(warnings, warning)
 	}
+	if modelClass == "high-growth-infrastructure" {
+		warnings = append(warnings, highGrowthInfrastructureWarning)
+		if warning == "" {
+			warning = highGrowthInfrastructureWarning
+		} else {
+			warning += "; " + highGrowthInfrastructureWarning
+		}
+	}
 	if anchorWarning != "" {
 		warnings = append(warnings, anchorWarning)
 		if warning == "" {
@@ -2388,6 +2541,77 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 			result.Optimistic["forward_eps"] = roundDecimal(*reportedForward, 4)
 		}
 		result.Optimistic["growth_rate"] = roundDecimal(clamp(growth, 0, .50), 4)
+	}
+	if modelClass == "high-growth-infrastructure" {
+		defensiveEPS := positivePtr(normalizedEPS)
+		if forwardEPS := positivePtr(forward); forwardEPS != nil {
+			if defensiveEPS == nil {
+				haircutEPS := *forwardEPS * .75
+				defensiveEPS = &haircutEPS
+			} else {
+				cappedForward := math.Min(*forwardEPS, *defensiveEPS*1.25)
+				defensiveEPS = floatPointer(math.Max(*defensiveEPS, cappedForward))
+			}
+		}
+		defensiveHigh := 0.0
+		if defensiveEPS != nil {
+			defensiveLow := *defensiveEPS * 15
+			defensiveHigh = *defensiveEPS * 20
+			defensiveMargin := math.Max(.45, margin)
+			if f.FreeCashFlow != nil && *f.FreeCashFlow < 0 {
+				defensiveMargin = math.Max(.50, defensiveMargin)
+			}
+			result.Defensive = specializedScenario(defensiveLow, defensiveHigh, "高增长基础设施：正常化 EPS × 15–20 倍 PE", defensiveMargin)
+		} else {
+			if shares != nil && f.Revenue != nil && isPositiveFinite(*f.Revenue) {
+				defensiveRevenue := valueOr(f.CurrentYearRevenueEstimate, 0)
+				if !isPositiveFinite(defensiveRevenue) {
+					defensiveGrowth := clamp(valueOr(f.RevenueGrowth, growth), .20, .30)
+					defensiveRevenue = *f.Revenue * (1 + clamp(defensiveGrowth*.5, .10, .15))
+				}
+				defensiveRevenue = clamp(defensiveRevenue, *f.Revenue, infrastructureForwardRevenue)
+				defensiveLow := math.Max(0, (defensiveRevenue*4-debt+cash) / *shares)
+				defensiveHigh = math.Max(0, (defensiveRevenue*6-debt+cash) / *shares)
+				if defensiveLow > 0 && defensiveHigh >= defensiveLow {
+					defensiveMargin := math.Max(.50, margin)
+					result.Defensive = specializedScenario(defensiveLow, defensiveHigh, "高增长基础设施：本年收入 EV/Revenue 4–6 倍防守区间", defensiveMargin)
+					result.Defensive["revenue_estimate"] = roundCurrency(defensiveRevenue)
+					result.Warnings = append(result.Warnings, "缺少可用正向 EPS，保守场景改用本年收入 EV/Revenue 4–6 倍并扣除净债务")
+				}
+			}
+			if result.Defensive == nil {
+				defensiveHigh = 0
+				result.Warnings = append(result.Warnings, "缺少可用正向 EPS 或收入净债务估值无法得出正值，保守区间暂不可用")
+			}
+		}
+
+		optimisticLow, optimisticHigh := math.MaxFloat64, 0.0
+		for _, candidate := range []float64{infrastructurePSLow, infrastructurePELow} {
+			if isPositiveFinite(candidate) {
+				optimisticLow = math.Min(optimisticLow, candidate)
+			}
+		}
+		for _, candidate := range []float64{infrastructurePSHigh, infrastructurePEHigh} {
+			if isPositiveFinite(candidate) {
+				optimisticHigh = math.Max(optimisticHigh, candidate)
+			}
+		}
+		if optimisticLow < math.MaxFloat64 {
+			if defensiveHigh > 0 {
+				optimisticLow = math.Max(optimisticLow, defensiveHigh)
+			}
+			optimisticHigh = math.Max(optimisticLow, optimisticHigh)
+			result.Optimistic = specializedScenario(optimisticLow, optimisticHigh, "高增长基础设施：前瞻 P/S 10–15 倍 + 远期 PE", .40)
+			if reportedForward != nil {
+				result.Optimistic["forward_eps"] = roundDecimal(*reportedForward, 4)
+			}
+			result.Optimistic["growth_rate"] = roundDecimal(clamp(valueOr(f.RevenueGrowth, growth), .20, .30), 4)
+			result.Optimistic["price_to_sales_low"] = 10.0
+			result.Optimistic["price_to_sales_high"] = 15.0
+			if infrastructureForwardRevenue > 0 {
+				result.Optimistic["forward_revenue_estimate"] = roundCurrency(infrastructureForwardRevenue)
+			}
+		}
 	}
 	if modelClass == "healthcare-plans" {
 		earnings := positivePtr(normalizedEPS)
@@ -2555,7 +2779,7 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 			}
 		}
 		if fcfPerShare, ok := resolveFCFPerShare(f); ok && requiredReturn > terminalGrowth {
-			dcfCandidate := dcfPerShare(fcfPerShare, clamp(classGrowth, -.02, .14), requiredReturn, terminalGrowth)
+			dcfCandidate := dcfPerShare(fcfPerShare, valuationDCFRate(f, classGrowth), requiredReturn, terminalGrowth)
 			if isPositiveFinite(dcfCandidate) {
 				defensiveCandidates = append(defensiveCandidates, dcfCandidate)
 			}
@@ -2571,7 +2795,12 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 	if modelClass == "high-growth" {
 		defensiveCandidates := make([]float64, 0, 3)
 		if normalizedEPS != nil {
-			defensiveCandidates = append(defensiveCandidates, *normalizedEPS*16)
+			defensiveEPS := *normalizedEPS
+			// 收入高速增长且远期 EPS 来自分析师时，用远期盈利建立防守锚点。
+			if f.ForwardEPSObserved && forward != nil && valueOr(f.RevenueGrowth, 0) >= .50 {
+				defensiveEPS = math.Max(defensiveEPS, *forward)
+			}
+			defensiveCandidates = append(defensiveCandidates, defensiveEPS*16)
 		}
 		requiredReturn := valueOr(f.RequiredReturn, defaultRequiredReturn)
 		terminalGrowth := valueOr(f.TerminalGrowth, clamp(classGrowth*.25, .015, .035))
@@ -2582,7 +2811,7 @@ func calculateSpecialized(f Fundamentals) (Result, bool) {
 			}
 		}
 		if fcfPerShare, ok := resolveFCFPerShare(f); ok && requiredReturn > terminalGrowth {
-			dcfCandidate := dcfPerShare(fcfPerShare, clamp(classGrowth, -.02, .14), requiredReturn, terminalGrowth)
+			dcfCandidate := dcfPerShare(fcfPerShare, valuationDCFRate(f, classGrowth), requiredReturn, terminalGrowth)
 			if isPositiveFinite(dcfCandidate) {
 				defensiveCandidates = append(defensiveCandidates, dcfCandidate)
 			}
@@ -3373,7 +3602,7 @@ func calculateGenericWithForwardEstimate(f Fundamentals, allowModeledForwardEPS 
 		growth := valueOr(f.GrowthRate, 0)
 		// Keep a fallback DCF bounded and deterministic when a provider sends a
 		// short-term growth spike. The owner-earnings and PE paths are unaffected.
-		growth = clamp(growth, -0.02, 0.14)
+		growth = valuationDCFRate(f, growth)
 		candidate := dcfPerShare(fcfPerShare, growth, requiredReturn, terminalGrowth)
 		if isPositiveFinite(candidate) {
 			rawMethods[MethodFCFDCF] = candidate
@@ -3494,7 +3723,7 @@ func calculateGenericWithForwardEstimate(f Fundamentals, allowModeledForwardEPS 
 			}
 		}
 		if fcfPerShare, ok := resolveFCFPerShare(f); ok && requiredReturn > terminalGrowth {
-			dcfCandidate := dcfPerShare(fcfPerShare, clamp(valueOr(f.GrowthRate, 0), -.02, .14), requiredReturn, terminalGrowth)
+			dcfCandidate := dcfPerShare(fcfPerShare, valuationDCFRate(f, valueOr(f.GrowthRate, 0)), requiredReturn, terminalGrowth)
 			if isPositiveFinite(dcfCandidate) {
 				defensiveValues = append(defensiveValues, dcfCandidate)
 			}
@@ -3810,6 +4039,17 @@ func resolveFCFPerShare(f Fundamentals) (float64, bool) {
 		return 0, false
 	}
 	return *f.FreeCashFlow / *f.SharesOutstanding, true
+}
+
+func valuationDCFRate(f Fundamentals, growth float64) float64 {
+	maxGrowth := .14
+	if isHighGrowthInfrastructure(f) {
+		maxGrowth = .30
+		if f.RevenueGrowth != nil {
+			growth = *f.RevenueGrowth
+		}
+	}
+	return clamp(growth, -.02, maxGrowth)
 }
 
 func dcfPerShare(base, growth, requiredReturn, terminalGrowth float64) float64 {

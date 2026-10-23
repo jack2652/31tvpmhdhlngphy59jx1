@@ -374,7 +374,7 @@ func TestOldGoValuationSourceIsRefreshable(t *testing.T) {
 	if isGoFairValueSource("valuation_v39") || isGoFairValueSource("python-valuation") {
 		t.Fatalf("non-Go valuation source incorrectly recognized as Go")
 	}
-	if goFairValueCacheVersion != "go_v4" || goFairValueSource != "valuation_go_v4" {
+	if goFairValueCacheVersion != "go_v10" || goFairValueSource != "valuation_go_v10" {
 		t.Fatalf("Go valuation cache/source version did not advance: version=%q source=%q", goFairValueCacheVersion, goFairValueSource)
 	}
 }
