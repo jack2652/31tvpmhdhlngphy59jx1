@@ -644,28 +644,32 @@ function drawChanIndicatorHeaders(target, model, candle) {
   const canvas = target.querySelector("canvas.chan-chart-canvas");
   const context = canvas?.getContext("2d");
   if (!context || !model || !(canvas.width > 0) || !(canvas.height > 0)
-    || !Number.isFinite(model.volumeTop) || !Number.isFinite(model.macdTop)) return;
+    || (![model.volumeTop, model.macdTop, model.dmiTop].some(Number.isFinite))) return;
   const svg = target.querySelector("svg");
-  const chartWidth = svg?.getBoundingClientRect().width || 0;
-  const leftBleed = Number(canvas.dataset.leftBleed) || 0;
+  const chartWidth = typeof svg?.getBoundingClientRect === "function" ? svg.getBoundingClientRect().width || 0 : 0;
+  const leftBleed = Number(canvas.dataset?.leftBleed) || 0;
   const pixelScale = canvas.width / (chartWidth + leftBleed);
   context.setTransform(pixelScale * chartWidth / model.width, 0, 0, canvas.height / model.height,
     pixelScale * leftBleed, 0);
   const color = chanThemeColor(target, "--muted", "#81909c");
   const width = Math.max(1, model.plotRight - model.plotLeft + 4);
-  context.clearRect(model.plotLeft - 2, model.volumeTop - 18, width, 16);
-  context.clearRect(model.plotLeft - 2, model.macdTop - 18, width, 16);
   context.font = indicatorHeaderFont(model);
   context.fillStyle = color;
   context.textAlign = "left";
   context.textBaseline = "alphabetic";
   const header = indicatorHeaderText(candle);
-  context.fillText(header.volume, model.plotLeft, model.volumeTop - 6);
+  if (Number.isFinite(model.volumeTop)) {
+    context.clearRect(model.plotLeft - 2, model.volumeTop - 18, width, 16);
+    context.fillText(header.volume, model.plotLeft, model.volumeTop - 6);
+  }
   const bullishColor = chanThemeColor(target, "--up", "#19bd83");
   const bearishColor = chanThemeColor(target, "--down", "#f04d68");
   const macdColor = candle?.macd?.hist > 0 ? bullishColor : candle?.macd?.hist < 0 ? bearishColor : color;
-  drawInlineIndicatorHeader(context, model, model.plotLeft, model.macdTop - 6, width,
-    header.macd, header.macdInterpretation, header.macdCompact, header.macdCompactInterpretation, color, macdColor);
+  if (Number.isFinite(model.macdTop)) {
+    context.clearRect(model.plotLeft - 2, model.macdTop - 18, width, 16);
+    drawInlineIndicatorHeader(context, model, model.plotLeft, model.macdTop - 6, width,
+      header.macd, header.macdInterpretation, header.macdCompact, header.macdCompactInterpretation, color, macdColor);
+  }
   if (!Number.isFinite(model.dmiTop)) return;
   context.clearRect(model.plotLeft - 2, model.dmiTop - 18, width, 16);
   // 美股图表使用绿色表示上涨、红色表示下跌。
@@ -696,6 +700,7 @@ function drawChanCanvas(target, binding) {
   }
   const context = canvas.getContext("2d");
   if (!context) return;
+  if (!canvas.dataset) canvas.dataset = {};
   canvas.dataset.leftBleed = String(leftBleed);
   canvas.style.left = `${-leftBleed}px`; canvas.style.top = "0";
   canvas.style.width = `${canvasWidth}px`; canvas.style.height = `${height}px`;
@@ -902,11 +907,18 @@ function drawChanCanvas(target, binding) {
   }
   // Keep the MACD pane visually separate from the volume block; the MACD header
   // sits in the gap and would otherwise look like the volume pane's footer.
-  if (Number.isFinite(model.volumeBottom) && Number.isFinite(model.macdTop)) {
-    const dividerY = Number.isFinite(model.indicatorDividerY)
-      ? model.indicatorDividerY
-      : model.volumeBottom + (model.macdTop - model.volumeBottom) / 3;
-    line(model.plotLeft, dividerY, model.plotRight, dividerY, colors.fieldLine, [], 1.5);
+  const dividerPositions = Array.isArray(model.indicatorDividers)
+    ? model.indicatorDividers
+    : [
+      Number.isFinite(model.indicatorDividerY) ? model.indicatorDividerY
+        : Number.isFinite(model.volumeBottom) && Number.isFinite(model.macdTop)
+          ? model.volumeBottom + (model.macdTop - model.volumeBottom) / 3 : NaN,
+      Number.isFinite(model.dmiDividerY) ? model.dmiDividerY
+        : Number.isFinite(model.macdBottom) && Number.isFinite(model.dmiTop)
+          ? model.macdBottom + (model.dmiTop - model.macdBottom) / 3 : NaN,
+    ];
+  for (const dividerY of dividerPositions) {
+    if (Number.isFinite(dividerY)) line(model.plotLeft, dividerY, model.plotRight, dividerY, colors.fieldLine, [], 1.5);
   }
   // MACD pane: histogram around zero plus DIF/DEA lines.
   if (Number.isFinite(model.macdTop) && Number.isFinite(model.macdBottom)) {
@@ -949,12 +961,6 @@ function drawChanCanvas(target, binding) {
       Math.max(1, model.plotRight - model.plotLeft), header.macd, header.macdInterpretation,
       header.macdCompact, header.macdCompactInterpretation, colors.text, macdColor);
     line(model.plotLeft, model.macdBottom, model.plotRight, model.macdBottom, colors.axis, [], 1);
-  }
-  if (Number.isFinite(model.macdBottom) && Number.isFinite(model.dmiTop)) {
-    const dividerY = Number.isFinite(model.dmiDividerY)
-      ? model.dmiDividerY
-      : model.macdBottom + (model.dmiTop - model.macdBottom) / 3;
-    line(model.plotLeft, dividerY, model.plotRight, dividerY, colors.fieldLine, [], 1.5);
   }
   // DMI uses a fixed 0-100 range so PDI, MDI, ADX, and the 25 threshold remain comparable.
   if (Number.isFinite(model.dmiTop) && Number.isFinite(model.dmiBottom)) {

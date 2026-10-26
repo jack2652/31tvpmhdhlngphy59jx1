@@ -205,13 +205,19 @@
         </section>
         <div class="chan-controls">
           <div class="chan-chart-controls"><h3>价格图表</h3><div class="chan-control-options">
-            <div class="chan-control-group chan-period-control-group"><span>周期</span><div class="detail-segmented" role="group" aria-label="K 线周期">
-              <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'daily' ? 'true' : 'false'" @click="chanPeriod = 'daily'">日线</button>
-              <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'weekly' ? 'true' : 'false'" @click="chanPeriod = 'weekly'">周线</button>
-              <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '15m' ? 'true' : 'false'" @click="chanPeriod = '15m'">15分钟</button>
-              <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '4h' ? 'true' : 'false'" @click="chanPeriod = '4h'">4小时</button>
-            </div></div>
-            <details class="chan-layer-menu">
+            <details class="chan-period-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+              <summary aria-label="周期设置">周期</summary>
+              <div class="chan-layer-menu-panel chan-period-menu-panel">
+                <button class="chan-layer-menu-close" type="button" aria-label="关闭周期面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                <section class="chan-layer-menu-display"><h4>周期选择</h4><div class="detail-segmented chan-layer-switches chan-period-switches" role="group" aria-label="K 线周期">
+                  <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'daily' ? 'true' : 'false'" @click="chanPeriod = 'daily'">日线</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'weekly' ? 'true' : 'false'" @click="chanPeriod = 'weekly'">周线</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '15m' ? 'true' : 'false'" @click="chanPeriod = '15m'">15分钟</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '4h' ? 'true' : 'false'" @click="chanPeriod = '4h'">4小时</button>
+                </div></section>
+              </div>
+            </details>
+            <details class="chan-layer-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
               <summary aria-label="图层设置">图层</summary>
               <div class="chan-layer-menu-panel">
                 <button class="chan-layer-menu-close" type="button" aria-label="关闭图层面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
@@ -230,6 +236,17 @@
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.pens ? 'true' : 'false'" @click="toggleChanChartLayer('pens')">笔</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.penCenters ? 'true' : 'false'" @click="toggleChanChartLayer('penCenters')">笔中枢</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.legacySignals ? 'true' : 'false'" @click="toggleChanChartLayer('legacySignals')">顶底观察</button>
+                </div></section>
+              </div>
+            </details>
+            <details class="chan-subchart-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+              <summary aria-label="副图设置">副图</summary>
+              <div class="chan-layer-menu-panel chan-subchart-menu-panel">
+                <button class="chan-layer-menu-close" type="button" aria-label="关闭副图面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                <section class="chan-layer-menu-display"><h4>副图显示</h4><div class="detail-segmented chan-layer-switches chan-subchart-switches" role="group" aria-label="副图显示选项">
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.volume ? 'true' : 'false'" @click="toggleChanSubchart('volume')">成交量</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.macd ? 'true' : 'false'" @click="toggleChanSubchart('macd')">MACD</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.dmi ? 'true' : 'false'" @click="toggleChanSubchart('dmi')">DMI</button>
                 </div></section>
               </div>
             </details>

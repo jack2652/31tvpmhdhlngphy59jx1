@@ -413,7 +413,7 @@
     return result;
   }
 
-  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null) {
+  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null) {
     const cachedLayouts = chartCache.get(frame.candles);
     const totalBars = frame.candles?.length || 0;
     // Start daily and 15-minute charts at the same readable 32-bar window on
@@ -432,6 +432,8 @@
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
     const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, recursiveCenterVisibility].join(":");
+    const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
+    const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("");
     // Only reserve the scenario lane when there is a path to draw. Reserving
     // it unconditionally leaves a large blank gutter on mobile charts whose
     // current structure produced no projection.
@@ -443,7 +445,7 @@
       const reference = Number.isFinite(anchor) && anchor > 0 ? anchor : spotPrice;
       return levels.some((level) => !Number.isFinite(reference) || Math.abs(level - reference) > 0.000001);
     });
-    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${ruleVersion || ""}`;
+    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${ruleVersion || ""}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
@@ -477,15 +479,34 @@
     const volumeHeight = mobile ? 84 : 72;
     const macdHeight = mobile ? 112 : 96;
     const dmiHeight = mobile ? 112 : 96;
-    const volumeTop = priceBottom + panelGap;
-    const volumeBottom = volumeTop + volumeHeight;
-    const macdTop = volumeBottom + indicatorGap;
-    const macdBottom = macdTop + macdHeight;
-    const dmiTop = macdBottom + indicatorGap;
-    const dmiBottom = dmiTop + dmiHeight;
-    const indicatorDividerY = volumeBottom + Math.round(indicatorGap / 3);
-    const dmiDividerY = macdBottom + Math.round(indicatorGap / 3);
-    const height = dmiBottom + bottom;
+    let paneBottom = priceBottom;
+    const panes = [];
+    const indicatorDividers = [];
+    for (const name of ["volume", "macd", "dmi"]) {
+      if (!visibleSubcharts[name]) continue;
+      const gap = panes.length ? indicatorGap : panelGap;
+      const paneTop = paneBottom + gap;
+      const paneHeight = name === "volume" ? volumeHeight : name === "macd" ? macdHeight : dmiHeight;
+      const pane = { name, top: paneTop, bottom: paneTop + paneHeight };
+      if (panes.length) {
+        pane.dividerY = paneBottom + Math.round(gap / 3);
+        indicatorDividers.push(pane.dividerY);
+      }
+      panes.push(pane);
+      paneBottom = pane.bottom;
+    }
+    const pane = (name) => panes.find((item) => item.name === name);
+    const paneEdge = (name, edge) => pane(name)?.[edge] ?? NaN;
+    const dividerBetween = (before, after) => {
+      const index = panes.findIndex((item) => item.name === after);
+      return index > 0 && panes[index - 1].name === before ? panes[index].dividerY : NaN;
+    };
+    const volumeTop = paneEdge("volume", "top"), volumeBottom = paneEdge("volume", "bottom");
+    const macdTop = paneEdge("macd", "top"), macdBottom = paneEdge("macd", "bottom");
+    const dmiTop = paneEdge("dmi", "top"), dmiBottom = paneEdge("dmi", "bottom");
+    const indicatorDividerY = dividerBetween("volume", "macd");
+    const dmiDividerY = dividerBetween("macd", "dmi");
+    const height = paneBottom + bottom;
     const plotWidth = width - left - right;
     // Keep the scenario lane independent from historical bars. Mobile uses a
     // slightly wider lane than desktop so the projection stays readable.
@@ -667,12 +688,16 @@
       labelY = Math.max(labelTop, Math.min(labelBottom, labelY));
       return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, side, status: signal.status, invalidated, label, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, start: date, end: date, startPrice: price, endPrice: price, confirmed: signal.status === "confirmed", formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || signal.phase_at, composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
     });
+    const activeIndicatorLabels = [visibleSubcharts.volume ? "成交量" : "", visibleSubcharts.macd ? "MACD（12、26、9）" : "", visibleSubcharts.dmi ? "DMI（14、6）" : ""].filter(Boolean);
+    const indicatorDescription = activeIndicatorLabels.length
+      ? `价格图下方显示${activeIndicatorLabels.join("、")}，与 K 线共用同一时间轴。`
+      : "副图默认隐藏，可通过“副图”菜单分别开启成交量、MACD 与 DMI。";
     const chart = {
       width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: priceBottom,
       priceBottom, volumeTop, volumeBottom, volumeMax, indicatorDividerY,
       macdTop, macdBottom, macdMin, macdMax, macdZeroY,
-      dmiTop, dmiBottom, dmiDividerY,
-      crosshairBottom: dmiBottom, interactionBottom: dmiBottom, axisBottom: dmiBottom,
+      dmiTop, dmiBottom, dmiDividerY, indicatorDividers,
+      crosshairBottom: paneBottom, interactionBottom: paneBottom, axisBottom: paneBottom,
       totalBars, visibleBars: bars.length, windowStart: startIndex, windowEnd: endIndex, endOffset,
       canZoomIn: bars.length > Math.min(12, totalBars), canZoomOut: bars.length < totalBars,
       canPanLeft: endOffset < maxOffset, canPanRight: endOffset > 0,
@@ -681,7 +706,7 @@
       historyRight, scenarioBoundary, scenarioLaneLeft, lastClose: frame.last_close,
       title: `${frame.label} K 线与结构观察，${firstDisplayDate} 至 ${lastDisplayDate}`,
       ruleVersion: recursiveRule,
-      description: "实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔和顶底观察均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。价格图下方依次为成交量、MACD（12、26、9）和 DMI（14、6），它们与 K 线共用同一时间轴。按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。",
+      description: `实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔和顶底观察均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。${indicatorDescription}按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；已开启的副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。`,
       points,
       chanCandles,
       structures: [
@@ -1158,13 +1183,13 @@
       freshness };
   }
 
-  function frameView(frame, spot, weekly = null, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, dataContext = null) {
+  function frameView(frame, spot, weekly = null, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, dataContext = null, subcharts = null) {
     if (!frame) return emptyFrame("--");
     const center = frame.position?.center;
     const last = frame.strokes?.[frame.strokes.length - 1];
     const fixed = (frame.strokes || []).filter((stroke) => stroke.confirmed);
     const guidance = frameGuidance(frame, spot, weekly);
-    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars, viewport, layers, ruleVersion);
+    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars, viewport, layers, ruleVersion, subcharts);
     if (chart) {
       chart.layerLevels = chart.availableRecursiveLevels || [];
       chart.segmentLevels = chart.availableSegmentLevels || [];
@@ -1235,7 +1260,7 @@
     };
   }
 
-  function view(payload, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null) {
+  function view(payload, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null, subcharts = null) {
     if (!payload) return empty();
     let historyTime = "--";
     if (payload.history?.fetched_at) {
@@ -1243,7 +1268,7 @@
       if (!Number.isNaN(date.getTime())) historyTime = date.toLocaleString("zh-CN", { hour12: false });
     }
     const dataContext = { priceCoordinate: payload.price_coordinate, history: payload.history, parameters: payload.parameters };
-    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version, dataContext), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version, dataContext);
+    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version, dataContext, subcharts), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version, dataContext, subcharts);
     const weeklyReady = Boolean(payload.weekly?.position?.center);
     const weeklyContext = weeklyReady ? `周线：${weekly.position}。` : `周线已有 ${weekly.bars} 根收盘 K 线、${weekly.confirmed} 根已确认笔，尚未形成中枢，不能给日线方向增加确认。`;
     // The view is replaced wholesale on every refresh; freezing the top level
@@ -1262,12 +1287,12 @@
 
   // Closed-bar intraday view. Each requested period is aggregated from stored
   // 15-minute history and uses the same renderer as daily/weekly.
-  function intradayView(payload, showScenarios = true, spotOverride = null, mobileChart = false, mobileBars = 30, viewport = null, layers = null) {
+  function intradayView(payload, showScenarios = true, spotOverride = null, mobileChart = false, mobileBars = 30, viewport = null, layers = null, subcharts = null) {
     const label = ({ "15m": "15分钟", "1h": "1小时", "2h": "2小时", "4h": "4小时" })[payload?.period] || "盘中";
     if (!payload || !payload.frame) return emptyFrame(label);
     const spot = spotOverride != null && Number.isFinite(Number(spotOverride)) && Number(spotOverride) > 0
       ? Number(spotOverride) : payload.spot;
-    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars, viewport, layers, payload.rule_version, { priceCoordinate: payload.price_coordinate, parameters: payload.parameters });
+    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars, viewport, layers, payload.rule_version, { priceCoordinate: payload.price_coordinate, parameters: payload.parameters }, subcharts);
   }
 
   // Refresh the current price position without rebuilding historical pens.

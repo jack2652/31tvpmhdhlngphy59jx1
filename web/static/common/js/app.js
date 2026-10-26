@@ -44,10 +44,15 @@ const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit",
   hour: "2-digit", minute: "2-digit", hourCycle: "h23",
 });
-const CHAN_CHART_PREFERENCES_VERSION = 4;
+const CHAN_CHART_PREFERENCES_VERSION = 5;
+const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
 const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true };
+const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false };
 function copyDefaultChanChartLayers() {
   return { ...DEFAULT_CHAN_CHART_LAYERS, segmentLevels: {}, recursiveCenters: {} };
+}
+function copyDefaultChanSubcharts() {
+  return { ...DEFAULT_CHAN_SUBCHARTS };
 }
 function matchesPreviousDefaultChanChartLayers(layers) {
   const previousDefaults = { pens: false, penCenters: false, legacySignals: false, chanCandles: true, segments: true, signals: true };
@@ -62,8 +67,8 @@ function readChanChartPreferences() {
   try {
     const stored = JSON.parse(localStorage.getItem(CHAN_CHART_PREFERENCES_KEY) || "null");
     if (!stored || typeof stored !== "object") {
-      const defaults = { period: "daily", layers: copyDefaultChanChartLayers() };
-      rememberChanChartPreferences(defaults.period, defaults.layers);
+      const defaults = { period: "daily", layers: copyDefaultChanChartLayers(), subcharts: copyDefaultChanSubcharts() };
+      rememberChanChartPreferences(defaults.period, defaults.layers, defaults.subcharts);
       return defaults;
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
@@ -77,21 +82,26 @@ function readChanChartPreferences() {
       layers[key] = Object.fromEntries(Object.entries(values)
         .filter(([level, visible]) => /^[0-7]$/.test(level) && typeof visible === "boolean"));
     }
+    const sourceSubcharts = stored.subcharts && typeof stored.subcharts === "object" ? stored.subcharts : {};
+    const subcharts = { ...DEFAULT_CHAN_SUBCHARTS };
+    for (const key of Object.keys(DEFAULT_CHAN_SUBCHARTS)) {
+      if (typeof sourceSubcharts[key] === "boolean") subcharts[key] = sourceSubcharts[key];
+    }
     const storedVersion = Number(stored.version) || 1;
     // Earlier builds persisted their defaults immediately, so upgrade an untouched
     // old default set while keeping any explicitly customized layer choices.
-    if (storedVersion < CHAN_CHART_PREFERENCES_VERSION && matchesPreviousDefaultChanChartLayers(sourceLayers)) {
+    if (storedVersion < CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF && matchesPreviousDefaultChanChartLayers(sourceLayers)) {
       Object.assign(layers, copyDefaultChanChartLayers());
     }
     // Persist the unified-menu preference format without resetting explicit
     // layer choices made before the menu redesign.
-    const preferences = { period: CHAN_CHART_PERIODS.includes(stored.period) ? stored.period : "daily", layers };
-    if (storedVersion < CHAN_CHART_PREFERENCES_VERSION) rememberChanChartPreferences(preferences.period, preferences.layers);
+    const preferences = { period: CHAN_CHART_PERIODS.includes(stored.period) ? stored.period : "daily", layers, subcharts };
+    if (storedVersion < CHAN_CHART_PREFERENCES_VERSION) rememberChanChartPreferences(preferences.period, preferences.layers, preferences.subcharts);
     return preferences;
-  } catch (error) { return { period: "daily", layers: copyDefaultChanChartLayers() }; }
+  } catch (error) { return { period: "daily", layers: copyDefaultChanChartLayers(), subcharts: copyDefaultChanSubcharts() }; }
 }
-function rememberChanChartPreferences(period, layers) {
-  try { localStorage.setItem(CHAN_CHART_PREFERENCES_KEY, JSON.stringify({ version: CHAN_CHART_PREFERENCES_VERSION, period, layers })); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
+function rememberChanChartPreferences(period, layers, subcharts) {
+  try { localStorage.setItem(CHAN_CHART_PREFERENCES_KEY, JSON.stringify({ version: CHAN_CHART_PREFERENCES_VERSION, period, layers, subcharts })); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
 }
 const initialChanChartPreferences = readChanChartPreferences();
 const state = {
@@ -106,6 +116,7 @@ const state = {
   chanMobileChart: window.matchMedia ? window.matchMedia("(max-width: 600px)").matches : false,
   chanViewports: { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } },
   chanChartLayers: initialChanChartPreferences.layers,
+  chanSubcharts: initialChanChartPreferences.subcharts,
   chanScenariosVisible: readChanScenarioVisibility(),
   chanIntradayPayload: { "15m": null, "4h": null },
   chanIntradayLoading: { "15m": false, "4h": false },
@@ -3972,7 +3983,7 @@ function refreshChanAnalysis(force = false) {
     // thousands of candles/segments that are only ever read, and the view is
     // rebuilt wholesale whenever anything changes.
     state.chanPayload = Object.freeze(OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload));
-    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers);
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers, state.chanSubcharts);
     // Adjusted Chan results intentionally omit market_analysis. The separate
     // /api/chan request feeds the trend and price-level cards above the chart.
     // SSE normally refreshes history completion immediately. Bounded retry
@@ -4075,7 +4086,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   }
   if (state.chanPayload?.symbol === state.symbol) {
     state.chanPayload = Object.freeze(OptionScopeChan.withSpot(state.chanPayload, finitePrice(price)));
-    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers);
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers, state.chanSubcharts);
   }
   if (CHAN_INTRADAY_PERIODS.some((period) => state.chanIntradayPayload[period])) {
     state.chanIntradaySpot = finitePrice(price);
@@ -5634,7 +5645,7 @@ const optionScopeApp = new Vue({
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
         const payload = this.chanIntradayPayload[this.chanPeriod];
         return payload
-          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, 30, this.chanViewports[this.chanPeriod], this.chanChartLayers)
+          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, 30, this.chanViewports[this.chanPeriod], this.chanChartLayers, this.chanSubcharts)
           : OptionScopeChan.emptyFrame(({ "15m": "15分钟", "4h": "4小时" })[this.chanPeriod]);
       }
       return this.view.chan[this.chanPeriod] || this.view.chan.daily;
@@ -5683,7 +5694,7 @@ const optionScopeApp = new Vue({
   },
   watch: {
     chanPeriod() {
-      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers);
+      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers, this.chanSubcharts);
       this.chanHoveredScenario = null;
       this.chanSpotGuideVisible = false;
       scheduleChanIntradayBoundaryRefresh(this.chanPeriod);
@@ -5692,10 +5703,18 @@ const optionScopeApp = new Vue({
   },
   methods: {
     closeChanLayerMenu(event) {
-      const menu = event?.currentTarget?.closest(".chan-layer-menu");
+      const menu = event?.currentTarget?.closest(".chan-layer-menu, .chan-subchart-menu, .chan-period-menu");
       if (!menu) return;
       menu.open = false;
       menu.querySelector("summary")?.focus();
+    },
+    toggleChanSubchart(name) {
+      if (!Object.prototype.hasOwnProperty.call(DEFAULT_CHAN_SUBCHARTS, name)) return;
+      this.chanSubcharts = { ...this.chanSubcharts, [name]: !this.chanSubcharts[name] };
+      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers, this.chanSubcharts);
+      if (!CHAN_INTRADAY_PERIODS.includes(this.chanPeriod) && this.chanPayload) {
+        this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
+      }
     },
     chanTurningStatus(index) {
       const turning = this.chanFrame?.turning;
@@ -5880,7 +5899,7 @@ const optionScopeApp = new Vue({
       if (this.chanScenarioHideTimer) window.clearTimeout(this.chanScenarioHideTimer);
       this.chanScenarioHideTimer = null;
       try { localStorage.setItem(CHAN_SCENARIOS_STORAGE_KEY, this.chanScenariosVisible ? "1" : "0"); } catch (error) { /* 存储不可用时保留当前页面状态。 */ }
-      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
     },
     toggleChanChartLayer(layer) {
       if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals") {
@@ -5892,13 +5911,13 @@ const optionScopeApp = new Vue({
         const centers = { ...recursiveCenters, [level]: !OptionScopeChan.isRecursiveCenterLevelVisible(this.chanChartLayers, level) };
         this.chanChartLayers = { ...this.chanChartLayers, recursiveCenters: centers };
       }
-      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers);
-      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
+      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers, this.chanSubcharts);
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
     },
     toggleChanSegmentLevel(level) {
       this.chanChartLayers = OptionScopeChan.toggleSegmentLevel(this.chanChartLayers, level);
-      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers);
-      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
+      rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers, this.chanSubcharts);
+      if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
     },
     isChanSegmentLevelVisible(level) {
       return OptionScopeChan.isSegmentLevelVisible(this.chanChartLayers, level);
@@ -5931,7 +5950,7 @@ const optionScopeApp = new Vue({
       const period = this.chanPeriod;
       this.chanViewports = { ...this.chanViewports, [period]: { visibleBars: viewport.visibleBars, endOffset: viewport.endOffset } };
       if ((period === "daily" || period === "weekly") && this.chanPayload) {
-        this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers);
+        this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
       }
     },
     panChanChart(deltaBars) {
@@ -6033,7 +6052,7 @@ window.addEventListener("resize", () => {
     const mobileChart = Boolean(window.matchMedia && window.matchMedia("(max-width: 600px)").matches);
     if (state.chanMobileChart === mobileChart) return;
     state.chanMobileChart = mobileChart;
-    if (state.chanPayload) state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, mobileChart, 30, state.chanViewports, state.chanChartLayers);
+    if (state.chanPayload) state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, mobileChart, 30, state.chanViewports, state.chanChartLayers, state.chanSubcharts);
   }, 120);
 });
 const initialQuery = parsePageQuery(location.search);

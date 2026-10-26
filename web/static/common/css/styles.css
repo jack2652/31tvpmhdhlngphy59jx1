@@ -73,17 +73,22 @@
 .chan-recursive-data p{margin:8px 0 0}
 .chan-layer-empty{padding:8px 10px;color:var(--muted);font-size:11px;white-space:nowrap}
 .chan-legend-recursive{width:20px;border-top:2px solid var(--blue);border-bottom:2px dashed var(--blue)}
-.chan-layer-menu{position:relative;z-index:5}
-.chan-layer-menu>summary{display:flex;align-items:center;gap:7px;min-height:36px;padding:0 13px;border:1px solid var(--field-line);border-radius:4px;background:var(--field);color:var(--text);font-size:12px;font-weight:600;cursor:pointer;list-style:none;white-space:nowrap}
-.chan-layer-menu>summary::-webkit-details-marker{display:none}
-.chan-layer-menu>summary::after{content:"";width:7px;height:7px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg) translateY(-2px);opacity:.7}
-.chan-layer-menu[open]>summary{border-color:var(--blue);color:var(--blue)}
-.chan-layer-menu[open]>summary::after{transform:rotate(225deg) translate(-1px,-1px)}
+.chan-layer-menu,.chan-subchart-menu,.chan-period-menu{position:relative;z-index:5}
+.chan-layer-menu>summary,.chan-subchart-menu>summary,.chan-period-menu>summary{display:flex;align-items:center;gap:7px;min-height:36px;padding:0 13px;border:1px solid var(--field-line);border-radius:4px;background:var(--field);color:var(--text);font-size:12px;font-weight:600;cursor:pointer;list-style:none;white-space:nowrap}
+.chan-layer-menu>summary::-webkit-details-marker,.chan-subchart-menu>summary::-webkit-details-marker,.chan-period-menu>summary::-webkit-details-marker{display:none}
+.chan-layer-menu>summary::after,.chan-subchart-menu>summary::after,.chan-period-menu>summary::after{content:"";width:7px;height:7px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg) translateY(-2px);opacity:.7}
+.chan-layer-menu[open]>summary,.chan-subchart-menu[open]>summary,.chan-period-menu[open]>summary{border-color:var(--blue);color:var(--blue)}
+.chan-layer-menu[open]>summary::after,.chan-subchart-menu[open]>summary::after,.chan-period-menu[open]>summary::after{transform:rotate(225deg) translate(-1px,-1px)}
+.chan-subchart-menu>summary:focus-visible,.chan-period-menu>summary:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 .chan-layer-menu-panel{position:absolute;top:calc(100% + 8px);left:0;display:grid;grid-template-areas:"display recursive pens";grid-template-columns:minmax(150px,.85fr) minmax(270px,1.4fr) minmax(180px,1fr);gap:16px;width:min(740px,calc(100vw - 40px));padding:16px;border:1px solid var(--line);border-radius:6px;background:var(--panel);box-shadow:0 12px 32px rgba(0,0,0,.18)}
 .chan-layer-menu-display{grid-area:display}
 .chan-layer-menu-recursive{grid-area:recursive}
 .chan-layer-menu-pens{grid-area:pens}
 .chan-layer-menu-panel>.chan-layer-menu-close{position:absolute;top:8px;right:8px;z-index:1;display:grid;width:28px;height:28px;place-items:center;padding:0;border:1px solid var(--line);border-radius:4px;background:var(--field);color:var(--muted);font:inherit;font-size:20px;line-height:1;cursor:pointer}
+.chan-subchart-menu-panel{grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(260px,calc(100vw - 40px));left:0;right:auto}
+.chan-subchart-menu-panel .chan-subchart-switches{width:max-content;max-width:100%}
+.chan-period-menu-panel{grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(330px,calc(100vw - 40px));left:0;right:auto}
+.chan-period-menu-panel .chan-period-switches{width:max-content;max-width:100%}
 .chan-layer-menu-panel>.chan-layer-menu-close:hover{border-color:var(--blue);color:var(--blue)}
 .chan-layer-menu-panel>.chan-layer-menu-close:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 .chan-layer-menu-panel section{min-width:0}
@@ -432,6 +437,12 @@
 }
 @media(max-width:600px){
   .chan-layer-menu{position:static}
+  .chan-subchart-menu,.chan-period-menu{position:static}
+  .chan-layer-menu>summary,.chan-subchart-menu>summary,.chan-period-menu>summary{min-height:44px}
+  .chan-subchart-menu-panel{position:fixed;top:auto;right:12px;left:12px;bottom:max(12px,env(safe-area-inset-bottom));width:auto;max-height:min(72vh,420px);overflow:auto;padding:16px}
+  .chan-subchart-menu-panel .detail-seg{min-height:38px}
+  .chan-period-menu-panel{position:fixed;top:auto;right:12px;left:12px;bottom:max(12px,env(safe-area-inset-bottom));width:auto;max-height:min(72vh,420px);overflow:auto;padding:16px}
+  .chan-period-menu-panel .detail-seg{min-height:38px}
   .chan-layer-menu-panel{position:fixed;top:auto;right:12px;left:12px;bottom:max(12px,env(safe-area-inset-bottom));grid-template-areas:"display" "recursive" "pens";grid-template-columns:1fr;gap:12px;width:auto;max-height:min(72vh,620px);overflow:auto;padding:14px;box-shadow:0 16px 42px rgba(0,0,0,.24)}
   .chan-controls .chan-layer-menu-panel .chan-layer-switches.detail-segmented{display:flex;flex:initial;width:auto;max-width:none;min-width:0;gap:6px;overflow:visible;border:0;border-radius:0;background:transparent;}
   .chan-layer-menu-panel .detail-seg{min-height:38px}
@@ -464,18 +475,10 @@
   .chan-overview-item:first-child{padding-top:0;border-right:0;border-bottom:1px solid var(--line)}
   .chan-controls{grid-template-columns:minmax(0,1fr);grid-template-rows:auto auto auto;grid-template-areas:"controls" "status" "levels";gap:10px}
   .chan-controls>span{text-align:left}
-  /* 周期按钮在窄屏分为两行排列，避免新增周期后按钮过窄或被裁切。 */
+  /* 周期菜单在窄屏保持可用，面板内部再按宽度排列选项。 */
   .chan-chart-controls{flex-wrap:wrap;gap:10px}
-  .chan-controls .detail-segmented{display:flex;flex:1 1 100%;flex-wrap:wrap}
-  .chan-controls .detail-seg{flex:1 1 25%;min-width:0;padding:5px 6px}
-  .chan-control-options{width:100%;align-items:flex-start;flex-direction:column}
-  .chan-control-group{width:100%;align-items:flex-start;flex-wrap:wrap;min-width:0}
-  .chan-control-group.chan-period-control-group:has(.detail-segmented:not(.chan-layer-switches)){display:grid;grid-template-columns:minmax(0,1fr);gap:6px}
-  .chan-control-group.chan-period-control-group>span{display:block}
-  .chan-period-control-group .detail-segmented{display:flex;flex:0 0 auto;width:100%;max-width:100%;overflow:visible}
-  .chan-period-control-group .detail-segmented{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
-  .chan-period-control-group .detail-seg{min-width:0;white-space:nowrap}
-  .chan-period-control-group .detail-seg:nth-child(n+3){border-top:1px solid var(--field-line)}
+  .chan-control-options{width:100%;align-items:center;flex-direction:row;flex-wrap:wrap;gap:8px}
+  .chan-control-options>details{flex:0 0 auto}
   .chan-chart-navigation{gap:4px}
   .chan-chart-navigation button{min-width:38px;min-height:38px;padding-inline:7px}
   .chan-chart-range{font-size:10px}
@@ -496,6 +499,9 @@
 }
 @media(min-width:601px) and (max-width:760px){
   .chan-layer-menu-panel{position:fixed;top:auto;right:16px;left:16px;bottom:max(16px,env(safe-area-inset-bottom));grid-template-areas:"display pens" "recursive recursive";grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 16px;width:auto;max-height:min(72vh,620px);overflow:auto;padding:16px;box-shadow:0 16px 42px rgba(0,0,0,.24)}
+}
+@media(min-width:601px) and (max-width:1100px){
+  .chan-period-menu-panel{position:absolute;top:calc(100% + 8px);right:auto;left:0;width:min(330px,calc(100vw - 32px));max-height:none;overflow:visible;padding:16px}
 }
 /* The single layer menu groups independent toggles without the former long segmented strip. */
 .chan-controls .chan-layer-menu-panel .chan-layer-switches.detail-segmented{display:flex;flex:initial;min-width:0;max-width:none;gap:5px;overflow:visible;border:0;border-radius:0;background:transparent;}
