@@ -70,7 +70,7 @@
     const path = [mapping.lower_timeframe, mapping.higher_timeframe].filter(Boolean).map((value) => periods[value] || value).join(" ← ") || "无相邻周期";
     return `关联周期 ${path} · ${state}`;
   }
-  function v4SignalLabel(kind) { return v4ClassLabels[kind] || kind || "结构信号"; }
+  function v4SignalLabel(kind) { return v4ClassLabels[kind] || kind || "递归买卖点"; }
   function structureReferenceLabel(value) {
     const raw = String(value || "");
     if (!raw) return "未关联结构";
@@ -706,7 +706,7 @@
       historyRight, scenarioBoundary, scenarioLaneLeft, lastClose: frame.last_close,
       title: `${frame.label} K 线与结构观察，${firstDisplayDate} 至 ${lastDisplayDate}`,
       ruleVersion: recursiveRule,
-      description: `实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔和顶底观察均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。${indicatorDescription}按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；已开启的副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。`,
+      description: `实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔、递归买卖点和笔级转折预警均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。${indicatorDescription}按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；已开启的副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。`,
       points,
       chanCandles,
       structures: [
@@ -1002,8 +1002,8 @@
     const allSignals = frame.signals_v4 || [];
     const pendingSignals = allSignals.filter((signal) => signal.status !== "invalidated");
     const invalidatedSignals = allSignals.filter((signal) => signal.status === "invalidated");
-    if (pendingSignals.length) return `已列出 ${pendingSignals.length} 条仍有效的多级结构信号候选，详情见下方信号与待确认条件。${invalidatedSignals.length ? `另有 ${invalidatedSignals.length} 条历史候选已失效。` : ""}`;
-    if (invalidatedSignals.length) return `曾识别 ${invalidatedSignals.length} 条结构信号候选，现已全部失效；候选保留在下方供回看。`;
+    if (pendingSignals.length) return `已列出 ${pendingSignals.length} 条仍有效的递归买卖点候选，详情见下方信号与待确认条件。${invalidatedSignals.length ? `另有 ${invalidatedSignals.length} 条历史候选已失效。` : ""}`;
+    if (invalidatedSignals.length) return `曾识别 ${invalidatedSignals.length} 条递归买卖点候选，现已全部失效；候选保留在下方供回看。`;
 
     const base = levels.find((level) => Number(level.level) === 0);
     if (!base) return "当前还没有可用的基础线段，暂不能建立多级中枢。";
@@ -1025,7 +1025,7 @@
     if (longestRun < 3) {
       const forming = segments.filter((segment) => !segment.confirmed).length;
       const blocker = base.waiting_for ? ` 当前结构：${base.status || "等待"}；${base.waiting_for}。` : "";
-      return `结构信号还未进入中枢判断：第 1 层最长连续已确认线段为 ${longestRun} 条，当前另有 ${forming} 条形成中；至少需要同链连续、方向交替的 3 条已确认线段，才可检查严格重叠中枢。${blocker}`;
+      return `递归买卖点还未进入中枢判断：第 1 层最长连续已确认线段为 ${longestRun} 条，当前另有 ${forming} 条形成中；至少需要同链连续、方向交替的 3 条已确认线段，才可检查严格重叠中枢。${blocker}`;
     }
     if (!closedCenters.length) {
       return centers.length
@@ -1057,7 +1057,7 @@
     const activeSignals = allSignals.filter((signal) => signal.status !== "invalidated");
     const invalidatedSignals = allSignals.filter((signal) => signal.status === "invalidated");
     const readiness = recursiveReadinessReason(frame) || (levels.length ? "多级结构已计算。" : "当前周期还没有可用的结构。");
-    const heading = activeSignals.length ? `有 ${activeSignals.length} 条结构信号`
+    const heading = activeSignals.length ? `有 ${activeSignals.length} 条递归买卖点`
       : invalidatedSignals.length ? `${invalidatedSignals.length} 条候选已失效`
       : closedCenters.length ? "中枢已闭合，等待信号条件"
         : formingCenters.length ? "中枢正在形成"

@@ -75,6 +75,8 @@ assert.match(template, /<details class="chan-subchart-menu"[^>]*@keydown\.esc\.s
 assert.match(template, /<div class="chan-layer-menu-panel chan-subchart-menu-panel">/, "副图面板复用图层面板容器");
 assert.match(template, /<details class="chan-period-menu"[^>]*@keydown\.esc\.stop\.prevent="closeChanLayerMenu"/, "周期使用与副图一致的下拉按钮");
 assert.match(template, /<summary aria-label="周期设置">周期<\/summary>/, "周期菜单显示统一的按钮标题");
+assert.match(template, />递归买卖点<\/button>/, "递归买卖点使用明确图层名称");
+assert.match(template, />笔级转折预警<\/button>/, "笔级转折预警使用明确图层名称");
 assert.match(template, /<div class="chan-layer-menu-panel chan-period-menu-panel">[\s\S]*aria-label="K 线周期"/, "点击周期按钮后显示四个周期选项");
 assert.doesNotMatch(template, /chan-period-control-group/, "周期不再使用常驻分段控件");
 for (const [name, label] of [["volume", "成交量"], ["macd", "MACD"], ["dmi", "DMI"]]) {
@@ -90,5 +92,7 @@ assert.match(styles, /\.chan-layer-menu>summary,\.chan-subchart-menu>summary,\.c
 assert.match(styles, /\.chan-period-menu-panel\{grid-template-areas:"display";grid-template-columns:minmax\(0,1fr\);width:min\(330px,calc\(100vw - 40px\)\)/, "周期面板按四个选项收窄");
 assert.match(app, /closest\("\.chan-layer-menu, \.chan-subchart-menu, \.chan-period-menu"\)/, "周期面板支持统一关闭处理");
 assert.match(styles, /\.chan-control-options\{width:100%;align-items:center;flex-direction:row;flex-wrap:wrap;gap:8px\}/, "手机端菜单按钮横向排列并自动换行");
+assert.match(styles, /\.chan-layer-menu-display \.chan-layer-empty\{display:block;flex:0 0 100%;width:100%;min-width:0;white-space:normal;overflow-wrap:anywhere;line-height:1\.5\}/, "图层状态提示独占一行并允许换行");
+assert.match(styles, /@media\(max-width:760px\)\{[\s\S]*?\.chan-controls\{grid-template-columns:minmax\(0,1fr\);grid-template-rows:auto auto auto;grid-template-areas:"controls" "status" "levels";gap:10px\}[\s\S]*?\.chan-control-options\{position:relative;width:100%;align-items:center;flex-direction:row;flex-wrap:wrap;gap:8px\}[\s\S]*?\.chan-control-options>details\{position:static\}[\s\S]*?\.chan-layer-menu-panel\{position:absolute;top:calc\(100% \+ 8px\)/, "窄屏图表控制器保持单列，菜单跟随按钮组展开");
 
 console.log("Chan subchart layout and UI checks passed");

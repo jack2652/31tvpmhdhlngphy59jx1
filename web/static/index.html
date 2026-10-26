@@ -175,7 +175,7 @@
           </dl>
           <details class="chan-recursive-detail"><summary>结构进度与当前等待条件</summary><div class="chan-recursive-levels" role="list" aria-label="各层结构状态"><article v-for="level in chanFrame.recursive.levels" :key="'recursive-level-' + level.level" role="listitem"><strong>第{{ Number(level.level) + 1 }}层</strong><span>{{ level.status }}</span><small>{{ level.confirmedSegments }} 条已确认线段 · {{ level.formingSegments }} 条形成中 · {{ level.closedCenters }} 个闭合中枢<span v-if="level.formingCenters"> · {{ level.formingCenters }} 个形成中</span></small><small v-if="level.waitingFor">当前等待：{{ level.waitingFor }}</small></article><div v-if="!chanFrame.recursive.levels.length" class="chan-muted">该周期尚无结构数据。</div></div><p class="chan-readiness-detail">{{ chanFrame.recursive.readiness }}</p></details>
           <details class="chan-recursive-detail">
-            <summary>结构信号 <span>{{ chanFrame.recursive.signalCountLabel }}</span></summary>
+            <summary>递归买卖点 <span>{{ chanFrame.recursive.signalCountLabel }}</span></summary>
             <div class="chan-recursive-signals" aria-live="polite">
               <article v-for="signal in chanFrame.recursive.signals" :key="signal.key">
                 <header><strong>{{ signal.label }} · 第{{ Number(signal.level) + 1 }}层</strong><span>{{ signal.status }} · {{ signal.phase }}</span></header>
@@ -197,7 +197,7 @@
                   </dl>
                 </details>
               </article>
-              <p v-if="!chanFrame.recursive.signals.length" class="chan-muted">当前周期没有符合条件的结构信号。</p>
+              <p v-if="!chanFrame.recursive.signals.length" class="chan-muted">当前周期没有符合条件的递归买卖点。</p>
             </div>
           </details>
           <details class="chan-recursive-detail"><summary>数据与识别说明</summary><p>{{ chanFrame.recursive.priceBasis }} · {{ chanFrame.recursive.mapping }} · {{ chanFrame.recursive.acceptedBars }}/{{ chanFrame.recursive.inputBars }} 根有效行情 · 缺口 {{ chanFrame.recursive.gaps }} 处 · {{ chanFrame.recursive.market }}</p></details>
@@ -223,8 +223,8 @@
                 <button class="chan-layer-menu-close" type="button" aria-label="关闭图层面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
                 <section class="chan-layer-menu-display"><h4>图表显示</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="主要图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.signals ? 'true' : 'false'" @click="toggleChanChartLayer('signals')">结构信号</button>
-                  <span v-if="chanChartLayers.signals && chanFrame.chart && !chanFrame.chart.signals.length" class="chan-layer-empty" role="status" :title="chanFrame.chart.totalSignalCount ? '打开结构信号详情查看候选状态' : '笔级顶部与底部观察请使用“顶底观察”图层'">{{ chanFrame.chart.totalPlottableSignalCount ? '当前窗口无标记 · 全周期 ' + chanFrame.chart.totalPlottableSignalCount + ' 处，拖动查看' : chanFrame.chart.totalSignalCount ? '有 ' + chanFrame.chart.totalSignalCount + ' 条候选待确认，查看结构信号详情' : '当前周期暂无递归买卖点' }}</span>
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.signals ? 'true' : 'false'" @click="toggleChanChartLayer('signals')">递归买卖点</button>
+                  <span v-if="chanChartLayers.signals && chanFrame.chart && !chanFrame.chart.signals.length" class="chan-layer-empty" role="status" :title="chanFrame.chart.totalSignalCount ? '打开递归买卖点详情查看候选状态' : '请打开“笔级转折预警”图层'">{{ chanFrame.chart.totalPlottableSignalCount ? '当前窗口无标记 · 全周期 ' + chanFrame.chart.totalPlottableSignalCount + ' 处，拖动查看' : chanFrame.chart.totalSignalCount ? '有 ' + chanFrame.chart.totalSignalCount + ' 条候选待确认，查看递归买卖点详情' : '当前周期暂无递归买卖点' }}</span>
                 </div></section>
                 <section class="chan-layer-menu-recursive"><h4>线段与中枢</h4><div class="detail-segmented chan-layer-switches chan-recursive-layer-switches" role="group" aria-label="各层线段和中枢">
                   <button v-for="level in chanSegmentLevels" :key="'segment-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanSegmentLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层结构'" @click="toggleChanSegmentLevel(level)">{{ level === 0 ? '第1层线段' : '第' + (level + 1) + '层走势' }}</button>
@@ -232,10 +232,10 @@
                   <button v-for="level in chanLayerLevels" :key="'center-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanRecursiveCenterLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层中枢'" @click="toggleChanChartLayer(level)">第{{ level + 1 }}层中枢</button>
                   <span v-if="!chanSegmentLevels.length && !chanLayerLevels.length" class="chan-layer-empty">等待结构形成</span>
                 </div></section>
-                <section class="chan-layer-menu-pens"><h4>笔级结构</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="笔级结构图层">
+                <section class="chan-layer-menu-pens"><h4>笔级转折预警</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="笔级转折预警图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.pens ? 'true' : 'false'" @click="toggleChanChartLayer('pens')">笔</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.penCenters ? 'true' : 'false'" @click="toggleChanChartLayer('penCenters')">笔中枢</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.legacySignals ? 'true' : 'false'" @click="toggleChanChartLayer('legacySignals')">顶底观察</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.legacySignals ? 'true' : 'false'" @click="toggleChanChartLayer('legacySignals')">笔级转折预警</button>
                 </div></section>
               </div>
             </details>
@@ -374,9 +374,9 @@
             </div>
             <p class="chan-guidance-note">{{ chanFrame.guidance.note }}</p>
           </section></details>
-          <details class="chan-more-fold"><summary>笔级观察信号</summary><section class="chan-signals" aria-labelledby="chan-signals-title">
+          <details class="chan-more-fold"><summary>笔级转折预警</summary><section class="chan-signals" aria-labelledby="chan-signals-title">
             <h3 id="chan-signals-title">观察信号</h3>
-            <div class="chan-signal-content"><p>{{ chanFrame.guidance.signalReason }}</p><article v-for="signal in chanFrame.legacySignals" :key="signal.key"><strong>{{ signal.label }} · {{ signal.statusLabel }}</strong><p>{{ signal.evidenceLabel || signal.detail }}</p><small>{{ signal.dateLabel }} · {{ signal.invalidationLabel }}<span v-if="signal.ratioLabel"> · {{ signal.ratioLabel }}</span></small></article><p v-if="!chanFrame.legacySignals.length" class="chan-muted">当前周期没有笔级观察信号。</p></div>
+            <div class="chan-signal-content"><p>{{ chanFrame.guidance.signalReason }}</p><article v-for="signal in chanFrame.legacySignals" :key="signal.key"><strong>{{ signal.label }} · {{ signal.statusLabel }}</strong><p>{{ signal.evidenceLabel || signal.detail }}</p><small>{{ signal.dateLabel }} · {{ signal.invalidationLabel }}<span v-if="signal.ratioLabel"> · {{ signal.ratioLabel }}</span></small></article><p v-if="!chanFrame.legacySignals.length" class="chan-muted">当前周期没有笔级转折预警。</p></div>
           </section></details>
           <details class="chan-more-fold"><summary>后续观察路径</summary><section class="chan-scenarios" aria-labelledby="chan-scenario-title">
             <div class="chan-section-heading"><h3 id="chan-scenario-title">接下来具体看什么</h3><span>收盘价格条件满足后，仍需后续结构确认</span></div>
