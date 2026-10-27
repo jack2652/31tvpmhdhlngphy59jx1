@@ -24,7 +24,7 @@ OUTPUT_NAME="$(basename "$OUTPUT_BINARY")"
 mkdir -p "$OUTPUT_PARENT"
 OUTPUT_PARENT="$(cd "$OUTPUT_PARENT" && pwd)"
 OUTPUT_BINARY="$OUTPUT_PARENT/$OUTPUT_NAME"
-[ ! -e "$OUTPUT_BINARY" ] || fail "output already exists: $OUTPUT_BINARY (choose another OUTPUT_BINARY)"
+
 TEMP_BINARY="$OUTPUT_BINARY.tmp.$$"
 cleanup() { rm -f "$TEMP_BINARY"; }
 trap cleanup EXIT

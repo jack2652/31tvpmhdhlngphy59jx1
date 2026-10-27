@@ -98,6 +98,26 @@ const paneDivider = indicator.strokes.find((stroke) => Math.abs(stroke.start[0] 
   && Math.abs(stroke.end[1] - dividerY) < 0.01);
 assert.ok(paneDivider, "volume and MACD panes must be separated by a divider line");
 
+function renderAFStochZ(enabled) {
+  context.strokes = [];
+  context.texts = [];
+  window.OptionScopeCharts.renderChanCanvas(target, {
+    chart: {
+      width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, historyRight: 940,
+      grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels: [], signals: [], segments: [],
+      afSignals: [{ side: "buy", label: "BUY", divergence: null, x: 180, y: 220, markerY: 220, labelX: 180, labelY: 242, hitLabelWidth: 34 },
+        { side: "sell", label: "H-Bear", divergence: "hidden", x: 360, y: 100, markerY: 100, labelX: 360, labelY: 78, hitLabelWidth: 48 }],
+    },
+    layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, afStochZ: enabled },
+  });
+  return context.texts;
+}
+
+assert.ok(!renderAFStochZ(false).some((text) => text.text === "BUY" || text.text === "H-Bear"), "hidden AF StochZ layer must not paint labels");
+const afLabels = renderAFStochZ(true);
+assert.ok(afLabels.some((text) => text.text === "BUY"), "enabled AF StochZ layer paints leading BUY labels");
+assert.ok(afLabels.some((text) => text.text === "H-Bear"), "enabled AF StochZ layer paints hidden divergence labels");
+
 context.strokes = [];
 context.texts = [];
 window.OptionScopeCharts.renderChanCanvas(target, {

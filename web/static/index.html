@@ -221,21 +221,44 @@
               <summary aria-label="图层设置">图层</summary>
               <div class="chan-layer-menu-panel">
                 <button class="chan-layer-menu-close" type="button" aria-label="关闭图层面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
-                <section class="chan-layer-menu-display"><h4>图表显示</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="主要图层">
+                <section class="chan-layer-menu-signals"><h4>信号标记</h4><div class="chan-layer-signal-items" role="group" aria-label="信号标记图层">
+                  <div class="chan-layer-signal-item">
+                    <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.signals ? 'true' : 'false'" aria-describedby="chan-signal-help-structure" @click="toggleChanChartLayer('signals')">结构买卖点</button>
+                    <small id="chan-signal-help-structure">多级走势结构确认后，才标记买入/卖出点（递归买卖点）。</small>
+                  </div>
+                  <div class="chan-layer-signal-item">
+                    <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.legacySignals ? 'true' : 'false'" aria-describedby="chan-signal-help-pen" @click="toggleChanChartLayer('legacySignals')">笔转折预警</button>
+                    <small id="chan-signal-help-pen">笔刚出现转向迹象时先提醒，后续走势变化可能让提示失效。</small>
+                  </div>
+                  <div class="chan-layer-signal-item">
+                    <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.afStochZ ? 'true' : 'false'" aria-describedby="chan-signal-help-momentum" @click="toggleChanChartLayer('afStochZ')">指标买卖与背离</button>
+                    <small id="chan-signal-help-momentum">结合指标强弱和价格转折提示买卖；两者走势不一致时标记背离（AF StochZ）。</small>
+                  </div>
+                </div>
+                <span v-if="chanChartLayers.signals && chanFrame.chart && !chanFrame.chart.signals.length" class="chan-layer-empty" role="status" :title="chanFrame.chart.totalSignalCount ? '打开结构买卖点详情查看候选状态' : '请打开“笔转折预警”图层'">{{ chanFrame.chart.totalPlottableSignalCount ? '当前窗口无标记 · 全周期 ' + chanFrame.chart.totalPlottableSignalCount + ' 处，拖动查看' : chanFrame.chart.totalSignalCount ? '有 ' + chanFrame.chart.totalSignalCount + ' 条候选待确认，查看结构买卖点详情' : '当前周期暂无结构买卖点' }}</span>
+                </section>
+                <section class="chan-layer-menu-display"><h4>价格图层</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="价格图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.signals ? 'true' : 'false'" @click="toggleChanChartLayer('signals')">递归买卖点</button>
-                  <span v-if="chanChartLayers.signals && chanFrame.chart && !chanFrame.chart.signals.length" class="chan-layer-empty" role="status" :title="chanFrame.chart.totalSignalCount ? '打开递归买卖点详情查看候选状态' : '请打开“笔级转折预警”图层'">{{ chanFrame.chart.totalPlottableSignalCount ? '当前窗口无标记 · 全周期 ' + chanFrame.chart.totalPlottableSignalCount + ' 处，拖动查看' : chanFrame.chart.totalSignalCount ? '有 ' + chanFrame.chart.totalSignalCount + ' 条候选待确认，查看递归买卖点详情' : '当前周期暂无递归买卖点' }}</span>
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.supportResistance ? 'true' : 'false'" @click="toggleChanChartLayer('supportResistance')">支撑/压力线</button>
                 </div></section>
-                <section class="chan-layer-menu-recursive"><h4>线段与中枢</h4><div class="detail-segmented chan-layer-switches chan-recursive-layer-switches" role="group" aria-label="各层线段和中枢">
-                  <button v-for="level in chanSegmentLevels" :key="'segment-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanSegmentLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层结构'" @click="toggleChanSegmentLevel(level)">{{ level === 0 ? '第1层线段' : '第' + (level + 1) + '层走势' }}</button>
-                  <span v-if="chanSegmentLevels.length && chanLayerLevels.length" class="chan-layer-divider" aria-hidden="true"></span>
-                  <button v-for="level in chanLayerLevels" :key="'center-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanRecursiveCenterLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层中枢'" @click="toggleChanChartLayer(level)">第{{ level + 1 }}层中枢</button>
-                  <span v-if="!chanSegmentLevels.length && !chanLayerLevels.length" class="chan-layer-empty">等待结构形成</span>
+                <section class="chan-layer-menu-recursive" aria-label="结构层级"><div class="chan-recursive-layer-groups" :class="{ 'chan-recursive-layer-groups-single': !chanSegmentLevels.length || !chanLayerLevels.length }">
+                  <div v-if="chanSegmentLevels.length" class="chan-recursive-layer-group">
+                    <h5>线段与走势</h5>
+                    <div class="detail-segmented chan-layer-switches chan-recursive-layer-switches" role="group" aria-label="各层线段和走势">
+                      <button v-for="level in chanSegmentLevels" :key="'segment-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanSegmentLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层结构'" @click="toggleChanSegmentLevel(level)">{{ level === 0 ? '第1层线段' : '第' + (level + 1) + '层走势' }}</button>
+                    </div>
+                  </div>
+                  <div v-if="chanLayerLevels.length" class="chan-recursive-layer-group chan-recursive-layer-group-center">
+                    <h5>中枢</h5>
+                    <div class="detail-segmented chan-layer-switches" role="group" aria-label="各层中枢">
+                      <button v-for="level in chanLayerLevels" :key="'center-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanRecursiveCenterLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层中枢'" @click="toggleChanChartLayer(level)">第{{ level + 1 }}层中枢</button>
+                    </div>
+                  </div>
+                  <span v-if="!chanSegmentLevels.length && !chanLayerLevels.length" class="chan-layer-empty" role="status">等待结构形成</span>
                 </div></section>
-                <section class="chan-layer-menu-pens"><h4>笔级转折预警</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="笔级转折预警图层">
+                <section class="chan-layer-menu-pens"><h4>笔结构</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="笔结构图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.pens ? 'true' : 'false'" @click="toggleChanChartLayer('pens')">笔</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.penCenters ? 'true' : 'false'" @click="toggleChanChartLayer('penCenters')">笔中枢</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.legacySignals ? 'true' : 'false'" @click="toggleChanChartLayer('legacySignals')">笔级转折预警</button>
                 </div></section>
               </div>
             </details>
@@ -502,6 +525,7 @@
   <script src="/static/common/js/charts.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/buyer-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-plan.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-stochz.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/app.js?v=__ASSET_VERSION__"></script>
 </body>

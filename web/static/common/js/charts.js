@@ -340,9 +340,21 @@ function bindChanChartHover(target, initialBinding) {
       return { signal, distance: Math.min(markerDistance, labelDistance) };
     }).filter(({ signal, distance }) => model.layers?.signals === true && distance <= 12)
       .sort((left, right) => left.distance - right.distance)[0]?.signal;
+    const afSignalHit = (model.afSignals || []).map((signal) => {
+      const markerDistance = Math.hypot(localX - signal.x, localY - signal.markerY);
+      const halfLabel = (signal.hitLabelWidth || 48) / 2;
+      const halfLabelHeight = (signal.labelHeight || 18) / 2;
+      const labelDistance = localY >= signal.labelY - halfLabelHeight && localY <= signal.labelY + halfLabelHeight && Math.abs(localX - signal.labelX) <= halfLabel ? 0 : Infinity;
+      return { signal, distance: Math.min(markerDistance, labelDistance) };
+    }).filter(({ distance }) => model.layers?.afStochZ === true && distance <= 14)
+      .sort((left, right) => left.distance - right.distance)[0]?.signal;
     if (signalHit) {
       structureTitle.textContent = `${signalHit.type} · ${signalHit.signalStatus}${signalHit.signalPhase && signalHit.signalPhase !== signalHit.signalStatus ? ` · ${signalHit.signalPhase}` : ""}`;
       structureBody.textContent = `${signalHit.start} · 参考价 ${formatMoney(signalHit.endPrice)} · 失效边界 ${signalHit.invalidationPrice == null ? "未知" : formatMoney(signalHit.invalidationPrice)}`;
+      structureDetail.hidden = false;
+    } else if (afSignalHit) {
+      structureTitle.textContent = afSignalHit.type || afSignalHit.label?.replace("\n", " · ") || "自适应随机Z信号";
+      structureBody.textContent = `${afSignalHit.date} · 确认于 ${afSignalHit.confirmedAt || "未知"} · Z ${formatIndicator(afSignalHit.z)}`;
       structureDetail.hidden = false;
     }
     const structure = (model.structures || []).map((item) => {
@@ -352,12 +364,12 @@ function bindChanChartHover(target, initialBinding) {
     })
       .filter(({ item, distance }) => distance <= (item.area ? 0 : 8))
       .sort((left, right) => left.distance - right.distance)[0]?.item;
-    if (!signalHit && structure) {
+    if (!signalHit && !afSignalHit && structure) {
       const detail = chanStructureTooltipDetails(structure);
       structureTitle.textContent = detail.title;
       structureBody.textContent = detail.body;
       structureDetail.hidden = false;
-    } else if (!signalHit) {
+    } else if (!signalHit && !afSignalHit) {
       structureDetail.hidden = true;
       structureTitle.textContent = ""; structureBody.textContent = "";
     }
@@ -808,6 +820,7 @@ function drawChanCanvas(target, binding) {
   }
   // Chan structural reference levels: recent swing highs/lows and the latest center boundaries.
   for (const level of model.keyLevels || []) {
+    if (model.layers?.supportResistance === false && ["support", "resistance"].includes(level.tone)) continue;
     const color = level.tone === "support" ? colors.up : level.tone === "resistance" ? colors.down : colors.blue;
     line(level.x1, level.y, level.x2, level.y, color, [3, 4], 1);
   }
@@ -842,6 +855,67 @@ function drawChanCanvas(target, binding) {
       : (model.plotLeft + model.historyRight) / 2;
     context.lineWidth = 3; context.lineJoin = "round"; context.strokeStyle = colors.panel; context.strokeText(signalLabel, labelX, labelY);
     context.fillStyle = color; context.fillText(signalLabel, labelX, labelY);
+  }
+  // AF StochZ overlays confirmed price pivots after the oscillator condition.
+  // The marker is painted separately from Chan signals so either layer can be
+  // inspected without changing the other layer's visibility.
+  if (model.layers?.afStochZ === true) for (const signal of model.afSignals || []) {
+    const color = signal.divergence === "hidden"
+      ? signal.side === "buy" ? colors.blue : colors.amber
+      : signal.side === "buy" ? colors.up : colors.down;
+    const markerY = Number.isFinite(signal.markerY) ? signal.markerY : signal.y;
+    const buy = signal.side === "buy";
+    context.beginPath();
+    context.moveTo(signal.x, markerY + (buy ? 7 : -7));
+    context.lineTo(signal.x - 6, markerY + (buy ? -3 : 3));
+    context.lineTo(signal.x + 6, markerY + (buy ? -3 : 3));
+    context.closePath();
+    context.fillStyle = color; context.globalAlpha = 0.92; context.fill(); context.globalAlpha = 1;
+    const labelLines = signal.labelLines || (signal.label || (buy ? "BUY" : "SELL")).split("\n");
+    const fontSize = model.mobileChart ? 11 : 8;
+    const lineHeight = fontSize + 2;
+    context.font = `650 ${fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`;
+    context.textAlign = "center"; context.textBaseline = "middle";
+    const textWidth = Math.max(...labelLines.map((labelLine) => typeof context.measureText === "function"
+      ? context.measureText(labelLine).width : Array.from(labelLine).length * fontSize * 0.55));
+    const labelWidth = Math.max(textWidth + 8, signal.hitLabelWidth || 0);
+    const labelHeight = Math.max(signal.labelHeight || 0, labelLines.length * lineHeight + 4);
+    const halfLabelWidth = labelWidth / 2;
+    const labelMinX = model.plotLeft + halfLabelWidth + 2;
+    const labelMaxX = model.historyRight - halfLabelWidth - 2;
+    const labelX = labelMinX <= labelMaxX
+      ? Math.max(labelMinX, Math.min(labelMaxX, signal.labelX ?? signal.x))
+      : (model.plotLeft + model.historyRight) / 2;
+    const plotTop = Number.isFinite(model.plotTop) ? model.plotTop : 0;
+    const priceBottom = Number.isFinite(model.priceBottom) ? model.priceBottom : model.plotBottom;
+    const labelMinY = plotTop + labelHeight / 2 + 2;
+    const labelMaxY = priceBottom - labelHeight / 2 - 2;
+    const preferredLabelY = Number.isFinite(signal.labelY) ? signal.labelY : markerY + (buy ? 22 : -18);
+    const labelY = labelMinY <= labelMaxY
+      ? Math.max(labelMinY, Math.min(labelMaxY, preferredLabelY))
+      : (plotTop + priceBottom) / 2;
+    const labelTop = labelY - labelHeight / 2;
+    const firstLineY = labelTop + (labelHeight - labelLines.length * lineHeight) / 2 + lineHeight / 2;
+    if (signal.labelConnector) {
+      const labelEdgeY = labelY > markerY ? labelY - labelHeight / 2 : labelY + labelHeight / 2;
+      context.beginPath();
+      context.moveTo(signal.x, markerY + (labelEdgeY > markerY ? 8 : -8));
+      context.lineTo(labelX, labelEdgeY);
+      context.strokeStyle = color; context.lineWidth = 1; context.globalAlpha = 0.62; context.stroke(); context.globalAlpha = 1;
+    }
+    if (signal.labelBackground !== false) {
+      context.globalAlpha = 0.96;
+      context.fillStyle = color;
+      context.fillRect(labelX - halfLabelWidth, labelTop, labelWidth, labelHeight);
+      context.globalAlpha = 1;
+      context.fillStyle = colors.panel;
+      labelLines.forEach((labelLine, lineIndex) => context.fillText(labelLine, labelX, firstLineY + lineIndex * lineHeight));
+    } else {
+      context.strokeStyle = colors.panel; context.lineWidth = 3; context.lineJoin = "round";
+      labelLines.forEach((labelLine, lineIndex) => context.strokeText(labelLine, labelX, firstLineY + lineIndex * lineHeight));
+      context.fillStyle = color;
+      labelLines.forEach((labelLine, lineIndex) => context.fillText(labelLine, labelX, firstLineY + lineIndex * lineHeight));
+    }
   }
   if (model.spot) {
     line(model.plotLeft, model.spot.y, model.historyRight, model.spot.y, colors.spot, [3, 4], 1);

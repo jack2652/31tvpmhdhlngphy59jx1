@@ -20,6 +20,7 @@
     return `${end.getUTCFullYear()}-${String(end.getUTCMonth() + 1).padStart(2, "0")}-${String(end.getUTCDate()).padStart(2, "0")} ${String(end.getUTCHours()).padStart(2, "0")}:${String(end.getUTCMinutes()).padStart(2, "0")}`;
   }
   const chartCache = new WeakMap();
+  const afStochZCache = new WeakMap();
   const turningKinds = new Set(["bottom_reversal_candidate", "top_exit_candidate"]);
   const penPointKinds = new Set(["third_buy_candidate", "third_sell_candidate"]);
   const v4ClassLabels = {
@@ -71,6 +72,107 @@
     return `关联周期 ${path} · ${state}`;
   }
   function v4SignalLabel(kind) { return v4ClassLabels[kind] || kind || "递归买卖点"; }
+  function placeAFSignalLabels(signals, recursiveSignals, legacySignals, chart) {
+    if (!signals?.length) return [];
+    const gap = 4;
+    const occupied = [];
+    const reserveBox = (left, top, width, height, kind = "marker") => occupied.push({ left, top, right: left + width, bottom: top + height, kind });
+    const reserveMarker = (x, y, radius = 7) => reserveBox(x - radius, y - radius, radius * 2, radius * 2, "marker");
+    const fontSize = chart.mobileChart ? 12 : 9;
+    (recursiveSignals || []).forEach((signal) => {
+      const width = signal.hitLabelWidth || Array.from(signal.label || "").length * fontSize + 8;
+      reserveBox(signal.labelX - width / 2, signal.labelY - fontSize - 2, width, fontSize + 6, "label");
+      reserveMarker(signal.x, signal.markerY ?? signal.y, 7);
+    });
+    (legacySignals || []).forEach((signal) => {
+      const width = Array.from(signal.label || "").length * fontSize + 8;
+      reserveBox(signal.labelX - width / 2, signal.labelY - fontSize - 2, width, fontSize + 6, "label");
+      reserveMarker(signal.x, signal.y, 7);
+    });
+    signals.forEach((signal) => reserveMarker(signal.x, signal.markerY ?? signal.y, 8));
+    const chanCandles = new Map((chart.layers?.chanCandles === false ? [] : chart.chanCandles || [])
+      .map((candle) => [candle.candleIndex, candle]));
+    (chart.candles || []).forEach((candle) => {
+      const merged = chanCandles.get(candle.index);
+      const bodyTop = candle.body, bodyBottom = candle.body + candle.bodyHeight;
+      const candleTop = merged
+        ? Math.min(merged.high, merged.low, candle.high, candle.low, bodyTop)
+        : Math.min(candle.high, bodyTop);
+      const candleBottom = merged
+        ? Math.max(merged.high, merged.low, candle.high, candle.low, bodyBottom)
+        : Math.max(candle.low, bodyBottom);
+      const width = candle.bodyWidth + 4;
+      reserveBox(candle.x - width / 2, candleTop, width, Math.max(1, candleBottom - candleTop), "candle");
+    });
+
+    const left = chart.plotLeft, right = chart.historyRight;
+    const top = chart.plotTop + 2, bottom = chart.priceBottom - 2;
+    const placed = new Map();
+    const ordered = [...signals].sort((a, b) => a.x - b.x || a.labelY - b.labelY);
+    ordered.forEach((signal) => {
+      const halfWidth = (signal.hitLabelWidth || 48) / 2;
+      const halfHeight = (signal.labelHeight || 18) / 2;
+      const minX = left + halfWidth, maxX = right - halfWidth;
+      const minY = top + halfHeight, maxY = bottom - halfHeight;
+      const baseX = Math.max(minX, Math.min(maxX, signal.labelX));
+      const baseY = Math.max(minY, Math.min(maxY, signal.labelY));
+      const yStep = Math.max(18, signal.labelHeight + gap);
+      const xStep = Math.max(28, (signal.hitLabelWidth || 48) + gap);
+      const maxYSteps = Math.min(24, Math.ceil(Math.max(0, maxY - minY) / yStep));
+      const maxXSteps = Math.min(8, Math.ceil(Math.max(0, maxX - minX) / xStep));
+      const preferredDirection = signal.side === "buy" ? 1 : -1;
+      const countOverlaps = (rect) => occupied.reduce((counts, other) => {
+        if (rect.left < other.right + gap && rect.right + gap > other.left
+          && rect.top < other.bottom + gap && rect.bottom + gap > other.top) counts[other.kind] += 1;
+        return counts;
+      }, { label: 0, marker: 0, candle: 0 });
+      const baseRect = {
+        left: baseX - halfWidth, right: baseX + halfWidth,
+        top: baseY - halfHeight, bottom: baseY + halfHeight,
+      };
+      let selected = { labelX: baseX, labelY: baseY };
+      const baseOverlaps = countOverlaps(baseRect);
+      if (baseOverlaps.label || baseOverlaps.marker || baseOverlaps.candle) {
+        const candidates = [];
+        for (let yStepIndex = 0; yStepIndex <= maxYSteps; yStepIndex += 1) {
+          const yOffsets = yStepIndex === 0 ? [0] : [preferredDirection * yStepIndex * yStep, -preferredDirection * yStepIndex * yStep];
+          for (let xStepIndex = 0; xStepIndex <= maxXSteps; xStepIndex += 1) {
+            const xOffsets = xStepIndex === 0 ? [0] : [xStepIndex * xStep, -xStepIndex * xStep];
+            for (const dy of yOffsets) for (const dx of xOffsets) {
+              const labelX = Math.max(minX, Math.min(maxX, baseX + dx));
+              const labelY = baseY + dy;
+              if (labelY < minY || labelY > maxY) continue;
+              candidates.push({ labelX, labelY, cost: Math.abs(dy) + Math.abs(dx) * 1.4 + (dy * preferredDirection < 0 ? 3 : 0) });
+            }
+          }
+        }
+        candidates.sort((a, b) => a.cost - b.cost);
+        let leastOverlap = Infinity;
+        for (const candidate of candidates) {
+          const rect = {
+            left: candidate.labelX - halfWidth, right: candidate.labelX + halfWidth,
+            top: candidate.labelY - halfHeight, bottom: candidate.labelY + halfHeight,
+          };
+          const overlaps = countOverlaps(rect);
+          const overlapCount = overlaps.label + overlaps.marker + overlaps.candle;
+          if (overlapCount === 0) { selected = candidate; break; }
+          // 拥挤时优先保持标签分开；无空位时去掉底色，避免实色框盖住 K 线。
+          const score = overlaps.label * 1000000000 + overlaps.marker * 10000000 + overlaps.candle * 100000 + candidate.cost;
+          if (score < leastOverlap) { leastOverlap = score; selected = candidate; }
+        }
+      }
+      const finalX = selected.labelX, finalY = selected.labelY;
+      const finalOverlaps = countOverlaps({
+        left: finalX - halfWidth, right: finalX + halfWidth,
+        top: finalY - halfHeight, bottom: finalY + halfHeight,
+      });
+      const naturalY = signal.markerY + (signal.side === "buy" ? halfHeight + 13 : -halfHeight - 13);
+      const moved = Math.abs(finalX - signal.x) > 1 || Math.abs(finalY - naturalY) > 2;
+      occupied.push({ left: finalX - halfWidth, right: finalX + halfWidth, top: finalY - halfHeight, bottom: finalY + halfHeight, kind: "label" });
+      placed.set(signal, { ...signal, labelX: finalX, labelY: finalY, labelConnector: moved, labelBackground: !finalOverlaps.label && !finalOverlaps.marker && !finalOverlaps.candle });
+    });
+    return signals.map((signal) => placed.get(signal) || signal);
+  }
   function structureReferenceLabel(value) {
     const raw = String(value || "");
     if (!raw) return "未关联结构";
@@ -413,6 +515,14 @@
     return result;
   }
 
+  function afStochZSeries(candles) {
+    const cached = afStochZCache.get(candles);
+    if (cached) return cached;
+    const result = window.OptionScopeStochZ?.calculate(candles || []) || { events: [], series: {} };
+    afStochZCache.set(candles, result);
+    return result;
+  }
+
   function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null) {
     const cachedLayouts = chartCache.get(frame.candles);
     const totalBars = frame.candles?.length || 0;
@@ -431,7 +541,7 @@
       ? frame.recursive_levels.flatMap((level) => level.segments || []) : (frame.segments || []);
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
-    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, recursiveCenterVisibility].join(":");
+    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, recursiveCenterVisibility].join(":");
     const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
     const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("");
     // Only reserve the scenario lane when there is a path to draw. Reserving
@@ -461,6 +571,7 @@
     }
     const bars = (frame.candles || []).slice(startIndex, endIndex);
     if (!bars.length) return null;
+    const afStochZ = layers?.afStochZ === true ? afStochZSeries(frame.candles || []) : { events: [], series: {} };
     const macd = macdSeries(frame.candles || []).slice(startIndex, endIndex);
     const dmi = dmiSeries(frame.candles || []).slice(startIndex, endIndex);
     const width = mobile ? 420 : 960;
@@ -528,6 +639,9 @@
     const selectedSegments = visibleSegments.filter((segment) => isSegmentLevelVisible(layers, segment.level));
     const selectedRecursiveCenters = visibleRecursiveCenters.filter((center) => isRecursiveCenterLevelVisible(layers, center.level));
     const selectedV4Signals = layers?.signals === false ? [] : visibleV4Signals;
+    const visibleAFSignals = layers?.afStochZ === true
+      ? (afStochZ.events || []).filter((signal) => signal.date >= firstDate && signal.date <= lastDate)
+      : [];
     const legacyRule = "strict-old-bi-v3";
     const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.11";
     let minimum = Infinity, maximum = -Infinity;
@@ -547,6 +661,10 @@
     });
     selectedV4Signals.forEach((signal) => {
       const price = Number(signal.price);
+      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
+    });
+    visibleAFSignals.forEach((signal) => {
+      const price = Number(signal.markerPrice ?? signal.price);
       if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
     });
     // Keep the daily/weekly scale tied to bars and structure. Intraday charts
@@ -688,6 +806,26 @@
       labelY = Math.max(labelTop, Math.min(labelBottom, labelY));
       return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, side, status: signal.status, invalidated, label, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, start: date, end: date, startPrice: price, endPrice: price, confirmed: signal.status === "confirmed", formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || signal.phase_at, composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
     });
+    const afSignalLayouts = visibleAFSignals.map((signal, index) => {
+      const price = Number(signal.price), markerPrice = Number(signal.markerPrice ?? signal.price);
+      const xPosition = x(dateIndex(signal.date)), yPosition = y(markerPrice);
+      const labelFontSize = mobile ? 11 : 8;
+      const lead = signal.kinds?.includes("lead");
+      const sideLabel = signal.side === "buy" ? "买入" : "卖出";
+      const divergenceLabel = signal.divergence === "regular"
+        ? (signal.side === "buy" ? "常规看涨背离" : "常规看跌背离")
+        : signal.divergence === "hidden" ? (signal.side === "buy" ? "隐藏看涨背离" : "隐藏看跌背离") : "";
+      const label = lead && divergenceLabel ? `${sideLabel}\n${divergenceLabel}` : lead ? sideLabel : divergenceLabel || signal.label;
+      const labelLines = label.split("\n");
+      const labelHalfWidth = Math.max(...labelLines.map((line) => Array.from(line).length * labelFontSize / 2)) + 4;
+      const labelHeight = labelLines.length * (labelFontSize + 2) + 4;
+      const labelLeft = left + labelHalfWidth, labelRight = historyRight - labelHalfWidth;
+      const labelX = labelLeft <= labelRight ? Math.max(labelLeft, Math.min(labelRight, xPosition)) : left + historyWidth / 2;
+      const buy = signal.side === "buy";
+      const preferredLabelY = yPosition + (buy ? labelHeight / 2 + 13 : -labelHeight / 2 - 13);
+      const labelY = Math.max(top + labelHeight / 2 + 2, Math.min(priceBottom - labelHeight / 2 - 2, preferredLabelY));
+      return { ...signal, key: `${signal.key}-${index}`, type: label.replace("\n", " · "), label, labelLines, labelHeight, labelFontSize, x: xPosition, y: yPosition, markerY: yPosition, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, endPrice: price, start: signal.date, confirmed: true };
+    });
     const activeIndicatorLabels = [visibleSubcharts.volume ? "成交量" : "", visibleSubcharts.macd ? "MACD（12、26、9）" : "", visibleSubcharts.dmi ? "DMI（14、6）" : ""].filter(Boolean);
     const indicatorDescription = activeIndicatorLabels.length
       ? `价格图下方显示${activeIndicatorLabels.join("、")}，与 K 线共用同一时间轴。`
@@ -731,7 +869,7 @@
       ],
       // `segments` here is the Canvas paint gate: the mapped segment list is
       // already filtered by the global default and any per-level overrides.
-      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false },
+      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
       // Keep per-level controls stable while users pan and zoom; their options
       // should describe the loaded structure, not only the current viewport.
       availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
@@ -758,6 +896,7 @@
       signals: signalLayouts.map(({ signal: _signal, key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice }) => ({
         key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice,
       })),
+      afSignals: afSignalLayouts,
       // Count only signals that can actually be drawn. The visible signal list
       // is intentionally limited to the current chart window so panning does
       // not pull off-screen markers onto the plot edge.
@@ -1210,6 +1349,7 @@
         label: `${penPointKinds.has(signal.kind) ? (buy ? "三买" : "三卖") : (buy ? "底" : "顶")}${invalidated ? "失效" : watch ? "观察" : "候选"}`, watch, invalidated,
         title: `${signal.label} · 极值 ${signal.origin_date || signal.date} ${money(signal.price)} · 首次识别 ${signal.observed_at || signal.confirmed_at} · 当前阶段 ${signal.phase_at || signal.confirmed_at}${invalidated ? " · 该观察已失效" : ""}` };
     }).filter(Boolean) : [];
+    const afSignals = chart ? placeAFSignalLabels(chart.afSignals, chart.signals, markers, chart) : [];
     const plan = window.OptionScopeChanPlan.view(frame, spot, weekly);
     if (plan.metrics.length) {
       guidance.title = plan.headline;
@@ -1256,7 +1396,7 @@
       plan,
       spotGuide: liveSpotGuide(frame, spot, guidance),
       dataSummary, marketSummary, recursive: recursiveStructureSummary(frame, ruleVersion, dataContext), legacySignals, recursiveSignals, signals: [...legacySignals, ...recursiveSignals],
-      guidance, chart: chart ? { ...chart, markers } : null,
+      guidance, chart: chart ? { ...chart, afSignals, markers } : null,
     };
   }
 
