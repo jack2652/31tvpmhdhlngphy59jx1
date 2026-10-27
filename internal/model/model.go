@@ -15,6 +15,7 @@ type Quote struct {
 	ChangePercent                     *float64       `json:"change_percent"`
 	TodayOpen                         *float64       `json:"today_open"`
 	PreviousClose                     *float64       `json:"previous_close"`
+	DailyBar                          *DailyBar      `json:"daily_bar,omitempty"`
 	Currency                          string         `json:"currency"`
 	MarketState                       string         `json:"market_state"`
 	Provider                          string         `json:"provider"`
@@ -60,6 +61,16 @@ type Quote struct {
 	FairValueErrors                   []string       `json:"fair_value_errors,omitempty"`
 	Warning                           string         `json:"warning,omitempty"`
 	Earnings                          any            `json:"-"`
+}
+
+type DailyBar struct {
+	Date      string  `json:"date"`
+	Open      float64 `json:"open"`
+	High      float64 `json:"high"`
+	Low       float64 `json:"low"`
+	Close     float64 `json:"close"`
+	Volume    float64 `json:"volume"`
+	IsForming bool    `json:"is_forming"`
 }
 
 type ExpirationsResponse struct {

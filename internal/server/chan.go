@@ -225,6 +225,67 @@ func intradayBars(entry intradayCacheEntry) []chananalysis.Bar {
 	return bars
 }
 
+func (s *Service) intradayDailyBarFallback(symbol string, quote model.Quote) *model.DailyBar {
+	state := strings.ToUpper(strings.TrimSpace(quote.MarketState))
+	if state != "REGULAR" && state != "POST" {
+		return nil
+	}
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	date := time.Now().In(location).Format(time.DateOnly)
+	entry, _, _, _ := s.intradayFrame(symbol)
+	var first, latest *chananalysis.Bar
+	var high, low, volume float64
+	for index := range entry.frame {
+		bar := chananalysis.Bar{}
+		bar.Date, _ = entry.frame[index]["date"].(string)
+		if len(bar.Date) < len(date) || bar.Date[:len(date)] != date {
+			continue
+		}
+		at, parseErr := time.ParseInLocation("2006-01-02 15:04", bar.Date, location)
+		if parseErr != nil || at.Hour()*60+at.Minute() < 9*60+30 || at.Hour()*60+at.Minute() >= 16*60 {
+			continue
+		}
+		bar.Open, _ = historyMapNumber(entry.frame[index], "open")
+		bar.High, _ = historyMapNumber(entry.frame[index], "high")
+		bar.Low, _ = historyMapNumber(entry.frame[index], "low")
+		bar.Close, _ = historyMapNumber(entry.frame[index], "close")
+		bar.Volume, _ = historyMapNumber(entry.frame[index], "volume")
+		if first == nil {
+			first = &bar
+			low = bar.Low
+		}
+		latest = &bar
+		high = math.Max(high, bar.High)
+		low = math.Min(low, bar.Low)
+		volume += bar.Volume
+	}
+	if first == nil || latest == nil || !finitePositive(first.Open) || !finitePositive(high) || !finitePositive(low) ||
+		!finitePositive(latest.Close) || high < low || volume < 0 {
+		return nil
+	}
+	open, close := first.Open, latest.Close
+	if finitePositivePointer(quote.TodayOpen) {
+		open = *quote.TodayOpen
+	}
+	forming := state == "REGULAR"
+	if forming && validMarketPrice(quote.Price) {
+		close = *quote.Price
+		high = math.Max(high, close)
+		low = math.Min(low, close)
+	}
+	if high < math.Max(open, close) || low > math.Min(open, close) {
+		return nil
+	}
+	return &model.DailyBar{Date: date, Open: open, High: high, Low: low, Close: close, Volume: volume, IsForming: forming}
+}
+
+func finitePositivePointer(value *float64) bool {
+	return value != nil && finitePositive(*value)
+}
+
 // chanAdjustedAnalysis serves the independent adjusted daily history used by
 // recursive Chan analysis. Existing /chan and quote paths remain raw-price.
 func (s *Service) chanAdjustedAnalysis(c *gin.Context) {

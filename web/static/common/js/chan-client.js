@@ -527,9 +527,23 @@
     return Math.max(0, Math.min(visibleCount - 1, Math.floor(visibleCount * 0.75)));
   }
 
-  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null) {
-    const cachedLayouts = chartCache.get(frame.candles);
-    const totalBars = frame.candles?.length || 0;
+  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null, liveBar = null) {
+    const sourceCandles = frame.candles || [];
+    let candlesForDisplay = sourceCandles;
+    let liveDisplayIndex = -1;
+    if (liveBar && ["1d", "daily"].includes(frame.period) && liveBar.date >= (sourceCandles[sourceCandles.length - 1]?.date || "")) {
+      const candle = { ...liveBar };
+      const existingIndex = sourceCandles.findIndex((bar) => bar.date === candle.date);
+      candlesForDisplay = sourceCandles.slice();
+      if (existingIndex >= 0) {
+        candlesForDisplay[existingIndex] = candle;
+        liveDisplayIndex = existingIndex;
+      } else {
+        candlesForDisplay.push(candle);
+        liveDisplayIndex = candlesForDisplay.length - 1;
+      }
+    }
+    const totalBars = candlesForDisplay.length;
     // Start daily and 15-minute charts at the same readable 32-bar window on
     // desktop and mobile; keep the rest of their history reachable by zooming.
     const defaultBars = ["1d", "15m"].includes(frame.period) ? Math.min(32, totalBars) : totalBars;
@@ -542,6 +556,8 @@
     const endIndex = totalBars - endOffset;
     const startIndex = Math.max(0, endIndex - visibleCount);
     const dataEndIndex = Math.min(totalBars, endIndex);
+    const liveCandleVisible = liveDisplayIndex >= startIndex && liveDisplayIndex < dataEndIndex;
+    const cachedLayouts = liveCandleVisible ? null : chartCache.get(frame.candles);
     const recursiveCenterLevels = [...new Set((frame.recursive_centers || []).map((center) => String(Number(center.level) || 0)))].sort();
     const recursiveCenterVisibility = recursiveCenterLevels.map((level) => level + "=" + (isRecursiveCenterLevelVisible(layers, level) ? 1 : 0)).join(",");
     const cacheSegments = frame.recursive_levels?.length
@@ -576,13 +592,13 @@
     if (cached && !newLevelsOutsideCache && !quoteOutsideCache) {
       return chartWithSpot(cached.chart, spot, cached.minimum, cached.maximum, cached.y, scenarios);
     }
-    const bars = (frame.candles || []).slice(startIndex, dataEndIndex);
+    const bars = candlesForDisplay.slice(startIndex, dataEndIndex);
     if (!bars.length) return null;
-    const afStochZ = layers?.afStochZ === true ? afStochZSeries(frame.candles || []) : { events: [], series: {} };
+    const afStochZ = layers?.afStochZ === true ? afStochZSeries(sourceCandles) : { events: [], series: {} };
     const trendlineResult = layers?.trendlines === true
-      ? window.OptionScopeTrendlines?.calculate(frame.candles || [], frame.strokes || [], cacheSegments, startIndex, endIndex) || null : null;
-    const macd = macdSeries(frame.candles || []).slice(startIndex, endIndex);
-    const dmi = dmiSeries(frame.candles || []).slice(startIndex, endIndex);
+      ? window.OptionScopeTrendlines?.calculate(sourceCandles, frame.strokes || [], cacheSegments, startIndex, endIndex) || null : null;
+    const macd = macdSeries(candlesForDisplay).slice(startIndex, endIndex);
+    const dmi = dmiSeries(candlesForDisplay).slice(startIndex, endIndex);
     const width = mobile ? 420 : 960;
     // Desktop retains room for the left price labels and current-price badge
     // without carrying the oversized axis gutter from the former right axis.
@@ -749,6 +765,12 @@
       if (rawEnd < startIndex || rawStart >= endIndex) continue;
       const candleIndex = Math.min(rawEnd, endIndex - 1) - startIndex;
       chanCandles[candleIndex] = { candleIndex, high: y(high), low: y(low), direction };
+    }
+    if (liveCandleVisible) {
+      const candleIndex = liveDisplayIndex - startIndex;
+      const candle = candlesForDisplay[liveDisplayIndex];
+      chanCandles[candleIndex] = { candleIndex, high: y(candle.high), low: y(candle.low),
+        direction: candle.close >= candle.open ? "up" : "down" };
     }
     const dateIndex = (date) => {
       if (date <= firstDate) return 0;
@@ -962,7 +984,7 @@
         const displayDate = displayBarTime(bar.date, frame.period);
         return { key: bar.date, index, date: bar.date, displayDate, x: x(index),
         prices: { open: bar.open, high: bar.high, low: bar.low, close: bar.close }, previousClose, closeChangePercent,
-        volume: Number(bar.volume) || 0, macd: macd[index] || null, dmi: dmi[index] || null,
+        volume: Number(bar.volume) || 0, isForming: Boolean(bar.is_forming), macd: macd[index] || null, dmi: dmi[index] || null,
         high: y(bar.high), low: y(bar.low), body: Math.min(y(bar.open), y(bar.close)),
         bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, slot * 0.56),
         direction: bar.close >= bar.open ? "up" : "down",
@@ -990,10 +1012,12 @@
         .map((index) => { const displayDate = displayBarTime(bars[index].date, frame.period); return { x: x(index), y: height - 12, label: mobile ? axisDateLabel(displayDate).slice(-5) : axisDateLabel(displayDate) }; }),
     };
     if (trendlineLayouts?.length) chart.description += "结构趋势线由已确认的笔与线段端点拟合，实线连接结构点，虚线延伸至当前窗口；收盘价有效穿越后不再显示。";
-    const layouts = cachedLayouts || new Map();
-    layouts.set(cacheKey, { chart, minimum, maximum, y });
-    if (layouts.size > 8) layouts.delete(layouts.keys().next().value);
-    if (!cachedLayouts) chartCache.set(frame.candles, layouts);
+    if (!liveCandleVisible) {
+      const layouts = cachedLayouts || new Map();
+      layouts.set(cacheKey, { chart, minimum, maximum, y });
+      if (layouts.size > 8) layouts.delete(layouts.keys().next().value);
+      if (!cachedLayouts) chartCache.set(frame.candles, layouts);
+    }
     return chartWithSpot(chart, spot, minimum, maximum, y, scenarios);
   }
 
@@ -1348,13 +1372,13 @@
       freshness };
   }
 
-  function frameView(frame, spot, weekly = null, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, dataContext = null, subcharts = null) {
+  function frameView(frame, spot, weekly = null, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, dataContext = null, subcharts = null, liveBar = null) {
     if (!frame) return emptyFrame("--");
     const center = frame.position?.center;
     const last = frame.strokes?.[frame.strokes.length - 1];
     const fixed = (frame.strokes || []).filter((stroke) => stroke.confirmed);
     const guidance = frameGuidance(frame, spot, weekly);
-    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars, viewport, layers, ruleVersion, subcharts);
+    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars, viewport, layers, ruleVersion, subcharts, liveBar);
     if (chart) {
       chart.layerLevels = chart.availableRecursiveLevels || [];
       chart.segmentLevels = chart.availableSegmentLevels || [];
@@ -1434,7 +1458,7 @@
       if (!Number.isNaN(date.getTime())) historyTime = date.toLocaleString("zh-CN", { hour12: false });
     }
     const dataContext = { priceCoordinate: payload.price_coordinate, history: payload.history, parameters: payload.parameters };
-    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version, dataContext, subcharts), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version, dataContext, subcharts);
+    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version, dataContext, subcharts, payload.live_daily_bar), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version, dataContext, subcharts);
     const weeklyReady = Boolean(payload.weekly?.position?.center);
     const weeklyContext = weeklyReady ? `周线：${weekly.position}。` : `周线已有 ${weekly.bars} 根收盘 K 线、${weekly.confirmed} 根已确认笔，尚未形成中枢，不能给日线方向增加确认。`;
     // The view is replaced wholesale on every refresh; freezing the top level
@@ -1463,7 +1487,7 @@
 
   // Refresh the current price position without rebuilding historical pens.
   // The daily/weekly structure remains tied to completed candles.
-  function withSpot(payload, spot, observed = null) {
+  function withSpot(payload, spot, observed = null, quote = undefined) {
     if (!payload) return payload;
     // Keep an observed intraday boundary break across a history refetch.
     // A later price recovery cannot reactivate the same candidate.
@@ -1535,7 +1559,92 @@
       if (d === "below" && w === "below") summary = { alignment: "down", label: "日周均处于中枢下方", detail: "两个周期的位置偏弱，关注日线反抽能否重新进入中枢" };
       if (d === "inside" && w === "inside") summary = { alignment: "range", label: "日周均处于中枢内部", detail: "两个周期都在重叠区内，等待突破和回试结构" };
     }
-    return { ...payload, spot, daily, weekly, summary };
+    let liveDailyBar = payload.live_daily_bar;
+    if (quote !== undefined) {
+      liveDailyBar = adjustedQuoteDailyBar(payload, quote, price);
+      if (quote == null) {
+        liveDailyBar = liveDailyBar || retainedQuoteDailyBar(payload, quote, price, observed);
+      } else if (!quote.daily_bar && quote.symbol === payload.symbol) {
+        liveDailyBar = liveDailyBar || retainedQuoteDailyBar(payload, quote, price, observed);
+      }
+    }
+    return { ...payload, spot, daily, weekly, summary, live_daily_bar: liveDailyBar };
+  }
+
+  function retainedQuoteDailyBar(payload, quote, adjustedSpot, observed) {
+    const sourceCandles = payload.daily?.candles || [];
+    const historyDate = sourceCandles[sourceCandles.length - 1]?.date || "";
+    const previousPayload = payload.live_daily_bar ? payload
+      : observed?.symbol === payload.symbol && observed.live_daily_bar ? observed : null;
+    const previous = previousPayload?.live_daily_bar;
+    const quoteDate = quoteEasternDate(quote);
+    if (!previous || previous.date !== quoteDate || !quoteDate || historyDate >= previous.date
+      || !samePriceCoordinate(previousPayload, payload)) return null;
+
+    const open = Number(previous.open), high = Number(previous.high), low = Number(previous.low);
+    const volume = Number(previous.volume);
+    let close = Number(previous.close);
+    if (![open, high, low, close, volume].every(Number.isFinite)
+      || open <= 0 || low <= 0 || low > high || volume < 0) return null;
+    if (String(quote.market_state || "").toUpperCase() === "REGULAR"
+      && Number.isFinite(Number(adjustedSpot)) && Number(adjustedSpot) > 0) {
+      close = Number(adjustedSpot);
+    }
+    return { ...previous, high: Math.max(high, close), low: Math.min(low, close), close };
+  }
+
+  function quoteEasternDate(quote) {
+    const timestamp = Date.parse(quote?.fetched_at || "");
+    const date = new Date(Number.isFinite(timestamp) ? timestamp : Date.now());
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(date).map((part) => [part.type, part.value]));
+    return `${parts.year}-${parts.month}-${parts.day}`;
+  }
+
+  function samePriceCoordinate(previousPayload, payload) {
+    const previous = previousPayload?.price_coordinate || {};
+    const current = payload?.price_coordinate || {};
+    if (previous.basis !== current.basis || previous.status !== current.status
+      || previous.factor_date !== current.factor_date) return false;
+    if (!["raw", "unadjusted", "split_dividend_adjusted"].includes(current.basis)
+      || current.status === "degraded") return false;
+    if (current.basis !== "split_dividend_adjusted") return true;
+    const previousFactor = Number(previous.adjustment_factor);
+    const currentFactor = Number(current.adjustment_factor);
+    return Number.isFinite(previousFactor) && previousFactor > 0
+      && Number.isFinite(currentFactor) && currentFactor > 0
+      && Math.abs(previousFactor - currentFactor) <= 1e-12;
+  }
+
+  function adjustedQuoteDailyBar(payload, quote, adjustedSpot) {
+    const source = quote?.symbol === payload.symbol ? quote.daily_bar : null;
+    if (!source || !/^\d{4}-\d{2}-\d{2}$/.test(String(source.date || ""))) return null;
+    const coordinate = payload.price_coordinate || {};
+    let factor = 1;
+    if (coordinate.basis === "split_dividend_adjusted") {
+      factor = Number(coordinate.adjustment_factor);
+      if (coordinate.status === "degraded" || !Number.isFinite(factor) || factor <= 0) return null;
+      if (coordinate.factor_date !== source.date) {
+        const factorDate = String(coordinate.factor_date || "");
+        // 最新复权因子为 1 时，较新的临时日 K 与原始价格处于同一坐标。
+        if (!factorDate || source.date <= factorDate || Math.abs(factor - 1) > 1e-8) return null;
+      }
+    } else if (coordinate.basis !== "raw" && coordinate.basis !== "unadjusted") {
+      return null;
+    }
+    const sourceCandles = payload.daily?.candles || [];
+    const lastDate = sourceCandles[sourceCandles.length - 1]?.date;
+    if (lastDate && source.date < lastDate) return null;
+    const open = Number(source.open) * factor;
+    let close = Number(source.close) * factor;
+    const forming = Boolean(source.is_forming) && String(quote.market_state || "").toUpperCase() === "REGULAR";
+    if (forming && Number.isFinite(Number(adjustedSpot)) && Number(adjustedSpot) > 0) close = Number(adjustedSpot);
+    const high = Math.max(Number(source.high) * factor, open, close);
+    const low = Math.min(Number(source.low) * factor, open, close);
+    const volume = Number(source.volume);
+    if (![open, high, low, close, volume].every(Number.isFinite) || open <= 0 || low <= 0 || low > high || volume < 0) return null;
+    return { date: source.date, open, high, low, close, volume, is_forming: forming };
   }
 
   // Each recursive segment level has an independent visibility state.

@@ -147,7 +147,7 @@
       </div>
     </section>
 
-    <section class="detail-group panel chan-panel" id="chan-analysis" aria-labelledby="chan-title" :aria-busy="chanLoading ? 'true' : 'false'">
+    <section class="detail-group panel chan-panel" id="chan-analysis" aria-labelledby="chan-title" :aria-busy="chanLoading && !chanFrame.available ? 'true' : 'false'">
       <div class="detail-header">
         <button class="detail-toggle" type="button" :aria-expanded="chanExpanded ? 'true' : 'false'" aria-controls="chan-body" @click="toggleChanPanel">
           <span class="detail-caret" aria-hidden="true"></span>
@@ -158,7 +158,7 @@
       <div class="detail-body chan-body" id="chan-body" v-show="chanExpanded">
         <div class="chan-summary">
           <div class="chan-summary-read"><span class="chan-section-label">{{ chanFrame.label }} · 结构概况</span><h2>{{ chanFrame.recursive.heading }}</h2><p>{{ chanFrame.recursive.trend }}</p></div>
-          <div class="chan-meta"><strong class="chan-summary-spot">现价 {{ view.chan.spot }}</strong><span class="chan-status-line" role="status">{{ chanLoading ? '正在计算…' : (view.chan.refreshing ? '行情正在后台更新' : '行情已更新至 ' + chanFrame.asOf) }}</span><span class="chan-summary-quality chan-quality" :class="'chan-quality-' + chanFrame.recursive.qualityClass">行情{{ chanFrame.recursive.quality }}</span></div>
+          <div class="chan-meta"><strong class="chan-summary-spot">现价 {{ view.chan.spot }}</strong><span class="chan-status-line" role="status">{{ chanStatusLine }}</span><span class="chan-summary-quality chan-quality" :class="'chan-quality-' + chanFrame.recursive.qualityClass">行情{{ chanFrame.recursive.quality }}</span></div>
         </div>
         <section class="chan-recursive" aria-labelledby="chan-recursive-title">
           <header class="chan-recursive-header">

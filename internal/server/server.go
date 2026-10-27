@@ -1085,6 +1085,9 @@ func (s *Service) fetchQuoteOnce(ctx context.Context, symbol string, persist, sn
 		if preserved, preserveErr := s.store.PreserveCachedFairValue(quote); preserveErr == nil {
 			quote = preserved
 		}
+		if quote.DailyBar == nil {
+			quote.DailyBar = s.intradayDailyBarFallback(symbol, quote)
+		}
 		return quote, nil
 	}
 	quote = s.decorateQuote(ctx, quote)
@@ -1094,6 +1097,9 @@ func (s *Service) fetchQuoteOnce(ctx context.Context, symbol string, persist, sn
 func (s *Service) persistQuoteSnapshot(symbol string, quote model.Quote) (model.Quote, error) {
 	if !validMarketPrice(quote.Price) {
 		return model.Quote{}, fmt.Errorf("refusing to replace cached quote for %s without a positive price", symbol)
+	}
+	if quote.DailyBar == nil {
+		quote.DailyBar = s.intradayDailyBarFallback(symbol, quote)
 	}
 	persisted, err := s.store.SaveQuotePreservingFairValue(quote)
 	if err != nil {
@@ -2135,6 +2141,9 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	}
 	chain := model.ChainResponse{Symbol: symbol, Expiration: selectedExpiration, FetchedAt: fetched, Data: rows, Source: "upstream"}
 	chain.IVModel = gamma.Annotate(rows, quote.Price)
+	if quote.DailyBar == nil {
+		quote.DailyBar = s.intradayDailyBarFallback(symbol, quote)
+	}
 	snapshotWriteStartedAt := time.Now()
 	persisted, saveErr := s.store.SaveQuoteAndChainSnapshot(quote, chain)
 	snapshotWriteDuration = time.Since(snapshotWriteStartedAt)

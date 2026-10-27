@@ -3982,7 +3982,7 @@ function refreshChanAnalysis(force = false) {
     // Freeze the raw payload before it enters Vue's reactive tree: it holds
     // thousands of candles/segments that are only ever read, and the view is
     // rebuilt wholesale whenever anything changes.
-    state.chanPayload = Object.freeze(OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload));
+    state.chanPayload = Object.freeze(OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload, liveQuote));
     state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers, state.chanSubcharts);
     // Adjusted Chan results intentionally omit market_analysis. The separate
     // /api/chan request feeds the trend and price-level cards above the chart.
@@ -4085,7 +4085,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     }
   }
   if (state.chanPayload?.symbol === state.symbol) {
-    state.chanPayload = Object.freeze(OptionScopeChan.withSpot(state.chanPayload, finitePrice(price)));
+    state.chanPayload = Object.freeze(OptionScopeChan.withSpot(state.chanPayload, finitePrice(price), null, quote));
     state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers, state.chanSubcharts);
   }
   if (CHAN_INTRADAY_PERIODS.some((period) => state.chanIntradayPayload[period])) {
@@ -5660,17 +5660,31 @@ const optionScopeApp = new Vue({
       };
     },
     chanLoadStatus() {
-      if (!CHAN_INTRADAY_PERIODS.includes(this.chanPeriod) && this.chanLoading) return "缠论行情加载中…";
+      const hasData = Boolean(this.chanFrame?.available);
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
         const attempts = this.chanIntradayRetryAttempts[this.chanPeriod] || 0;
-        if (this.chanIntradayLoading[this.chanPeriod]) return `${this.chanPeriod === "15m" ? "15分钟" : "4小时"}行情加载中…`;
-        if (attempts >= CHAN_INTRADAY_RETRY_LIMIT && !this.chanIntradayRetryTimers[this.chanPeriod]) return "盘中行情失败，继续低频自动重试";
-        if (attempts > 0) return `盘中行情正在自动重试（${attempts}/${CHAN_INTRADAY_RETRY_LIMIT}）`;
+        const timer = this.chanIntradayRetryTimers[this.chanPeriod];
+        if (hasData) return attempts >= CHAN_INTRADAY_RETRY_LIMIT && !timer && !this.chanIntradayLoading[this.chanPeriod]
+          ? "后台更新暂不可用，当前显示最近行情" : "";
+        if (attempts >= CHAN_INTRADAY_RETRY_LIMIT && !timer && !this.chanIntradayLoading[this.chanPeriod]) return "盘中行情暂不可用，请重试";
+        if (attempts > 0) return "盘中行情正在后台重试";
         return "";
       }
-      if (this.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT && !this.chanRetryTimer) return "缠论行情失败，继续低频自动重试";
-      if (this.chanRetryAttempts > 0) return `缠论行情正在自动重试（${this.chanRetryAttempts}/${CHAN_ANALYSIS_RETRY_LIMIT}）`;
+      if (hasData) return this.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT && !this.chanRetryTimer && !this.chanLoading
+        ? "后台更新暂不可用，当前显示最近行情" : "";
+      if (this.chanRetryAttempts >= CHAN_ANALYSIS_RETRY_LIMIT && !this.chanRetryTimer && !this.chanLoading) return "缠论行情暂不可用，请重试";
+      if (this.chanRetryAttempts > 0) return "缠论行情正在后台重试";
       return "";
+    },
+    chanStatusLine() {
+      if (this.chanFrame?.available) return `行情已更新至 ${this.chanFrame.asOf}`;
+      const intraday = CHAN_INTRADAY_PERIODS.includes(this.chanPeriod);
+      const retrying = intraday
+        ? (this.chanIntradayRetryAttempts[this.chanPeriod] || 0) > 0
+        : this.chanRetryAttempts > 0;
+      if (retrying) return "等待行情";
+      const loading = intraday ? this.chanIntradayLoading[this.chanPeriod] : this.chanLoading;
+      return loading ? (intraday ? "盘中行情加载中…" : "正在计算…") : "等待行情";
     },
     chanLoadRetryAvailable() {
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) return !this.chanIntradayLoading[this.chanPeriod] && !this.chanIntradayRetryTimers[this.chanPeriod] && (this.chanIntradayRetryAttempts[this.chanPeriod] || 0) >= CHAN_INTRADAY_RETRY_LIMIT;

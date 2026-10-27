@@ -180,6 +180,7 @@ func (a *Alpaca) Quote(ctx context.Context, symbol string) (model.Quote, error) 
 	if hasTodayOpen {
 		todayOpenPtr = &todayOpen
 	}
+	dailyCandle := alpacaDailyBar(dailyBar)
 
 	asOf := firstTimestamp(latestQuote["t"], latestTrade["t"], minuteBar["t"])
 	session := map[string]any{
@@ -201,6 +202,7 @@ func (a *Alpaca) Quote(ctx context.Context, symbol string) (model.Quote, error) 
 		Price:            &price,
 		TodayOpen:        todayOpenPtr,
 		PreviousClose:    previousClosePtr,
+		DailyBar:         dailyCandle,
 		Currency:         "USD",
 		MarketState:      "OVERNIGHT",
 		Provider:         "alpaca-overnight",
@@ -209,6 +211,31 @@ func (a *Alpaca) Quote(ctx context.Context, symbol string) (model.Quote, error) 
 		Sessions:         map[string]any{"overnight": session},
 		FairValuePending: true,
 	}, nil
+}
+
+func alpacaDailyBar(values map[string]any) *model.DailyBar {
+	stamp, ok := firstTimestamp(values["t"]).(string)
+	if !ok {
+		return nil
+	}
+	at, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil {
+		return nil
+	}
+	open, openOK := positiveField(values, "o")
+	high, highOK := positiveField(values, "h")
+	low, lowOK := positiveField(values, "l")
+	close, closeOK := positiveField(values, "c")
+	volume, volumeOK := finiteNumber(values["v"])
+	if !openOK || !highOK || !lowOK || !closeOK || !volumeOK || volume < 0 ||
+		high < math.Max(open, close) || low > math.Min(open, close) || low > high {
+		return nil
+	}
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	return &model.DailyBar{Date: at.In(location).Format(time.DateOnly), Open: open, High: high, Low: low, Close: close, Volume: volume}
 }
 
 func (a *Alpaca) fetchSnapshot(ctx context.Context, symbol string) (map[string]any, error) {

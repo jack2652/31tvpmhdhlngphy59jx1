@@ -589,9 +589,36 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 	fetched := now.UTC()
 	return model.Quote{
 		Symbol: symbol, Price: optionalFloat(price), ChangePercent: change, TodayOpen: regularOpen, PreviousClose: optionalFloat(previous),
+		DailyBar: yahooRegularDailyBar(metaQuote, now, state),
 		Currency: stringOr(currency, "USD"), MarketState: strings.ToUpper(state), Provider: "yahoo-chart", Source: "upstream", FetchedAt: &fetched,
 		Sessions: sessions, FairValuePending: true,
 	}, nil
+}
+
+func yahooRegularDailyBar(quote *yahooQuoteModel, now time.Time, state string) *model.DailyBar {
+	if quote == nil {
+		return nil
+	}
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	dateTime := quote.RegularMarketTime
+	if dateTime.IsZero() || dateTime.After(now) {
+		return nil
+	}
+	forming := state == "REGULAR" &&
+		dateTime.In(location).Format(time.DateOnly) == now.In(location).Format(time.DateOnly)
+	bar := &model.DailyBar{
+		Date: dateTime.In(location).Format(time.DateOnly), Open: quote.RegularMarketOpen,
+		High: quote.RegularMarketDayHigh, Low: quote.RegularMarketDayLow,
+		Close: quote.RegularMarketPrice, Volume: float64(quote.RegularMarketVolume), IsForming: forming,
+	}
+	if !validYahooPrice(bar.Open) || !validYahooPrice(bar.High) || !validYahooPrice(bar.Low) || !validYahooPrice(bar.Close) ||
+		bar.High < math.Max(bar.Open, bar.Close) || bar.Low > math.Min(bar.Open, bar.Close) || bar.Low > bar.High || bar.Volume < 0 {
+		return nil
+	}
+	return bar
 }
 
 type yahooOptionChainResult struct {

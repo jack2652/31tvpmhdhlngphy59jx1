@@ -312,7 +312,7 @@ function bindChanChartHover(target, initialBinding) {
     setPaneTag(tagDmi, inDmiPane, dmiAtCursor == null ? "" : formatIndicator(dmiAtCursor), localY);
     if (shownCandle !== candle) {
       title.textContent = displayDate;
-      subtitle.textContent = `${model.periodLabel} · 已收盘 K 线`;
+      subtitle.textContent = `${model.periodLabel} · ${candle.isForming ? "形成中 K 线" : "已收盘 K 线"}`;
       const directionClass = candle.prices.close > candle.prices.open ? "chan-ohlc-up"
         : candle.prices.close < candle.prices.open ? "chan-ohlc-down" : "chan-ohlc-flat";
       Object.keys(values).forEach((key) => {

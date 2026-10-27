@@ -146,7 +146,7 @@ func (s *SQLite) initSchema(conn *sql.Conn) error {
 CREATE TABLE IF NOT EXISTS quote_snapshots (
  id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, fetched_at TEXT NOT NULL,
  price REAL, change_percent REAL, currency TEXT, market_state TEXT, provider TEXT NOT NULL,
- raw_json TEXT, sessions_json TEXT, today_open REAL, previous_close REAL,
+ raw_json TEXT, sessions_json TEXT, daily_bar_json TEXT, today_open REAL, previous_close REAL,
  fair_value REAL, fair_value_low REAL, fair_value_high REAL, fair_value_buy_low REAL, fair_value_buy_high REAL,
  fair_value_source TEXT, fair_value_model TEXT, fair_value_methods_json TEXT, fair_value_forward_eps REAL, fair_value_forward_eps_source TEXT,
  fair_value_safety_margin REAL, fair_value_confidence TEXT, fair_value_confidence_score REAL,
@@ -351,6 +351,7 @@ func ensureCompatibilityColumns(conn *sql.Conn) error {
 		// populated table without a default, so backfill a neutral legacy marker.
 		{"quote_snapshots", "provider", "TEXT NOT NULL DEFAULT 'legacy'"},
 		{"quote_snapshots", "sessions_json", "TEXT"},
+		{"quote_snapshots", "daily_bar_json", "TEXT"},
 		{"quote_snapshots", "today_open", "REAL"},
 		{"quote_snapshots", "previous_close", "REAL"},
 		{"quote_snapshots", "fair_value", "REAL"},
@@ -648,6 +649,7 @@ func (s *SQLite) LatestQuote(symbol string) (model.Quote, bool, error) {
 	var quoteID int64
 	var fetched, sessions string
 	var rawJSON sql.NullString
+	var dailyBarJSON sql.NullString
 	var providerName, currency, marketState, fairSource, fairModel sql.NullString
 	var epsSource, confidence, regime, modelUnderRegime, normalizedEPSSource sql.NullString
 	var marketCapQuality, ownerEarningsRatioSource sql.NullString
@@ -673,7 +675,7 @@ func (s *SQLite) LatestQuote(symbol string) (model.Quote, bool, error) {
   ), fetched_at) ELSE fetched_at END AS market_fetched_at
  FROM quote_snapshots WHERE symbol=?
 )
-SELECT id, raw_json, market_fetched_at, price, change_percent, today_open, previous_close, currency, market_state, provider, COALESCE(sessions_json, '{}'),
+SELECT id, raw_json, market_fetched_at, price, change_percent, today_open, previous_close, currency, market_state, provider, COALESCE(sessions_json, '{}'), daily_bar_json,
  fair_value, fair_value_low, fair_value_high, fair_value_buy_low, fair_value_buy_high, fair_value_source, fair_value_model, fair_value_methods_json,
  fair_value_forward_eps, fair_value_forward_eps_source, fair_value_safety_margin, fair_value_confidence,
  fair_value_confidence_score, fair_value_interest_coverage, fair_value_regime, fair_value_regime_signals_json,
@@ -685,7 +687,7 @@ SELECT id, raw_json, market_fetched_at, price, change_percent, today_open, previ
 FROM quote_rows
 ORDER BY CASE WHEN price IS NOT NULL AND price > 0 THEN 0 ELSE 1 END,
  market_fetched_at DESC, CASE WHEN provider='go-valuation' THEN 0 ELSE 1 END, fetched_at DESC LIMIT 1`, symbol).Scan(
-		&quoteID, &rawJSON, &fetched, &price, &change, &todayOpen, &previous, &currency, &marketState, &providerName, &sessions,
+		&quoteID, &rawJSON, &fetched, &price, &change, &todayOpen, &previous, &currency, &marketState, &providerName, &sessions, &dailyBarJSON,
 		&fairValue, &fairLow, &fairHigh, &fairBuyLow, &fairBuyHigh, &fairSource, &fairModel, &methodsJSON,
 		&forwardEPS, &epsSource, &safetyMargin, &confidence, &confidenceScore, &interestCoverage,
 		&regime, &regimeSignals, &modelUnderRegime, &defensive, &optimistic, &normalizedEPSSource,
@@ -703,6 +705,9 @@ ORDER BY CASE WHEN price IS NOT NULL AND price > 0 THEN 0 ELSE 1 END,
 	_ = json.Unmarshal([]byte(sessions), &quote.Sessions)
 	if quote.Sessions == nil {
 		quote.Sessions = map[string]any{}
+	}
+	if dailyBarJSON.Valid {
+		_ = json.Unmarshal([]byte(dailyBarJSON.String), &quote.DailyBar)
 	}
 	when, err := time.Parse(time.RFC3339Nano, fetched)
 	if err != nil {
@@ -787,8 +792,12 @@ func (s *SQLite) saveQuoteSnapshot(quote model.Quote) (model.Quote, error) {
 		quote.FetchedAt = &now
 	}
 	sessions, _ := json.Marshal(quote.Sessions)
+	dailyBar, err := json.Marshal(quote.DailyBar)
+	if err != nil {
+		return model.Quote{}, err
+	}
 	result, err := s.db.Exec(`INSERT INTO quote_snapshots
-(symbol, fetched_at, price, change_percent, today_open, currency, market_state, provider, sessions_json, previous_close,
+(symbol, fetched_at, price, change_percent, today_open, currency, market_state, provider, sessions_json, daily_bar_json, previous_close,
  fair_value, fair_value_low, fair_value_high, fair_value_buy_low, fair_value_buy_high, fair_value_source, fair_value_model, fair_value_methods_json,
  fair_value_forward_eps, fair_value_forward_eps_source, fair_value_safety_margin, fair_value_confidence,
  fair_value_confidence_score, fair_value_interest_coverage, fair_value_regime, fair_value_regime_signals_json,
@@ -797,11 +806,11 @@ func (s *SQLite) saveQuoteSnapshot(quote model.Quote) (model.Quote, error) {
  fair_value_historical_valuation_percentiles_json, fair_value_shareholder_total_return_yield,
  fair_value_market_cap_data_quality, fair_value_data_quality_score,
  fair_value_owner_earnings_maintenance_ratio, fair_value_owner_earnings_ratio_source)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 
-		quote.Symbol, storedTimestamp(*quote.FetchedAt), valueOrNil(quote.Price), valueOrNil(quote.ChangePercent), valueOrNil(quote.TodayOpen), quote.Currency, quote.MarketState, quote.Provider, string(sessions), valueOrNil(quote.PreviousClose),
+		quote.Symbol, storedTimestamp(*quote.FetchedAt), valueOrNil(quote.Price), valueOrNil(quote.ChangePercent), valueOrNil(quote.TodayOpen), quote.Currency, quote.MarketState, quote.Provider, string(sessions), string(dailyBar), valueOrNil(quote.PreviousClose),
 		valueOrNilFloatAny(quote.FairValue), valueOrNilFloatAny(quote.FairValueLow), valueOrNilFloatAny(quote.FairValueHigh), valueOrNilFloatAny(quote.FairValueBuyLow), valueOrNilFloatAny(quote.FairValueBuyHigh), quote.FairValueSource, quote.FairValueModel, jsonOrEmptyObject(quote.FairValueMethods),
 		valueOrNil(quote.FairValueForwardEPS), valueOrNil(quote.FairValueForwardEPSSource), valueOrNil(quote.FairValueSafetyMargin), valueOrNil(quote.FairValueConfidence),
 		valueOrNil(quote.FairValueConfidenceScore), valueOrNil(quote.FairValueInterestCoverage), valueOrNil(quote.FairValueRegime), jsonOrEmptyObject(quote.FairValueRegimeSignals),
@@ -849,8 +858,12 @@ func (s *SQLite) SaveQuoteAndChainSnapshot(quote model.Quote, chain model.ChainR
 	}
 	defer tx.Rollback()
 	sessions, _ := json.Marshal(quote.Sessions)
+	dailyBar, err := json.Marshal(quote.DailyBar)
+	if err != nil {
+		return model.Quote{}, err
+	}
 	quoteResult, err := tx.Exec(`INSERT INTO quote_snapshots
-	(symbol, fetched_at, price, change_percent, today_open, currency, market_state, provider, sessions_json, previous_close,
+	(symbol, fetched_at, price, change_percent, today_open, currency, market_state, provider, sessions_json, daily_bar_json, previous_close,
 	 fair_value, fair_value_low, fair_value_high, fair_value_buy_low, fair_value_buy_high, fair_value_source, fair_value_model, fair_value_methods_json,
 	 fair_value_forward_eps, fair_value_forward_eps_source, fair_value_safety_margin, fair_value_confidence,
 	 fair_value_confidence_score, fair_value_interest_coverage, fair_value_regime, fair_value_regime_signals_json,
@@ -860,12 +873,12 @@ func (s *SQLite) SaveQuoteAndChainSnapshot(quote model.Quote, chain model.ChainR
 	 fair_value_market_cap_data_quality, fair_value_data_quality_score,
 	 fair_value_owner_earnings_maintenance_ratio, fair_value_owner_earnings_ratio_source)
 	VALUES (
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 			?, ?, ?, ?, ?, ?, ?
 		)`,
-		quote.Symbol, storedTimestamp(*quote.FetchedAt), valueOrNil(quote.Price), valueOrNil(quote.ChangePercent), valueOrNil(quote.TodayOpen), quote.Currency, quote.MarketState, quote.Provider, string(sessions), valueOrNil(quote.PreviousClose),
+		quote.Symbol, storedTimestamp(*quote.FetchedAt), valueOrNil(quote.Price), valueOrNil(quote.ChangePercent), valueOrNil(quote.TodayOpen), quote.Currency, quote.MarketState, quote.Provider, string(sessions), string(dailyBar), valueOrNil(quote.PreviousClose),
 		valueOrNilFloatAny(quote.FairValue), valueOrNilFloatAny(quote.FairValueLow), valueOrNilFloatAny(quote.FairValueHigh), valueOrNilFloatAny(quote.FairValueBuyLow), valueOrNilFloatAny(quote.FairValueBuyHigh), quote.FairValueSource, quote.FairValueModel, jsonOrEmptyObject(quote.FairValueMethods),
 		valueOrNil(quote.FairValueForwardEPS), valueOrNil(quote.FairValueForwardEPSSource), valueOrNil(quote.FairValueSafetyMargin), valueOrNil(quote.FairValueConfidence),
 		valueOrNil(quote.FairValueConfidenceScore), valueOrNil(quote.FairValueInterestCoverage), valueOrNil(quote.FairValueRegime), jsonOrEmptyObject(quote.FairValueRegimeSignals),
