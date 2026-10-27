@@ -523,6 +523,10 @@
     return result;
   }
 
+  function futureOffsetLimit(visibleCount) {
+    return Math.max(0, Math.min(visibleCount - 1, Math.floor(visibleCount * 0.75)));
+  }
+
   function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null) {
     const cachedLayouts = chartCache.get(frame.candles);
     const totalBars = frame.candles?.length || 0;
@@ -532,16 +536,19 @@
     const requestedBars = Number(viewport?.visibleBars);
     const visibleCount = Math.max(1, Math.min(totalBars, Number.isFinite(requestedBars) && requestedBars > 0 ? Math.floor(requestedBars) : (defaultBars || mobileBars || 30)));
     const maxOffset = Math.max(0, totalBars - visibleCount);
-    const endOffset = Math.max(0, Math.min(maxOffset, Math.floor(Number(viewport?.endOffset) || 0)));
+    const maxFutureOffset = futureOffsetLimit(visibleCount);
+    const requestedOffset = Number(viewport?.endOffset);
+    const endOffset = Math.max(-maxFutureOffset, Math.min(maxOffset, Math.floor(Number.isFinite(requestedOffset) ? requestedOffset : 0)));
     const endIndex = totalBars - endOffset;
     const startIndex = Math.max(0, endIndex - visibleCount);
+    const dataEndIndex = Math.min(totalBars, endIndex);
     const recursiveCenterLevels = [...new Set((frame.recursive_centers || []).map((center) => String(Number(center.level) || 0)))].sort();
     const recursiveCenterVisibility = recursiveCenterLevels.map((level) => level + "=" + (isRecursiveCenterLevelVisible(layers, level) ? 1 : 0)).join(",");
     const cacheSegments = frame.recursive_levels?.length
       ? frame.recursive_levels.flatMap((level) => level.segments || []) : (frame.segments || []);
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
-    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, recursiveCenterVisibility].join(":");
+    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, recursiveCenterVisibility].join(":");
     const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
     const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("");
     // Only reserve the scenario lane when there is a path to draw. Reserving
@@ -569,9 +576,11 @@
     if (cached && !newLevelsOutsideCache && !quoteOutsideCache) {
       return chartWithSpot(cached.chart, spot, cached.minimum, cached.maximum, cached.y, scenarios);
     }
-    const bars = (frame.candles || []).slice(startIndex, endIndex);
+    const bars = (frame.candles || []).slice(startIndex, dataEndIndex);
     if (!bars.length) return null;
     const afStochZ = layers?.afStochZ === true ? afStochZSeries(frame.candles || []) : { events: [], series: {} };
+    const trendlineResult = layers?.trendlines === true
+      ? window.OptionScopeTrendlines?.calculate(frame.candles || [], frame.strokes || [], cacheSegments, startIndex, endIndex) || null : null;
     const macd = macdSeries(frame.candles || []).slice(startIndex, endIndex);
     const dmi = dmiSeries(frame.candles || []).slice(startIndex, endIndex);
     const width = mobile ? 420 : 960;
@@ -678,7 +687,27 @@
     minimum -= padding;
     maximum += padding;
     const y = (price) => top + (maximum - price) / (maximum - minimum) * plotHeight;
-    const x = (index) => left + (index + 0.5) / bars.length * historyWidth;
+    const slot = historyWidth / visibleCount;
+    const x = (index) => left + (index + 0.5) * slot;
+    const trendlineLayouts = (() => {
+      if (!trendlineResult?.length) return null;
+      const toX = (rawIndex) => left + (rawIndex - startIndex + 0.5) * slot;
+      return trendlineResult.filter((trendline) => trendline.endIndex >= startIndex && trendline.startIndex < endIndex).map((trendline) => {
+        const yAt = (index) => y(trendline.startPrice + trendline.slope * (index - trendline.startIndex));
+        const reachesLatestData = trendline.endIndex >= dataEndIndex - 1;
+        const displayEnd = reachesLatestData ? endIndex - 1 : Math.min(trendline.endIndex, endIndex - 1);
+        const solidEnd = Math.min(trendline.solidEndIndex, displayEnd);
+        const extension = trendline.solidEndIndex < displayEnd ? {
+          x1: toX(trendline.solidEndIndex), y1: yAt(trendline.solidEndIndex),
+          x2: displayEnd === endIndex - 1 ? historyRight : toX(displayEnd), y2: yAt(displayEnd),
+        } : null;
+        return {
+          side: trendline.side,
+          solid: { x1: toX(trendline.startIndex), y1: yAt(trendline.startIndex), x2: toX(solidEnd), y2: yAt(solidEnd) },
+          extension,
+        };
+      });
+    })();
     let volumeMax = 0;
     for (const bar of bars) volumeMax = Math.max(volumeMax, Number(bar.volume) || 0);
     if (!(volumeMax > 0)) volumeMax = 1;
@@ -732,15 +761,9 @@
       return low >= bars.length ? bars.length - 1 : low;
     };
     const latestRecursiveCenter = selectedRecursiveCenters[selectedRecursiveCenters.length - 1];
-    let latestL0Center = null;
-    for (let index = allRecursiveCenters.length - 1; index >= 0; index -= 1) {
-      if (Number(allRecursiveCenters[index].level) === 0) {
-        latestL0Center = allRecursiveCenters[index];
-        break;
-      }
-    }
     const zones = (frame.centers || []).filter((center) => center.end >= firstDate && center.start <= lastDate);
     const latest = frame.centers?.[frame.centers.length - 1];
+    const visibleCenterForLevels = latestRecursiveCenter || (layers?.penCenters === true ? latest : null);
     if (latest && latest.end < firstDate && latest.lower < maximum && latest.upper > minimum) zones.push(latest);
     // Adjacent pens share a turning point. Label the actual endpoint once;
     // clipped endpoints outside the visible candle range are not labelled.
@@ -836,15 +859,16 @@
       macdTop, macdBottom, macdMin, macdMax, macdZeroY,
       dmiTop, dmiBottom, dmiDividerY, indicatorDividers,
       crosshairBottom: paneBottom, interactionBottom: paneBottom, axisBottom: paneBottom,
-      totalBars, visibleBars: bars.length, windowStart: startIndex, windowEnd: endIndex, endOffset,
-      canZoomIn: bars.length > Math.min(12, totalBars), canZoomOut: bars.length < totalBars,
-      canPanLeft: endOffset < maxOffset, canPanRight: endOffset > 0,
-      canResetViewport: endOffset > 0 || bars.length !== defaultBars,
+      totalBars, visibleBars: visibleCount, windowStart: startIndex, windowEnd: endIndex, endOffset,
+      maxOffset, maxFutureOffset,
+      canZoomIn: visibleCount > Math.min(12, totalBars), canZoomOut: visibleCount < totalBars,
+      canPanLeft: endOffset < maxOffset, canPanRight: endOffset > -maxFutureOffset,
+      canResetViewport: endOffset !== 0 || visibleCount !== defaultBars,
       minimum, maximum, periodLabel: frame.label,
       historyRight, scenarioBoundary, scenarioLaneLeft, lastClose: frame.last_close,
       title: `${frame.label} K 线与结构观察，${firstDisplayDate} 至 ${lastDisplayDate}`,
       ruleVersion: recursiveRule,
-      description: `实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔、递归买卖点和笔级转折预警均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。${indicatorDescription}按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。图表右侧虚线为根据已知结构边界绘制的条件情景示意，没有未来时间刻度，也不表示目标价或确定预测；现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；已开启的副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。`,
+      description: `实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔、递归买卖点和笔级转折预警均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。${indicatorDescription}按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。向左拖动可将 K 线移入右侧空白槽，查看未破位结构趋势线的延长；趋势线延长与右侧条件情景均为基于已知数据的示意，不代表未来行情或确定预测。现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；已开启的副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。`,
       points,
       chanCandles,
       structures: [
@@ -869,7 +893,7 @@
       ],
       // `segments` here is the Canvas paint gate: the mapped segment list is
       // already filtered by the global default and any per-level overrides.
-      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
+      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
       // Keep per-level controls stable while users pan and zoom; their options
       // should describe the loaded structure, not only the current viewport.
       availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
@@ -897,6 +921,7 @@
         key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice,
       })),
       afSignals: afSignalLayouts,
+      trendlines: trendlineLayouts,
       // Count only signals that can actually be drawn. The visible signal list
       // is intentionally limited to the current chart window so panning does
       // not pull off-screen markers onto the plot edge.
@@ -911,13 +936,13 @@
         const ordered = [...sourceEndpoints].sort((a, b) => b.date.localeCompare(a.date));
         const lastHigh = ordered.find((point) => point.kind === "top");
         const lastLow = ordered.find((point) => point.kind === "bottom");
-        const centerLower = Number(latestL0Center?.zd ?? latestL0Center?.lower ?? latestL0Center?.lower_price ?? latest?.lower);
-        const centerUpper = Number(latestL0Center?.zg ?? latestL0Center?.upper ?? latestL0Center?.upper_price ?? latest?.upper);
+        const centerLower = Number(visibleCenterForLevels?.zd ?? visibleCenterForLevels?.lower ?? visibleCenterForLevels?.lower_price);
+        const centerUpper = Number(visibleCenterForLevels?.zg ?? visibleCenterForLevels?.upper ?? visibleCenterForLevels?.upper_price);
         const candidates = [
           lastHigh && { key: "recent-high", label: lastHigh.confirmed ? "近端高点" : "形成中高点", price: lastHigh.price, date: lastHigh.date, tone: "resistance" },
           lastLow && { key: "recent-low", label: lastLow.confirmed ? "近端低点" : "形成中低点", price: lastLow.price, date: lastLow.date, tone: "support" },
-          (latestL0Center || latest) && Number.isFinite(centerUpper) && { key: "center-upper", label: "中枢上沿", price: centerUpper, date: latestL0Center?.start || latest?.start, tone: "center" },
-          (latestL0Center || latest) && Number.isFinite(centerLower) && { key: "center-lower", label: "中枢下沿", price: centerLower, date: latestL0Center?.start || latest?.start, tone: "center" },
+          visibleCenterForLevels && Number.isFinite(centerUpper) && { key: "center-upper", label: "中枢上沿", price: centerUpper, date: visibleCenterForLevels.start, tone: "center" },
+          visibleCenterForLevels && Number.isFinite(centerLower) && { key: "center-lower", label: "中枢下沿", price: centerLower, date: visibleCenterForLevels.start, tone: "center" },
         ].filter((level) => level && level.price > minimum && level.price < maximum);
         const seen = new Set();
         const distinct = candidates.filter((level) => {
@@ -939,7 +964,7 @@
         prices: { open: bar.open, high: bar.high, low: bar.low, close: bar.close }, previousClose, closeChangePercent,
         volume: Number(bar.volume) || 0, macd: macd[index] || null, dmi: dmi[index] || null,
         high: y(bar.high), low: y(bar.low), body: Math.min(y(bar.open), y(bar.close)),
-        bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, historyWidth / bars.length * 0.56),
+        bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, slot * 0.56),
         direction: bar.close >= bar.open ? "up" : "down",
         title: `${displayDate} · 开 ${money(bar.open)} · 高 ${money(bar.high)} · 低 ${money(bar.low)} · 收 ${money(bar.close)}` };
       }),
@@ -964,6 +989,7 @@
       dates: [...new Set([0, Math.floor((bars.length - 1) / 2), bars.length - 1])]
         .map((index) => { const displayDate = displayBarTime(bars[index].date, frame.period); return { x: x(index), y: height - 12, label: mobile ? axisDateLabel(displayDate).slice(-5) : axisDateLabel(displayDate) }; }),
     };
+    if (trendlineLayouts?.length) chart.description += "结构趋势线由已确认的笔与线段端点拟合，实线连接结构点，虚线延伸至当前窗口；收盘价有效穿越后不再显示。";
     const layouts = cachedLayouts || new Map();
     layouts.set(cacheKey, { chart, minimum, maximum, y });
     if (layouts.size > 8) layouts.delete(layouts.keys().next().value);
@@ -1544,5 +1570,5 @@
     return { ...(layers || {}), segments: !visible, segmentLevels: {} };
   }
 
-  window.OptionScopeChan = { empty, view, withSpot, intradayView, emptyFrame, isSegmentLevelVisible, isRecursiveCenterLevelVisible, allSegmentLevelsVisible, toggleSegmentLevel, toggleAllSegmentLevels };
+  window.OptionScopeChan = { empty, view, withSpot, intradayView, emptyFrame, futureOffsetLimit, isSegmentLevelVisible, isRecursiveCenterLevelVisible, allSegmentLevelsVisible, toggleSegmentLevel, toggleAllSegmentLevels };
 }(window));

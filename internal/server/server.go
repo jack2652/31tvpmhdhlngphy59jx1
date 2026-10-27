@@ -849,7 +849,7 @@ func (s *Service) index(c *gin.Context) {
 	content := strings.ReplaceAll(string(page), "__DEFAULT_SYMBOL__", defaultSymbol)
 	content = strings.ReplaceAll(content, "__ACCESS_KEY_REQUIRED__", strconv.FormatBool(s.cfg.AccessKey != ""))
 	versionHash := sha256.New()
-	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-client.js", "common/js/app.js", "common/img/option-scope-mark.svg", "common/img/option-scope-favicon.svg"} {
+	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-trendlines.js", "common/js/chan-client.js", "common/js/app.js", "common/img/option-scope-mark.svg", "common/img/option-scope-favicon.svg"} {
 		if contents, err := fs.ReadFile(assets, asset); err == nil {
 			_, _ = versionHash.Write(contents)
 		}

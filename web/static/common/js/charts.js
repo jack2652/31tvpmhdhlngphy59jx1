@@ -397,8 +397,10 @@ function bindChanChartHover(target, initialBinding) {
     );
     if (point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > (model.crosshairBottom ?? model.plotBottom)) { hide(); return; }
     lastPointer = event;
-    const slot = ((model.historyRight ?? model.plotRight) - model.plotLeft) / model.candles.length;
-    const index = Math.max(0, Math.min(model.candles.length - 1, Math.floor((point.x - model.plotLeft) / slot)));
+    const visibleBars = Math.max(1, Number(model.visibleBars) || model.candles.length);
+    const slot = ((model.historyRight ?? model.plotRight) - model.plotLeft) / visibleBars;
+    const index = Math.floor((point.x - model.plotLeft) / slot);
+    if (index >= model.candles.length) { hide(); return; }
     show(index, point.y, point.x);
   };
   const cancelPointerMove = scheduleChartPointerMove(target, onMove, () => { hide(); hideScenarioHover(); });
@@ -793,6 +795,28 @@ function drawChanCanvas(target, binding) {
     }
     context.fillStyle = color; context.strokeStyle = color; context.lineWidth = 1;
     context.fillRect(candle.x - candle.bodyWidth / 2, candle.body, candle.bodyWidth, candle.bodyHeight);
+  }
+  if (model.layers?.trendlines === true && model.trendlines) {
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    context.globalAlpha = 0.82;
+    for (const trendline of model.trendlines || []) {
+      const color = trendline.side === "support" ? colors.up : colors.down;
+      const width = model.mobileChart ? 1.8 : 1.35;
+      if (trendline.solid) line(trendline.solid.x1, trendline.solid.y1, trendline.solid.x2, trendline.solid.y2, color, [], width);
+      if (trendline.extension) line(trendline.extension.x1, trendline.extension.y1, trendline.extension.x2, trendline.extension.y2, color, [4, 4], width);
+      // 端点采用很小的圆点，强化结构锚点但不遮盖 K 线实体。
+      for (const point of trendline.solid ? [
+        { x: trendline.solid.x1, y: trendline.solid.y1 },
+        { x: trendline.solid.x2, y: trendline.solid.y2 },
+      ] : []) {
+        context.beginPath(); context.fillStyle = color;
+        context.arc(point.x, point.y, model.mobileChart ? 2.4 : 1.8, 0, Math.PI * 2); context.fill();
+      }
+    }
+    context.restore();
   }
   // Recursive segments are drawn as their own layer. Confirmed segments are
   // solid; the current forming endpoint is dashed. Hue identifies the level.
@@ -1333,7 +1357,8 @@ function bindChanChartInteraction(element, binding) {
       state.drag.moved = true;
       element.classList.add("chan-chart-dragging");
     }
-    const slot = (model.historyRight - model.plotLeft) / model.candles.length;
+    const visibleBars = Math.max(1, Number(model.visibleBars) || model.candles.length);
+    const slot = (model.historyRight - model.plotLeft) / visibleBars;
     if (Math.abs(dx) > 0.25 && state.drag.moved) {
       state.drag.fractionalBars += dx / Math.max(1, slot);
       const wholeBars = Math.trunc(state.drag.fractionalBars);

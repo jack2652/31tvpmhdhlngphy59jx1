@@ -44,9 +44,9 @@ const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit",
   hour: "2-digit", minute: "2-digit", hourCycle: "h23",
 });
-const CHAN_CHART_PREFERENCES_VERSION = 6;
+const CHAN_CHART_PREFERENCES_VERSION = 8;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false };
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false };
 const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false };
 function copyDefaultChanChartLayers() {
   return { ...DEFAULT_CHAN_CHART_LAYERS, segmentLevels: {}, recursiveCenters: {} };
@@ -73,7 +73,7 @@ function readChanChartPreferences() {
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -5902,7 +5902,7 @@ const optionScopeApp = new Vue({
       if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
     },
     toggleChanChartLayer(layer) {
-      if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "afStochZ") {
+      if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "afStochZ" || layer === "trendlines") {
         this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };
       } else {
         const level = Number(layer);
@@ -5931,18 +5931,21 @@ const optionScopeApp = new Vue({
       const viewport = this.chanViewports[this.chanPeriod];
       const total = chart.totalBars || chart.candles.length;
       const current = chart.visibleBars || chart.candles.length;
-      const currentOffset = chart.endOffset || 0;
-      const maxVisible = total;
+      const currentOffset = Number.isFinite(Number(viewport.endOffset)) ? Number(viewport.endOffset) : (chart.endOffset || 0);
+      const maxOffset = chart.maxOffset ?? Math.max(0, total - current);
+      const maxFutureOffset = chart.maxFutureOffset ?? OptionScopeChan.futureOffsetLimit(current);
       if (action === "reset") { viewport.visibleBars = 0; viewport.endOffset = 0; }
       else if (action === "zoom-in" || action === "zoom-out") {
-        const next = Math.max(Math.min(12, total), Math.min(maxVisible, Math.round(current * (action === "zoom-in" ? 0.75 : 1.35))));
-        const center = total - currentOffset - current / 2;
+        const next = Math.max(Math.min(12, total), Math.min(total, Math.round(current * (action === "zoom-in" ? 0.75 : 1.35))));
+        const anchor = total - currentOffset - current / 2;
+        const nextFutureOffset = OptionScopeChan.futureOffsetLimit(next);
+        const start = Math.max(0, Math.min(total + nextFutureOffset - next, Math.round(anchor - (next - 1) / 2)));
         viewport.visibleBars = next;
-        viewport.endOffset = Math.max(0, Math.min(total - next, Math.round(total - center - next / 2)));
+        viewport.endOffset = Math.max(-nextFutureOffset, Math.min(total - next, total - start - next));
       } else {
         const step = Math.max(1, Math.round(current * 0.7));
-        if (action === "left") viewport.endOffset = Math.max(0, Math.min(total - current, currentOffset + step));
-        if (action === "right") viewport.endOffset = Math.max(0, currentOffset - step);
+        if (action === "left") viewport.endOffset = Math.max(-maxFutureOffset, Math.min(maxOffset, currentOffset + step));
+        if (action === "right") viewport.endOffset = Math.max(-maxFutureOffset, Math.min(maxOffset, currentOffset - step));
       }
       this.commitChanViewport(viewport);
     },
@@ -5957,9 +5960,11 @@ const optionScopeApp = new Vue({
       const chart = this.chanFrame?.chart;
       if (!chart?.candles?.length || !Number.isFinite(deltaBars) || !deltaBars) return;
       const viewport = { ...this.chanViewports[this.chanPeriod] };
-      const maxOffset = Math.max(0, chart.totalBars - chart.visibleBars);
+      const maxOffset = chart.maxOffset ?? Math.max(0, chart.totalBars - chart.visibleBars);
+      const maxFutureOffset = chart.maxFutureOffset ?? OptionScopeChan.futureOffsetLimit(chart.visibleBars);
       viewport.visibleBars = chart.visibleBars;
-      viewport.endOffset = Math.max(0, Math.min(maxOffset, (viewport.endOffset || chart.endOffset) + Math.round(deltaBars)));
+      const currentOffset = Number.isFinite(Number(viewport.endOffset)) ? Number(viewport.endOffset) : (chart.endOffset || 0);
+      viewport.endOffset = Math.max(-maxFutureOffset, Math.min(maxOffset, currentOffset + Math.round(deltaBars)));
       this.commitChanViewport(viewport);
     },
     zoomChanChart(factor, anchorIndex = null, anchorRatio = 0.5, baseVisible = null) {
@@ -5971,10 +5976,13 @@ const optionScopeApp = new Vue({
       const visible = Number.isFinite(baseVisible) ? baseVisible : (viewport.visibleBars || chart.visibleBars);
       const next = Math.max(minVisible, Math.min(total, Math.round(visible * factor)));
       const ratioValue = Math.max(0, Math.min(1, Number(anchorRatio) || 0));
-      const currentStart = Math.max(0, total - (viewport.endOffset || chart.endOffset) - visible);
+      const currentOffset = Number.isFinite(Number(viewport.endOffset)) ? Number(viewport.endOffset) : (chart.endOffset || 0);
+      const currentStart = Math.max(0, total - currentOffset - visible);
       const anchor = Number.isFinite(anchorIndex) ? anchorIndex : currentStart + ratioValue * Math.max(0, visible - 1);
-      const start = Math.max(0, Math.min(total - next, Math.round(anchor - ratioValue * (next - 1))));
-      this.commitChanViewport({ visibleBars: next, endOffset: Math.max(0, total - start - next) });
+      const maxFutureOffset = OptionScopeChan.futureOffsetLimit(next);
+      const start = Math.max(0, Math.min(total + maxFutureOffset - next, Math.round(anchor - ratioValue * (next - 1))));
+      const endOffset = Math.max(-maxFutureOffset, Math.min(total - next, total - start - next));
+      this.commitChanViewport({ visibleBars: next, endOffset });
     },
     toggleChanPanel() {
       this.chanExpanded = !this.chanExpanded;

@@ -240,7 +240,9 @@
                 <section class="chan-layer-menu-display"><h4>价格图层</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="价格图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.supportResistance ? 'true' : 'false'" @click="toggleChanChartLayer('supportResistance')">支撑/压力线</button>
-                </div></section>
+                  <button class="detail-seg" type="button" title="按已确认的笔与线段高低点绘制支撑和压力趋势线；收盘破位后结束" :aria-pressed="chanChartLayers.trendlines ? 'true' : 'false'" @click="toggleChanChartLayer('trendlines')">结构趋势线</button>
+                </div>
+                </section>
                 <section class="chan-layer-menu-recursive" aria-label="结构层级"><div class="chan-recursive-layer-groups" :class="{ 'chan-recursive-layer-groups-single': !chanSegmentLevels.length || !chanLayerLevels.length }">
                   <div v-if="chanSegmentLevels.length" class="chan-recursive-layer-group">
                     <h5>线段与走势</h5>
@@ -526,6 +528,7 @@
   <script src="/static/common/js/buyer-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-plan.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-stochz.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-trendlines.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/app.js?v=__ASSET_VERSION__"></script>
 </body>
