@@ -749,6 +749,7 @@ func (w *gzipResponseWriter) finish() {
 }
 
 func quoteAPIValue(quote model.Quote) any {
+	quote = expireFormingQuoteDailyBar(quote, time.Now())
 	encoded, err := json.Marshal(quote)
 	if err != nil {
 		return quote
@@ -770,6 +771,20 @@ func quoteAPIValue(quote model.Quote) any {
 		payload["fair_value_historical_valuation_percentiles_json"] = quote.FairValueHistoricalValuationJSON
 	}
 	return payload
+}
+
+func expireFormingQuoteDailyBar(quote model.Quote, now time.Time) model.Quote {
+	if quote.DailyBar == nil || !quote.DailyBar.IsForming {
+		return quote
+	}
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	if quote.DailyBar.Date != now.In(location).Format(time.DateOnly) || !marketcalendar.IsRegularSession(now) {
+		quote.DailyBar = nil
+	}
+	return quote
 }
 
 func refreshAPIValue(response model.RefreshResponse) any {

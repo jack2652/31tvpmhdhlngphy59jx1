@@ -180,7 +180,7 @@ function bindChanChartHover(target, initialBinding) {
   structureDetail.append(structureTitle, structureBody);
   tooltip.replaceChildren(title, subtitle);
   const values = {};
-  [["open", "开盘"], ["high", "最高"], ["low", "最低"], ["close", "收盘"]].forEach(([key, label]) => {
+  [["open", "开盘"], ["close", "收盘"], ["high", "最高"], ["low", "最低"]].forEach(([key, label]) => {
     const row = document.createElement("div");
     row.className = "chart-tooltip-row chan-ohlc-row";
     const name = document.createElement("span");

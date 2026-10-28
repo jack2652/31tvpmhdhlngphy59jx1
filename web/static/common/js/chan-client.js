@@ -1578,7 +1578,9 @@
       : observed?.symbol === payload.symbol && observed.live_daily_bar ? observed : null;
     const previous = previousPayload?.live_daily_bar;
     const quoteDate = quoteEasternDate(quote);
-    if (!previous || previous.date !== quoteDate || !quoteDate || historyDate >= previous.date
+    if (!previous || !quote || quote.source === "sqlite"
+      || String(quote.market_state || "").toUpperCase() !== "REGULAR"
+      || previous.date !== quoteDate || !quoteDate || historyDate >= previous.date
       || !samePriceCoordinate(previousPayload, payload)) return null;
 
     const open = Number(previous.open), high = Number(previous.high), low = Number(previous.low);
@@ -1595,7 +1597,8 @@
 
   function quoteEasternDate(quote) {
     const timestamp = Date.parse(quote?.fetched_at || "");
-    const date = new Date(Number.isFinite(timestamp) ? timestamp : Date.now());
+    if (!Number.isFinite(timestamp)) return "";
+    const date = new Date(timestamp);
     const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
       timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
     }).formatToParts(date).map((part) => [part.type, part.value]));
@@ -1620,6 +1623,8 @@
   function adjustedQuoteDailyBar(payload, quote, adjustedSpot) {
     const source = quote?.symbol === payload.symbol ? quote.daily_bar : null;
     if (!source || !/^\d{4}-\d{2}-\d{2}$/.test(String(source.date || ""))) return null;
+    const marketState = String(quote.market_state || "").toUpperCase();
+    if (source.is_forming && (marketState !== "REGULAR" || quoteEasternDate(quote) !== source.date)) return null;
     const coordinate = payload.price_coordinate || {};
     let factor = 1;
     if (coordinate.basis === "split_dividend_adjusted") {
@@ -1635,10 +1640,10 @@
     }
     const sourceCandles = payload.daily?.candles || [];
     const lastDate = sourceCandles[sourceCandles.length - 1]?.date;
-    if (lastDate && source.date < lastDate) return null;
+    if (lastDate && (source.is_forming ? source.date < lastDate : source.date <= lastDate)) return null;
     const open = Number(source.open) * factor;
     let close = Number(source.close) * factor;
-    const forming = Boolean(source.is_forming) && String(quote.market_state || "").toUpperCase() === "REGULAR";
+    const forming = Boolean(source.is_forming) && marketState === "REGULAR";
     if (forming && Number.isFinite(Number(adjustedSpot)) && Number(adjustedSpot) > 0) close = Number(adjustedSpot);
     const high = Math.max(Number(source.high) * factor, open, close);
     const low = Math.min(Number(source.low) * factor, open, close);

@@ -72,11 +72,12 @@ func (s *Service) intradayChanAnalysis(c *gin.Context) {
 }
 
 func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, string, bool) {
+	now := time.Now()
 	// Both periods derive from the same 15-minute series, so one cache entry per
 	// symbol covers them and switching periods reuses the fetch.
 	s.intradayMu.Lock()
 	memoryCached, memoryFound := s.intradayHistoryCache[symbol]
-	if memoryFound && time.Since(memoryCached.fetchedAt) < 3*time.Minute {
+	if memoryFound && now.Sub(memoryCached.fetchedAt) < 3*time.Minute && !intradayPostCloseRefreshNeeded(memoryCached, now) {
 		memoryCached.lastAccess = time.Now()
 		s.intradayHistoryCache[symbol] = memoryCached
 		s.intradayMu.Unlock()
@@ -93,7 +94,7 @@ func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, stri
 					persisted = intradayCacheEntry{frame: bars, fetchedAt: fetchedAt, lastAccess: time.Now()}
 					persistedSource = "sqlite"
 				}
-				if !persisted.fetchedAt.IsZero() && time.Since(persisted.fetchedAt) < 3*time.Minute {
+				if !persisted.fetchedAt.IsZero() && now.Sub(persisted.fetchedAt) < 3*time.Minute && !intradayPostCloseRefreshNeeded(persisted, now) {
 					s.intradayMu.Lock()
 					if s.intradayHistoryCache == nil {
 						s.intradayHistoryCache = make(map[string]intradayCacheEntry)
@@ -125,6 +126,29 @@ func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, stri
 		return intradayCacheEntry{}, "none", "盘中历史刷新暂不可用，请稍候重试", false
 	}
 	return intradayCacheEntry{}, "none", "盘中历史正在获取，请稍候", true
+}
+
+func intradayPostCloseRefreshNeeded(entry intradayCacheEntry, now time.Time) bool {
+	if len(entry.frame) == 0 || entry.fetchedAt.IsZero() {
+		return false
+	}
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	localNow := now.In(location)
+	if !marketcalendar.IsTradingDay(localNow) {
+		return false
+	}
+	closeMinute := marketcalendar.RegularCloseMinute(localNow)
+	closeAt := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, location).
+		Add(time.Duration(closeMinute) * time.Minute)
+	if localNow.Before(closeAt) || !entry.fetchedAt.Before(closeAt) {
+		return false
+	}
+	today := localNow.Format(time.DateOnly)
+	date, _ := entry.frame[len(entry.frame)-1]["date"].(string)
+	return strings.HasPrefix(date, today)
 }
 
 // scheduleIntradayRefresh fetches stale intraday history without holding the
