@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"log"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -208,6 +210,7 @@ func (s *Service) scheduleIntradayRefresh(symbol string) bool {
 			log.Printf("background intraday history refresh failed symbol=%s: %v", symbol, err)
 			s.intradayMu.Lock()
 			s.intradayRefreshAfter[symbol] = time.Now().Add(30 * time.Second)
+			trimSymbolStateCache(s.intradayRefreshAfter, symbol, s.cfg.LowMemory, func(at time.Time) time.Time { return at })
 			s.intradayMu.Unlock()
 			return
 		}
@@ -519,10 +522,56 @@ func chanAnalysisCacheKey(symbol string, daily, intraday, market []chananalysis.
 		Intraday: intraday,
 		Market:   market,
 	}
-	encoded, _ := json.Marshal(payload)
-	digest := sha256.Sum256(encoded)
-	return "chan-adjusted-v2:" + hex.EncodeToString(digest[:])
+	state := chanAnalysisHashPool.Get().(*chanAnalysisHashState)
+	state.digest.Reset()
+	state.writer.reset()
+	_ = state.encoder.Encode(payload)
+	var digest [sha256.Size]byte
+	digestBytes := state.digest.Sum(digest[:0])
+	key := "chan-adjusted-v2:" + hex.EncodeToString(digestBytes)
+	chanAnalysisHashPool.Put(state)
+	return key
 }
+
+type chanAnalysisHashWriter struct {
+	digest  hash.Hash
+	last    [1]byte
+	pending bool
+}
+
+// Write 延迟写入最后一个字节，以去掉 Encoder 追加的换行并保留旧缓存键。
+func (writer *chanAnalysisHashWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if writer.pending {
+		_, _ = writer.digest.Write(writer.last[:])
+	}
+	if len(data) > 1 {
+		_, _ = writer.digest.Write(data[:len(data)-1])
+	}
+	writer.last[0] = data[len(data)-1]
+	writer.pending = true
+	return len(data), nil
+}
+
+func (writer *chanAnalysisHashWriter) reset() {
+	writer.last[0] = 0
+	writer.pending = false
+}
+
+type chanAnalysisHashState struct {
+	digest  hash.Hash
+	writer  chanAnalysisHashWriter
+	encoder *json.Encoder
+}
+
+var chanAnalysisHashPool = sync.Pool{New: func() any {
+	state := &chanAnalysisHashState{digest: sha256.New()}
+	state.writer.digest = state.digest
+	state.encoder = json.NewEncoder(&state.writer)
+	return state
+}}
 
 func completedChanDailyBarsForCache(input []chananalysis.Bar, cutoff time.Time) []chananalysis.Bar {
 	location, err := time.LoadLocation("America/New_York")
@@ -1110,6 +1159,7 @@ func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string, force boo
 			log.Printf("background adjusted Chan history refresh failed symbol=%s: %v", symbol, err)
 			s.chanAdjustedMu.Lock()
 			s.chanAdjustedRetryAfter[cacheKey] = time.Now().Add(30 * time.Second)
+			trimSymbolStateCache(s.chanAdjustedRetryAfter, cacheKey, s.cfg.LowMemory, func(at time.Time) time.Time { return at })
 			s.chanAdjustedMu.Unlock()
 			return
 		}
@@ -1117,6 +1167,7 @@ func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string, force boo
 			log.Printf("background adjusted Chan history SQLite write failed symbol=%s: %v", symbol, err)
 			s.chanAdjustedMu.Lock()
 			s.chanAdjustedRetryAfter[cacheKey] = time.Now().Add(30 * time.Second)
+			trimSymbolStateCache(s.chanAdjustedRetryAfter, cacheKey, s.cfg.LowMemory, func(at time.Time) time.Time { return at })
 			s.chanAdjustedMu.Unlock()
 			return
 		}
@@ -1137,6 +1188,7 @@ func (s *Service) scheduleChanAdjustedRefresh(cacheKey, symbol string, force boo
 			// same five-year request on every page view when the symbol has not
 			// traded for five years yet.
 			s.chanAdjustedRetryAfter[cacheKey] = time.Now().Add(chanAdjustedHistoryRetryDelay)
+			trimSymbolStateCache(s.chanAdjustedRetryAfter, cacheKey, s.cfg.LowMemory, func(at time.Time) time.Time { return at })
 		}
 		s.chanAdjustedMu.Unlock()
 		s.publishAnalyticsEvent(symbol, result.FetchedAt)

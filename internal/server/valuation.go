@@ -1240,7 +1240,13 @@ func (s *Service) scheduleValuationAfterSnapshot(symbol string, quote *model.Quo
 		copied := *quote
 		snapshot = &copied
 	}
+	s.mu.Lock()
+	if s.background.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
 	s.backgroundWG.Add(1)
+	s.mu.Unlock()
 	go func() {
 		defer s.backgroundWG.Done()
 		timer := time.NewTimer(lowMemoryValuationDelay)
@@ -1268,6 +1274,10 @@ func (s *Service) scheduleValuationWithQuote(symbol string, quote *model.Quote) 
 		return
 	}
 	s.mu.Lock()
+	if s.background.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
 	if s.valuationJobs[symbol] {
 		s.mu.Unlock()
 		return
@@ -1279,6 +1289,7 @@ func (s *Service) scheduleValuationWithQuote(symbol string, quote *model.Quote) 
 		return
 	}
 	s.valuationAttempts[symbol] = time.Now()
+	trimSymbolStateCache(s.valuationAttempts, symbol, s.cfg.LowMemory, func(at time.Time) time.Time { return at })
 	s.valuationJobs[symbol] = true
 	s.backgroundWG.Add(1)
 	ctx := s.background

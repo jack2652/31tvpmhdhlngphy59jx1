@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,8 +23,9 @@ import (
 )
 
 const (
-	defaultCboeOptionsURL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{symbol}.json"
-	defaultCboeCacheTTL   = 15 * time.Second
+	defaultCboeOptionsURL       = "https://cdn.cboe.com/api/global/delayed_quotes/options/{symbol}.json"
+	defaultCboeCacheTTL         = 15 * time.Second
+	maxCboeOptionsResponseBytes = 16 << 20
 )
 
 var (
@@ -273,28 +273,173 @@ func (c *CboeOptionsClient) fetchUncached(ctx context.Context, symbol string, ga
 		return CboeOptionsPayloadDTO{}, fmt.Errorf("Cboe 请求失败（HTTP %d）：%s", response.StatusCode, detail)
 	}
 	var payload CboeOptionsPayloadDTO
-	body, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
-	if err != nil {
-		return CboeOptionsPayloadDTO{}, fmt.Errorf("read Cboe options response: %w", err)
+	limitedBody := &io.LimitedReader{R: response.Body, N: maxCboeOptionsResponseBytes + 1}
+	bodyReader := &utf8ValidatingReader{source: limitedBody}
+	decoder := json.NewDecoder(bodyReader)
+	decodeErr := decoder.Decode(&payload)
+	if bodyReader.readErr != nil {
+		return CboeOptionsPayloadDTO{}, fmt.Errorf("read Cboe options response: %w", bodyReader.readErr)
 	}
-	if !utf8.Valid(body) {
-		return CboeOptionsPayloadDTO{}, errors.New("decode Cboe options response: invalid UTF-8")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	if err := decoder.Decode(&payload); err != nil {
-		return CboeOptionsPayloadDTO{}, fmt.Errorf("decode Cboe options response: %w", err)
+	if decodeErr != nil {
+		if limitedBody.N == 0 {
+			return CboeOptionsPayloadDTO{}, fmt.Errorf("decode Cboe options response: exceeds %d-byte limit", maxCboeOptionsResponseBytes)
+		}
+		return CboeOptionsPayloadDTO{}, fmt.Errorf("decode Cboe options response: %w", decodeErr)
 	}
 	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
+	trailingErr := decoder.Decode(&trailing)
+	if bodyReader.readErr != nil {
+		return CboeOptionsPayloadDTO{}, fmt.Errorf("read Cboe options response: %w", bodyReader.readErr)
+	}
+	if trailingErr != io.EOF {
+		if limitedBody.N == 0 {
+			return CboeOptionsPayloadDTO{}, fmt.Errorf("decode Cboe options response: exceeds %d-byte limit", maxCboeOptionsResponseBytes)
+		}
+		if trailingErr == nil {
 			return CboeOptionsPayloadDTO{}, errors.New("decode Cboe options response: multiple JSON values")
 		}
-		return CboeOptionsPayloadDTO{}, fmt.Errorf("decode Cboe options response: %w", err)
+		return CboeOptionsPayloadDTO{}, fmt.Errorf("decode Cboe options response: %w", trailingErr)
+	}
+	if limitedBody.N == 0 {
+		return CboeOptionsPayloadDTO{}, fmt.Errorf("decode Cboe options response: exceeds %d-byte limit", maxCboeOptionsResponseBytes)
 	}
 	if payload.Data == nil || payload.Data.Options == nil {
 		return CboeOptionsPayloadDTO{}, errors.New("Cboe options response is missing data.options")
 	}
 	return payload, nil
+}
+
+type utf8ValidatingReader struct {
+	source       io.Reader
+	pending      [utf8.UTFMax]byte
+	pendingSize  int
+	pendingValid bool
+	pendingErr   error
+	invalid      bool
+	readErr      error
+}
+
+// Read 按块校验 UTF-8，并暂存分块边界上的不完整字符。
+func (reader *utf8ValidatingReader) Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
+	if reader.invalid {
+		return 0, errors.New("invalid UTF-8")
+	}
+	if reader.pendingSize > 0 {
+		if !reader.pendingValid {
+			if err := reader.completePendingRune(); err != nil {
+				return 0, err
+			}
+			if !reader.pendingValid {
+				return 0, nil
+			}
+		}
+		readSize := copy(buffer, reader.pending[:reader.pendingSize])
+		copy(reader.pending[:], reader.pending[readSize:reader.pendingSize])
+		reader.pendingSize -= readSize
+		if reader.pendingSize == 0 {
+			reader.pendingValid = false
+		}
+		return readSize, nil
+	}
+	if reader.pendingErr != nil {
+		err := reader.pendingErr
+		reader.pendingErr = nil
+		return 0, err
+	}
+	readSize, readErr := reader.source.Read(buffer)
+	if readErr != nil && readErr != io.EOF && reader.readErr == nil {
+		reader.readErr = readErr
+	}
+	if readSize == 0 {
+		return 0, readErr
+	}
+	if utf8.Valid(buffer[:readSize]) {
+		return readSize, readErr
+	}
+	for tailSize := 1; tailSize < utf8.UTFMax && tailSize <= readSize; tailSize++ {
+		validSize := readSize - tailSize
+		if utf8.FullRune(buffer[validSize:readSize]) || !utf8.Valid(buffer[:validSize]) {
+			continue
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				reader.invalid = true
+				return validSize, errors.New("invalid UTF-8")
+			}
+			return validSize, readErr
+		}
+		reader.pendingSize = copy(reader.pending[:], buffer[validSize:readSize])
+		if validSize > 0 {
+			return validSize, nil
+		}
+		if err := reader.completePendingRune(); err != nil {
+			return 0, err
+		}
+		if !reader.pendingValid {
+			return 0, nil
+		}
+		copied := copy(buffer, reader.pending[:reader.pendingSize])
+		copy(reader.pending[:], reader.pending[copied:reader.pendingSize])
+		reader.pendingSize -= copied
+		if reader.pendingSize == 0 {
+			reader.pendingValid = false
+		}
+		return copied, nil
+	}
+	reader.invalid = true
+	return 0, errors.New("invalid UTF-8")
+}
+
+func (reader *utf8ValidatingReader) completePendingRune() error {
+	width := utf8EncodedRuneWidth(reader.pending[0])
+	if width == 0 {
+		reader.invalid = true
+		return errors.New("invalid UTF-8")
+	}
+	for reader.pendingSize < width {
+		readSize, err := reader.source.Read(reader.pending[reader.pendingSize:width])
+		reader.pendingSize += readSize
+		if err == io.EOF {
+			if reader.pendingSize < width {
+				reader.invalid = true
+				return errors.New("invalid UTF-8")
+			}
+			reader.pendingErr = io.EOF
+		} else if err != nil {
+			if reader.readErr == nil {
+				reader.readErr = err
+			}
+			return err
+		}
+		if readSize == 0 && err == nil {
+			return nil
+		}
+	}
+	if !utf8.Valid(reader.pending[:width]) {
+		reader.invalid = true
+		return errors.New("invalid UTF-8")
+	}
+	reader.pendingSize = width
+	reader.pendingValid = true
+	return nil
+}
+
+func utf8EncodedRuneWidth(first byte) int {
+	switch {
+	case first < utf8.RuneSelf:
+		return 1
+	case first >= 0xc2 && first <= 0xdf:
+		return 2
+	case first >= 0xe0 && first <= 0xef:
+		return 3
+	case first >= 0xf0 && first <= 0xf4:
+		return 4
+	default:
+		return 0
+	}
 }
 
 // Quote returns the delayed underlying price embedded in Cboe's option snapshot.
@@ -451,15 +596,11 @@ func cboeChainRowsFromPayload(symbol, expiration string, payload CboeOptionsPayl
 }
 
 func decodeCboeOption(raw json.RawMessage) (CboeOptionDTO, bool) {
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+	var row *CboeOptionDTO
+	if err := json.Unmarshal(raw, &row); err != nil || row == nil {
 		return CboeOptionDTO{}, false
 	}
-	var row CboeOptionDTO
-	if err := json.Unmarshal(raw, &row); err != nil {
-		return CboeOptionDTO{}, false
-	}
-	return row, true
+	return *row, true
 }
 
 func cboeMarketState(moment time.Time) string {

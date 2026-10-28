@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
@@ -26,7 +25,9 @@ import (
 )
 
 const (
-	optionsURL = "https://query1.finance.yahoo.com/v7/finance/options/%s"
+	optionsURL                     = "https://query1.finance.yahoo.com/v7/finance/options/%s"
+	lowMemoryQuoteTickerCacheLimit = 128
+	defaultQuoteTickerCacheLimit   = 512
 )
 
 var symbolPattern = regexp.MustCompile(`^[A-Z0-9][A-Z0-9.\-]{0,9}$`)
@@ -48,9 +49,11 @@ type Yahoo struct {
 	// authentication handshake once per process instead of on every refresh.
 	// Only Quote uses these; option-chain and fundamentals keep short-lived
 	// tickers so their own caches cannot serve stale data.
-	quoteTickersMu  sync.Mutex
-	quoteTickers    map[string]yahooTicker
-	quoteTickerInit map[string]*yahooTickerInit
+	quoteTickersMu      sync.Mutex
+	quoteTickers        map[string]yahooTickerCacheEntry
+	quoteTickerInit     map[string]*yahooTickerInit
+	quoteTickerCacheMax int
+	quoteTickerSequence uint64
 	// interactiveGate reserves upstream slots for the first-render requests
 	// (current price and expiration catalogue). Option chains, Gamma batches,
 	// fundamentals, and history share semaphore; without a separate gate a
@@ -63,6 +66,18 @@ type yahooTickerInit struct {
 	done   chan struct{}
 	ticker yahooTicker
 	err    error
+}
+
+type yahooTickerCacheEntry struct {
+	ticker   yahooTicker
+	lastUsed uint64
+}
+
+func boundedQuoteTickerCacheEntries(lowMemory bool) int {
+	if lowMemory {
+		return lowMemoryQuoteTickerCacheLimit
+	}
+	return defaultQuoteTickerCacheLimit
 }
 
 type yahooCrumbGetter interface {
@@ -91,10 +106,14 @@ func NewYahoo(timeout time.Duration, concurrency int) *Yahoo {
 	fundamentals.Gate, fundamentals.GateWait = semaphore, timeout
 	earnings := NewYahooEarningsClient(client)
 	earnings.Gate, earnings.GateWait = semaphore, timeout
-	return &Yahoo{client: client, optionsURL: optionsURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTicker), quoteTickerInit: make(map[string]*yahooTickerInit), interactiveGate: interactiveGate}
+	return &Yahoo{client: client, optionsURL: optionsURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTickerCacheEntry), quoteTickerInit: make(map[string]*yahooTickerInit), quoteTickerCacheMax: boundedQuoteTickerCacheEntries(false), interactiveGate: interactiveGate}
 }
 
 func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress string) (*Yahoo, error) {
+	return newYahooWithProxy(timeout, concurrency, proxyAddress, false)
+}
+
+func newYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress string, lowMemory bool) (*Yahoo, error) {
 	if timeout <= 0 {
 		timeout = 12 * time.Second
 	}
@@ -133,20 +152,21 @@ func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress stri
 	fundamentals.tickerFactory = tickerFactory
 	earnings.tickerFactory = tickerFactory
 	return &Yahoo{
-		client:          client,
-		authClient:      authClient,
-		optionsAuth:     optionsAuth,
-		optionsURL:      optionsURL,
-		fundamentals:    fundamentals,
-		earnings:        earnings,
-		tickerFactory:   tickerFactory,
-		timeout:         timeout,
-		gateWait:        timeout,
-		semaphore:       semaphore,
-		now:             time.Now,
-		quoteTickers:    make(map[string]yahooTicker),
-		quoteTickerInit: make(map[string]*yahooTickerInit),
-		interactiveGate: interactiveGate,
+		client:              client,
+		authClient:          authClient,
+		optionsAuth:         optionsAuth,
+		optionsURL:          optionsURL,
+		fundamentals:        fundamentals,
+		earnings:            earnings,
+		tickerFactory:       tickerFactory,
+		timeout:             timeout,
+		gateWait:            timeout,
+		semaphore:           semaphore,
+		now:                 time.Now,
+		quoteTickers:        make(map[string]yahooTickerCacheEntry),
+		quoteTickerInit:     make(map[string]*yahooTickerInit),
+		quoteTickerCacheMax: boundedQuoteTickerCacheEntries(lowMemory),
+		interactiveGate:     interactiveGate,
 	}, nil
 }
 
@@ -183,9 +203,12 @@ func (y *Yahoo) quoteTicker(ctx context.Context, symbol string) (yahooTicker, er
 		return nil, errors.New("go-yfinance ticker factory is unavailable")
 	}
 	y.quoteTickersMu.Lock()
-	if ticker, ok := y.quoteTickers[symbol]; ok {
+	if entry, ok := y.quoteTickers[symbol]; ok {
+		y.quoteTickerSequence++
+		entry.lastUsed = y.quoteTickerSequence
+		y.quoteTickers[symbol] = entry
 		y.quoteTickersMu.Unlock()
-		return ticker, nil
+		return entry.ticker, nil
 	}
 	if pending := y.quoteTickerInit[symbol]; pending != nil {
 		y.quoteTickersMu.Unlock()
@@ -204,13 +227,41 @@ func (y *Yahoo) quoteTicker(ctx context.Context, symbol string) (yahooTicker, er
 	if err != nil {
 		pending.err = err
 	} else {
-		y.quoteTickers[symbol] = ticker
+		y.cacheQuoteTickerLocked(symbol, ticker)
 		pending.ticker = ticker
 	}
 	delete(y.quoteTickerInit, symbol)
 	close(pending.done)
 	y.quoteTickersMu.Unlock()
 	return pending.ticker, pending.err
+}
+
+func (y *Yahoo) cacheQuoteTickerLocked(symbol string, ticker yahooTicker) {
+	limit := y.quoteTickerCacheMax
+	if limit < 1 {
+		limit = lowMemoryQuoteTickerCacheLimit
+	}
+	if len(y.quoteTickers) >= limit {
+		target := limit * 9 / 10
+		if target >= limit {
+			target = limit - 1
+		}
+		for len(y.quoteTickers) > target {
+			oldestSymbol := ""
+			oldestUse := ^uint64(0)
+			for cachedSymbol, entry := range y.quoteTickers {
+				if entry.lastUsed < oldestUse {
+					oldestSymbol, oldestUse = cachedSymbol, entry.lastUsed
+				}
+			}
+			if oldestSymbol == "" {
+				break
+			}
+			delete(y.quoteTickers, oldestSymbol)
+		}
+	}
+	y.quoteTickerSequence++
+	y.quoteTickers[symbol] = yahooTickerCacheEntry{ticker: ticker, lastUsed: y.quoteTickerSequence}
 }
 
 // Fundamentals fetches optional Yahoo financial inputs used by valuation. It is
@@ -639,114 +690,139 @@ type yahooOptionExtensions struct {
 	} `json:"optionChain"`
 }
 
-// The SDK's option model omits Gamma and field-presence information.
 type yahooOptionContractExtension struct {
-	fields         map[string]json.RawMessage
-	contractSymbol string
-	gamma          float64
+	ContractSymbol    string               `json:"contractSymbol"`
+	Strike            yahooJSONFloat       `json:"strike"`
+	LastPrice         yahooJSONFloat       `json:"lastPrice"`
+	Bid               yahooJSONFloat       `json:"bid"`
+	Ask               yahooJSONFloat       `json:"ask"`
+	PercentChange     yahooJSONFloat       `json:"percentChange"`
+	Volume            yahooJSONInt         `json:"volume"`
+	OpenInterest      yahooJSONInt         `json:"openInterest"`
+	ImpliedVolatility yahooJSONFloat       `json:"impliedVolatility"`
+	InTheMoney        yahooJSONBool        `json:"inTheMoney"`
+	Gamma             yahooJSONStrictFloat `json:"gamma"`
 }
 
-func (contract *yahooOptionContractExtension) UnmarshalJSON(data []byte) error {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
+type yahooJSONFloat struct {
+	value   float64
+	present bool
+	valid   bool
+}
+
+func (value *yahooJSONFloat) UnmarshalJSON(data []byte) error {
+	*value = yahooJSONFloat{present: true}
+	if isJSONNull(data) {
+		return nil
 	}
-	contract.fields = make(map[string]json.RawMessage, 11)
-	for _, name := range []string{
-		"contractSymbol", "strike", "lastPrice", "bid", "ask", "percentChange",
-		"volume", "openInterest", "impliedVolatility", "inTheMoney", "gamma",
-	} {
-		if raw, ok := fields[name]; ok {
-			contract.fields[name] = raw
-		}
+	if err := json.Unmarshal(data, &value.value); err == nil {
+		value.valid = true
+		return nil
 	}
-	if raw := contract.fields["contractSymbol"]; len(raw) > 0 && !isJSONNull(raw) {
-		if err := json.Unmarshal(raw, &contract.contractSymbol); err != nil {
-			return err
-		}
-	}
-	if raw := contract.fields["gamma"]; len(raw) > 0 && !isJSONNull(raw) {
-		if err := json.Unmarshal(raw, &contract.gamma); err != nil {
-			return err
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+		if err == nil {
+			value.value = parsed
+			value.valid = true
 		}
 	}
 	return nil
 }
 
-func (contract yahooOptionContractExtension) float(name string, value float64) *float64 {
-	raw, ok := contract.fields[name]
-	if !ok {
-		// The SDK model remains authoritative when the dated raw extension is
-		// missing a contract or field. Its non-zero values are still useful; a
-		// zero without raw presence cannot be distinguished from an omitted field.
-		if value != 0 {
-			return &value
-		}
+func yahooFloatPointer(value yahooJSONFloat) *float64 {
+	if !value.present || !value.valid || math.IsNaN(value.value) || math.IsInf(value.value, 0) {
 		return nil
 	}
-	if isJSONNull(raw) {
-		return nil
-	}
-	var parsed float64
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		var text string
-		if json.Unmarshal(raw, &text) != nil {
-			return nil
-		}
-		parsed, err = strconv.ParseFloat(strings.TrimSpace(text), 64)
-		if err != nil {
-			return nil
-		}
-	}
-	if math.IsNaN(parsed) || math.IsInf(parsed, 0) {
-		return nil
-	}
+	parsed := value.value
 	return &parsed
 }
 
-func (contract yahooOptionContractExtension) integer(name string, value int64) *int64 {
-	raw, ok := contract.fields[name]
-	if !ok {
-		if value != 0 {
-			return &value
-		}
+type yahooJSONStrictFloat struct {
+	value   float64
+	present bool
+	null    bool
+}
+
+func (value *yahooJSONStrictFloat) UnmarshalJSON(data []byte) error {
+	*value = yahooJSONStrictFloat{present: true}
+	if isJSONNull(data) {
+		value.null = true
 		return nil
 	}
-	if isJSONNull(raw) {
+	return json.Unmarshal(data, &value.value)
+}
+
+func yahooStrictFloatPointer(value yahooJSONStrictFloat) *float64 {
+	if !value.present || value.null || math.IsNaN(value.value) || math.IsInf(value.value, 0) {
 		return nil
 	}
-	var parsed int64
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		var text string
-		if json.Unmarshal(raw, &text) != nil {
-			return nil
-		}
-		parsed, err = strconv.ParseInt(strings.TrimSpace(text), 10, 64)
-		if err != nil {
-			return nil
-		}
-	}
+	parsed := value.value
 	return &parsed
 }
 
-func (contract yahooOptionContractExtension) boolKnown(name string, sdkValue bool) bool {
-	raw, ok := contract.fields[name]
-	if !ok {
-		return sdkValue
-	}
-	return !isJSONNull(raw)
+type yahooJSONInt struct {
+	value   int64
+	present bool
+	valid   bool
 }
 
-func (contract yahooOptionContractExtension) boolValue(name string, fallback bool) bool {
-	raw, ok := contract.fields[name]
-	if !ok || isJSONNull(raw) {
+func (value *yahooJSONInt) UnmarshalJSON(data []byte) error {
+	*value = yahooJSONInt{present: true}
+	if isJSONNull(data) {
+		return nil
+	}
+	if err := json.Unmarshal(data, &value.value); err == nil {
+		value.valid = true
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		parsed, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+		if err == nil {
+			value.value = parsed
+			value.valid = true
+		}
+	}
+	return nil
+}
+
+func yahooIntPointer(value yahooJSONInt) *int64 {
+	if !value.present || !value.valid {
+		return nil
+	}
+	parsed := value.value
+	return &parsed
+}
+
+type yahooJSONBool struct {
+	value   bool
+	present bool
+	null    bool
+	valid   bool
+}
+
+func (value *yahooJSONBool) UnmarshalJSON(data []byte) error {
+	*value = yahooJSONBool{present: true}
+	if isJSONNull(data) {
+		value.null = true
+		return nil
+	}
+	if err := json.Unmarshal(data, &value.value); err == nil {
+		value.valid = true
+	}
+	return nil
+}
+
+func (value yahooJSONBool) known() bool {
+	return value.present && !value.null
+}
+
+func (value yahooJSONBool) boolOr(fallback bool) bool {
+	if !value.present || value.null || !value.valid {
 		return fallback
 	}
-	var value bool
-	if json.Unmarshal(raw, &value) != nil {
-		return fallback
-	}
-	return value
+	return value.value
 }
 
 func isJSONNull(raw json.RawMessage) bool {
@@ -889,15 +965,15 @@ func yahooOptionRows(selected yahooOptionExpiration, expiration string) []model.
 	appendRows := func(contracts []yahooOptionContractExtension, kind string) {
 		for _, extension := range contracts {
 			rows = append(rows, model.OptionRow{
-				ContractSymbol: extension.contractSymbol, Provider: "yahoo-options", ContractType: kind,
-				Strike: extension.float("strike", 0), LastPrice: extension.float("lastPrice", 0),
-				Bid: extension.float("bid", 0), Ask: extension.float("ask", 0),
-				Volume: extension.integer("volume", 0), OpenInterest: extension.integer("openInterest", 0),
-				ImpliedVolatility: extension.float("impliedVolatility", 0),
-				Gamma:             extension.float("gamma", extension.gamma),
-				InTheMoney:        extension.boolValue("inTheMoney", false),
-				InTheMoneyKnown:   extension.boolKnown("inTheMoney", false),
-				ChangePercent:     extension.float("percentChange", 0), Expiration: expiration,
+				ContractSymbol: extension.ContractSymbol, Provider: "yahoo-options", ContractType: kind,
+				Strike: yahooFloatPointer(extension.Strike), LastPrice: yahooFloatPointer(extension.LastPrice),
+				Bid: yahooFloatPointer(extension.Bid), Ask: yahooFloatPointer(extension.Ask),
+				Volume: yahooIntPointer(extension.Volume), OpenInterest: yahooIntPointer(extension.OpenInterest),
+				ImpliedVolatility: yahooFloatPointer(extension.ImpliedVolatility),
+				Gamma:             yahooStrictFloatPointer(extension.Gamma),
+				InTheMoney:        extension.InTheMoney.boolOr(false),
+				InTheMoneyKnown:   extension.InTheMoney.known(),
+				ChangePercent:     yahooFloatPointer(extension.PercentChange), Expiration: expiration,
 			})
 		}
 	}
@@ -961,15 +1037,7 @@ func (y *Yahoo) getOptionsWithCrumb(ctx context.Context, endpoint string, query 
 		if fetched.response.StatusCode < http.StatusOK || fetched.response.StatusCode >= http.StatusMultipleChoices {
 			return &yahooHTTPStatusError{status: fetched.response.StatusCode}
 		}
-		decoder := json.NewDecoder(strings.NewReader(fetched.response.Body))
-		if err := decoder.Decode(target); err != nil {
-			return fmt.Errorf("decode Yahoo options response: %w", err)
-		}
-		var trailing any
-		if err := decoder.Decode(&trailing); err != io.EOF {
-			if err == nil {
-				return errors.New("decode Yahoo options response: unexpected trailing JSON")
-			}
+		if err := json.Unmarshal([]byte(fetched.response.Body), target); err != nil {
 			return fmt.Errorf("decode Yahoo options response: %w", err)
 		}
 		return nil

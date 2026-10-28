@@ -153,6 +153,7 @@ func (s *Service) scheduleHistoryRefresh(symbol, period string, maxAge time.Dura
 		} else {
 			s.mu.Lock()
 			s.historyRefreshAfter[key] = time.Now().Add(30 * time.Second)
+			trimSymbolStateCache(s.historyRefreshAfter, key, s.cfg.LowMemory, func(at time.Time) time.Time { return at })
 			s.mu.Unlock()
 		}
 		if warning, _ := result["warning"].(string); warning != "" && ctx.Err() == nil {
@@ -300,24 +301,47 @@ func (s *Service) loadExtremes(ctx context.Context, symbol string, history map[s
 	if usableFreshExtremes(latest, history, s.cfg.ExtremesMaxAge) {
 		return map[string]any{"extremes": latest["extremes"], "fetched_at": latest["fetched_at"], "source": "sqlite", "warning": nil}
 	}
-	loader, ok := s.provider.(HistoryProvider)
-	if !ok {
-		return map[string]any{"extremes": cached["extremes"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["extremes"], cached["fetched_at"]), "warning": "market provider does not support daily history"}
+	var payload map[string]any
+	var fetchedAt time.Time
+	var compactClient provider.PriceExtremesHistoryClient
+	if source, ok := s.provider.(provider.PriceExtremesHistorySource); ok {
+		compactClient = source.PriceExtremesHistoryClient()
 	}
-	result, fetchErr := guardedHistoryCall(s, ctx, func() (provider.HistoryResult, error) {
-		return loader.History(ctx, symbol, "max")
-	})
-	if fetchErr != nil {
-		return map[string]any{"extremes": cached["extremes"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["extremes"], cached["fetched_at"]), "warning": fetchErr.Error()}
+	if compactClient != nil {
+		type compactHistoryFetch struct {
+			points    []provider.HistoryExtremePoint
+			fetchedAt time.Time
+		}
+		result, fetchErr := guardedHistoryCall(s, ctx, func() (compactHistoryFetch, error) {
+			points, fetchedAt, err := compactClient.FetchPriceExtremes(ctx, symbol)
+			return compactHistoryFetch{points: points, fetchedAt: fetchedAt}, err
+		})
+		if fetchErr != nil {
+			return map[string]any{"extremes": cached["extremes"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["extremes"], cached["fetched_at"]), "warning": fetchErr.Error()}
+		}
+		payload = calculatePriceExtremesPoints(result.points)
+		fetchedAt = result.fetchedAt
+	} else {
+		loader, ok := s.provider.(HistoryProvider)
+		if !ok {
+			return map[string]any{"extremes": cached["extremes"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["extremes"], cached["fetched_at"]), "warning": "market provider does not support daily history"}
+		}
+		result, fetchErr := guardedHistoryCall(s, ctx, func() (provider.HistoryResult, error) {
+			return loader.History(ctx, symbol, "max")
+		})
+		if fetchErr != nil {
+			return map[string]any{"extremes": cached["extremes"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["extremes"], cached["fetched_at"]), "warning": fetchErr.Error()}
+		}
+		payload = calculatePriceExtremes(result.Bars)
+		fetchedAt = result.FetchedAt
 	}
-	payload := calculatePriceExtremes(result.Bars)
 	if payload == nil {
 		return map[string]any{"extremes": cached["extremes"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["extremes"], cached["fetched_at"]), "warning": "upstream history contains no valid high/low bars"}
 	}
-	if err := s.store.WritePayload("price_extremes", symbol, payload, result.FetchedAt); err != nil {
+	if err := s.store.WritePayload("price_extremes", symbol, payload, fetchedAt); err != nil {
 		return map[string]any{"extremes": cached["extremes"], "fetched_at": cached["fetched_at"], "source": cacheSource(cached["extremes"], cached["fetched_at"]), "warning": err.Error()}
 	}
-	return map[string]any{"extremes": payload, "fetched_at": result.FetchedAt, "source": "upstream", "warning": nil}
+	return map[string]any{"extremes": payload, "fetched_at": fetchedAt, "source": "upstream", "warning": nil}
 }
 
 // A previous go-yfinance range=max daily request could be silently coarsened
@@ -554,44 +578,56 @@ func historyLeaseWait(lowMemory bool) time.Duration {
 }
 
 func calculatePriceExtremes(bars []map[string]any) map[string]any {
-	type point struct {
-		day             string
-		high, low       float64
-		hasHigh, hasLow bool
-	}
-	points := make([]point, 0, len(bars))
+	points := make([]provider.HistoryExtremePoint, 0, len(bars))
 	for _, bar := range bars {
 		day, ok := bar["date"].(string)
 		if !ok || len(day) < 10 {
 			continue
 		}
-		if _, err := time.Parse("2006-01-02", day[:10]); err != nil {
+		parsedDay, err := time.Parse(time.DateOnly, day[:10])
+		if err != nil {
 			continue
 		}
 		high, highOK := numericHistoryValue(bar["high"])
 		low, lowOK := numericHistoryValue(bar["low"])
-		points = append(points, point{day: day[:10], high: high, low: low, hasHigh: highOK, hasLow: lowOK})
+		points = append(points, provider.HistoryExtremePoint{
+			Date: parsedDay, High: high, Low: low, HasHigh: highOK, HasLow: lowOK,
+		})
 	}
+	return calculatePriceExtremesPoints(points)
+}
+
+func calculatePriceExtremesPoints(points []provider.HistoryExtremePoint) map[string]any {
+	valid := points[:0]
+	for _, point := range points {
+		if !point.Date.IsZero() {
+			valid = append(valid, point)
+		}
+	}
+	points = valid
 	if len(points) == 0 {
 		return nil
 	}
-	sort.Slice(points, func(i, j int) bool { return points[i].day < points[j].day })
-	reference, _ := time.Parse("2006-01-02", points[len(points)-1].day)
-	cutoff := reference.AddDate(0, 0, -365).Format("2006-01-02")
-	extreme := func(items []point, wantHigh bool) any {
+	sort.Slice(points, func(i, j int) bool { return points[i].Date.Before(points[j].Date) })
+	reference := points[len(points)-1].Date
+	cutoff := reference.AddDate(0, 0, -365)
+	extreme := func(windowOnly, wantHigh bool) any {
 		bestSet := false
 		var best float64
 		var bestDate string
-		for _, item := range items {
-			value, ok := item.low, item.hasLow
+		for _, item := range points {
+			if windowOnly && item.Date.Before(cutoff) {
+				continue
+			}
+			value, ok := item.Low, item.HasLow
 			if wantHigh {
-				value, ok = item.high, item.hasHigh
+				value, ok = item.High, item.HasHigh
 			}
 			if !ok {
 				continue
 			}
 			if !bestSet || (wantHigh && value > best) || (!wantHigh && value < best) {
-				bestSet, best, bestDate = true, value, item.day
+				bestSet, best, bestDate = true, value, item.Date.Format(time.DateOnly)
 			}
 		}
 		if !bestSet {
@@ -599,16 +635,16 @@ func calculatePriceExtremes(bars []map[string]any) map[string]any {
 		}
 		return map[string]any{"price": roundPythonDecimal(best, 4), "date": bestDate}
 	}
-	window := make([]point, 0, len(points))
+	windowBars := 0
 	for _, item := range points {
-		if item.day >= cutoff {
-			window = append(window, item)
+		if !item.Date.Before(cutoff) {
+			windowBars++
 		}
 	}
 	return map[string]any{
-		"week52":      map[string]any{"high": extreme(window, true), "low": extreme(window, false)},
-		"all_time":    map[string]any{"high": extreme(points, true), "low": extreme(points, false)},
-		"window_days": 365, "reference_date": points[len(points)-1].day, "bars": len(points), "window_bars": len(window),
+		"week52":      map[string]any{"high": extreme(true, true), "low": extreme(true, false)},
+		"all_time":    map[string]any{"high": extreme(false, true), "low": extreme(false, false)},
+		"window_days": 365, "reference_date": reference.Format(time.DateOnly), "bars": len(points), "window_bars": windowBars,
 	}
 }
 

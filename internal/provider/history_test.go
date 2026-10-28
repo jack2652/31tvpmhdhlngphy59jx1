@@ -15,20 +15,97 @@ func TestNormalizeYFinanceHistoryPreservesBarsAndExtremes(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := normalizeYFinanceHistory("QQQ", "max", []ym.Bar{
+		{Date: time.Date(2024, 12, 31, 15, 0, 0, 0, time.UTC), Open: 50, High: 100, Low: 1, Close: 50, Volume: 50},
 		{Date: time.Date(2025, 1, 2, 15, 0, 0, 0, time.UTC), Open: 10, High: 12, Low: 9, Close: 11, Volume: 100},
 		{Date: time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC), Open: 20, High: 24, Low: 18, Close: 22, Volume: 200},
 	}, location)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Source != "" || len(result.Bars) != 2 {
+	if result.Source != "" || len(result.Bars) != 3 {
 		t.Fatalf("unexpected normalized result: %#v", result)
 	}
-	if result.Bars[0]["date"] != "2025-01-02" || result.Bars[1]["close"] != float64(22) {
+	if result.Bars[0]["date"] != "2024-12-31" || result.Bars[2]["close"] != float64(22) {
 		t.Fatalf("unexpected bars: %#v", result.Bars)
 	}
-	if result.AllTimeHigh == nil || *result.AllTimeHigh != 24 || result.AllTimeLow == nil || *result.AllTimeLow != 9 {
+	if result.AllTimeHigh == nil || *result.AllTimeHigh != 100 || result.AllTimeLow == nil || *result.AllTimeLow != 1 {
 		t.Fatalf("unexpected extremes: high=%v low=%v", result.AllTimeHigh, result.AllTimeLow)
+	}
+	if result.FiftyTwoWeekHigh == nil || *result.FiftyTwoWeekHigh != 24 || result.FiftyTwoWeekLow == nil || *result.FiftyTwoWeekLow != 9 {
+		t.Fatalf("unexpected 52-week extremes: high=%v low=%v", result.FiftyTwoWeekHigh, result.FiftyTwoWeekLow)
+	}
+}
+
+func TestNormalizeYFinanceExtremePointsMatchesHistoryOHLCValidity(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bars := []ym.Bar{
+		{Date: time.Date(2024, 12, 31, 15, 0, 0, 0, time.UTC), High: 100, Low: 1, Close: 50, Volume: 50},
+		{Date: time.Date(2025, 1, 2, 15, 0, 0, 0, time.UTC), Close: 11, Volume: 100},
+		{Date: time.Date(2026, 1, 2, 15, 0, 0, 0, time.UTC), High: 24, Low: 18, Close: 22, Volume: 200},
+	}
+	full, err := normalizeYFinanceHistory("QQQ", "max", bars, location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	points, err := normalizeYFinanceExtremePoints(bars, location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != len(full.Bars) {
+		t.Fatalf("compact points=%d, full bars=%d", len(points), len(full.Bars))
+	}
+	for index, point := range points {
+		bar := full.Bars[index]
+		barDate, _ := time.Parse(time.DateOnly, bar["date"].(string))
+		if !point.Date.Equal(barDate) {
+			t.Errorf("point %d date=%s, full bar date=%s", index, point.Date, barDate)
+		}
+		for _, field := range []struct {
+			name string
+			got  float64
+			ok   bool
+		}{
+			{"high", point.High, point.HasHigh}, {"low", point.Low, point.HasLow},
+		} {
+			value, present := bar[field.name].(float64)
+			if field.ok != present || (present && field.got != value) {
+				t.Errorf("point %d %s=(%v,%v), full bar=(%v,%v)", index, field.name, field.got, field.ok, value, present)
+			}
+		}
+	}
+}
+
+func TestFetchYFinancePriceExtremesUsesMaxDailyHistory(t *testing.T) {
+	fixedTime := time.Date(2026, 10, 9, 20, 0, 0, 0, time.UTC)
+	var got ym.HistoryParams
+	client := &YFinanceHistoryClient{
+		TimeNow: func() time.Time { return fixedTime }, Location: time.UTC,
+		TickerFactory: func(symbol string) (yahooTicker, error) {
+			if symbol != "LITE" {
+				t.Fatalf("ticker symbol=%q, want LITE", symbol)
+			}
+			return &yahooSDKTestTicker{historyFunc: func(params ym.HistoryParams) ([]ym.Bar, error) {
+				got = params
+				return []ym.Bar{{Date: fixedTime, Open: 10, High: 12, Low: 9, Close: 11, Volume: 100}}, nil
+			}}, nil
+		},
+	}
+	points, fetchedAt, err := client.FetchPriceExtremes(context.Background(), "lite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Interval != "1d" || got.AutoAdjust || got.Period != "" || got.Start == nil || got.End == nil {
+		t.Fatalf("extremes history request=%+v, want explicit raw daily max range", got)
+	}
+	want := HistoryExtremePoint{Date: time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC), High: 12, Low: 9, HasHigh: true, HasLow: true}
+	if len(points) != 1 || !points[0].Date.Equal(want.Date) || points[0].High != want.High || points[0].Low != want.Low || points[0].HasHigh != want.HasHigh || points[0].HasLow != want.HasLow {
+		t.Fatalf("compact points=%+v, want %+v", points, want)
+	}
+	if !fetchedAt.Equal(fixedTime) {
+		t.Fatalf("fetched_at=%s, want %s", fetchedAt, fixedTime)
 	}
 }
 

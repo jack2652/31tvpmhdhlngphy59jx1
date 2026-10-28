@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,11 +18,55 @@ import (
 	"option-scope-go/internal/store"
 )
 
+func TestTrimSymbolStateCacheBoundsAndKeepsNewest(t *testing.T) {
+	for _, lowMemory := range []bool{true, false} {
+		limit := boundedSymbolStateEntries(lowMemory)
+		states := make(map[string]time.Time, limit+1)
+		base := time.Date(2026, time.October, 29, 0, 0, 0, 0, time.UTC)
+		for index := range limit + 1 {
+			key := fmt.Sprintf("SYM%04d", index)
+			states[key] = base.Add(time.Duration(index) * time.Second)
+		}
+		newestKey := fmt.Sprintf("SYM%04d", limit)
+
+		trimSymbolStateCache(states, newestKey, lowMemory, func(at time.Time) time.Time { return at })
+
+		if len(states) > limit {
+			t.Errorf("lowMemory=%t cache size=%d, limit=%d", lowMemory, len(states), limit)
+		}
+		if _, exists := states[newestKey]; !exists {
+			t.Errorf("lowMemory=%t newest entry %q was evicted", lowMemory, newestKey)
+		}
+		if _, exists := states["SYM0000"]; exists {
+			t.Errorf("lowMemory=%t oldest entry was retained", lowMemory)
+		}
+	}
+}
+
 type historyTestProvider struct {
 	testMarketProvider
 	historyCalls atomic.Int64
 	history      provider.HistoryResult
 	historyErr   error
+}
+
+type compactExtremesProvider struct {
+	historyTestProvider
+	points     []provider.HistoryExtremePoint
+	fetchedAt  time.Time
+	pointCalls atomic.Int64
+}
+
+func (p *compactExtremesProvider) PriceExtremesHistoryClient() provider.PriceExtremesHistoryClient {
+	return p
+}
+
+func (p *compactExtremesProvider) FetchPriceExtremes(ctx context.Context, _ string) ([]provider.HistoryExtremePoint, time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, time.Time{}, err
+	}
+	p.pointCalls.Add(1)
+	return p.points, p.fetchedAt, nil
 }
 
 type historyBarrierProvider struct {
@@ -791,6 +837,39 @@ func TestLoadExtremesRefreshesFreshSparseCache(t *testing.T) {
 	got := service.loadExtremes(context.Background(), "LITE", map[string]any{"bars": bars})
 	if got["source"] != "upstream" || providerStub.historyCalls.Load() != 1 {
 		t.Fatalf("sparse cached extrema not refreshed: result=%#v calls=%d", got, providerStub.historyCalls.Load())
+	}
+}
+
+func TestLoadExtremesUsesCompactHistoryAndMatchesMapResult(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history-extremes-compact.db")
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fetchedAt := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	points := []provider.HistoryExtremePoint{
+		{Date: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), High: 100, Low: 0.5, HasHigh: true, HasLow: true},
+		{Date: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), High: 15, Low: 7, HasHigh: true, HasLow: true},
+		{Date: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), High: 10, Low: 5, HasHigh: true, HasLow: true},
+	}
+	providerStub := &compactExtremesProvider{points: points, fetchedAt: fetchedAt}
+	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamConcurrency: 2}, repository, providerStub)
+	defer service.Close()
+
+	got := service.loadExtremes(context.Background(), "LITE", map[string]any{})
+	want := calculatePriceExtremes([]map[string]any{
+		{"date": "2024-01-01", "high": 100.0, "low": 0.5},
+		{"date": "2026-01-01", "high": 15.0, "low": 7.0},
+		{"date": "2025-01-01", "high": 10.0, "low": 5.0},
+	})
+	if got["source"] != "upstream" || !reflect.DeepEqual(got["extremes"], want) {
+		t.Fatalf("compact extremes=%#v, want source=upstream and payload=%#v", got, want)
+	}
+	if !got["fetched_at"].(time.Time).Equal(fetchedAt) {
+		t.Fatalf("fetched_at=%v, want %v", got["fetched_at"], fetchedAt)
+	}
+	if providerStub.pointCalls.Load() != 1 || providerStub.historyCalls.Load() != 0 {
+		t.Fatalf("compact calls=%d full history calls=%d, want 1 and 0", providerStub.pointCalls.Load(), providerStub.historyCalls.Load())
 	}
 }
 

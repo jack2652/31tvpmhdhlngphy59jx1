@@ -102,14 +102,19 @@ func (h *Hybrid) ValidateAlpacaCredentials(ctx context.Context) string {
 
 // NewDefaultHybrid composes deployable clients from runtime configuration.
 func NewDefaultHybrid(timeout time.Duration, concurrency int, proxy, alpacaKey, alpacaSecret string, waitValues ...time.Duration) (*Hybrid, error) {
-	return newDefaultHybrid(timeout, 15*time.Second, concurrency, proxy, alpacaKey, alpacaSecret, waitValues...)
+	return newDefaultHybrid(timeout, 15*time.Second, concurrency, proxy, alpacaKey, alpacaSecret, false, waitValues...)
 }
 
-func newDefaultHybrid(timeout, cboeTimeout time.Duration, concurrency int, proxyAddress, alpacaKey, alpacaSecret string, waitValues ...time.Duration) (*Hybrid, error) {
+// NewDefaultHybridWithMemoryProfile 按显式资源模式构建默认行情 provider。
+func NewDefaultHybridWithMemoryProfile(timeout time.Duration, concurrency int, proxy, alpacaKey, alpacaSecret string, lowMemory bool, waitValues ...time.Duration) (*Hybrid, error) {
+	return newDefaultHybrid(timeout, 15*time.Second, concurrency, proxy, alpacaKey, alpacaSecret, lowMemory, waitValues...)
+}
+
+func newDefaultHybrid(timeout, cboeTimeout time.Duration, concurrency int, proxyAddress, alpacaKey, alpacaSecret string, lowMemory bool, waitValues ...time.Duration) (*Hybrid, error) {
 	if err := outboundhttp.ValidateProxy(proxyAddress); err != nil {
 		return nil, err
 	}
-	regular, err := NewYahooWithProxy(timeout, concurrency, proxyAddress)
+	regular, err := newYahooWithProxy(timeout, concurrency, proxyAddress, lowMemory)
 	if err != nil {
 		return nil, err
 	}
@@ -484,6 +489,17 @@ func (h *Hybrid) History(ctx context.Context, symbol, period string) (HistoryRes
 	}
 	return h.HistoryClient.Fetch(ctx, symbol, period)
 }
+
+// PriceExtremesHistoryClient 返回底层支持的紧凑价格极值读取能力。
+func (h *Hybrid) PriceExtremesHistoryClient() PriceExtremesHistoryClient {
+	if h == nil || h.HistoryClient == nil {
+		return nil
+	}
+	client, _ := h.HistoryClient.(PriceExtremesHistoryClient)
+	return client
+}
+
+var _ PriceExtremesHistorySource = (*Hybrid)(nil)
 
 // Fundamentals keeps the hybrid provider's optional valuation surface aligned
 // with the regular Yahoo client.  Quote and option routing may switch by market

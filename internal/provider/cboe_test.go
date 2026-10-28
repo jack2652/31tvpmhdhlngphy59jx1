@@ -1,9 +1,12 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -13,6 +16,89 @@ import (
 	"testing"
 	"time"
 )
+
+type cboeResponseTestTransport []byte
+
+func (transport cboeResponseTestTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(bytes.NewReader(transport)),
+		Request:    request,
+	}, nil
+}
+
+type cboeChunkedTestReader struct {
+	data      []byte
+	chunkSize int
+	offset    int
+}
+
+func (reader *cboeChunkedTestReader) Read(buffer []byte) (int, error) {
+	if reader.offset == len(reader.data) {
+		return 0, io.EOF
+	}
+	readSize := min(len(buffer), reader.chunkSize, len(reader.data)-reader.offset)
+	copy(buffer, reader.data[reader.offset:reader.offset+readSize])
+	reader.offset += readSize
+	return readSize, nil
+}
+
+func TestUTF8ValidatingReaderHandlesSplitCodePoints(t *testing.T) {
+	input := []byte(`{"text":"三根K线"}`)
+	reader := &utf8ValidatingReader{source: &cboeChunkedTestReader{data: input, chunkSize: 1}}
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read split UTF-8 input: %v", err)
+	}
+	if !bytes.Equal(decoded, input) {
+		t.Fatalf("decoded bytes = %q, want %q", decoded, input)
+	}
+	reader = &utf8ValidatingReader{source: &cboeChunkedTestReader{data: input, chunkSize: 1}}
+	decoded = make([]byte, 0, len(input))
+	buffer := make([]byte, 1)
+	for {
+		readSize, readErr := reader.Read(buffer)
+		decoded = append(decoded, buffer[:readSize]...)
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			t.Fatalf("read UTF-8 input with one-byte buffer: %v", readErr)
+		}
+		if readSize == 0 {
+			t.Fatal("one-byte reader made no progress")
+		}
+	}
+	if !bytes.Equal(decoded, input) {
+		t.Fatalf("one-byte decoded bytes = %q, want %q", decoded, input)
+	}
+	invalid := []byte{'{', '"', 'v', '"', ':', '"', 0xe4, 'x', 0xb8, '"', '}'}
+	reader = &utf8ValidatingReader{source: &cboeChunkedTestReader{data: invalid, chunkSize: 1}}
+	if _, err := io.ReadAll(reader); err == nil || !strings.Contains(err.Error(), "invalid UTF-8") {
+		t.Fatalf("read split invalid UTF-8 input error = %v, want invalid UTF-8", err)
+	}
+}
+
+func TestDecodeCboeOptionAcceptsOnlyJSONObjects(t *testing.T) {
+	for _, raw := range []string{`null`, `[]`, `"contract"`, `1`, `true`} {
+		if _, ok := decodeCboeOption(json.RawMessage(raw)); ok {
+			t.Errorf("decodeCboeOption(%s) accepted a non-object value", raw)
+		}
+	}
+	row, ok := decodeCboeOption(json.RawMessage(`{"option":"QQQ300118C00450000"}`))
+	if !ok || row.Option != "QQQ300118C00450000" {
+		t.Fatalf("decodeCboeOption object=(%+v,%v)", row, ok)
+	}
+}
+
+func TestCboeOptionsClientRejectsOversizedResponse(t *testing.T) {
+	body := []byte(`{"data":{"options":[]}}` + strings.Repeat(" ", maxCboeOptionsResponseBytes))
+	client := NewCboeOptionsClient(&http.Client{Transport: cboeResponseTestTransport(body)}, "https://cboe.invalid/{symbol}")
+	if _, _, err := client.fetch(context.Background(), "QQQ"); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("fetch() error = %v, want response size limit error", err)
+	}
+}
 
 func TestCboeOptionsClientExpirationsAndChain(t *testing.T) {
 	const expiration = "2030-01-18"

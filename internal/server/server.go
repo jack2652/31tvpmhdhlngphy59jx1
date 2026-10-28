@@ -256,7 +256,7 @@ type Service struct {
 }
 
 func New(cfg config.Config) (*Service, error) {
-	marketProvider, err := provider.NewDefaultHybrid(cfg.UpstreamTimeout, cfg.UpstreamConcurrency, cfg.MarketProxy, cfg.AlpacaAPIKey, cfg.AlpacaAPISecret, cfg.UpstreamWait)
+	marketProvider, err := provider.NewDefaultHybridWithMemoryProfile(cfg.UpstreamTimeout, cfg.UpstreamConcurrency, cfg.MarketProxy, cfg.AlpacaAPIKey, cfg.AlpacaAPISecret, cfg.LowMemory, cfg.UpstreamWait)
 	if err != nil {
 		return nil, err
 	}
@@ -381,10 +381,27 @@ func boundedChanAnalysisDurableCacheEntries(lowMemory bool) int {
 }
 
 const (
-	quoteCacheLimit      = 512
-	chainCacheLimit      = 256
-	lowMemoryCacheDivide = 4
+	quoteCacheLimit           = 512
+	chainCacheLimit           = 256
+	lowMemoryCacheDivide      = 4
+	defaultSymbolStateLimit   = 512
+	lowMemorySymbolStateLimit = 128
 )
+
+func boundedSymbolStateEntries(lowMemory bool) int {
+	if lowMemory {
+		return lowMemorySymbolStateLimit
+	}
+	return defaultSymbolStateLimit
+}
+
+// trimSymbolStateCache 在 symbol 状态超过容量时批量淘汰最旧项；调用方持有对应互斥锁。
+func trimSymbolStateCache[T any](cache map[string]T, key string, lowMemory bool, lastAccess func(T) time.Time) {
+	limit := boundedSymbolStateEntries(lowMemory)
+	if len(cache) > limit {
+		evictOldestHistoryCacheEntry(cache, key, limit*9/10, lastAccess)
+	}
+}
 
 // trimSymbolCachesLocked bounds the per-symbol quote and option-chain caches.
 // Both are pure caches backed by SQLite, so dropping the oldest entries keeps a
@@ -2396,13 +2413,13 @@ func (s *Service) prefetchSymbolAnalytics(symbol string, force bool) {
 		return
 	}
 	s.mu.Lock()
-	if s.analyticsPrefetch[symbol] {
+	if s.background.Err() != nil || s.analyticsPrefetch[symbol] {
 		s.mu.Unlock()
 		return
 	}
 	s.analyticsPrefetch[symbol] = true
-	s.mu.Unlock()
 	s.backgroundWG.Add(1)
+	s.mu.Unlock()
 	go func() {
 		defer s.backgroundWG.Done()
 		defer func() {
@@ -3162,7 +3179,13 @@ func (s *Service) releaseHousekeepingLease() {
 
 func (s *Service) startHousekeeping() {
 	s.cleanupOnce.Do(func() {
+		s.mu.Lock()
+		if s.background.Err() != nil {
+			s.mu.Unlock()
+			return
+		}
 		s.backgroundWG.Add(1)
+		s.mu.Unlock()
 		go func() {
 			defer s.backgroundWG.Done()
 			if !s.runHousekeepingPass(true) {

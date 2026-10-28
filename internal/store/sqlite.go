@@ -1552,8 +1552,8 @@ func (s *SQLite) WriteHistory(symbol string, bars []map[string]any, fetchedAt ti
 		if err != nil || parsed.Format(time.DateOnly) != rawDate {
 			return fmt.Errorf("history bar %d has invalid date %q", index, rawDate)
 		}
-		values := make([]any, 5)
-		for valueIndex, field := range []string{"open", "high", "low", "close", "volume"} {
+		var values [5]any
+		for valueIndex, field := range [...]string{"open", "high", "low", "close", "volume"} {
 			value, err := finiteSQLiteNumber(bar[field])
 			if err != nil {
 				return fmt.Errorf("history bar %d field %s: %w", index, field, err)
@@ -1567,20 +1567,20 @@ func (s *SQLite) WriteHistory(symbol string, bars []map[string]any, fetchedAt ti
 		if !closeOK || closeValue <= 0 {
 			continue
 		}
-		openValue, openOK := optionalHistoryNumber(values[0])
-		highValue, highOK := optionalHistoryNumber(values[1])
-		lowValue, lowOK := optionalHistoryNumber(values[2])
-		volumeValue, volumeOK := optionalHistoryNumber(values[4])
+		openValue, openPresent, openOK := optionalHistoryNumber(values[0])
+		highValue, highPresent, highOK := optionalHistoryNumber(values[1])
+		lowValue, lowPresent, lowOK := optionalHistoryNumber(values[2])
+		volumeValue, volumePresent, volumeOK := optionalHistoryNumber(values[4])
 		if !openOK || !highOK || !lowOK || !volumeOK ||
-			openValue != nil && *openValue <= 0 ||
-			highValue != nil && *highValue <= 0 ||
-			lowValue != nil && *lowValue <= 0 ||
-			volumeValue != nil && *volumeValue < 0 ||
-			highValue != nil && lowValue != nil && *highValue < *lowValue ||
-			highValue != nil && *highValue < closeValue ||
-			lowValue != nil && *lowValue > closeValue ||
-			openValue != nil && highValue != nil && *highValue < *openValue ||
-			openValue != nil && lowValue != nil && *lowValue > *openValue {
+			openPresent && openValue <= 0 ||
+			highPresent && highValue <= 0 ||
+			lowPresent && lowValue <= 0 ||
+			volumePresent && volumeValue < 0 ||
+			highPresent && lowPresent && highValue < lowValue ||
+			highPresent && highValue < closeValue ||
+			lowPresent && lowValue > closeValue ||
+			openPresent && highPresent && highValue < openValue ||
+			openPresent && lowPresent && lowValue > openValue {
 			continue
 		}
 		prepared = append(prepared, preparedBar{day: rawDate, open: values[0], high: values[1], low: values[2], close: values[3], volume: values[4]})
@@ -1644,8 +1644,8 @@ func (s *SQLite) WriteIntradayHistory(symbol, interval string, bars []map[string
 		if err != nil || parsed.Format("2006-01-02 15:04") != rawTime {
 			return fmt.Errorf("intraday history bar %d has invalid time %q", index, rawTime)
 		}
-		values := make([]any, 5)
-		for valueIndex, field := range []string{"open", "high", "low", "close", "volume"} {
+		var values [5]any
+		for valueIndex, field := range [...]string{"open", "high", "low", "close", "volume"} {
 			value, err := finiteSQLiteNumber(bar[field])
 			if err != nil {
 				return fmt.Errorf("intraday history bar %d field %s: %w", index, field, err)
@@ -1656,11 +1656,20 @@ func (s *SQLite) WriteIntradayHistory(symbol, interval string, bars []map[string
 		if !closeOK || closeValue <= 0 {
 			continue
 		}
-		openValue, openOK := optionalHistoryNumber(values[0])
-		highValue, highOK := optionalHistoryNumber(values[1])
-		lowValue, lowOK := optionalHistoryNumber(values[2])
-		volumeValue, volumeOK := optionalHistoryNumber(values[4])
-		if !openOK || !highOK || !lowOK || !volumeOK || openValue != nil && *openValue <= 0 || highValue != nil && *highValue <= 0 || lowValue != nil && *lowValue <= 0 || volumeValue != nil && *volumeValue < 0 || highValue != nil && lowValue != nil && *highValue < *lowValue || highValue != nil && *highValue < closeValue || lowValue != nil && *lowValue > closeValue || openValue != nil && highValue != nil && *highValue < *openValue || openValue != nil && lowValue != nil && *lowValue > *openValue {
+		openValue, openPresent, openOK := optionalHistoryNumber(values[0])
+		highValue, highPresent, highOK := optionalHistoryNumber(values[1])
+		lowValue, lowPresent, lowOK := optionalHistoryNumber(values[2])
+		volumeValue, volumePresent, volumeOK := optionalHistoryNumber(values[4])
+		if !openOK || !highOK || !lowOK || !volumeOK ||
+			openPresent && openValue <= 0 ||
+			highPresent && highValue <= 0 ||
+			lowPresent && lowValue <= 0 ||
+			volumePresent && volumeValue < 0 ||
+			highPresent && lowPresent && highValue < lowValue ||
+			highPresent && highValue < closeValue ||
+			lowPresent && lowValue > closeValue ||
+			openPresent && highPresent && highValue < openValue ||
+			openPresent && lowPresent && lowValue > openValue {
 			continue
 		}
 		prepared = append(prepared, preparedBar{at: rawTime, open: values[0], high: values[1], low: values[2], close: values[3], volume: values[4]})
@@ -1727,15 +1736,12 @@ WHERE symbol=? AND interval=? AND close IS NOT NULL AND close > 0 ORDER BY bar_t
 	return map[string]any{"bars": bars, "fetched_at": nilIfEmpty(latestFetched), "source": "sqlite"}, nil
 }
 
-func optionalHistoryNumber(value any) (*float64, bool) {
+func optionalHistoryNumber(value any) (float64, bool, bool) {
 	if value == nil {
-		return nil, true
+		return 0, false, true
 	}
 	number, ok := value.(float64)
-	if !ok {
-		return nil, false
-	}
-	return &number, true
+	return number, true, ok
 }
 
 // finiteSQLiteNumber preserves NULLs and normalizes supported numeric inputs

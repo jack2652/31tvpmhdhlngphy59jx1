@@ -1,6 +1,9 @@
 package provider
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // HistoryResult 保存日线或盘中历史行情的标准化 OHLC 结果。
 type HistoryResult struct {
@@ -26,21 +29,21 @@ type ChanAdjustedHistoryResult struct {
 	Timeframe      string           `json:"timeframe"`
 }
 
-func historyExtremes(bars []map[string]any) (*float64, *float64) {
-	var high, low *float64
-	for _, bar := range bars {
-		if value, ok := bar["high"].(float64); ok {
-			if high == nil || value > *high {
-				v := value
-				high = &v
-			}
-		}
-		if value, ok := bar["low"].(float64); ok {
-			if low == nil || value < *low {
-				v := value
-				low = &v
-			}
-		}
-	}
-	return high, low
+// HistoryExtremePoint 保存计算价格极值所需的单根日线数据；日期使用 UTC 零点。
+type HistoryExtremePoint struct {
+	Date    time.Time
+	High    float64
+	Low     float64
+	HasHigh bool
+	HasLow  bool
+}
+
+// PriceExtremesHistoryClient 只返回高低价计算所需的数据，不构造完整 OHLCV 记录。
+type PriceExtremesHistoryClient interface {
+	FetchPriceExtremes(context.Context, string) ([]HistoryExtremePoint, time.Time, error)
+}
+
+// PriceExtremesHistorySource 暴露可选的紧凑价格极值读取能力。
+type PriceExtremesHistorySource interface {
+	PriceExtremesHistoryClient() PriceExtremesHistoryClient
 }

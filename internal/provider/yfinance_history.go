@@ -50,6 +50,19 @@ func (c *YFinanceHistoryClient) FetchAdjusted(ctx context.Context, symbol, perio
 	return c.fetch(ctx, symbol, period, true)
 }
 
+// FetchPriceExtremes 直接读取并标准化价格极值所需的日期与高低价。
+func (c *YFinanceHistoryClient) FetchPriceExtremes(ctx context.Context, symbol string) ([]HistoryExtremePoint, time.Time, error) {
+	_, bars, err := c.fetchHistoryBars(ctx, symbol, "max", false)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	points, err := normalizeYFinanceExtremePoints(bars, c.Location)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	return points, c.historyFetchedAt(), nil
+}
+
 // FetchChanAdjusted derives adjusted OHLC from Yahoo's raw OHLC and adjusted
 // close in one history response. Chan analysis must never silently fall back
 // to raw prices.
@@ -321,23 +334,37 @@ func normalizeYFinanceIntradayHistory(symbol string, bars []ym.Bar, location *ti
 }
 
 func (c *YFinanceHistoryClient) fetch(ctx context.Context, rawSymbol, period string, adjusted bool) (HistoryResult, error) {
-	if err := ctx.Err(); err != nil {
+	symbol, bars, err := c.fetchHistoryBars(ctx, rawSymbol, period, adjusted)
+	if err != nil {
 		return HistoryResult{}, err
 	}
+	result, err := normalizeYFinanceHistory(symbol, strings.ToLower(strings.TrimSpace(period)), bars, c.Location)
+	if err != nil {
+		return HistoryResult{}, err
+	}
+	result.FetchedAt = c.historyFetchedAt()
+	result.Source = "go-yfinance"
+	return result, nil
+}
+
+func (c *YFinanceHistoryClient) fetchHistoryBars(ctx context.Context, rawSymbol, period string, adjusted bool) (string, []ym.Bar, error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
 	if c == nil {
-		return HistoryResult{}, errors.New("go-yfinance history client is nil")
+		return "", nil, errors.New("go-yfinance history client is nil")
 	}
 	symbol, err := NormalizeSymbol(rawSymbol)
 	if err != nil {
 		if strings.EqualFold(strings.TrimSpace(rawSymbol), "^GSPC") {
 			symbol = "^GSPC"
 		} else {
-			return HistoryResult{}, err
+			return "", nil, err
 		}
 	}
 	period = strings.ToLower(strings.TrimSpace(period))
 	if !supportedHistoryPeriod(period) {
-		return HistoryResult{}, fmt.Errorf("unsupported Yahoo history period %q", period)
+		return "", nil, fmt.Errorf("unsupported Yahoo history period %q", period)
 	}
 	// yfinance expands period="max" to an explicit period1/period2 range.
 	// Yahoo's range=max form with daily bars can silently return one bar per
@@ -352,19 +379,16 @@ func (c *YFinanceHistoryClient) fetch(ctx context.Context, rawSymbol, period str
 		return ticker.History(historyParams)
 	})
 	if err != nil {
-		return HistoryResult{}, fmt.Errorf("go-yfinance history: %w", err)
+		return "", nil, fmt.Errorf("go-yfinance history: %w", err)
 	}
-	result, err := normalizeYFinanceHistory(symbol, period, bars, c.Location)
-	if err != nil {
-		return HistoryResult{}, err
-	}
+	return symbol, bars, nil
+}
+
+func (c *YFinanceHistoryClient) historyFetchedAt() time.Time {
 	if c.TimeNow != nil {
-		result.FetchedAt = c.TimeNow().UTC()
-	} else {
-		result.FetchedAt = time.Now().UTC()
+		return c.TimeNow().UTC()
 	}
-	result.Source = "go-yfinance"
-	return result, nil
+	return time.Now().UTC()
 }
 
 func historyRequestParams(period string, adjusted bool, now time.Time) ym.HistoryParams {
@@ -397,6 +421,8 @@ func normalizeYFinanceHistory(symbol, period string, bars []ym.Bar, location *ti
 		location = time.UTC
 	}
 	out := make([]map[string]any, 0, len(bars))
+	var allTimeHigh, allTimeLow float64
+	hasAllTimeHigh, hasAllTimeLow := false, false
 	for index, bar := range bars {
 		if bar.Date.IsZero() {
 			return HistoryResult{}, fmt.Errorf("go-yfinance history bar %d has missing date", index)
@@ -434,30 +460,95 @@ func normalizeYFinanceHistory(symbol, period string, bars []ym.Bar, location *ti
 			"open": open, "high": high, "low": low, "close": bar.Close,
 			"volume": bar.Volume,
 		})
+		if bar.High != 0 && (!hasAllTimeHigh || bar.High > allTimeHigh) {
+			allTimeHigh, hasAllTimeHigh = bar.High, true
+		}
+		if bar.Low != 0 && (!hasAllTimeLow || bar.Low < allTimeLow) {
+			allTimeLow, hasAllTimeLow = bar.Low, true
+		}
 	}
 	if len(out) == 0 {
 		return HistoryResult{}, errors.New("go-yfinance history has no valid closing prices")
 	}
 	result := HistoryResult{Symbol: symbol, Bars: out}
+	if hasAllTimeHigh {
+		result.AllTimeHigh = &allTimeHigh
+	}
+	if hasAllTimeLow {
+		result.AllTimeLow = &allTimeLow
+	}
 	if period == "max" {
-		result.AllTimeHigh, result.AllTimeLow = historyExtremes(out)
 		latest, err := time.ParseInLocation("2006-01-02", out[len(out)-1]["date"].(string), location)
 		if err == nil {
-			cutoff := latest.AddDate(-1, 0, 0)
-			window := make([]map[string]any, 0, len(out))
+			cutoff := latest.AddDate(-1, 0, 0).Format(time.DateOnly)
+			var windowHigh, windowLow float64
+			hasWindowHigh, hasWindowLow := false, false
 			for _, item := range out {
-				day, parseErr := time.ParseInLocation("2006-01-02", item["date"].(string), location)
-				if parseErr == nil && !day.Before(cutoff) {
-					window = append(window, item)
+				day, ok := item["date"].(string)
+				if !ok || day < cutoff {
+					continue
+				}
+				if high, ok := item["high"].(float64); ok && (!hasWindowHigh || high > windowHigh) {
+					windowHigh, hasWindowHigh = high, true
+				}
+				if low, ok := item["low"].(float64); ok && (!hasWindowLow || low < windowLow) {
+					windowLow, hasWindowLow = low, true
 				}
 			}
-			result.FiftyTwoWeekHigh, result.FiftyTwoWeekLow = historyExtremes(window)
+			if hasWindowHigh {
+				result.FiftyTwoWeekHigh = &windowHigh
+			}
+			if hasWindowLow {
+				result.FiftyTwoWeekLow = &windowLow
+			}
 		}
 	}
 	return result, nil
+}
+
+func normalizeYFinanceExtremePoints(bars []ym.Bar, location *time.Location) ([]HistoryExtremePoint, error) {
+	if len(bars) == 0 {
+		return nil, errors.New("go-yfinance returned empty history")
+	}
+	if location == nil {
+		location = time.UTC
+	}
+	points := make([]HistoryExtremePoint, 0, len(bars))
+	for index, bar := range bars {
+		if bar.Date.IsZero() {
+			return nil, fmt.Errorf("go-yfinance history bar %d has missing date", index)
+		}
+		values := []struct {
+			name  string
+			value float64
+		}{
+			{"open", bar.Open}, {"high", bar.High}, {"low", bar.Low}, {"close", bar.Close},
+		}
+		for _, item := range values {
+			if math.IsNaN(item.value) || math.IsInf(item.value, 0) {
+				return nil, fmt.Errorf("go-yfinance history bar %d has non-finite %s", index, item.name)
+			}
+		}
+		if bar.Close == 0 {
+			continue
+		}
+		if bar.Volume < 0 {
+			return nil, fmt.Errorf("go-yfinance history bar %d has negative volume", index)
+		}
+		localDate := bar.Date.In(location)
+		points = append(points, HistoryExtremePoint{
+			Date: time.Date(localDate.Year(), localDate.Month(), localDate.Day(), 0, 0, 0, 0, time.UTC),
+			High: bar.High, Low: bar.Low, HasHigh: bar.High != 0, HasLow: bar.Low != 0,
+		})
+	}
+	if len(points) == 0 {
+		return nil, errors.New("go-yfinance history has no valid closing prices")
+	}
+	return points, nil
 }
 
 var _ interface {
 	Fetch(context.Context, string, string) (HistoryResult, error)
 	FetchAdjusted(context.Context, string, string) (HistoryResult, error)
 } = (*YFinanceHistoryClient)(nil)
+var _ PriceExtremesHistoryClient = (*YFinanceHistoryClient)(nil)

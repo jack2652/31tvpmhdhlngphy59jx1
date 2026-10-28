@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,6 +70,129 @@ func (t *yahooSDKTestTicker) Close() {
 
 func setYahooSDKTestTicker(yahoo *Yahoo, ticker *yahooSDKTestTicker) {
 	yahoo.tickerFactory = func(string) (yahooTicker, error) { return ticker, nil }
+}
+
+func TestYahooQuoteTickerCacheEvictsLeastRecentlyUsed(t *testing.T) {
+	yahoo := NewYahoo(time.Second, 1)
+	t.Cleanup(func() { _ = yahoo.Close() })
+	yahoo.tickerFactory = func(string) (yahooTicker, error) {
+		return &yahooSDKTestTicker{}, nil
+	}
+	limit := yahoo.quoteTickerCacheMax
+	for index := range limit {
+		if _, err := yahoo.quoteTicker(context.Background(), fmt.Sprintf("T%03d", index)); err != nil {
+			t.Fatalf("initialize quote ticker %d: %v", index, err)
+		}
+	}
+	if _, err := yahoo.quoteTicker(context.Background(), "T000"); err != nil {
+		t.Fatalf("refresh recently used ticker: %v", err)
+	}
+	if _, err := yahoo.quoteTicker(context.Background(), fmt.Sprintf("T%03d", limit)); err != nil {
+		t.Fatalf("initialize ticker beyond cache limit: %v", err)
+	}
+
+	yahoo.quoteTickersMu.Lock()
+	defer yahoo.quoteTickersMu.Unlock()
+	if len(yahoo.quoteTickers) > limit {
+		t.Fatalf("quote ticker cache size=%d, limit=%d", len(yahoo.quoteTickers), limit)
+	}
+	if _, ok := yahoo.quoteTickers["T000"]; !ok {
+		t.Fatal("recently used ticker was evicted")
+	}
+	if _, ok := yahoo.quoteTickers["T001"]; ok {
+		t.Fatal("least recently used ticker was retained")
+	}
+	if _, ok := yahoo.quoteTickers[fmt.Sprintf("T%03d", limit)]; !ok {
+		t.Fatal("new ticker was not cached")
+	}
+}
+
+func TestQuoteTickerCacheLimitsFollowMemoryProfile(t *testing.T) {
+	if got := boundedQuoteTickerCacheEntries(true); got != lowMemoryQuoteTickerCacheLimit {
+		t.Fatalf("low-memory ticker cache limit=%d, want %d", got, lowMemoryQuoteTickerCacheLimit)
+	}
+	if got := boundedQuoteTickerCacheEntries(false); got != defaultQuoteTickerCacheLimit {
+		t.Fatalf("default ticker cache limit=%d, want %d", got, defaultQuoteTickerCacheLimit)
+	}
+
+	yahoo, err := newYahooWithProxy(time.Second, 2, "", true)
+	if err != nil {
+		t.Fatalf("create low-memory Yahoo client: %v", err)
+	}
+	t.Cleanup(func() { _ = yahoo.Close() })
+	if yahoo.quoteTickerCacheMax != lowMemoryQuoteTickerCacheLimit {
+		t.Fatalf("low-memory Yahoo ticker cache limit=%d, want %d", yahoo.quoteTickerCacheMax, lowMemoryQuoteTickerCacheLimit)
+	}
+}
+
+func TestYahooQuoteTickerCacheSupportsLimitOne(t *testing.T) {
+	yahoo := NewYahoo(time.Second, 1)
+	t.Cleanup(func() { _ = yahoo.Close() })
+	yahoo.quoteTickerCacheMax = 1
+	yahoo.tickerFactory = func(string) (yahooTicker, error) {
+		return &yahooSDKTestTicker{}, nil
+	}
+	for _, symbol := range []string{"FIRST", "SECOND"} {
+		if _, err := yahoo.quoteTicker(context.Background(), symbol); err != nil {
+			t.Fatalf("create ticker %s: %v", symbol, err)
+		}
+	}
+	if len(yahoo.quoteTickers) != 1 {
+		t.Fatalf("ticker cache size=%d, want exactly 1", len(yahoo.quoteTickers))
+	}
+	if _, exists := yahoo.quoteTickers["SECOND"]; !exists {
+		t.Fatal("new ticker was not retained at cache limit 1")
+	}
+}
+
+func TestYahooQuoteTickerSingleflightOnConcurrentMiss(t *testing.T) {
+	yahoo := NewYahoo(time.Second, 1)
+	t.Cleanup(func() { _ = yahoo.Close() })
+	const callers = 16
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var factoryCalls atomic.Int64
+	yahoo.tickerFactory = func(string) (yahooTicker, error) {
+		if factoryCalls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return &yahooSDKTestTicker{}, nil
+	}
+
+	start := make(chan struct{})
+	results := make(chan yahooTicker, callers)
+	errorsSeen := make(chan error, callers)
+	var workers sync.WaitGroup
+	workers.Add(callers)
+	for range callers {
+		go func() {
+			defer workers.Done()
+			<-start
+			ticker, err := yahoo.quoteTicker(context.Background(), "QQQ")
+			results <- ticker
+			errorsSeen <- err
+		}()
+	}
+	close(start)
+	<-started
+	close(release)
+	workers.Wait()
+	if factoryCalls.Load() != 1 {
+		t.Fatalf("ticker factory calls=%d, want 1", factoryCalls.Load())
+	}
+	var first yahooTicker
+	for range callers {
+		if err := <-errorsSeen; err != nil {
+			t.Fatalf("concurrent quote ticker lookup: %v", err)
+		}
+		ticker := <-results
+		if first == nil {
+			first = ticker
+		} else if ticker != first {
+			t.Fatal("concurrent lookups returned different ticker instances")
+		}
+	}
 }
 
 func setYahooSDKTestTickerFromOptionJSON(t *testing.T, yahoo *Yahoo, body string) {
@@ -786,6 +910,32 @@ func TestYahooChainPreservesNullableOptionNumericFields(t *testing.T) {
 	}
 	if rows[0].ContractType != "call" || rows[1].ContractType != "call" || zero.ContractType != "call" {
 		t.Fatalf("single-sided calls were not retained: %#v", rows)
+	}
+}
+
+func TestYahooOptionContractExtensionParsesNumericStrings(t *testing.T) {
+	var payload yahooOptionExtensions
+	const body = `{"optionChain":{"result":[{"options":[{"expirationDate":1895011200,"calls":[{"contractSymbol":"STRING","strike":"100.5","lastPrice":"12.5","bid":"12","ask":"13","percentChange":"2.5","volume":"7","openInterest":"20","impliedVolatility":"0.25","gamma":0.015,"inTheMoney":true},{"contractSymbol":"INVALID","strike":"bad","volume":"1.5","inTheMoney":"unknown"}],"puts":[]}]}],"error":null}}`
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decode option extensions: %v", err)
+	}
+	rows := yahooOptionRows(payload.OptionChain.Result[0].Options[0], "2030-01-18")
+	if len(rows) != 2 {
+		t.Fatalf("decoded rows=%d, want 2", len(rows))
+	}
+	row := rows[0]
+	if row.Strike == nil || *row.Strike != 100.5 || row.LastPrice == nil || *row.LastPrice != 12.5 || row.Bid == nil || *row.Bid != 12 || row.Ask == nil || *row.Ask != 13 || row.ChangePercent == nil || *row.ChangePercent != 2.5 || row.Volume == nil || *row.Volume != 7 || row.OpenInterest == nil || *row.OpenInterest != 20 || row.ImpliedVolatility == nil || *row.ImpliedVolatility != 0.25 || row.Gamma == nil || *row.Gamma != 0.015 {
+		t.Fatalf("numeric strings were not retained: %#v", row)
+	}
+	if !row.InTheMoneyKnown || !row.InTheMoney {
+		t.Fatalf("boolean field was not retained: %#v", row)
+	}
+	invalid := rows[1]
+	if invalid.Strike != nil || invalid.Volume != nil || invalid.InTheMoney || !invalid.InTheMoneyKnown {
+		t.Fatalf("invalid optional values changed behavior: %#v", invalid)
+	}
+	if err := json.Unmarshal([]byte(`{"gamma":"0.015"}`), &yahooOptionContractExtension{}); err == nil {
+		t.Fatal("string Gamma was accepted, want the existing strict numeric format")
 	}
 }
 

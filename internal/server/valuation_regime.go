@@ -125,6 +125,7 @@ func (s *Service) detectValuationRegime(ctx context.Context, symbol string, fund
 		s.valuationRegimes = make(map[string]cachedValuationRegime)
 	}
 	s.valuationRegimes[key] = cachedValuationRegime{regime: regime, signals: cloneAnyMap(signals), at: time.Now()}
+	trimSymbolStateCache(s.valuationRegimes, key, s.cfg.LowMemory, func(entry cachedValuationRegime) time.Time { return entry.at })
 	s.mu.Unlock()
 	return regime, signals
 }
