@@ -112,7 +112,7 @@ assert.equal(tooltip.children[0].textContent, "2026-10-15");
 const changeRow = tooltip.children.find((child) => child.className.includes("chan-ohlc-change-row"));
 assert.ok(changeRow, "tooltip must include the close-change row");
 assert.equal(changeRow.children[1].textContent, "+5.00%");
-assert.deepEqual(Array.from(tooltip.children.filter((child) => child.className.includes("chan-ohlc-row") && !child.className.includes("change")).map((row) => row.children[1].textContent)), ["$100.00", "$107.00", "$99.00", "$105.00"]);
+assert.deepEqual(Array.from(tooltip.children.filter((child) => child.className.includes("chan-ohlc-row") && !child.className.includes("change")).map((row) => row.children[1].textContent)), ["$100.00", "$105.00", "$107.00", "$99.00"]);
 
 // Projection routes live on the canvas; hover hit testing must still open and
 // close the scenario card without any per-route SVG nodes.

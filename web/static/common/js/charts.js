@@ -796,6 +796,127 @@ function drawChanCanvas(target, binding) {
     context.fillStyle = color; context.strokeStyle = color; context.lineWidth = 1;
     context.fillRect(candle.x - candle.bodyWidth / 2, candle.body, candle.bodyWidth, candle.bodyHeight);
   }
+  if (model.layers?.turtle === true && model.turtleChannels?.length) {
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    const drawStepChannel = (field, dash, alpha) => {
+      context.beginPath();
+      context.setLineDash(dash);
+      context.strokeStyle = colors.blue;
+      context.lineWidth = model.mobileChart ? 1.7 : 1.2;
+      context.globalAlpha = alpha;
+      let active = false, previousY = NaN;
+      for (const point of model.turtleChannels) {
+        const value = point?.[field];
+        if (!point || !Number.isFinite(value)) {
+          if (active) context.stroke();
+          context.beginPath();
+          active = false;
+          previousY = NaN;
+          continue;
+        }
+        if (!active) {
+          context.moveTo(point.x, value);
+          active = true;
+        } else {
+          context.lineTo(point.x, previousY);
+          context.lineTo(point.x, value);
+        }
+        previousY = value;
+      }
+      if (active) context.stroke();
+      context.setLineDash([]);
+      context.globalAlpha = 1;
+    };
+    drawStepChannel("entryUpperY", [], 0.9);
+    drawStepChannel("entryLowerY", [], 0.9);
+    drawStepChannel("exitUpperY", [4, 3], 0.48);
+    drawStepChannel("exitLowerY", [4, 3], 0.48);
+    context.restore();
+    for (const event of model.turtleEvents || []) {
+      const color = event.kind === "long-entry" || event.kind === "short-exit" ? colors.up : colors.down;
+      const radius = Number.isFinite(event.markerRadius) ? event.markerRadius : (model.mobileChart ? 5 : 4);
+      context.beginPath();
+      context.moveTo(event.x, event.y + (event.upMarker ? -radius : radius));
+      context.lineTo(event.x - radius, event.y + (event.upMarker ? radius : -radius));
+      context.lineTo(event.x + radius, event.y + (event.upMarker ? radius : -radius));
+      context.closePath();
+      context.fillStyle = color;
+      context.fill();
+      context.font = `650 ${event.fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`;
+      context.textAlign = "center";
+      context.textBaseline = "alphabetic";
+      context.lineWidth = 3;
+      context.lineJoin = "round";
+      context.strokeStyle = colors.panel;
+      context.strokeText(event.label, event.x, event.labelY);
+      context.fillStyle = color;
+      context.fillText(event.label, event.x, event.labelY);
+    }
+  }
+  if (model.layers?.granville === true) {
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    context.beginPath();
+    context.setLineDash([]);
+    context.strokeStyle = colors.amber;
+    context.lineWidth = model.mobileChart ? 2 : 1.5;
+    context.globalAlpha = 0.9;
+    let active = false;
+    for (const point of model.granvilleAverage || []) {
+      if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+        active = false;
+        continue;
+      }
+      if (active) context.lineTo(point.x, point.y);
+      else context.moveTo(point.x, point.y);
+      active = true;
+    }
+    context.stroke();
+    context.globalAlpha = 1;
+
+    for (const event of model.granvilleEvents || []) {
+      const color = event.side === "buy" ? colors.up : colors.down;
+      const radius = Number.isFinite(event.markerRadius) ? event.markerRadius : (model.mobileChart ? 5 : 4);
+      context.beginPath();
+      context.moveTo(event.x, event.y + (event.upMarker ? -radius : radius));
+      context.lineTo(event.x - radius, event.y + (event.upMarker ? radius : -radius));
+      context.lineTo(event.x + radius, event.y + (event.upMarker ? radius : -radius));
+      context.closePath();
+      context.fillStyle = color;
+      context.fill();
+      if (event.labelConnector && event.labelVisible !== false) {
+        const labelBelowMarker = event.labelY > event.y;
+        const labelEdgeY = labelBelowMarker ? event.labelY - event.fontSize - 2 : event.labelY + 2;
+        context.beginPath();
+        context.moveTo(event.x, event.y + (labelBelowMarker ? radius + 1 : -radius - 1));
+        context.lineTo(event.x, labelEdgeY);
+        context.strokeStyle = color;
+        context.lineWidth = 1;
+        context.globalAlpha = 0.62;
+        context.stroke();
+        context.globalAlpha = 1;
+      }
+      if (event.labelVisible !== false) {
+        const labelHalfWidth = Array.from(event.label).length * event.fontSize / 2 + 3;
+        const labelTop = event.labelY - event.fontSize - 2;
+        context.globalAlpha = 0.96;
+        context.fillStyle = color;
+        context.fillRect(event.x - labelHalfWidth, labelTop, labelHalfWidth * 2, event.fontSize + 4);
+        context.globalAlpha = 1;
+        context.font = `650 ${event.fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`;
+        context.textAlign = "center";
+        context.textBaseline = "alphabetic";
+        context.fillStyle = colors.panel;
+        context.fillText(event.label, event.x, event.labelY);
+      }
+    }
+    context.restore();
+  }
   if (model.layers?.trendlines === true && model.trendlines) {
     context.save();
     context.beginPath();

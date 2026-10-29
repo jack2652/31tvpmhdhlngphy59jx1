@@ -44,9 +44,10 @@ const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit",
   hour: "2-digit", minute: "2-digit", hourCycle: "h23",
 });
-const CHAN_CHART_PREFERENCES_VERSION = 8;
+const CHAN_CHART_PREFERENCES_VERSION = 9;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false };
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false };
+const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville"];
 const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false };
 function copyDefaultChanChartLayers() {
   return { ...DEFAULT_CHAN_CHART_LAYERS, segmentLevels: {}, recursiveCenters: {} };
@@ -73,7 +74,7 @@ function readChanChartPreferences() {
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -93,10 +94,14 @@ function readChanChartPreferences() {
     if (storedVersion < CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF && matchesPreviousDefaultChanChartLayers(sourceLayers)) {
       Object.assign(layers, copyDefaultChanChartLayers());
     }
+    const hasConflictingIndicators = EXCLUSIVE_CHAN_INDICATOR_LAYERS.filter((key) => layers[key]).length > 1;
+    if (hasConflictingIndicators) {
+      for (const key of EXCLUSIVE_CHAN_INDICATOR_LAYERS) layers[key] = false;
+    }
     // Persist the unified-menu preference format without resetting explicit
     // layer choices made before the menu redesign.
     const preferences = { period: CHAN_CHART_PERIODS.includes(stored.period) ? stored.period : "daily", layers, subcharts };
-    if (storedVersion < CHAN_CHART_PREFERENCES_VERSION) rememberChanChartPreferences(preferences.period, preferences.layers, preferences.subcharts);
+    if (storedVersion < CHAN_CHART_PREFERENCES_VERSION || hasConflictingIndicators) rememberChanChartPreferences(preferences.period, preferences.layers, preferences.subcharts);
     return preferences;
   } catch (error) { return { period: "daily", layers: copyDefaultChanChartLayers(), subcharts: copyDefaultChanSubcharts() }; }
 }
@@ -5717,7 +5722,7 @@ const optionScopeApp = new Vue({
   },
   methods: {
     closeChanLayerMenu(event) {
-      const menu = event?.currentTarget?.closest(".chan-layer-menu, .chan-subchart-menu, .chan-period-menu");
+      const menu = event?.currentTarget?.closest(".chan-layer-menu, .chan-subchart-menu, .chan-period-menu, .chan-indicator-menu");
       if (!menu) return;
       menu.open = false;
       menu.querySelector("summary")?.focus();
@@ -5916,7 +5921,15 @@ const optionScopeApp = new Vue({
       if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
     },
     toggleChanChartLayer(layer) {
-      if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "afStochZ" || layer === "trendlines") {
+      if (EXCLUSIVE_CHAN_INDICATOR_LAYERS.includes(layer)) {
+        const enabled = !this.chanChartLayers[layer];
+        this.chanChartLayers = {
+          ...this.chanChartLayers,
+          afStochZ: enabled && layer === "afStochZ",
+          turtle: enabled && layer === "turtle",
+          granville: enabled && layer === "granville",
+        };
+      } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "trendlines") {
         this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };
       } else {
         const level = Number(layer);

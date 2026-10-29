@@ -564,7 +564,7 @@
       ? frame.recursive_levels.flatMap((level) => level.segments || []) : (frame.segments || []);
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
-    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, recursiveCenterVisibility].join(":");
+    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, layers?.turtle === true ? 1 : 0, layers?.granville === true ? 1 : 0, recursiveCenterVisibility].join(":");
     const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
     const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("");
     // Only reserve the scenario lane when there is a path to draw. Reserving
@@ -597,8 +597,11 @@
     const afStochZ = layers?.afStochZ === true ? afStochZSeries(sourceCandles) : { events: [], series: {} };
     const trendlineResult = layers?.trendlines === true
       ? window.OptionScopeTrendlines?.calculate(sourceCandles, frame.strokes || [], cacheSegments, startIndex, endIndex) || null : null;
+    const dmiValues = dmiSeries(candlesForDisplay);
+    const turtleResult = layers?.turtle === true ? window.OptionScopeTurtle?.calculate(candlesForDisplay, dmiValues) || null : null;
+    const granvilleResult = layers?.granville === true ? window.OptionScopeGranville?.calculate(candlesForDisplay) || null : null;
     const macd = macdSeries(candlesForDisplay).slice(startIndex, endIndex);
-    const dmi = dmiSeries(candlesForDisplay).slice(startIndex, endIndex);
+    const dmi = dmiValues.slice(startIndex, endIndex);
     const width = mobile ? 420 : 960;
     // Desktop retains room for the left price labels and current-price badge
     // without carrying the oversized axis gutter from the former right axis.
@@ -667,6 +670,10 @@
     const visibleAFSignals = layers?.afStochZ === true
       ? (afStochZ.events || []).filter((signal) => signal.date >= firstDate && signal.date <= lastDate)
       : [];
+    const visibleTurtleChannels = (turtleResult?.channels || []).slice(startIndex, dataEndIndex);
+    const visibleTurtleEvents = (turtleResult?.events || []).filter((event) => event.index >= startIndex && event.index < dataEndIndex);
+    const visibleGranvilleAverage = (granvilleResult?.sma || []).slice(startIndex, dataEndIndex);
+    const visibleGranvilleEvents = (granvilleResult?.events || []).filter((event) => event.index >= startIndex && event.index < dataEndIndex);
     const legacyRule = "strict-old-bi-v3";
     const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.11";
     let minimum = Infinity, maximum = -Infinity;
@@ -692,6 +699,19 @@
       const price = Number(signal.markerPrice ?? signal.price);
       if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
     });
+    visibleTurtleChannels.forEach((channel) => {
+      if (!channel) return;
+      for (const price of Object.values(channel)) {
+        if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
+      }
+    });
+    visibleTurtleEvents.forEach((event) => {
+      const price = Number(event.price);
+      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
+    });
+    visibleGranvilleAverage.forEach((price) => {
+      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
+    });
     // Keep the daily/weekly scale tied to bars and structure. Intraday charts
     // include the live quote because their scenario paths follow it.
     if (Number.isFinite(liveScenarioPrice) && liveScenarioPrice > 0) scenarioLevels.push(liveScenarioPrice);
@@ -705,6 +725,164 @@
     const y = (price) => top + (maximum - price) / (maximum - minimum) * plotHeight;
     const slot = historyWidth / visibleCount;
     const x = (index) => left + (index + 0.5) * slot;
+    const turtleChannelLayouts = visibleTurtleChannels.map((channel, index) => channel ? ({
+      x: x(index),
+      entryUpperY: y(channel.entryUpper), entryLowerY: y(channel.entryLower),
+      exitUpperY: y(channel.exitUpper), exitLowerY: y(channel.exitLower),
+    }) : null);
+    const turtleEventLabels = { "long-entry": "多入", "short-entry": "空入", "long-exit": "平多", "short-exit": "平空" };
+    const turtleEventLayouts = visibleTurtleEvents.map((event) => {
+      const localIndex = event.index - startIndex;
+      const upMarker = event.kind === "long-entry" || event.kind === "short-exit";
+      const candle = bars[localIndex];
+      const markerRadius = mobile ? 5 : 4;
+      const markerGap = mobile ? 3 : 2;
+      const fontSize = mobile ? 11 : 8;
+      const label = `${turtleEventLabels[event.kind] || "信号"}${event.forming ? "*" : ""}`;
+      const labelHalfWidth = Array.from(label).length * fontSize / 2 + 3;
+      const labelGap = mobile ? 3 : 2;
+      const lowerMarkerY = y(candle.low) + markerRadius + markerGap;
+      const upperMarkerY = y(candle.high) - markerRadius - markerGap;
+      const lowerLabelY = lowerMarkerY + markerRadius + labelGap + fontSize;
+      const upperLabelY = upperMarkerY - markerRadius - labelGap;
+      const labelMinY = top + fontSize;
+      const labelMaxY = priceBottom - 2;
+      const markerMinY = top + markerRadius;
+      const markerMaxY = priceBottom - markerRadius;
+      const fitsSide = (markerY, labelY) => markerY >= markerMinY && markerY <= markerMaxY
+        && labelY >= labelMinY && labelY <= labelMaxY;
+      const preferredFits = upMarker
+        ? fitsSide(lowerMarkerY, lowerLabelY)
+        : fitsSide(upperMarkerY, upperLabelY);
+      const alternateFits = upMarker
+        ? fitsSide(upperMarkerY, upperLabelY)
+        : fitsSide(lowerMarkerY, lowerLabelY);
+      const markerBelowCandle = upMarker
+        ? preferredFits || !alternateFits
+        : !preferredFits && alternateFits;
+      const markerY = Math.max(markerMinY, Math.min(markerMaxY, markerBelowCandle ? lowerMarkerY : upperMarkerY));
+      const labelCandidateY = markerBelowCandle ? lowerLabelY : upperLabelY;
+      const labelY = Math.max(labelMinY, Math.min(labelMaxY, labelCandidateY));
+      return {
+        key: `${event.date}-${event.kind}`, kind: event.kind, date: event.date, price: event.price,
+        x: Math.max(left + labelHalfWidth, Math.min(historyRight - labelHalfWidth, x(localIndex))),
+        y: markerY, markerRadius, upMarker, forming: event.forming, label, labelY, fontSize,
+      };
+    });
+    const granvilleAverageLayouts = visibleGranvilleAverage.map((price, index) => Number.isFinite(price)
+      ? ({ x: x(index), y: y(price) }) : null);
+    const granvilleEventsBeforePlacement = visibleGranvilleEvents.map((event) => {
+      const localIndex = event.index - startIndex;
+      const candle = bars[localIndex];
+      const upMarker = event.side === "buy";
+      const markerRadius = mobile ? 5 : 4;
+      const markerGap = mobile ? 3 : 2;
+      const fontSize = mobile ? 11 : 8;
+      const label = `${upMarker ? "买" : "卖"}${event.rule}`;
+      const labelHalfWidth = Array.from(label).length * fontSize / 2 + 3;
+      const labelGap = mobile ? 3 : 2;
+      const lowerMarkerY = y(candle.low) + markerRadius + markerGap;
+      const upperMarkerY = y(candle.high) - markerRadius - markerGap;
+      const lowerLabelY = lowerMarkerY + markerRadius + labelGap + fontSize;
+      const upperLabelY = upperMarkerY - markerRadius - labelGap;
+      const labelMinY = top + fontSize;
+      const labelMaxY = priceBottom - 2;
+      const markerMinY = top + markerRadius;
+      const markerMaxY = priceBottom - markerRadius;
+      const fitsSide = (markerY, labelY) => markerY >= markerMinY && markerY <= markerMaxY
+        && labelY >= labelMinY && labelY <= labelMaxY;
+      const preferredFits = upMarker
+        ? fitsSide(lowerMarkerY, lowerLabelY)
+        : fitsSide(upperMarkerY, upperLabelY);
+      const alternateFits = upMarker
+        ? fitsSide(upperMarkerY, upperLabelY)
+        : fitsSide(lowerMarkerY, lowerLabelY);
+      const markerBelowCandle = upMarker
+        ? preferredFits || !alternateFits
+        : !preferredFits && alternateFits;
+      const markerY = Math.max(markerMinY, Math.min(markerMaxY, markerBelowCandle ? lowerMarkerY : upperMarkerY));
+      const labelY = Math.max(labelMinY, Math.min(labelMaxY, markerBelowCandle ? lowerLabelY : upperLabelY));
+      return {
+        key: `${event.date}-${event.rule}`, date: event.date, rule: event.rule, side: event.side,
+        price: event.price, x: Math.max(left + labelHalfWidth, Math.min(historyRight - labelHalfWidth, x(localIndex))),
+        y: markerY, markerRadius, upMarker, label, labelY, labelDirection: markerBelowCandle ? 1 : -1, fontSize,
+      };
+    });
+    const occupiedGranvilleLabels = [];
+    const reserveGranvilleBox = (box) => occupiedGranvilleLabels.push(box);
+    const labelBox = (event, labelY = event.labelY) => {
+      const halfWidth = Array.from(event.label).length * event.fontSize / 2 + 3;
+      return { left: event.x - halfWidth, right: event.x + halfWidth, top: labelY - event.fontSize - 2, bottom: labelY + 2 };
+    };
+    const markerBox = (event) => ({
+      left: event.x - event.markerRadius - 2, right: event.x + event.markerRadius + 2,
+      top: event.y - event.markerRadius - 2, bottom: event.y + event.markerRadius + 2,
+    });
+    const overlapsGranvilleBox = (box) => occupiedGranvilleLabels.some((other) =>
+      box.left < other.right + 2 && box.right + 2 > other.left
+      && box.top < other.bottom + 2 && box.bottom + 2 > other.top);
+    if (granvilleEventsBeforePlacement.length) {
+      const mergedCandleRanges = new Map();
+      if (layers?.chanCandles !== false) {
+        for (const merged of frame.merged_candles || []) {
+          const rawStart = Number(merged.raw_start), rawEnd = Number(merged.raw_end);
+          const high = Number(merged.high), low = Number(merged.low);
+          if (!Number.isInteger(rawStart) || !Number.isInteger(rawEnd) || rawStart > rawEnd
+            || !Number.isFinite(high) || !Number.isFinite(low) || high < low
+            || rawEnd < startIndex || rawStart >= endIndex) continue;
+          const localIndex = Math.min(rawEnd, endIndex - 1) - startIndex;
+          if (localIndex >= 0 && localIndex < bars.length) {
+            mergedCandleRanges.set(localIndex, { high: y(high), low: y(low) });
+          }
+        }
+      }
+      bars.forEach((candle, index) => {
+        const bodyTop = Math.min(y(candle.open), y(candle.close));
+        const bodyBottom = Math.max(y(candle.open), y(candle.close));
+        const merged = mergedCandleRanges.get(index);
+        const candleTop = Math.min(y(candle.high), y(candle.low), bodyTop, bodyBottom, merged?.high ?? Infinity, merged?.low ?? Infinity);
+        const candleBottom = Math.max(y(candle.high), y(candle.low), bodyTop, bodyBottom, merged?.high ?? -Infinity, merged?.low ?? -Infinity);
+        const halfWidth = Math.max(1, slot * 0.56) / 2 + 1;
+        const horizontalGap = Math.max(4, Math.min(6, slot * 0.2));
+        const verticalGap = mobile ? 6 : 5;
+        reserveGranvilleBox({
+          left: x(index) - halfWidth - horizontalGap,
+          right: x(index) + halfWidth + horizontalGap,
+          top: candleTop - verticalGap,
+          bottom: candleBottom + verticalGap,
+        });
+      });
+    }
+    // 先保留原始及合并 K 线与已绘制信号，再为葛兰碧文字寻找空位。
+    for (const event of turtleEventLayouts) {
+      reserveGranvilleBox(labelBox(event));
+      reserveGranvilleBox(markerBox(event));
+    }
+    granvilleEventsBeforePlacement.forEach((event) => reserveGranvilleBox(markerBox(event)));
+    const granvilleEventLayouts = granvilleEventsBeforePlacement.map((event) => {
+      const labelMinY = top + event.fontSize;
+      const labelMaxY = priceBottom - 2;
+      const step = event.fontSize + 4;
+      const candidates = [event.labelY];
+      const maxLanes = Math.ceil((priceBottom - top) / step);
+      for (let lane = 1; lane <= maxLanes; lane += 1) {
+        candidates.push(event.labelY + event.labelDirection * lane * step);
+        candidates.push(event.labelY - event.labelDirection * lane * step);
+      }
+      const labelY = candidates.find((candidate) => {
+        if (candidate < labelMinY || candidate > labelMaxY) return false;
+        return !overlapsGranvilleBox(labelBox(event, candidate));
+      });
+      const labelVisible = Number.isFinite(labelY);
+      if (labelVisible) reserveGranvilleBox(labelBox(event, labelY));
+      const placedLabelY = labelVisible ? labelY : event.labelY;
+      return {
+        ...event,
+        labelY: placedLabelY,
+        labelVisible,
+        labelConnector: labelVisible && Math.abs(placedLabelY - event.labelY) > 2,
+      };
+    });
     const trendlineLayouts = (() => {
       if (!trendlineResult?.length) return null;
       const toX = (rawIndex) => left + (rawIndex - startIndex + 0.5) * slot;
@@ -915,7 +1093,7 @@
       ],
       // `segments` here is the Canvas paint gate: the mapped segment list is
       // already filtered by the global default and any per-level overrides.
-      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
+      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
       // Keep per-level controls stable while users pan and zoom; their options
       // should describe the loaded structure, not only the current viewport.
       availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
@@ -944,6 +1122,10 @@
       })),
       afSignals: afSignalLayouts,
       trendlines: trendlineLayouts,
+      turtleChannels: turtleChannelLayouts,
+      turtleEvents: turtleEventLayouts,
+      granvilleAverage: granvilleAverageLayouts,
+      granvilleEvents: granvilleEventLayouts,
       // Count only signals that can actually be drawn. The visible signal list
       // is intentionally limited to the current chart window so panning does
       // not pull off-screen markers onto the plot edge.
@@ -1012,6 +1194,18 @@
         .map((index) => { const displayDate = displayBarTime(bars[index].date, frame.period); return { x: x(index), y: height - 12, label: mobile ? axisDateLabel(displayDate).slice(-5) : axisDateLabel(displayDate) }; }),
     };
     if (trendlineLayouts?.length) chart.description += "结构趋势线由已确认的笔与线段端点拟合，实线连接结构点，虚线延伸至当前窗口；收盘价有效穿越后不再显示。";
+    if (layers?.turtle === true) {
+      const eventDescription = turtleEventLayouts.length
+        ? `当前窗口信号：${turtleEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
+        : "当前窗口暂无海龟突破/退出信号。";
+      chart.description += `海龟通道按当前周期的前 20 根 K 线计算入场轨、前 10 根计算退出轨；入场需 PDI/MDI 与方向一致、ADX(14,6) 高于 25 且高于 3 根前、连续两根已收盘 K 线守住突破位，并且收盘价位于 55 周期 EMA 同侧、EMA 近 5 根方向一致；过滤条件不满足时不建立新仓，已有仓位仍按 K 线高低价触及退出，未收盘 K 线也可能触发退出；${eventDescription}`;
+    }
+    if (layers?.granville === true) {
+      const eventDescription = granvilleEventLayouts.length
+        ? `当前窗口信号：${granvilleEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
+        : "当前窗口暂无葛兰碧信号。";
+      chart.description += `葛兰碧规则使用当前周期 200 期 SMA，20 期斜率判断趋势；回踩阈值约 0.3 ATR(14)，乖离阈值约 2 ATR(14)。交叉、回踩与乖离回归信号是八条定性规则的量化近似，仅在 K 线收盘后确认；${eventDescription}`;
+    }
     if (!liveCandleVisible) {
       const layouts = cachedLayouts || new Map();
       layouts.set(cacheKey, { chart, minimum, maximum, y });

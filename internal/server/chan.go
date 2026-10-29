@@ -294,9 +294,6 @@ func (s *Service) intradayDailyBarFallback(symbol string, quote model.Quote) *mo
 		return nil
 	}
 	open, close := first.Open, latest.Close
-	if finitePositivePointer(quote.TodayOpen) {
-		open = *quote.TodayOpen
-	}
 	forming := state == "REGULAR"
 	if forming && validMarketPrice(quote.Price) {
 		close = *quote.Price
@@ -307,10 +304,6 @@ func (s *Service) intradayDailyBarFallback(symbol string, quote model.Quote) *mo
 		return nil
 	}
 	return &model.DailyBar{Date: date, Open: open, High: high, Low: low, Close: close, Volume: volume, IsForming: forming}
-}
-
-func finitePositivePointer(value *float64) bool {
-	return value != nil && finitePositive(*value)
 }
 
 // chanAdjustedAnalysis serves the independent adjusted daily history used by

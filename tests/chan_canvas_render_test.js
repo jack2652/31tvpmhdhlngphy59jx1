@@ -4,11 +4,11 @@ const vm = require("node:vm");
 
 const window = { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} };
 const context = {
-  dash: [], strokes: [], texts: [], rects: [],
+  dash: [], strokes: [], texts: [], rects: [], fills: 0,
   setTransform() {}, clearRect() {}, beginPath() {}, moveTo(x, y) { this.start = [x, y]; },
   lineTo(x, y) { this.end = [x, y]; }, stroke() { this.strokes.push({ start: this.start, end: this.end, dash: [...this.dash], width: this.lineWidth, color: this.strokeStyle }); },
-  setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font }); }, arc() {}, fill() {}, strokeText() {},
-  save() {}, restore() {}, translate() {}, rotate() {}, closePath() {},
+  setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font }); }, arc() {}, fill() { this.fills += 1; }, strokeText() {},
+  save() {}, restore() {}, translate() {}, rotate() {}, closePath() {}, rect() {}, clip() {},
 };
 const canvas = { width: 0, height: 0, style: {}, getContext: () => context };
 const svg = { getBoundingClientRect: () => ({ width: 960, height: 340 }) };
@@ -117,6 +117,36 @@ assert.ok(!renderAFStochZ(false).some((text) => text.text === "BUY" || text.text
 const afLabels = renderAFStochZ(true);
 assert.ok(afLabels.some((text) => text.text === "BUY"), "enabled AF StochZ layer paints leading BUY labels");
 assert.ok(afLabels.some((text) => text.text === "H-Bear"), "enabled AF StochZ layer paints hidden divergence labels");
+
+context.texts = [];
+context.fills = 0;
+window.OptionScopeCharts.renderChanCanvas(target, {
+  chart: {
+    width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300,
+    historyRight: 940, grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [],
+    keyLevels: [], signals: [], dates: [], segments: [], granvilleAverage: [],
+    granvilleEvents: [{ side: "sell", x: 120, y: 100, markerRadius: 4, upMarker: false, label: "卖8", labelY: 80, fontSize: 8, labelVisible: false }],
+  },
+  layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, granville: true },
+});
+assert.ok(!context.texts.some((text) => text.text === "卖8"), "没有无重叠位置时隐藏葛兰碧文字");
+assert.equal(context.fills, 1, "隐藏葛兰碧文字时仍绘制对应三角标记");
+
+context.strokes = [];
+context.texts = [];
+context.rects = [];
+window.OptionScopeCharts.renderChanCanvas(target, {
+  chart: {
+    width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300,
+    historyRight: 940, grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [],
+    keyLevels: [], signals: [], dates: [], segments: [], granvilleAverage: [],
+    granvilleEvents: [{ side: "sell", x: 120, y: 100, markerRadius: 4, upMarker: false, label: "卖8", labelY: 80, fontSize: 8, labelVisible: true, labelConnector: true }],
+  },
+  layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, granville: true },
+});
+assert.ok(context.rects.some((rect) => rect.x === 109 && rect.y === 70 && rect.width === 22 && rect.height === 12), "葛兰碧标签使用信号色底框");
+assert.ok(context.texts.some((text) => text.text === "卖8"), "可见的葛兰碧标签绘制文字");
+assert.ok(context.strokes.some((stroke) => stroke.start[0] === 120 && stroke.start[1] === 95 && stroke.end[0] === 120 && stroke.end[1] === 82), "葛兰碧引线从三角尖端连到标签框边缘");
 
 context.strokes = [];
 context.texts = [];

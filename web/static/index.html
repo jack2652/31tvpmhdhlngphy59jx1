@@ -151,13 +151,13 @@
       <div class="detail-header">
         <button class="detail-toggle" type="button" :aria-expanded="chanExpanded ? 'true' : 'false'" aria-controls="chan-body" @click="toggleChanPanel">
           <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">CHAN STRUCTURE</span><span class="detail-title" id="chan-title">缠论 · 多级结构分析</span></span>
+          <span class="detail-text"><span class="eyebrow">CHAN STRUCTURE · INDICATOR ANALYSIS</span><span class="detail-title" id="chan-title">缠论结构 · 技术指标分析</span></span>
           <span class="detail-action">{{ chanExpanded ? '收起' : '展开' }}</span>
         </button>
       </div>
       <div class="detail-body chan-body" id="chan-body" v-show="chanExpanded">
         <div class="chan-summary">
-          <div class="chan-summary-read"><span class="chan-section-label">{{ chanFrame.label }} · 结构概况</span><h2>{{ chanFrame.recursive.heading }}</h2><p>{{ chanFrame.recursive.trend }}</p></div>
+          <div class="chan-summary-read"><span class="chan-section-label">缠论结构 · {{ chanFrame.label }}概况</span><h2>{{ chanFrame.recursive.heading }}</h2><p>{{ chanFrame.recursive.trend }}</p></div>
           <div class="chan-meta"><strong class="chan-summary-spot">现价 {{ view.chan.spot }}</strong><span class="chan-status-line" role="status">{{ chanStatusLine }}</span><span class="chan-summary-quality chan-quality" :class="'chan-quality-' + chanFrame.recursive.qualityClass">行情{{ chanFrame.recursive.quality }}</span></div>
         </div>
         <section class="chan-recursive" aria-labelledby="chan-recursive-title">
@@ -230,10 +230,6 @@
                     <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.legacySignals ? 'true' : 'false'" aria-describedby="chan-signal-help-pen" @click="toggleChanChartLayer('legacySignals')">笔转折预警</button>
                     <small id="chan-signal-help-pen">笔刚出现转向迹象时先提醒，后续走势变化可能让提示失效。</small>
                   </div>
-                  <div class="chan-layer-signal-item">
-                    <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.afStochZ ? 'true' : 'false'" aria-describedby="chan-signal-help-momentum" @click="toggleChanChartLayer('afStochZ')">指标买卖与背离</button>
-                    <small id="chan-signal-help-momentum">结合指标强弱和价格转折提示买卖；两者走势不一致时标记背离（AF StochZ）。</small>
-                  </div>
                 </div>
                 <span v-if="chanChartLayers.signals && chanFrame.chart && !chanFrame.chart.signals.length" class="chan-layer-empty" role="status" :title="chanFrame.chart.totalSignalCount ? '打开结构买卖点详情查看候选状态' : '请打开“笔转折预警”图层'">{{ chanFrame.chart.totalPlottableSignalCount ? '当前窗口无标记 · 全周期 ' + chanFrame.chart.totalPlottableSignalCount + ' 处，拖动查看' : chanFrame.chart.totalSignalCount ? '有 ' + chanFrame.chart.totalSignalCount + ' 条候选待确认，查看结构买卖点详情' : '当前周期暂无结构买卖点' }}</span>
                 </section>
@@ -273,6 +269,44 @@
                   <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.macd ? 'true' : 'false'" @click="toggleChanSubchart('macd')">MACD</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.dmi ? 'true' : 'false'" @click="toggleChanSubchart('dmi')">DMI</button>
                 </div></section>
+              </div>
+            </details>
+            <details class="chan-indicator-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+              <summary aria-label="技术指标设置">指标</summary>
+              <div class="chan-layer-menu-panel chan-indicator-menu-panel">
+                <button class="chan-layer-menu-close" type="button" aria-label="关闭指标面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                <section class="chan-layer-menu-display">
+                  <h4>价格指标</h4>
+                  <div class="chan-indicator-options">
+                    <div class="chan-indicator-option">
+                      <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.afStochZ ? 'true' : 'false'" :aria-expanded="chanChartLayers.afStochZ ? 'true' : 'false'" aria-controls="chan-af-stochz-help" @click="toggleChanChartLayer('afStochZ')">AF StochZ</button>
+                    </div>
+                    <div class="chan-indicator-option">
+                      <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.turtle ? 'true' : 'false'" :aria-expanded="chanChartLayers.turtle ? 'true' : 'false'" aria-controls="chan-turtle-help" @click="toggleChanChartLayer('turtle')">海龟交易法</button>
+                    </div>
+                    <div class="chan-indicator-option">
+                      <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.granville ? 'true' : 'false'" :aria-expanded="chanChartLayers.granville ? 'true' : 'false'" aria-controls="chan-granville-help" @click="toggleChanChartLayer('granville')">葛兰碧法则</button>
+                    </div>
+                    <div id="chan-af-stochz-help" class="chan-indicator-description-body" role="region" aria-label="指标买卖与背离说明" v-show="chanChartLayers.afStochZ">
+                      <small>结合指标强弱和价格转折提示买卖；两者走势不一致时标记背离（指标买卖与背离）。</small>
+                    </div>
+                    <div id="chan-turtle-help" class="chan-indicator-description-body" role="region" aria-label="海龟交易法说明" v-show="chanChartLayers.turtle">
+                      <small>20 根前序 K 线突破入场，10 根反向通道退出；须连续两根收盘守位、PDI/MDI 方向一致、ADX(14,6)&gt;25 且高于 3 根前，并通过 55 EMA 过滤。数据不足时不入场；这是过滤版，不含系统一获利过滤、ATR 仓位和加仓规则。</small>
+                      <div class="chan-turtle-legend" role="list" aria-label="海龟通道图例">
+                        <span role="listitem"><i class="chan-turtle-swatch chan-turtle-swatch-entry" aria-hidden="true"></i>20 根入场通道</span>
+                        <span role="listitem"><i class="chan-turtle-swatch chan-turtle-swatch-exit" aria-hidden="true"></i>10 根退出通道</span>
+                        <small>方向或趋势强度不符时不产生新入场；已有仓位仍按通道退出。未收盘 K 线可能触发退出。</small>
+                      </div>
+                    </div>
+                    <div id="chan-granville-help" class="chan-indicator-description-body" role="region" aria-label="葛兰碧法则说明" v-show="chanChartLayers.granville">
+                      <small>当前周期 200 期简单均线；回踩阈值约 0.3 ATR，远离阈值约 2 ATR。买4同一轮低位乖离只提示一次，收盘价回到均线下方 0.5 ATR 内后重置。卖8同一轮高乖离只提示一次，回到均线 1 ATR 内后重置。八条定性规则的量化近似，信号仅在 K 线收盘后确认。</small>
+                      <div class="chan-granville-legend" role="list" aria-label="葛兰碧法则图例">
+                        <span role="listitem"><i class="chan-granville-swatch" aria-hidden="true"></i>200 期 SMA</span>
+                        <small><span class="chan-granville-buy">买1-买4</span> · <span class="chan-granville-sell">卖5-卖8</span></small>
+                      </div>
+                    </div>
+                  </div>
+                </section>
               </div>
             </details>
           </div></div>
@@ -529,6 +563,8 @@
   <script src="/static/common/js/chan-plan.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-stochz.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-trendlines.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-turtle.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-granville.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/app.js?v=__ASSET_VERSION__"></script>
 </body>
