@@ -311,6 +311,7 @@ const state = {
     chainTitle: "GEX 热力图 · 选择到期日查看",
     dataSource: "尚未加载",
     fetchedAt: "快照时间 --",
+    fetchedAtTitle: "",
     chainHeatNote: "等待数据",
     chainRows: [],
     chainEmpty: "输入标的并载入数据",
@@ -539,6 +540,7 @@ function restoreClientSnapshot(symbol, expiration = "", allowStale = false) {
   state.displayedLevelsContext = [symbol, state.expiration, state.levelBasisMode].join("|");
   state.analysisReady = Boolean(cached.analysisReady);
   Object.assign(state.view, view);
+  updateSnapshotStatus();
   if (quoteIsETF(quote)) applyETFValuationDefaults();
   state.lastAnalysis = null;
   // The persisted view is authoritative while offline. Keep the raw rows in
@@ -1416,6 +1418,27 @@ function formatOptionQuote(value) {
   return Number.isFinite(number) && number >= 0 ? number.toFixed(2) : "--";
 }
 function formatTime(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { timeZone: "America/New_York", hour12: false }); }
+function formatEasternTime(value) { return value ? `${formatTime(value)} 美东` : "--"; }
+function formatEasternClock(value) {
+  if (!value) return "--:--";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? "--:--"
+    : date.toLocaleTimeString("zh-CN", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+function updateSnapshotStatus() {
+  const quoteAt = state.lastQuote?.fetched_at || null;
+  const chainAt = state.displayedChainFetchedAt || state.chainFetchedAt || null;
+  if (quoteAt) {
+    state.view.fetchedAt = `行情更新 ${formatEasternTime(quoteAt)}`;
+    state.view.fetchedAtTitle = chainAt
+      ? `最新行情：${formatEasternTime(quoteAt)}；期权链快照：${formatEasternTime(chainAt)}`
+      : `最新行情：${formatEasternTime(quoteAt)}`;
+    return;
+  }
+  state.view.fetchedAt = chainAt ? `期权链快照 ${formatEasternTime(chainAt)}` : "快照时间 --";
+  state.view.fetchedAtTitle = chainAt ? `期权链快照：${formatEasternTime(chainAt)}` : "";
+}
 function formatFlowInterval(value) {
   const seconds = Number(value);
   if (!Number.isFinite(seconds) || seconds < 0) return "相邻快照";
@@ -4092,6 +4115,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.view.quoteMarket = quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
+  updateSnapshotStatus();
   if (state.chainView === "heatmap") renderChainHeatmap();
   scheduleQuoteRecovery(state.lastQuote);
   // 行情可能晚于期权链到达。现价档位变化后重新触发一次价位计算，否则
@@ -4523,7 +4547,7 @@ function renderChainTable() {
 const CHAIN_HEATMAP_HORIZON_DAYS = 45;
 let chainHeatmapLoadToken = 0;
 let chainHeatmapLoadingSymbol = "";
-let chainHeatmapCache = { symbol: "", expirations: new Map() };
+let chainHeatmapCache = { symbol: "", expirations: new Map(), availableExpirations: new Set() };
 
 function heatmapExpiryDates(dates) {
   const todayParts = new Intl.DateTimeFormat("en-US", {
@@ -4545,24 +4569,24 @@ function renderChainHeatmap() {
     source.set(state.expiration, { rows: state.chainRows, fetchedAt: state.chainFetchedAt, current: true });
   }
   const spot = finitePrice(state.lastQuote?.price ?? state.chainSpot);
+  const quoteFetchedAt = state.lastQuote?.fetched_at || null;
   const current = state.expiration;
   const expirations = [...source.keys()].sort();
   const columns = expirations.map((expiration) => {
     const entry = source.get(expiration);
     const isSelected = expiration === current;
-    const isCurrentSnapshot = isSelected && entry?.current === true
-      && state.chainFetchedExpiration === expiration && state.chainFetchedSymbol === state.symbol;
+    const displayTime = isSelected ? (quoteFetchedAt || entry?.fetchedAt) : entry?.fetchedAt;
     const date = new Date(`${expiration}T12:00:00Z`);
     return {
       expiration,
       label: Number.isNaN(date.getTime()) ? expiration : new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", timeZone: "UTC" }).format(date),
-      source: isCurrentSnapshot ? "当前" : "缓存",
-      updatedAt: entry?.fetchedAt
-        ? new Date(entry.fetchedAt).toLocaleTimeString("zh-CN", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false })
-        : "--:--",
+      source: isSelected ? "行情" : "缓存",
+      updatedAt: formatEasternClock(displayTime),
       current: isSelected,
-      live: isCurrentSnapshot,
-      title: `${expiration} · ${isCurrentSnapshot ? "当前期限快照" : "缓存参考"} · ${formatTime(entry?.fetchedAt)}`,
+      selected: isSelected,
+      title: isSelected
+        ? `${expiration} · GEX 按最新行情 ${formatEasternTime(quoteFetchedAt || entry?.fetchedAt)} 估算 · 期权链快照 ${formatEasternTime(entry?.fetchedAt)}`
+        : `${expiration} · 缓存参考 · 期权链快照 ${formatEasternTime(entry?.fetchedAt)}`,
     };
   });
   if (!Number.isFinite(spot) || spot <= 0 || !columns.length) {
@@ -4574,6 +4598,7 @@ function renderChainHeatmap() {
   const upper = spot * 1.15;
   const valuesByExpiration = new Map();
   const strikeSet = new Set();
+  const gexLabel = state.chainFilter === "call" ? "看涨 GEX" : state.chainFilter === "put" ? "看跌 GEX" : "净 GEX";
   let peak = 0;
   for (const column of columns) {
     const entry = source.get(column.expiration);
@@ -4582,6 +4607,7 @@ function renderChainHeatmap() {
     const spotSquared = spot * spot;
     const spotKey = gammaSpotBucket(spot);
     for (const option of rows) {
+      if (state.chainFilter !== "all" && option.contract_type !== state.chainFilter) continue;
       const strike = Number(option.strike);
       if (!Number.isFinite(strike) || strike < lower || strike > upper) continue;
       const gex = contractGex(option, spot, spotSquared, spotKey);
@@ -4615,13 +4641,13 @@ function renderChainHeatmap() {
           value: formatGex(value / 1000000, 1),
           className: `chain-heatmap-cell ${value > 0 ? "chain-heatmap-cell-positive" : value < 0 ? "chain-heatmap-cell-negative" : "chain-heatmap-cell-zero"}${percent >= 65 ? " chain-heatmap-cell-hot" : ""}${spotClass}`,
           style: `--heat:${percent}`,
-          title: `${column.expiration} · 行权价 ${formatMoney(strike)} · 净 GEX ${formatGex(value / 1000000, 2)} · ${column.live ? "当前期限" : "缓存参考"}`,
+          title: `${column.expiration} · 行权价 ${formatMoney(strike)} · ${gexLabel} ${formatGex(value / 1000000, 2)} · ${column.selected ? "已选期限，按最新行情估算" : "缓存参考"}`,
         };
       }),
     };
   });
   state.view.chainHeatmap = { columns, rows: modelRows };
-  state.view.chainHeatmapEmpty = "当前价 ±15% 区间内暂无可计算 GEX";
+  state.view.chainHeatmapEmpty = `当前价 ±15% 区间内暂无可计算 ${gexLabel}`;
 }
 
 function updateChainHeatmapMeta(loaded, total) {
@@ -4631,7 +4657,7 @@ function updateChainHeatmapMeta(loaded, total) {
 async function loadChainHeatmapBackground(catalogPayload = null) {
   const symbol = state.symbol;
   if (chainHeatmapLoadingSymbol === symbol) return;
-  if (chainHeatmapCache.symbol !== symbol) chainHeatmapCache = { symbol, expirations: new Map() };
+  if (chainHeatmapCache.symbol !== symbol) chainHeatmapCache = { symbol, expirations: new Map(), availableExpirations: new Set() };
   const token = ++chainHeatmapLoadToken;
   chainHeatmapLoadingSymbol = symbol;
   const currentRows = state.chainRows?.length && state.chainFetchedSymbol === symbol
@@ -4648,7 +4674,11 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
   try {
     const catalog = catalogPayload || await request(`/api/expirations/${encodeURIComponent(symbol)}`);
     if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
-    const dates = heatmapExpiryDates(catalog?.cached_expirations || [])
+    const cachedCatalogDates = [...new Set((catalog?.cached_expirations || []).filter(Boolean))].sort();
+    chainHeatmapCache.availableExpirations = new Set(cachedCatalogDates);
+    const availableDates = [...new Set([...(catalog?.expirations || []), ...cachedCatalogDates])].sort();
+    if (availableDates.length) applyExpirations(availableDates, state.expiration);
+    const dates = heatmapExpiryDates(cachedCatalogDates)
       .filter((expiration) => expiration !== state.expiration);
     const cachedDates = [...chainHeatmapCache.expirations.keys()].filter((expiration) => expiration !== state.expiration);
     const pendingDates = dates.filter((expiration) => !chainHeatmapCache.expirations.has(expiration));
@@ -4747,6 +4777,11 @@ function renderChain(payload, quote, analysisPayload) {
   ].join("|");
   // 自动刷新经常拿到同一份快照。签名一致时跳过聚合、图表和表格。
   if (signature === chainRenderSignature && state.view.chainRows.length) {
+    if (quote?.fetched_at && quote.fetched_at !== state.lastQuote?.fetched_at) {
+      state.lastQuote = quote;
+      updateSnapshotStatus();
+      if (state.chainView === "heatmap") renderChainHeatmap();
+    }
     if (state.pendingAnalyticsRefresh && state.lastAnalysis?.points?.length) schedulePushedAnalyticsRefresh();
     return;
   }
@@ -4759,7 +4794,6 @@ function renderChain(payload, quote, analysisPayload) {
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
   const oiFallback = payload.oi_fallback || {};
   state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < SNAPSHOT_FRESH_SECONDS ? "上游新快照" : "本地缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
-  state.view.fetchedAt = `快照时间 ${formatTime(payload.fetched_at)}`;
   state.view.totalCount = formatNumber(rows.length);
   let callVolume = 0, putVolume = 0, callInterest = 0, putInterest = 0;
   for (const row of rows) {
@@ -4780,6 +4814,7 @@ function renderChain(payload, quote, analysisPayload) {
   state.displayedChainSymbol = payload.symbol || state.symbol;
   state.displayedChainExpiration = payload.expiration || state.expiration;
   state.displayedChainFetchedAt = payload.fetched_at || null;
+  updateSnapshotStatus();
   renderAnalysis(analysisRows, quote?.price, analysisPayload, rows, payload.iv_model || {}, activeBasis(quote));
   if (state.pendingAnalyticsRefresh && state.lastAnalysis?.points?.length) schedulePushedAnalyticsRefresh();
   state.chainRows = Object.freeze(rows); state.chainSpot = quote?.price ?? null;
@@ -4791,7 +4826,10 @@ function renderChain(payload, quote, analysisPayload) {
 
 // emptyLabel：本地没有到期日时的占位文案，需要区分「还没抓过」（正在获取）和「该标的没有期权」。
 function applyExpirations(dates, preferred, emptyLabel = "正在获取到期日…") {
-  const unique = [...new Set((dates || []).filter(Boolean))];
+  const cachedDates = chainHeatmapCache.symbol === state.symbol
+    ? [...chainHeatmapCache.availableExpirations]
+    : [];
+  const unique = [...new Set([...(dates || []), ...cachedDates].filter(Boolean))].sort();
   state.expirationOptions = unique;
   state.expirationPlaceholder = emptyLabel;
   if (!unique.length) {
@@ -4836,7 +4874,7 @@ async function renderCachedHistoryOnly(loadId, quote = null) {
     && state.chainRows?.length) return;
   state.view.chainTitle = chainViewTitle(symbol, state.expiration);
   state.view.dataSource = "SQLite 行情/日线 · 无期权链缓存";
-  state.view.fetchedAt = usableQuote?.fetched_at ? `行情 ${formatTime(usableQuote.fetched_at)}` : "SQLite 暂无行情缓存";
+  updateSnapshotStatus();
   state.view.totalCount = "0";
   state.view.callVolume = "0";
   state.view.putVolume = "0";
@@ -4925,6 +4963,7 @@ function showPending(message, preserveCache = false) {
   state.view.chainTitle = chainViewTitle(state.symbol, state.expiration);
   state.view.dataSource = "后台刷新中";
   state.view.fetchedAt = "快照时间 --";
+  state.view.fetchedAtTitle = "等待行情与期权链快照";
   state.view.totalCount = "--";
   state.view.callVolume = "--";
   state.view.putVolume = "--";
@@ -6221,11 +6260,18 @@ const optionScopeApp = new Vue({
     expirationChanged() { return switchExpiration(this.expiration); },
     expirationMenuChanged(open) { return setExpirationMenuOpen(open); },
     selectHeatmapExpiration(expiration) {
-      if (this.loading || !this.expirationOptions.includes(expiration) || expiration === this.expiration) return;
+      const availableFromCache = chainHeatmapCache.symbol === state.symbol
+        && chainHeatmapCache.availableExpirations.has(expiration);
+      if (this.loading || (!this.expirationOptions.includes(expiration) && !availableFromCache) || expiration === this.expiration) return;
+      if (!this.expirationOptions.includes(expiration)) {
+        this.expirationOptions = [...new Set([...this.expirationOptions, expiration])].sort();
+      }
       this.expiration = expiration;
       return switchExpiration(expiration);
     },
-    filterChanged() { return renderChainTable(); },
+    filterChanged() {
+      return this.chainView === "heatmap" ? renderChainHeatmap() : renderChainTable();
+    },
     toggleChainView() {
       this.chainView = this.chainView === "heatmap" ? "table" : "heatmap";
       rememberChainViewPreference(this.chainView);
