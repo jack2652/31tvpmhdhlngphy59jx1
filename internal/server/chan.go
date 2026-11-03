@@ -463,6 +463,7 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	if rawSpot != nil && adjustedSpot == nil && factor != nil {
 		result.Warnings = append(result.Warnings, "当前现价无效；未与复权结构比较")
 	}
+	result.Daily.FutureTradingDates = futureTradingDates(result.Daily)
 	if marketWarning != "" {
 		result.Warnings = append(result.Warnings, marketWarning)
 	}
@@ -475,6 +476,28 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 		response["daily"], response["weekly"] = result.Daily, result.Weekly
 	}
 	c.JSON(http.StatusOK, response)
+}
+
+func futureTradingDates(frame chananalysis.Frame) []string {
+	if frame.Period != "1d" || len(frame.Candles) == 0 {
+		return nil
+	}
+	lastDate := frame.Candles[len(frame.Candles)-1].Date
+	if len(lastDate) < len(time.DateOnly) {
+		return nil
+	}
+	days, ok := marketcalendar.ParseDateOnly(lastDate[:len(time.DateOnly)])
+	if !ok {
+		return nil
+	}
+	// 覆盖图表可平移的未来空槽，并为右侧情景留白保留一格。
+	count := len(frame.Candles)*3/4 + 1
+	dates := make([]string, 0, count)
+	for index := 0; index < count; index++ {
+		days = marketcalendar.NextTradingDayOrdinal(days)
+		dates = append(dates, marketcalendar.FormatDateOnly(days))
+	}
+	return dates
 }
 
 // compactChanFrame omits heavy fields the browser chart does not read. The

@@ -235,15 +235,20 @@ function bindChanChartHover(target, initialBinding) {
     label.setAttribute("text-anchor", "middle");
     label.textContent = text;
   };
-  const show = (index, localY, localXOverride = null) => {
-    const candle = model?.candles?.[index];
+  const show = (index, localY, localXOverride = null, pendingDate = "") => {
+    const candle = pendingDate ? {
+      key: `pending-${pendingDate}`, date: pendingDate, displayDate: pendingDate,
+      x: localXOverride, pending: true, prices: {}, volume: null,
+    } : model?.candles?.[index];
     if (!candle || !target.offsetWidth || !target.offsetHeight) { hide(); return; }
     activeIndex = index;
-    if (shownHeaderCandle !== candle) {
+    const candleIdentity = candle.pending ? candle.key : candle;
+    if (shownHeaderCandle !== candleIdentity) {
       drawChanIndicatorHeaders(target, model, candle);
-      shownHeaderCandle = candle;
+      shownHeaderCandle = candleIdentity;
     }
     const localX = Number.isFinite(localXOverride) ? localXOverride : candle.x;
+    const crosshairX = candle.pending ? localX : candle.x;
     const crosshairBottom = Number.isFinite(model.crosshairBottom) ? model.crosshairBottom : model.plotBottom;
     const inPricePane = localY >= model.plotTop && localY <= model.plotBottom;
     const inVolumePane = Number.isFinite(model.volumeTop) && Number.isFinite(model.volumeBottom)
@@ -256,11 +261,11 @@ function bindChanChartHover(target, initialBinding) {
     const priceRange = model.maximum - model.minimum;
     const cursorY = Math.max(model.plotTop, Math.min(model.plotBottom, localY));
     const price = model.maximum - (cursorY - model.plotTop) / plotHeight * priceRange;
-    setLine(vertical, candle.x, model.plotTop, candle.x, crosshairBottom);
+    setLine(vertical, crosshairX, model.plotTop, crosshairX, crosshairBottom);
     // The Chan chart reserves its right side for scenario cards; keep the
     // historical crosshair inside the candle plot so it cannot strike text.
     if (inPricePane) {
-      setLine(horizontal, model.plotLeft, cursorY, model.historyRight ?? model.plotRight, cursorY);
+      setLine(horizontal, model.plotLeft, cursorY, candle.pending ? model.plotRight : model.historyRight ?? model.plotRight, cursorY);
       horizontal.removeAttribute("visibility");
     } else {
       horizontal.setAttribute("visibility", "hidden");
@@ -286,7 +291,7 @@ function bindChanChartHover(target, initialBinding) {
     const displayDate = candle.displayDate || candle.date;
     const axisDate = displayDate.includes(" ") ? displayDate.slice(5) : displayDate;
     const dateWidth = Math.max(84, axisDate.length * 7 + 12);
-    setTag(tagX, axisDate, Math.max(2, Math.min(model.width - dateWidth - 2, candle.x - dateWidth / 2)), model.height - 22, dateWidth);
+    setTag(tagX, axisDate, Math.max(2, Math.min(model.width - dateWidth - 2, crosshairX - dateWidth / 2)), model.height - 22, dateWidth);
     const priceLabel = formatMoney(price), priceWidth = Math.min(model.plotLeft - 4, Math.max(42, priceLabel.length * 6 + 10));
     // Preserve the current-price badge when the cursor reaches the same price.
     const overlapsSpot = inPricePane && model.spot && Math.abs(cursorY - model.spot.y) < model.spot.height / 2 + 10;
@@ -310,20 +315,20 @@ function bindChanChartHover(target, initialBinding) {
     setPaneTag(tagVolume, inVolumePane, volumeAtCursor == null ? "" : formatVolume(Math.max(0, volumeAtCursor)), localY);
     setPaneTag(tagMacd, inMacdPane, macdAtCursor == null ? "" : formatIndicator(macdAtCursor), localY);
     setPaneTag(tagDmi, inDmiPane, dmiAtCursor == null ? "" : formatIndicator(dmiAtCursor), localY);
-    if (shownCandle !== candle) {
+    if (candle.pending ? shownCandle?.key !== candle.key : shownCandle !== candle) {
       title.textContent = displayDate;
-      subtitle.textContent = `${model.periodLabel} · ${candle.isForming ? "形成中 K 线" : "已收盘 K 线"}`;
-      const directionClass = candle.prices.close > candle.prices.open ? "chan-ohlc-up"
+      subtitle.textContent = `${model.periodLabel} · ${candle.pending ? "待开盘 K 线" : candle.isForming ? "形成中 K 线" : "已收盘 K 线"}`;
+      const directionClass = candle.pending ? "chan-ohlc-flat" : candle.prices.close > candle.prices.open ? "chan-ohlc-up"
         : candle.prices.close < candle.prices.open ? "chan-ohlc-down" : "chan-ohlc-flat";
       Object.keys(values).forEach((key) => {
-        values[key].textContent = formatMoney(candle.prices[key]);
+        values[key].textContent = candle.pending ? "-" : formatMoney(candle.prices[key]);
         values[key].className = `chan-ohlc-value ${directionClass}`;
       });
       const change = candle.closeChangePercent;
-      changeValue.textContent = Number.isFinite(change)
+      changeValue.textContent = candle.pending ? "-" : Number.isFinite(change)
         ? `${change > 0 ? "+" : ""}${change.toFixed(2)}%` : "未知";
-      changeValue.className = `chan-ohlc-value ${!Number.isFinite(change) ? "chan-ohlc-flat" : change > 0 ? "chan-ohlc-up" : change < 0 ? "chan-ohlc-down" : "chan-ohlc-flat"}`;
-      volumeValue.textContent = formatVolume(candle.volume);
+      changeValue.className = `chan-ohlc-value ${candle.pending || !Number.isFinite(change) ? "chan-ohlc-flat" : change > 0 ? "chan-ohlc-up" : change < 0 ? "chan-ohlc-down" : "chan-ohlc-flat"}`;
+      volumeValue.textContent = candle.pending ? "-" : formatVolume(candle.volume);
       shownCandle = candle;
     }
     const distanceToSegment = (item) => {
@@ -332,7 +337,7 @@ function bindChanChartHover(target, initialBinding) {
       const ratio = lengthSquared ? Math.max(0, Math.min(1, ((localX - item.x1) * dx + (localY - item.y1) * dy) / lengthSquared)) : 0;
       return Math.hypot(localX - (item.x1 + ratio * dx), localY - (item.y1 + ratio * dy));
     };
-    const signalHit = (model.signals || []).map((signal) => {
+    const signalHit = candle.pending ? null : (model.signals || []).map((signal) => {
       const markerDistance = Math.hypot(localX - signal.x, localY - (Number.isFinite(signal.markerY) ? signal.markerY : signal.y));
       const halfLabel = (signal.hitLabelWidth || 48) / 2;
       const labelX = Number.isFinite(signal.labelX) ? signal.labelX : signal.x;
@@ -340,7 +345,7 @@ function bindChanChartHover(target, initialBinding) {
       return { signal, distance: Math.min(markerDistance, labelDistance) };
     }).filter(({ signal, distance }) => model.layers?.signals === true && distance <= 12)
       .sort((left, right) => left.distance - right.distance)[0]?.signal;
-    const afSignalHit = (model.afSignals || []).map((signal) => {
+    const afSignalHit = candle.pending ? null : (model.afSignals || []).map((signal) => {
       const markerDistance = Math.hypot(localX - signal.x, localY - signal.markerY);
       const halfLabel = (signal.hitLabelWidth || 48) / 2;
       const halfLabelHeight = (signal.labelHeight || 18) / 2;
@@ -357,7 +362,7 @@ function bindChanChartHover(target, initialBinding) {
       structureBody.textContent = `${afSignalHit.date} · 确认于 ${afSignalHit.confirmedAt || "未知"} · Z ${formatIndicator(afSignalHit.z)}`;
       structureDetail.hidden = false;
     }
-    const structure = (model.structures || []).map((item) => {
+    const structure = candle.pending ? null : (model.structures || []).map((item) => {
       const inArea = item.area && localX >= Math.min(item.x1, item.x2) && localX <= Math.max(item.x1, item.x2)
         && localY >= Math.min(item.y1, item.y2) && localY <= Math.max(item.y1, item.y2);
       return { item, distance: item.area ? (inArea ? 5 : Infinity) : distanceToSegment(item) };
@@ -378,7 +383,7 @@ function bindChanChartHover(target, initialBinding) {
     const matrix = svg.getScreenCTM();
     if (!matrix) { hide(); return; }
     const point = svg.createSVGPoint();
-    point.x = candle.x; point.y = cursorY;
+    point.x = crosshairX; point.y = cursorY;
     const client = point.matrixTransform(matrix);
     const bounds = target.getBoundingClientRect();
     const tooltipWidth = tooltip.offsetWidth;
@@ -395,13 +400,27 @@ function bindChanChartHover(target, initialBinding) {
       scenariosVisible && event.pointerType === "mouse" && !event.buttons ? chanProjectionKeyAt(model, point) : null,
       event,
     );
-    if (point.x < model.plotLeft || point.x > (model.historyRight ?? model.plotRight) || point.y < model.plotTop || point.y > (model.crosshairBottom ?? model.plotBottom)) { hide(); return; }
+    if (point.x < model.plotLeft || point.x > model.plotRight || point.y < model.plotTop || point.y > (model.crosshairBottom ?? model.plotBottom)) { hide(); return; }
     lastPointer = event;
     const visibleBars = Math.max(1, Number(model.visibleBars) || model.candles.length);
-    const slot = ((model.historyRight ?? model.plotRight) - model.plotLeft) / visibleBars;
+    const historyRight = model.historyRight ?? model.plotRight;
+    const slot = (historyRight - model.plotLeft) / visibleBars;
+    if (point.x > historyRight) {
+      if (Number(model.endOffset) > 0) { hide(); return; }
+      const pendingIndex = Number(model.pendingSlotCount) || 0;
+      const pendingDate = model.pendingOpenDates?.[pendingIndex];
+      if (!pendingDate) { hide(); return; }
+      show(model.candles.length + pendingIndex, point.y, point.x, pendingDate);
+      return;
+    }
     const index = Math.floor((point.x - model.plotLeft) / slot);
-    if (index >= model.candles.length) { hide(); return; }
-    show(index, point.y, point.x);
+    if (index < model.candles.length) {
+      show(index, point.y, point.x);
+      return;
+    }
+    const pendingDate = model.pendingOpenDates?.[index - model.candles.length];
+    if (!pendingDate) { hide(); return; }
+    show(index, point.y, point.x, pendingDate);
   };
   const cancelPointerMove = scheduleChartPointerMove(target, onMove, () => { hide(); hideScenarioHover(); });
   const showClose = (index) => {
@@ -417,7 +436,7 @@ function bindChanChartHover(target, initialBinding) {
     cancelPointerMove();
     if (event.key === "Escape") { hide(); hideScenarioHover(); return; }
     const last = model.candles.length - 1;
-    const current = activeIndex ?? last;
+    const current = activeIndex == null ? last : Math.max(0, Math.min(last, activeIndex));
     const next = event.key === "Home" ? 0 : event.key === "End" ? last : current + (event.key === "ArrowLeft" ? -1 : 1);
     showClose(Math.max(0, Math.min(last, next)));
   };
@@ -571,6 +590,13 @@ function compactMacdInterpretation(macd) {
 }
 
 function indicatorHeaderText(candle) {
+  if (candle?.pending) {
+    return {
+      volume: "成交量  -",
+      macd: "MACD  -", macdCompact: "MACD -", macdInterpretation: "", macdCompactInterpretation: "",
+      dmi: "DMI  -", dmiCompact: "DMI -", dmiStatus: "", dmiInterpretation: "",
+    };
+  }
   const volume = candle && Number.isFinite(Number(candle.volume)) ? formatVolume(candle.volume) : "--";
   const macd = candle?.macd;
   const dmi = candle?.dmi;

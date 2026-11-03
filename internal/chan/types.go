@@ -407,6 +407,7 @@ type Frame struct {
 	MergedCandles      []MergedCandle      `json:"merged_candles"`
 	AsOf               string              `json:"as_of"`
 	LastClose          *float64            `json:"last_close"`
+	FutureTradingDates []string            `json:"future_trading_dates,omitempty"`
 	Position           Position            `json:"position"`
 	Direction          string              `json:"direction"`
 	Structure          string              `json:"structure"`

@@ -28,6 +28,7 @@ const CHAN_FOLD_KEYS = {
 };
 const CHAN_SCENARIOS_STORAGE_KEY = "option-scope-chan-scenarios-visible";
 const CHAN_CHART_PREFERENCES_KEY = "option-scope-chan-chart-preferences";
+const CHAIN_VIEW_STORAGE_KEY = "option-scope-chain-view";
 const CHAN_INTRADAY_PERIODS = ["15m", "4h"];
 const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "4h"];
 const CHAN_ANALYSIS_RETRY_LIMIT = 60;
@@ -49,6 +50,16 @@ const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
 const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false };
 const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville"];
 const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false };
+function readChainViewPreference() {
+  try {
+    const stored = localStorage.getItem(CHAIN_VIEW_STORAGE_KEY);
+    return stored === "table" || stored === "heatmap" ? stored : "heatmap";
+  } catch (error) { return "heatmap"; }
+}
+function rememberChainViewPreference(view) {
+  if (view !== "table" && view !== "heatmap") return;
+  try { localStorage.setItem(CHAIN_VIEW_STORAGE_KEY, view); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
+}
 function copyDefaultChanChartLayers() {
   return { ...DEFAULT_CHAN_CHART_LAYERS, segmentLevels: {}, recursiveCenters: {} };
 }
@@ -219,6 +230,7 @@ const state = {
     pending: { buy: null, sell: null },
   },
   chainFilter: "all",
+  chainView: readChainViewPreference(),
   chainRows: [],
   chainSpot: null,
   levelBasisMode: "live",
@@ -296,12 +308,15 @@ const state = {
         rowspan: 1,
       },
     },
-    chainTitle: "期权链 · 选择到期日查看",
+    chainTitle: "GEX 热力图 · 选择到期日查看",
     dataSource: "尚未加载",
     fetchedAt: "快照时间 --",
     chainHeatNote: "等待数据",
     chainRows: [],
     chainEmpty: "输入标的并载入数据",
+    chainHeatmap: { columns: [], rows: [] },
+    chainHeatmapMeta: "当前到期日实时快照 · 等待读取缓存期限",
+    chainHeatmapEmpty: "等待期权数据",
     chart: {
       netGex: "净 Gamma 0 · 估算",
       gammaFlip: "零 Gamma 0.00 · 估算",
@@ -1400,7 +1415,7 @@ function formatOptionQuote(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number.toFixed(2) : "--";
 }
-function formatTime(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false }); }
+function formatTime(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { timeZone: "America/New_York", hour12: false }); }
 function formatFlowInterval(value) {
   const seconds = Number(value);
   if (!Number.isFinite(seconds) || seconds < 0) return "相邻快照";
@@ -4077,6 +4092,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.view.quoteMarket = quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
+  if (state.chainView === "heatmap") renderChainHeatmap();
   scheduleQuoteRecovery(state.lastQuote);
   // 行情可能晚于期权链到达。现价档位变化后重新触发一次价位计算，否则
   // 触达概率、强化色、最佳买卖点和止损会一直停在无 IV 的客户端回退结果，
@@ -4504,6 +4520,175 @@ function renderChainTable() {
   renderChainRows(shown, state.chainSpot, emptyLabel);
 }
 
+const CHAIN_HEATMAP_HORIZON_DAYS = 45;
+let chainHeatmapLoadToken = 0;
+let chainHeatmapLoadingSymbol = "";
+let chainHeatmapCache = { symbol: "", expirations: new Map() };
+
+function heatmapExpiryDates(dates) {
+  const todayParts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date()).reduce((parts, part) => ({ ...parts, [part.type]: part.value }), {});
+  const today = `${todayParts.year}-${todayParts.month}-${todayParts.day}`;
+  const lastDay = new Date(`${today}T00:00:00Z`);
+  lastDay.setUTCDate(lastDay.getUTCDate() + CHAIN_HEATMAP_HORIZON_DAYS);
+  const lastDate = lastDay.toISOString().slice(0, 10);
+  return [...new Set((dates || []).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)
+    && date >= today && date <= lastDate))].sort();
+}
+
+function renderChainHeatmap() {
+  if (chainHeatmapCache.symbol !== state.symbol) return;
+  const source = new Map(chainHeatmapCache.expirations);
+  if (state.chainRows?.length && state.chainFetchedSymbol === state.symbol
+    && state.chainFetchedExpiration === state.expiration) {
+    source.set(state.expiration, { rows: state.chainRows, fetchedAt: state.chainFetchedAt, current: true });
+  }
+  const spot = finitePrice(state.lastQuote?.price ?? state.chainSpot);
+  const current = state.expiration;
+  const expirations = [...source.keys()].sort();
+  const columns = expirations.map((expiration) => {
+    const entry = source.get(expiration);
+    const isSelected = expiration === current;
+    const isCurrentSnapshot = isSelected && entry?.current === true
+      && state.chainFetchedExpiration === expiration && state.chainFetchedSymbol === state.symbol;
+    const date = new Date(`${expiration}T12:00:00Z`);
+    return {
+      expiration,
+      label: Number.isNaN(date.getTime()) ? expiration : new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", timeZone: "UTC" }).format(date),
+      source: isCurrentSnapshot ? "当前" : "缓存",
+      updatedAt: entry?.fetchedAt
+        ? new Date(entry.fetchedAt).toLocaleTimeString("zh-CN", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false })
+        : "--:--",
+      current: isSelected,
+      live: isCurrentSnapshot,
+      title: `${expiration} · ${isCurrentSnapshot ? "当前期限快照" : "缓存参考"} · ${formatTime(entry?.fetchedAt)}`,
+    };
+  });
+  if (!Number.isFinite(spot) || spot <= 0 || !columns.length) {
+    state.view.chainHeatmap = { columns, rows: [] };
+    state.view.chainHeatmapEmpty = !Number.isFinite(spot) || spot <= 0 ? "现价暂不可用，无法计算 GEX" : "当前没有可用的期权链缓存";
+    return;
+  }
+  const lower = spot * 0.85;
+  const upper = spot * 1.15;
+  const valuesByExpiration = new Map();
+  const strikeSet = new Set();
+  let peak = 0;
+  for (const column of columns) {
+    const entry = source.get(column.expiration);
+    const values = new Map();
+    const rows = Array.isArray(entry?.rows) ? entry.rows : [];
+    const spotSquared = spot * spot;
+    const spotKey = gammaSpotBucket(spot);
+    for (const option of rows) {
+      const strike = Number(option.strike);
+      if (!Number.isFinite(strike) || strike < lower || strike > upper) continue;
+      const gex = contractGex(option, spot, spotSquared, spotKey);
+      if (gex == null) continue;
+      values.set(strike, (values.get(strike) || 0) + gex);
+      strikeSet.add(strike);
+    }
+    for (const value of values.values()) peak = Math.max(peak, Math.abs(value));
+    valuesByExpiration.set(column.expiration, values);
+  }
+  const strikes = [...strikeSet].sort((a, b) => b - a);
+  let nearestStrike = null;
+  let nearestDistance = Infinity;
+  for (const strike of strikes) {
+    const distance = Math.abs(strike - spot);
+    if (distance < nearestDistance) { nearestStrike = strike; nearestDistance = distance; }
+  }
+  const modelRows = strikes.map((strike) => {
+    const currentSpot = strike === nearestStrike;
+    return {
+      key: String(strike),
+      strike: formatMoney(strike),
+      currentSpot,
+      cells: columns.map((column) => {
+        const spotClass = currentSpot && column.current ? " chain-heatmap-current-spot-cell" : "";
+        const value = valuesByExpiration.get(column.expiration).get(strike);
+        if (value == null) return { key: `${column.expiration}|${strike}`, value: "-", className: `chain-heatmap-cell chain-heatmap-cell-empty${spotClass}`, style: "", title: `${column.expiration} · ${formatMoney(strike)} · 无数据` };
+        const percent = peak > 0 ? Math.round(Math.sqrt(Math.min(Math.abs(value) / peak, 1)) * 100) : 0;
+        return {
+          key: `${column.expiration}|${strike}`,
+          value: formatGex(value / 1000000, 1),
+          className: `chain-heatmap-cell ${value > 0 ? "chain-heatmap-cell-positive" : value < 0 ? "chain-heatmap-cell-negative" : "chain-heatmap-cell-zero"}${percent >= 65 ? " chain-heatmap-cell-hot" : ""}${spotClass}`,
+          style: `--heat:${percent}`,
+          title: `${column.expiration} · 行权价 ${formatMoney(strike)} · 净 GEX ${formatGex(value / 1000000, 2)} · ${column.live ? "当前期限" : "缓存参考"}`,
+        };
+      }),
+    };
+  });
+  state.view.chainHeatmap = { columns, rows: modelRows };
+  state.view.chainHeatmapEmpty = "当前价 ±15% 区间内暂无可计算 GEX";
+}
+
+function updateChainHeatmapMeta(loaded, total) {
+  state.view.chainHeatmapMeta = `当前期限随快照更新 · 缓存期限 ${loaded}/${total} · GEX 估算仅供参考`;
+}
+
+async function loadChainHeatmapBackground(catalogPayload = null) {
+  const symbol = state.symbol;
+  if (chainHeatmapLoadingSymbol === symbol) return;
+  if (chainHeatmapCache.symbol !== symbol) chainHeatmapCache = { symbol, expirations: new Map() };
+  const token = ++chainHeatmapLoadToken;
+  chainHeatmapLoadingSymbol = symbol;
+  const currentRows = state.chainRows?.length && state.chainFetchedSymbol === symbol
+    && state.chainFetchedExpiration === state.expiration ? state.chainRows : [];
+  if (currentRows.length) {
+    chainHeatmapCache.expirations.set(state.expiration, {
+      rows: currentRows, fetchedAt: state.chainFetchedAt, current: true,
+    });
+  }
+  renderChainHeatmap();
+  state.view.chainHeatmapMeta = currentRows.length
+    ? "当前期限随快照更新 · 正在逐个读取其他期限缓存 · GEX 估算仅供参考"
+    : "正在载入当前期限快照 · GEX 估算仅供参考";
+  try {
+    const catalog = catalogPayload || await request(`/api/expirations/${encodeURIComponent(symbol)}`);
+    if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
+    const dates = heatmapExpiryDates(catalog?.cached_expirations || [])
+      .filter((expiration) => expiration !== state.expiration);
+    const cachedDates = [...chainHeatmapCache.expirations.keys()].filter((expiration) => expiration !== state.expiration);
+    const pendingDates = dates.filter((expiration) => !chainHeatmapCache.expirations.has(expiration));
+    const total = cachedDates.length + pendingDates.length;
+    updateChainHeatmapMeta(cachedDates.length, total);
+    renderChainHeatmap();
+    for (const expiration of pendingDates) {
+      if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
+      try {
+        const payload = await request(`/api/chain/${encodeURIComponent(symbol)}?expiration=${encodeURIComponent(expiration)}`);
+        if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
+        if (payload?.data?.length && payload?.source === "sqlite") {
+          chainHeatmapCache.expirations.set(expiration, { rows: payload.data, fetchedAt: payload.fetched_at, current: false });
+        }
+        const loaded = [...chainHeatmapCache.expirations.keys()].filter((date) => date !== state.expiration).length;
+        updateChainHeatmapMeta(loaded, total);
+        renderChainHeatmap();
+      } catch (error) {
+        const loaded = [...chainHeatmapCache.expirations.keys()].filter((date) => date !== state.expiration).length;
+        state.view.chainHeatmapMeta = `当前期限随快照更新 · 缓存期限 ${loaded}/${total} · 部分缓存暂不可用`;
+      }
+    }
+    const loaded = [...chainHeatmapCache.expirations.keys()].filter((date) => date !== state.expiration).length;
+    updateChainHeatmapMeta(loaded, total);
+    renderChainHeatmap();
+  } catch (error) {
+    if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
+    state.view.chainHeatmapMeta = currentRows.length
+      ? "当前期限随快照更新 · 其他期限缓存暂不可用 · GEX 估算仅供参考"
+      : `热力图数据暂不可用：${error.message}`;
+  } finally {
+    if (token === chainHeatmapLoadToken) chainHeatmapLoadingSymbol = "";
+  }
+}
+
+function chainViewTitle(symbol, expiration, view = state.chainView) {
+  const label = view === "heatmap" ? "GEX 热力图" : "期权链";
+  return `${label} · ${symbol}${expiration ? ` · ${expiration}` : ""}`;
+}
+
 function renderChain(payload, quote, analysisPayload) {
   if (payload?.symbol && payload.symbol !== state.symbol) return;
   // 晚到的旧期限不能把下拉框拽回去，也不能盖掉用户刚选的链。
@@ -4568,7 +4753,7 @@ function renderChain(payload, quote, analysisPayload) {
   state.expiration = payload.expiration;
   // 基准价开关切换时要用最近一次快照重算，这里留一份引用。
   state.lastQuote = quote || null;
-  state.view.chainTitle = `期权链 · ${payload.symbol} · ${payload.expiration}`;
+  state.view.chainTitle = chainViewTitle(payload.symbol, payload.expiration);
   // 期权链始终从本地缓存读取，这里按快照新鲜度标注来源，避免刚抓完还显示“缓存”造成误解。
   const snapshotAge = payload.fetched_at ? (Date.now() - new Date(payload.fetched_at).getTime()) / 1000 : null;
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
@@ -4599,6 +4784,7 @@ function renderChain(payload, quote, analysisPayload) {
   if (state.pendingAnalyticsRefresh && state.lastAnalysis?.points?.length) schedulePushedAnalyticsRefresh();
   state.chainRows = Object.freeze(rows); state.chainSpot = quote?.price ?? null;
   renderChainTable();
+  if (state.chainView === "heatmap") renderChainHeatmap();
   chainRenderSignature = signature;
   rememberClientSnapshot();
 }
@@ -4613,6 +4799,7 @@ function applyExpirations(dates, preferred, emptyLabel = "正在获取到期日�
   }
   const requested = preferred || parsePageQuery(location.search).expiration || state.expiration;
   state.expiration = unique.includes(requested) ? requested : unique[0];
+  state.view.chainTitle = chainViewTitle(state.symbol, state.expiration);
   return true;
 }
 
@@ -4647,7 +4834,7 @@ async function renderCachedHistoryOnly(loadId, quote = null) {
   if (state.displayedChainSymbol === symbol
     && state.displayedChainExpiration === state.expiration
     && state.chainRows?.length) return;
-  state.view.chainTitle = `期权链 · ${symbol}`;
+  state.view.chainTitle = chainViewTitle(symbol, state.expiration);
   state.view.dataSource = "SQLite 行情/日线 · 无期权链缓存";
   state.view.fetchedAt = usableQuote?.fetched_at ? `行情 ${formatTime(usableQuote.fetched_at)}` : "SQLite 暂无行情缓存";
   state.view.totalCount = "0";
@@ -4735,7 +4922,7 @@ function showPending(message, preserveCache = false) {
     state.view.fairOptimisticSource = "等待估值数据";
     if (quoteIsETF(null)) applyETFValuationDefaults();
   }
-  state.view.chainTitle = `期权链 · ${state.symbol}${state.expiration ? ` · ${state.expiration}` : ""}`;
+  state.view.chainTitle = chainViewTitle(state.symbol, state.expiration);
   state.view.dataSource = "后台刷新中";
   state.view.fetchedAt = "快照时间 --";
   state.view.totalCount = "--";
@@ -5384,6 +5571,7 @@ async function loadExpirations(loadId, fallbackSnapshot = null, refresh = false)
     applyExpirations(allDates, cachedExpiration, retryable ? "正在获取到期日…" : "该标的没有期权到期日");
     if (!retryable) clearSnapshotRetry();
     else scheduleSnapshotRetry(loadId, Math.max(10000, requestError?.retryAfterMs || 0));
+    if (state.chainView === "heatmap") void loadChainHeatmapBackground(payload);
     await loadChain({ loadId });
     return;
   }
@@ -5571,6 +5759,7 @@ async function loadSymbol() {
     }
   } finally {
     state.loading = false;
+    if (state.chainView === "heatmap" && chainHeatmapCache.symbol !== state.symbol) void loadChainHeatmapBackground();
     // 首次进入新标的时行情/期权链可能先完成，估值仍在后端线程计算；
     // 在 loading 解除后启动独立轻量轮询，避免必须手动刷新整页才能看到估值。
     if (state.lastQuote) scheduleFairValuePoll(state.lastQuote);
@@ -5590,6 +5779,7 @@ async function switchExpiration(expiration) {
   const token = ++expirationSwitchToken;
   const previousSnapshot = displayedClientSnapshotRef();
   state.expiration = expiration;
+  state.view.chainTitle = chainViewTitle(state.symbol, expiration);
   connectPushStream(state.symbol);
   resetOptionFlow("正在读取当前期限的相邻快照…");
   setError("");
@@ -6030,7 +6220,18 @@ const optionScopeApp = new Vue({
     },
     expirationChanged() { return switchExpiration(this.expiration); },
     expirationMenuChanged(open) { return setExpirationMenuOpen(open); },
+    selectHeatmapExpiration(expiration) {
+      if (this.loading || !this.expirationOptions.includes(expiration) || expiration === this.expiration) return;
+      this.expiration = expiration;
+      return switchExpiration(expiration);
+    },
     filterChanged() { return renderChainTable(); },
+    toggleChainView() {
+      this.chainView = this.chainView === "heatmap" ? "table" : "heatmap";
+      rememberChainViewPreference(this.chainView);
+      this.view.chainTitle = chainViewTitle(state.symbol, state.expiration, this.chainView);
+      if (this.chainView === "heatmap") loadChainHeatmapBackground();
+    },
     toggleTheme() {
       const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
       applyTheme(next);
@@ -6050,7 +6251,7 @@ function updateClock() {
   if (clock) clock.textContent = clockFormatter.format(new Date());
   // 状态跟随时钟更新，不写 Vue 数据。
 }
-const clockFormatter = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const clockFormatter = new Intl.DateTimeFormat("zh-CN", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 updateClock();
 setInterval(updateClock, 1000);
 // 容器尺寸与上次绘制不一致时按新尺寸重绘图表：窗口缩放、图表折叠组展开后都走这里。

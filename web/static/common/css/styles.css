@@ -787,12 +787,61 @@
    把状态栏推到标题行正中、和右侧文案之间空出一大块，这里让状态栏与文案一起贴住右边缘。 */
 .detail-header .panel-status+.detail-action{margin-left:0}
 /* 类型筛选靠左，与表格左侧对齐；底部留一点边距，和表头拉开距离。 */
-.chain-toolbar{display:flex;justify-content:flex-start;padding:12px 18px 10px}
+.chain-toolbar{display:flex;align-items:center;gap:10px;justify-content:flex-start;padding:12px 18px 10px}
+.chain-view-toggle{display:inline-flex;min-height:34px;align-items:center;justify-content:center;gap:7px;padding:0 12px;border:1px solid color-mix(in srgb,var(--blue) 34%,var(--field-line));border-radius:4px;background:color-mix(in srgb,var(--blue) 8%,var(--field));color:var(--blue);font:inherit;font-size:12px;font-weight:600;line-height:1;white-space:nowrap;cursor:pointer}
+.chain-view-toggle:hover{border-color:var(--blue);background:color-mix(in srgb,var(--blue) 13%,var(--field));color:var(--blue)}
+.chain-view-toggle:active{background:color-mix(in srgb,var(--blue) 18%,var(--field))}
+.chain-view-toggle i{font-size:13px;line-height:1}
+.chain-view-toggle:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.chain-heatmap-panel{--chain-heatmap-surface:var(--panel);--chain-heatmap-header:var(--table-head);--chain-heatmap-line:var(--row-line);--chain-heatmap-text:var(--text);--chain-heatmap-muted:var(--muted-2);--chain-heatmap-amber:var(--amber);border-top:1px solid var(--chain-heatmap-line);background:var(--chain-heatmap-surface);color:var(--chain-heatmap-text)}
+.chain-heatmap-meta{padding:10px 18px 7px;color:var(--chain-heatmap-muted);font-size:11px}
+.chain-heatmap-wrap{overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain}
+.chain-heatmap{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;background:var(--chain-heatmap-surface);color:var(--chain-heatmap-text)}
+.chain-heatmap th,.chain-heatmap td{height:34px;min-width:92px;padding:5px 9px;border-right:1px solid var(--chain-heatmap-line);border-bottom:1px solid var(--chain-heatmap-line);text-align:right;white-space:nowrap}
+.chain-heatmap thead th{position:sticky;top:0;z-index:3;height:42px;background:var(--chain-heatmap-header);text-align:center}
+.chain-heatmap thead th span,.chain-heatmap thead th small{display:block}
+.chain-heatmap thead th span{color:var(--chain-heatmap-text);font-size:11px;font-variant-numeric:tabular-nums}
+.chain-heatmap thead th small{color:var(--chain-heatmap-muted);font-size:9px;font-weight:500;letter-spacing:0}
+.chain-heatmap thead .chain-heatmap-expiration-head{padding:0}
+.chain-heatmap-expiration-button{display:flex;width:100%;height:100%;min-height:42px;flex-direction:column;align-items:center;justify-content:center;gap:2px;padding:5px 9px;border:0;background:transparent;color:inherit;font:inherit;cursor:pointer}
+.chain-heatmap-expiration-button:hover:not(:disabled){background:color-mix(in srgb,var(--blue) 8%,var(--chain-heatmap-header))}
+.chain-heatmap-expiration-button:focus-visible{position:relative;z-index:1;outline:2px solid var(--blue);outline-offset:-3px}
+.chain-heatmap-expiration-button:disabled{cursor:wait}
+.chain-heatmap .chain-heatmap-strike-head,.chain-heatmap .chain-heatmap-strike{position:sticky;left:0;z-index:4;min-width:112px;text-align:right;background:var(--chain-heatmap-surface);color:var(--chain-heatmap-text)}
+.chain-heatmap .chain-heatmap-strike-head{z-index:5;background:var(--chain-heatmap-header)}
+.chain-heatmap-current-head{box-shadow:inset 0 -2px var(--chain-heatmap-spot)}
+.chain-heatmap .chain-heatmap-strike{font-size:11px;font-variant-numeric:tabular-nums}
+.chain-heatmap-strike span{display:block;color:var(--chain-heatmap-amber);font-size:9px;font-weight:500}
+.chain-heatmap-cell{font-size:11px;font-variant-numeric:tabular-nums;color:var(--chain-heatmap-text)}
+:root{--gex-heat-up:#24f72c;--gex-heat-down:#fd162a;--gex-heat-floor:12;--gex-heat-gain:88;--gex-heat-ink:#101b16;--gex-spot-cell-bg:#245a91}
+:root[data-theme="light"]{--gex-heat-up:#3c9f32;--gex-heat-down:#c52236;--gex-heat-floor:18;--gex-heat-gain:82;--gex-heat-ink:#142019;--gex-spot-cell-bg:#1f6feb}
+:root{--chain-heatmap-up:#24f72c;--chain-heatmap-down:#fd162a;--chain-heatmap-floor:12;--chain-heatmap-gain:88;--chain-heatmap-ink:#101b16;--chain-heatmap-spot:var(--gex-spot-cell-bg)}
+:root[data-theme="light"]{--chain-heatmap-up:#3c9f32;--chain-heatmap-down:#c52236;--chain-heatmap-floor:18;--chain-heatmap-gain:82;--chain-heatmap-ink:#142019;--chain-heatmap-spot:var(--gex-spot-cell-bg)}
+.chain-call .chain-heat{--heat-tone:var(--gex-heat-up);--heat-floor:var(--gex-heat-floor);--heat-gain:var(--gex-heat-gain)}
+.chain-put .chain-heat{--heat-tone:var(--gex-heat-down);--heat-floor:var(--gex-heat-floor);--heat-gain:var(--gex-heat-gain)}
+.chain-put .chain-heat-hot{color:#fff;text-shadow:0 1px 1px rgba(0,0,0,.28)}
+.chain-heatmap-cell-positive{background-color:color-mix(in srgb,var(--chain-heatmap-up) calc((var(--chain-heatmap-floor) + var(--chain-heatmap-gain) * var(--heat) / 100) * 1%),var(--chain-heatmap-surface))}
+.chain-heatmap-cell-negative{background-color:color-mix(in srgb,var(--chain-heatmap-down) calc((var(--chain-heatmap-floor) + var(--chain-heatmap-gain) * var(--heat) / 100) * 1%),var(--chain-heatmap-surface))}
+.chain-heatmap-cell-zero{color:var(--chain-heatmap-muted)}
+.chain-heatmap-cell-hot{color:var(--chain-heatmap-ink);font-weight:650}
+.chain-heatmap-cell-negative.chain-heatmap-cell-hot{color:#fff;text-shadow:0 1px 1px rgba(0,0,0,.28)}
+.chain-heatmap td.chain-heatmap-current-spot-cell{font-weight:700}
+.chain-heatmap-cell-empty{color:var(--chain-heatmap-muted);text-align:center}
+.chain-heatmap-spot-row th,.chain-heatmap-spot-row td{border-top:1px solid var(--chain-heatmap-amber);border-bottom:1px solid var(--chain-heatmap-amber)}
+.chain-heatmap-spot-row .chain-heatmap-strike{color:var(--chain-heatmap-amber)}
+.chain-heatmap-empty{height:120px!important;color:var(--chain-heatmap-muted);text-align:center!important}
+.chain-heatmap-legend{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:9px 18px 12px;color:var(--chain-heatmap-muted);font-size:10px}
+.chain-heatmap-legend span{display:inline-flex;align-items:center;gap:5px}
+.chain-heatmap-legend i{display:inline-block;width:9px;height:9px;border-radius:2px}
+.chain-heatmap-positive{background:var(--chain-heatmap-up)}
+.chain-heatmap-negative{background:var(--chain-heatmap-down)}
+.chain-heatmap-spot{border:1px solid var(--chain-heatmap-amber)}
 .chain-fold{border-top:1px solid var(--line)}
 .chain-fold[hidden]{display:none}
 /* 窄屏（基础媒体查询里）状态栏会整行占满并换行，「展开/收起」因此落到下一行最左；
    这里在窄屏把 auto 外边距还回来（同优先级下靠后生效），保证它与另两个折叠组一样贴右。 */
 @media(max-width:900px){.detail-header .panel-status+.detail-action{margin-left:auto}}
+@media(max-width:600px){.chain-toolbar{align-items:center;gap:9px;padding:10px 12px}.chain-filter{min-width:0}.chain-filter select{max-width:118px}.chain-view-toggle{margin-left:auto}.chain-heatmap-meta{padding:9px 12px}.chain-heatmap th,.chain-heatmap td{min-width:82px;padding:5px 7px}.chain-heatmap .chain-heatmap-strike-head,.chain-heatmap .chain-heatmap-strike{min-width:94px}.chain-heatmap-legend{gap:9px;padding-right:12px;padding-left:12px}}
 /* 两个分析面板折叠时会隐藏标题栏内的切换组；此时「展开」应恢复通用 auto 外边距，贴到标题栏最右侧。
    展开后由切换组自身的 auto 外边距负责靠右，操作文字紧随其后。 */
 .analysis-detail-header>.detail-modes[hidden]+.detail-action,

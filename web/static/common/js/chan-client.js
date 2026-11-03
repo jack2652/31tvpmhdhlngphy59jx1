@@ -544,6 +544,10 @@
       }
     }
     const totalBars = candlesForDisplay.length;
+    const displayLastDate = candlesForDisplay[candlesForDisplay.length - 1]?.date || "";
+    const pendingOpenDates = ["1d", "daily"].includes(frame.period)
+      ? (frame.future_trading_dates || []).filter((date) => date > displayLastDate)
+      : [];
     // Start daily and 15-minute charts at the same readable 32-bar window on
     // desktop and mobile; keep the rest of their history reachable by zooming.
     const defaultBars = ["1d", "15m"].includes(frame.period) ? Math.min(32, totalBars) : totalBars;
@@ -1065,6 +1069,9 @@
       canPanLeft: endOffset < maxOffset, canPanRight: endOffset > -maxFutureOffset,
       canResetViewport: endOffset !== 0 || visibleCount !== defaultBars,
       minimum, maximum, periodLabel: frame.label,
+      period: frame.period,
+      pendingOpenDates,
+      pendingSlotCount: Math.max(0, endIndex - dataEndIndex),
       historyRight, scenarioBoundary, scenarioLaneLeft, lastClose: frame.last_close,
       title: `${frame.label} K 线与结构观察，${firstDisplayDate} 至 ${lastDisplayDate}`,
       ruleVersion: recursiveRule,
