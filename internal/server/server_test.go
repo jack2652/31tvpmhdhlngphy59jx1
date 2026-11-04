@@ -2227,6 +2227,42 @@ func TestExpirationsReadsSharedCatalogAndTreatsExpiredOnlyCacheAsPending(t *test
 	}
 }
 
+func TestActiveExpirationsExpireAtNewYorkClose(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := []string{"2026-11-02", "2026-11-03", "2026-11-04"}
+	tests := []struct {
+		name string
+		now  time.Time
+		want []string
+	}{
+		{
+			name: "before close",
+			now:  time.Date(2026, time.November, 3, 15, 59, 0, 0, location),
+			want: []string{"2026-11-03", "2026-11-04"},
+		},
+		{
+			name: "at close",
+			now:  time.Date(2026, time.November, 3, 16, 0, 0, 0, location),
+			want: []string{"2026-11-04"},
+		},
+		{
+			name: "overnight",
+			now:  time.Date(2026, time.November, 3, 21, 52, 0, 0, location),
+			want: []string{"2026-11-04"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := activeExpirationsAt(values, test.now, location); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("activeExpirationsAt() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestExpirationsDistinguishesCatalogFromReadableSQLiteBatches(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "expiration-readable-batches.db")
 	cfg := config.Config{DatabasePath: path, UpstreamTimeout: time.Second}

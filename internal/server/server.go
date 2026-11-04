@@ -4257,10 +4257,17 @@ func activeExpirations(values []string) []string {
 	if err != nil {
 		location = time.UTC
 	}
-	today := time.Now().In(location).Format("2006-01-02")
+	return activeExpirationsAt(values, time.Now().In(location), location)
+}
+
+func activeExpirationsAt(values []string, now time.Time, location *time.Location) []string {
+	localNow := now.In(location)
+	today := localNow.Format("2006-01-02")
+	todayExpiry := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 16, 0, 0, 0, location)
+	todayIsActive := localNow.Before(todayExpiry)
 	active := make([]string, 0, len(values))
 	for _, value := range values {
-		if value >= today {
+		if value > today || value == today && todayIsActive {
 			active = append(active, value)
 		}
 	}

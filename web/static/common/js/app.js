@@ -521,13 +521,16 @@ function restoreClientSnapshot(symbol, expiration = "", allowStale = false) {
   const payload = cloneClientSnapshot(cached.payload);
   const view = cloneClientSnapshot(cached.view);
   if (!quote || !payload || !view) return false;
+  if (!isActiveExpiration(cached.expiration)) return false;
   // A persisted page view is only a startup shortcut while both market data
   // snapshots are recent. Stale data remains available to explicit outage
   // recovery paths, where the UI labels it as a local cache.
   if (!allowStale && (!quoteIsFresh(quote) || !snapshotTimestampIsFresh(payload.fetched_at))) return false;
   delete view.chan;
   state.expiration = cached.expiration;
-  state.expirationOptions = cloneClientSnapshot(cached.expirationOptions || []);
+  state.expirationOptions = activeExpirationDates(cached.expirationOptions || []);
+  if (!state.expirationOptions.includes(state.expiration)) state.expirationOptions.push(state.expiration);
+  state.expirationOptions.sort();
   state.lastQuote = quote;
   state.chainRows = Object.freeze(payload.data);
   state.chainSpot = cached.chainSpot ?? quote.price ?? null;
@@ -1097,9 +1100,11 @@ function refreshWorkPending() {
 
 function setExpirationMenuOpen(open) {
   expirationMenuOpen = Boolean(open);
+  if (open) state.expirationOptions = activeExpirationDates(state.expirationOptions);
   if (!open) {
     if (state.pendingSnapshotRefresh) setTimeout(applyPendingSnapshotRefresh, 0);
     if (state.pendingGammaRefresh) setTimeout(applyPushedGammaUpdate, 0);
+    void recoverExpiredExpiration();
   }
 }
 
@@ -1120,6 +1125,10 @@ function applyPushedSnapshotPayload(message) {
   const quote = payload.quote;
   const chain = payload.chain;
   if (!quote || !chain?.data?.length || message.symbol !== state.symbol) return false;
+  if (chain.expiration && !isActiveExpiration(chain.expiration)) {
+    renderQuote(quote);
+    return true;
+  }
   if (chain.expiration && state.expiration && chain.expiration !== state.expiration) return false;
   const loadId = state.loadId;
   if (!quoteAndChainAreAligned(quote, chain.fetched_at)) return false;
@@ -4116,6 +4125,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
   updateSnapshotStatus();
+  void recoverExpiredExpiration();
   if (state.chainView === "heatmap") renderChainHeatmap();
   scheduleQuoteRecovery(state.lastQuote);
   // 行情可能晚于期权链到达。现价档位变化后重新触发一次价位计算，否则
@@ -4550,15 +4560,22 @@ let chainHeatmapLoadingSymbol = "";
 let chainHeatmapCache = { symbol: "", expirations: new Map(), availableExpirations: new Set() };
 
 function heatmapExpiryDates(dates) {
-  const todayParts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
-  }).formatToParts(new Date()).reduce((parts, part) => ({ ...parts, [part.type]: part.value }), {});
-  const today = `${todayParts.year}-${todayParts.month}-${todayParts.day}`;
+  const nowParts = newYorkIntradayParts(new Date(syncedNow()));
+  const today = nowParts.date;
   const lastDay = new Date(`${today}T00:00:00Z`);
   lastDay.setUTCDate(lastDay.getUTCDate() + CHAIN_HEATMAP_HORIZON_DAYS);
   const lastDate = lastDay.toISOString().slice(0, 10);
   return [...new Set((dates || []).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)
-    && date >= today && date <= lastDate))].sort();
+    && isActiveExpiration(date, nowParts) && date <= lastDate))].sort();
+}
+
+function isActiveExpiration(expiration, nowParts = newYorkIntradayParts(new Date(syncedNow()))) {
+  if (typeof expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(expiration)) return false;
+  return expiration > nowParts.date || expiration === nowParts.date && nowParts.minute < 16 * 60;
+}
+
+function activeExpirationDates(dates) {
+  return [...new Set((dates || []).filter((date) => isActiveExpiration(date)))].sort();
 }
 
 function renderChainHeatmap() {
@@ -4571,7 +4588,7 @@ function renderChainHeatmap() {
   const spot = finitePrice(state.lastQuote?.price ?? state.chainSpot);
   const quoteFetchedAt = state.lastQuote?.fetched_at || null;
   const current = state.expiration;
-  const expirations = [...source.keys()].sort();
+  const expirations = [...source.keys()].filter((expiration) => isActiveExpiration(expiration)).sort();
   const columns = expirations.map((expiration) => {
     const entry = source.get(expiration);
     const isSelected = expiration === current;
@@ -4674,13 +4691,14 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
   try {
     const catalog = catalogPayload || await request(`/api/expirations/${encodeURIComponent(symbol)}`);
     if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
-    const cachedCatalogDates = [...new Set((catalog?.cached_expirations || []).filter(Boolean))].sort();
+    const cachedCatalogDates = activeExpirationDates(catalog?.cached_expirations || []);
     chainHeatmapCache.availableExpirations = new Set(cachedCatalogDates);
-    const availableDates = [...new Set([...(catalog?.expirations || []), ...cachedCatalogDates])].sort();
+    const availableDates = activeExpirationDates([...(catalog?.expirations || []), ...cachedCatalogDates]);
     if (availableDates.length) applyExpirations(availableDates, state.expiration);
     const dates = heatmapExpiryDates(cachedCatalogDates)
       .filter((expiration) => expiration !== state.expiration);
-    const cachedDates = [...chainHeatmapCache.expirations.keys()].filter((expiration) => expiration !== state.expiration);
+    const cachedDates = [...chainHeatmapCache.expirations.keys()]
+      .filter((expiration) => isActiveExpiration(expiration) && expiration !== state.expiration);
     const pendingDates = dates.filter((expiration) => !chainHeatmapCache.expirations.has(expiration));
     const total = cachedDates.length + pendingDates.length;
     updateChainHeatmapMeta(cachedDates.length, total);
@@ -4693,15 +4711,18 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
         if (payload?.data?.length && payload?.source === "sqlite") {
           chainHeatmapCache.expirations.set(expiration, { rows: payload.data, fetchedAt: payload.fetched_at, current: false });
         }
-        const loaded = [...chainHeatmapCache.expirations.keys()].filter((date) => date !== state.expiration).length;
+        const loaded = [...chainHeatmapCache.expirations.keys()]
+          .filter((date) => isActiveExpiration(date) && date !== state.expiration).length;
         updateChainHeatmapMeta(loaded, total);
         renderChainHeatmap();
       } catch (error) {
-        const loaded = [...chainHeatmapCache.expirations.keys()].filter((date) => date !== state.expiration).length;
+        const loaded = [...chainHeatmapCache.expirations.keys()]
+          .filter((date) => isActiveExpiration(date) && date !== state.expiration).length;
         state.view.chainHeatmapMeta = `当前期限随快照更新 · 缓存期限 ${loaded}/${total} · 部分缓存暂不可用`;
       }
     }
-    const loaded = [...chainHeatmapCache.expirations.keys()].filter((date) => date !== state.expiration).length;
+    const loaded = [...chainHeatmapCache.expirations.keys()]
+      .filter((date) => isActiveExpiration(date) && date !== state.expiration).length;
     updateChainHeatmapMeta(loaded, total);
     renderChainHeatmap();
   } catch (error) {
@@ -4721,6 +4742,10 @@ function chainViewTitle(symbol, expiration, view = state.chainView) {
 
 function renderChain(payload, quote, analysisPayload) {
   if (payload?.symbol && payload.symbol !== state.symbol) return;
+  if (payload?.expiration && !isActiveExpiration(payload.expiration)) {
+    void recoverExpiredExpiration();
+    return;
+  }
   // 晚到的旧期限不能把下拉框拽回去，也不能盖掉用户刚选的链。
   if (payload?.expiration && state.expiration && payload.expiration !== state.expiration) return;
   const rows = Array.isArray(payload?.data) ? payload.data : [];
@@ -4829,10 +4854,15 @@ function applyExpirations(dates, preferred, emptyLabel = "正在获取到期日�
   const cachedDates = chainHeatmapCache.symbol === state.symbol
     ? [...chainHeatmapCache.availableExpirations]
     : [];
-  const unique = [...new Set([...(dates || []), ...cachedDates].filter(Boolean))].sort();
+  const unique = activeExpirationDates([...(dates || []), ...cachedDates]);
   state.expirationOptions = unique;
   state.expirationPlaceholder = emptyLabel;
   if (!unique.length) {
+    if (state.expiration && !isActiveExpiration(state.expiration)) {
+      state.expiration = null;
+      state.view.chainTitle = chainViewTitle(state.symbol, state.expiration);
+      syncPageQuery();
+    }
     return false;
   }
   const requested = preferred || parsePageQuery(location.search).expiration || state.expiration;
@@ -5517,6 +5547,11 @@ async function refreshInBackground(loadId) {
   } catch (error) {
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
     if (await restartIfExpirationChanged(expiration)) return;
+    if (error.status === 404 && expiration) {
+      state.refreshInFlight = null;
+      await recoverExpiredExpiration(loadId);
+      return;
+    }
     state.view.lastStatus = `后台刷新失败，仍显示本地缓存（${error.message}）`;
     if (!state.view.chainRows.length) setError(error.message);
     // 失败后不追加读请求：超时的服务端线程可能仍在抓取期权链，恢复读取
@@ -5810,11 +5845,52 @@ async function loadSymbol() {
 // 并发保护是三层：菜单打开时暂停自动刷新；这一层防重复触发；
 // renderSnapshot / refreshInBackground 还会拿「请求时的到期日」校验，响应回来时若选择已经变了就整份丢弃并按新期限重入。
 let expirationSwitchToken = 0;
+let expirationRecoveryPromise = null;
+
+async function recoverExpiredExpiration(loadId = state.loadId) {
+  if (!state.expiration || isActiveExpiration(state.expiration)) return;
+  state.expirationOptions = activeExpirationDates(state.expirationOptions);
+  if (expirationRecoveryPromise) return expirationRecoveryPromise;
+  if (state.loading || state.refreshInFlight || expirationMenuOpen) return;
+
+  const recovery = (async () => {
+    const nextExpiration = state.expirationOptions[0];
+    if (nextExpiration) {
+      state.expiration = nextExpiration;
+      state.view.chainTitle = chainViewTitle(state.symbol, nextExpiration);
+      syncPageQuery();
+      await switchExpiration(nextExpiration);
+      return;
+    }
+    state.expiration = null;
+    state.expirationOptions = [];
+    state.view.chainTitle = chainViewTitle(state.symbol, null);
+    state.chainRows = Object.freeze([]);
+    state.view.chainRows = [];
+    state.view.chainEmpty = "当前没有未到期的期权";
+    syncPageQuery();
+    await loadExpirations(loadId);
+  })();
+  expirationRecoveryPromise = recovery;
+  try {
+    await recovery;
+  } catch (error) {
+    if (isCurrentLoad(loadId)) state.view.lastStatus = `到期日已结束，正在重新获取有效期限（${error.message}）`;
+  } finally {
+    if (expirationRecoveryPromise === recovery) expirationRecoveryPromise = null;
+  }
+}
 
 // 切换到期日时下拉框的禁用兜底时间：超过这个时间还没拿到数据就放开，防止网络卡死导致控件永久不可用。
 const EXPIRATION_SWITCH_TIMEOUT_MS = 20000;
 
 async function switchExpiration(expiration) {
+  if (!isActiveExpiration(expiration)) {
+    state.expiration = expiration;
+    state.expirationOptions = activeExpirationDates(state.expirationOptions);
+    void recoverExpiredExpiration();
+    return;
+  }
   const token = ++expirationSwitchToken;
   const previousSnapshot = displayedClientSnapshotRef();
   state.expiration = expiration;
@@ -6260,6 +6336,7 @@ const optionScopeApp = new Vue({
     expirationChanged() { return switchExpiration(this.expiration); },
     expirationMenuChanged(open) { return setExpirationMenuOpen(open); },
     selectHeatmapExpiration(expiration) {
+      if (!isActiveExpiration(expiration)) return;
       const availableFromCache = chainHeatmapCache.symbol === state.symbol
         && chainHeatmapCache.availableExpirations.has(expiration);
       if (this.loading || (!this.expirationOptions.includes(expiration) && !availableFromCache) || expiration === this.expiration) return;
