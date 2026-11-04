@@ -117,7 +117,7 @@ func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, stri
 		refreshing := s.scheduleIntradayRefresh(symbol)
 		warning := ""
 		if !refreshing {
-			warning = "盘中历史仍在刷新冷却期内，暂时显示 SQLite 缓存"
+			warning = "盘中历史仍在刷新冷却期内，暂时显示本地缓存"
 		}
 		return persisted, persistedSource, warning, refreshing
 	}

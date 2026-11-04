@@ -67,9 +67,9 @@ func gammaJobPayload(job *gammaJob, claimed bool) map[string]any {
 	}
 	if job.persistError != "" {
 		if warning, _ := result["error_message"].(string); warning != "" {
-			result["error_message"] = warning + "; Gamma 状态写入 SQLite 失败：" + job.persistError
+			result["error_message"] = warning + "; Gamma 状态保存失败：" + job.persistError
 		} else {
-			result["error_message"] = "Gamma 状态写入 SQLite 失败：" + job.persistError
+			result["error_message"] = "Gamma 状态保存失败：" + job.persistError
 		}
 	}
 	return result

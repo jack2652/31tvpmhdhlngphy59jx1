@@ -5,6 +5,7 @@
   const TREND_SLOPE_PERIOD = 5;
   const MIN_ADX = 25;
   const EMA_ALPHA = 2 / (TREND_PERIOD + 1);
+  const completedCache = new WeakMap();
 
   function validBar(bar) {
     const open = Number(bar?.open), high = Number(bar?.high), low = Number(bar?.low), close = Number(bar?.close);
@@ -140,5 +141,59 @@
     return { channels, events };
   }
 
-  window.OptionScopeTurtle = { calculate };
+  function positionAfter(events) {
+    let position = "flat";
+    for (const event of events) {
+      if (event.kind === "long-entry") position = "long";
+      else if (event.kind === "short-entry") position = "short";
+      else if (event.kind === "long-exit" || event.kind === "short-exit") position = "flat";
+    }
+    return position;
+  }
+
+  function cachedCompletedResult(sourceCandles, dmi, endIndex) {
+    let entries = completedCache.get(sourceCandles);
+    if (!entries) {
+      entries = new Map();
+      completedCache.set(sourceCandles, entries);
+    }
+    if (entries.has(endIndex)) return entries.get(endIndex);
+    const candles = endIndex === sourceCandles.length ? sourceCandles : sourceCandles.slice(0, endIndex);
+    const result = calculate(candles, dmi);
+    const cached = { ...result, position: positionAfter(result.events) };
+    entries.set(endIndex, cached);
+    if (entries.size > 2) entries.delete(entries.keys().next().value);
+    return cached;
+  }
+
+  function calculateWithLiveBar(sourceCandles, displayCandles, dmi, liveIndex) {
+    const liveBar = liveIndex >= 0 ? displayCandles[liveIndex] : null;
+    if (liveBar && liveBar.is_forming !== true) return calculate(displayCandles, dmi);
+    if (!liveBar) {
+      return { ...cachedCompletedResult(sourceCandles, dmi, sourceCandles.length), liveIndex: -1, liveChannel: null, liveEvent: null };
+    }
+    const baseEnd = liveIndex < sourceCandles.length ? liveIndex : sourceCandles.length;
+    const completed = cachedCompletedResult(sourceCandles, dmi, baseEnd);
+    let liveChannel = null, liveEvent = null;
+    if (validBar(liveBar)) {
+      const entryUpper = priorRange(displayCandles, liveIndex, ENTRY_PERIOD, "high", "max");
+      const entryLower = priorRange(displayCandles, liveIndex, ENTRY_PERIOD, "low", "min");
+      const exitUpper = priorRange(displayCandles, liveIndex, EXIT_PERIOD, "high", "max");
+      const exitLower = priorRange(displayCandles, liveIndex, EXIT_PERIOD, "low", "min");
+      if ([entryUpper, entryLower, exitUpper, exitLower].every(Number.isFinite)) {
+        liveChannel = { entryUpper, entryLower, exitUpper, exitLower };
+        const open = Number(liveBar.open), high = Number(liveBar.high), low = Number(liveBar.low);
+        if (completed.position === "long" && low < exitLower) {
+          liveEvent = { index: liveIndex, date: String(liveBar.date || ""), kind: "long-exit",
+            price: Number.isFinite(open) && open < exitLower ? open : exitLower, forming: true };
+        } else if (completed.position === "short" && high > exitUpper) {
+          liveEvent = { index: liveIndex, date: String(liveBar.date || ""), kind: "short-exit",
+            price: Number.isFinite(open) && open > exitUpper ? open : exitUpper, forming: true };
+        }
+      }
+    }
+    return { channels: completed.channels, events: completed.events, liveIndex, liveChannel, liveEvent };
+  }
+
+  window.OptionScopeTurtle = { calculate, calculateWithLiveBar };
 })(window);

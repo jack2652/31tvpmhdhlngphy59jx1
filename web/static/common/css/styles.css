@@ -793,6 +793,8 @@
 .chain-view-toggle:active{background:color-mix(in srgb,var(--blue) 18%,var(--field))}
 .chain-view-toggle i{font-size:13px;line-height:1}
 .chain-view-toggle:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.chain-batch-refresh{margin-left:auto}
+.chain-batch-refresh:disabled{opacity:.55;cursor:not-allowed}
 .chain-heatmap-panel{--chain-heatmap-surface:var(--panel);--chain-heatmap-header:var(--table-head);--chain-heatmap-line:var(--row-line);--chain-heatmap-text:var(--text);--chain-heatmap-muted:var(--muted-2);--chain-heatmap-amber:var(--amber);border-top:1px solid var(--chain-heatmap-line);background:var(--chain-heatmap-surface);color:var(--chain-heatmap-text)}
 .chain-heatmap-meta{padding:10px 18px 7px;color:var(--chain-heatmap-muted);font-size:11px}
 .chain-heatmap-wrap{overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain}
@@ -841,7 +843,7 @@
 /* 窄屏（基础媒体查询里）状态栏会整行占满并换行，「展开/收起」因此落到下一行最左；
    这里在窄屏把 auto 外边距还回来（同优先级下靠后生效），保证它与另两个折叠组一样贴右。 */
 @media(max-width:900px){.detail-header .panel-status+.detail-action{margin-left:auto}}
-@media(max-width:600px){.chain-toolbar{align-items:center;gap:9px;padding:10px 12px}.chain-filter{min-width:0}.chain-filter select{max-width:118px}.chain-view-toggle{margin-left:auto}.chain-heatmap-meta{padding:9px 12px}.chain-heatmap th,.chain-heatmap td{min-width:82px;padding:5px 7px}.chain-heatmap .chain-heatmap-strike-head,.chain-heatmap .chain-heatmap-strike{min-width:94px}.chain-heatmap-legend{gap:9px;padding-right:12px;padding-left:12px}}
+@media(max-width:600px){.chain-toolbar{align-items:center;flex-wrap:wrap;gap:9px;padding:10px 12px}.chain-filter{min-width:0}.chain-filter select{max-width:118px}.chain-view-toggle{margin-left:0}.chain-batch-refresh{margin-left:auto}.chain-heatmap-meta{padding:9px 12px}.chain-heatmap th,.chain-heatmap td{min-width:82px;padding:5px 7px}.chain-heatmap .chain-heatmap-strike-head,.chain-heatmap .chain-heatmap-strike{min-width:94px}.chain-heatmap-legend{gap:9px;padding-right:12px;padding-left:12px}}
 /* 两个分析面板折叠时会隐藏标题栏内的切换组；此时「展开」应恢复通用 auto 外边距，贴到标题栏最右侧。
    展开后由切换组自身的 auto 外边距负责靠右，操作文字紧随其后。 */
 .analysis-detail-header>.detail-modes[hidden]+.detail-action,

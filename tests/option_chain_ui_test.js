@@ -63,14 +63,25 @@ assert.match(toggleView, /this\.chainView = this\.chainView === "heatmap" \? "ta
 const loadSymbol = app.slice(app.indexOf("async function loadSymbol()"), app.indexOf("let expirationSwitchToken"));
 const loadExpirations = app.slice(app.indexOf("async function loadExpirations("), app.indexOf("function displayedSnapshotMatches()"));
 assert.match(loadExpirations, /if \(state\.chainView === "heatmap"\) void loadChainHeatmapBackground\(payload\);\s*await loadChain\(\{ loadId \}\)/, "other expiry caches must load in the background once the current expiry is known");
-assert.match(app, /async function loadChainHeatmapBackground\(catalogPayload = null\)[\s\S]*?const catalog = catalogPayload \|\| await request/, "the existing expiry catalog must be reused instead of fetching it again on initial load");
+const heatmapBackgroundStart = app.indexOf("async function loadChainHeatmapBackground(");
+const heatmapBackgroundEnd = app.indexOf("\nasync function refreshHeatmapExpiration(", heatmapBackgroundStart);
+const heatmapBackground = app.slice(heatmapBackgroundStart, heatmapBackgroundEnd);
+assert.match(heatmapBackground, /let catalog = catalogPayload;[\s\S]*catalog = catalog \|\| await request/, "the initial expiry catalog must be reused when provided");
+assert.match(heatmapBackground, /if \(chainHeatmapLoadingSymbol === symbol\) \{\s*chainHeatmapReloadRequested = true;\s*return;/, "directory refresh triggers during an in-flight scan must be coalesced");
+assert.match(heatmapBackground, /const reloadRequested = chainHeatmapReloadRequested;\s*chainHeatmapReloadRequested = false;[\s\S]*if \(reloadRequested && symbol === state\.symbol && state\.chainView === "heatmap"\) \{\s*void loadChainHeatmapBackground\(\);/, "a coalesced refresh must reread the latest directory after releasing the single-flight lock");
+assert.match(app, /const batchResult = status\?\.refresh\?\.result \|\| \{\};\s*\/\/ Gamma 每批可能把新的到期日写入 SQLite，完成后立即补读热力图目录。\s*if \(status\?\.refresh && state\.chainView === "heatmap"\) \{\s*void loadChainHeatmapBackground\(\);/, "each completed Gamma batch must refresh the heatmap cache directory");
 assert.match(app, /state\.view\.chainTitle = chainViewTitle\(state\.symbol, state\.expiration\);\s*return true;/, "selecting the current expiration must update the title before loading its chain");
 assert.match(app, /state\.view\.chainTitle = chainViewTitle\(state\.symbol, expiration\)/, "changing expiry must immediately update the section title");
 const selectHeatmapExpiration = app.slice(app.indexOf("selectHeatmapExpiration(expiration) {"), app.indexOf("filterChanged() {", app.indexOf("selectHeatmapExpiration(expiration) {")));
-assert.match(selectHeatmapExpiration, /this\.loading \|\| !this\.expirationOptions\.includes\(expiration\) \|\| expiration === this\.expiration/, "expiry selection must ignore loading, unavailable, and already selected dates");
+assert.match(selectHeatmapExpiration, /this\.loading \|\| \(!this\.expirationOptions\.includes\(expiration\) && !availableFromCache\) \|\| expiration === this\.expiration/, "expiry selection must allow cached dates and ignore loading, unavailable, and already selected dates");
 assert.match(selectHeatmapExpiration, /this\.expiration = expiration;\s*return switchExpiration\(expiration\)/, "the selector and dashboard must switch through the existing expiry loader");
 const switchCalls = [];
-const selectMethodContext = { switchExpiration(expiration) { switchCalls.push(expiration); return expiration; } };
+const selectMethodContext = {
+  state: { symbol: "TEST" },
+  chainHeatmapCache: { symbol: "TEST", availableExpirations: new Set(["2026-11-20"]) },
+  isActiveExpiration() { return true; },
+  switchExpiration(expiration) { switchCalls.push(expiration); return expiration; },
+};
 vm.runInNewContext(`this.selectHeatmapExpiration = ({${selectHeatmapExpiration.trim()}}).selectHeatmapExpiration`, selectMethodContext);
 const selection = {
   loading: false,
@@ -81,8 +92,86 @@ assert.equal(selectMethodContext.selectHeatmapExpiration.call(selection, "2026-1
 assert.equal(selection.expiration, "2026-11-13", "selecting a heatmap header must update the top selector state");
 assert.deepEqual(switchCalls, ["2026-11-13"], "a valid heatmap expiry must invoke the existing loader once");
 assert.equal(selectMethodContext.selectHeatmapExpiration.call(selection, "2026-11-13"), undefined, "selecting the current expiry must be a no-op");
-assert.equal(selectMethodContext.selectHeatmapExpiration.call(selection, "2026-11-20"), undefined, "an unavailable expiry must be a no-op");
+assert.equal(selectMethodContext.selectHeatmapExpiration.call(selection, "2026-11-20"), "2026-11-20", "a cached expiry missing from the selector must still be switchable");
+assert.deepEqual(Array.from(selection.expirationOptions), ["2026-11-06", "2026-11-13", "2026-11-20"], "a selected cached expiry must be added to the selector");
+assert.equal(selectMethodContext.selectHeatmapExpiration.call(selection, "2026-11-27"), undefined, "an unavailable expiry must be a no-op");
 assert.equal(selectMethodContext.selectHeatmapExpiration.call({ ...selection, loading: true }, "2026-11-06"), undefined, "a pending chain load must block another expiry switch");
-assert.deepEqual(switchCalls, ["2026-11-13"], "ignored expiry selections must not start extra loader calls");
+assert.deepEqual(switchCalls, ["2026-11-13", "2026-11-20"], "ignored expiry selections must not start extra loader calls");
 
-console.log("Option-chain view UI contract checks passed");
+async function verifyHeatmapDirectoryRefreshCoalescing() {
+  const currentExpiration = "2026-11-06";
+  const discoveredExpiration = "2026-11-13";
+  const testState = {
+    symbol: "TEST",
+    loadId: 1,
+    chainView: "heatmap",
+    expiration: currentExpiration,
+    expirationOptions: [currentExpiration],
+    chainRows: [],
+    chainFetchedSymbol: "",
+    chainFetchedExpiration: "",
+    chainFetchedAt: null,
+    view: { chainHeatmapMeta: "", chainHeatmap: { columns: [], rows: [] } },
+  };
+  let resolveFirstCatalog;
+  let catalogRequests = 0;
+  const context = {
+    state: testState,
+    CHAIN_HEATMAP_DISCOVERY_BASE_DELAY_MS: 4000,
+    chainHeatmapLoadToken: 0,
+    chainHeatmapLoadingSymbol: "",
+    chainHeatmapReloadRequested: false,
+    chainHeatmapDiscoveryDelayMs: 4000,
+    chainHeatmapCache: { symbol: "", expirations: new Map(), availableExpirations: new Set() },
+    cancelChainHeatmapDiscovery() {},
+    renderChainHeatmap() {},
+    activeExpirationDates(dates) { return [...new Set(dates || [])].sort(); },
+    heatmapExpiryDates(dates) { return [...new Set(dates || [])].sort(); },
+    applyExpirationCutoffs() {},
+    applyExpirations(dates) { testState.expirationOptions = dates; },
+    isActiveExpiration() { return true; },
+    updateChainHeatmapMeta() {},
+    scheduleChainHeatmapDiscovery() {},
+    request(path) {
+      if (path.startsWith("/api/expirations/")) {
+        catalogRequests += 1;
+        if (catalogRequests === 1) {
+          return new Promise((resolve) => { resolveFirstCatalog = resolve; });
+        }
+        return Promise.resolve({
+          expirations: [currentExpiration, discoveredExpiration],
+          cached_expirations: [currentExpiration, discoveredExpiration],
+          source: "sqlite",
+        });
+      }
+      return Promise.resolve({
+        data: [{ strike: 100 }],
+        fetched_at: "2026-11-05T15:00:00Z",
+        source: "sqlite",
+      });
+    },
+  };
+  vm.runInNewContext(`${heatmapBackground}\nthis.loadChainHeatmapBackground = loadChainHeatmapBackground;`, context);
+
+  const initialLoad = context.loadChainHeatmapBackground();
+  const coalescedLoad = context.loadChainHeatmapBackground();
+  await coalescedLoad;
+  assert.equal(context.chainHeatmapReloadRequested, true, "an in-flight directory read must remember a later refresh request");
+  resolveFirstCatalog({
+    expirations: [currentExpiration],
+    cached_expirations: [currentExpiration],
+    source: "sqlite",
+  });
+  await initialLoad;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(catalogRequests, 2, "a coalesced refresh must reread the directory once after the original scan");
+  assert.equal(context.chainHeatmapCache.expirations.has(discoveredExpiration), true, "the newly cached expiry must be added without reloading the page");
+}
+
+verifyHeatmapDirectoryRefreshCoalescing().then(() => {
+  console.log("Option-chain view UI contract checks passed");
+}).catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

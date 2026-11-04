@@ -11,6 +11,7 @@
   const BUY_FOUR_REARM_ATR = 0.5;
   const SELL_EIGHT_REARM_ATR = 1;
   const TREND_ATR = 0.5;
+  const completedCache = new WeakMap();
 
   function validBar(bar) {
     const open = Number(bar?.open), high = Number(bar?.high), low = Number(bar?.low), close = Number(bar?.close);
@@ -142,5 +143,43 @@
     return { sma, events };
   }
 
-  window.OptionScopeGranville = { calculate };
+  function cachedCompletedResult(sourceCandles, endIndex) {
+    let entries = completedCache.get(sourceCandles);
+    if (!entries) {
+      entries = new Map();
+      completedCache.set(sourceCandles, entries);
+    }
+    if (entries.has(endIndex)) return entries.get(endIndex);
+    const bars = endIndex === sourceCandles.length ? sourceCandles : sourceCandles.slice(0, endIndex);
+    const result = calculate(bars);
+    entries.set(endIndex, result);
+    if (entries.size > 2) entries.delete(entries.keys().next().value);
+    return result;
+  }
+
+  function liveAverage(bars, liveIndex) {
+    const liveBar = bars[liveIndex];
+    if (!validBar(liveBar)) return null;
+    let sum = Number(liveBar.close);
+    let count = 1;
+    for (let index = liveIndex - 1; index >= 0 && count < SMA_PERIOD; index -= 1) {
+      if (!validBar(bars[index])) break;
+      sum += Number(bars[index].close);
+      count += 1;
+    }
+    return count === SMA_PERIOD ? sum / SMA_PERIOD : null;
+  }
+
+  function calculateWithLiveBar(sourceCandles, displayCandles, liveIndex) {
+    const liveBar = liveIndex >= 0 ? displayCandles[liveIndex] : null;
+    if (liveBar && liveBar.is_forming !== true) return calculate(displayCandles);
+    if (!liveBar) {
+      return { ...cachedCompletedResult(sourceCandles, sourceCandles.length), liveIndex: -1, liveSma: null };
+    }
+    const endIndex = Math.max(0, Math.min(liveIndex, sourceCandles.length));
+    const completed = cachedCompletedResult(sourceCandles, endIndex);
+    return { ...completed, liveIndex, liveSma: liveAverage(displayCandles, liveIndex) };
+  }
+
+  window.OptionScopeGranville = { calculate, calculateWithLiveBar };
 })(window);

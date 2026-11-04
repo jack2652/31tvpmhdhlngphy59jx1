@@ -21,6 +21,9 @@
   }
   const chartCache = new WeakMap();
   const afStochZCache = new WeakMap();
+  const quoteEasternDateFormatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+  });
   const turningKinds = new Set(["bottom_reversal_candidate", "top_exit_candidate"]);
   const penPointKinds = new Set(["third_buy_candidate", "third_sell_candidate"]);
   const v4ClassLabels = {
@@ -431,13 +434,21 @@
   // the viewport, keeping pan/zoom cheap.
   const macdSeriesCache = new WeakMap();
   function macdSeries(candles) {
-    if (!candles?.length) return [];
+    if (!candles?.length) {
+      if (candles && !macdSeriesCache.has(candles)) {
+        const state = { emaFast: null, emaSlow: null, dea: null };
+        macdSeriesCache.set(candles, { values: [], beforeLast: state, finalState: state });
+      }
+      return [];
+    }
     const cached = macdSeriesCache.get(candles);
-    if (cached) return cached;
+    if (cached) return cached.values;
     const result = new Array(candles.length);
     const fastWeight = 2 / 13, slowWeight = 2 / 27, signalWeight = 2 / 10;
     let emaFast = null, emaSlow = null, dea = null;
+    let beforeLast = { emaFast, emaSlow, dea };
     for (let index = 0; index < candles.length; index += 1) {
+      if (index === candles.length - 1) beforeLast = { emaFast, emaSlow, dea };
       const close = Number(candles[index]?.close);
       if (!Number.isFinite(close)) { result[index] = null; continue; }
       emaFast = emaFast == null ? close : close * fastWeight + emaFast * (1 - fastWeight);
@@ -446,72 +457,110 @@
       dea = dea == null ? dif : dif * signalWeight + dea * (1 - signalWeight);
       result[index] = { dif, dea, hist: (dif - dea) * 2 };
     }
-    macdSeriesCache.set(candles, result);
+    macdSeriesCache.set(candles, { values: result, beforeLast, finalState: { emaFast, emaSlow, dea } });
+    return result;
+  }
+
+  function macdWindow(sourceCandles, startIndex, endIndex, liveBar = null, liveIndex = -1) {
+    const values = macdSeries(sourceCandles);
+    const result = values.slice(startIndex, Math.min(endIndex, values.length));
+    if (!liveBar || liveIndex < startIndex || liveIndex >= endIndex) return result;
+    const cached = macdSeriesCache.get(sourceCandles);
+    const replacing = liveIndex < values.length;
+    const state = replacing ? cached.beforeLast : cached.finalState;
+    const close = Number(liveBar.close);
+    let value = null;
+    if (Number.isFinite(close)) {
+      const fastWeight = 2 / 13, slowWeight = 2 / 27, signalWeight = 2 / 10;
+      const emaFast = state.emaFast == null ? close : close * fastWeight + state.emaFast * (1 - fastWeight);
+      const emaSlow = state.emaSlow == null ? close : close * slowWeight + state.emaSlow * (1 - slowWeight);
+      const dif = emaFast - emaSlow;
+      const dea = state.dea == null ? dif : dif * signalWeight + state.dea * (1 - signalWeight);
+      value = { dif, dea, hist: (dif - dea) * 2 };
+    }
+    result[liveIndex - startIndex] = value;
     return result;
   }
 
   // Calculate DMI (14, 6) over the full frame so viewport changes retain the
   // same warm-up and smoothing state as the source candle sequence.
   const dmiSeriesCache = new WeakMap();
+  // DMI(14, 6) 的实时尾值只需最近 21 根 K 线，历史序列继续复用稳定数组缓存。
+  const DMI_TAIL_BARS = 21;
+  function createDmiState() {
+    return { movementWindow: [], dxWindow: [], trueRangeSum: 0, plusSum: 0, minusSum: 0, dxSum: 0 };
+  }
+  function resetDmiState(state) {
+    state.movementWindow.length = 0;
+    state.dxWindow.length = 0;
+    state.trueRangeSum = 0; state.plusSum = 0; state.minusSum = 0; state.dxSum = 0;
+  }
+  function dmiPoint(candles, index, state) {
+    const candle = candles[index];
+    const high = Number(candle?.high), low = Number(candle?.low);
+    if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) {
+      resetDmiState(state);
+      return null;
+    }
+    let trueRange = high - low, plusMove = 0, minusMove = 0;
+    if (index > 0) {
+      const previous = candles[index - 1];
+      const previousHigh = Number(previous?.high), previousLow = Number(previous?.low);
+      const previousClose = Number(previous?.close);
+      if (Number.isFinite(previousHigh) && Number.isFinite(previousLow) && Number.isFinite(previousClose)) {
+        trueRange = Math.max(high - low, Math.abs(high - previousClose), Math.abs(previousClose - low));
+        const highMove = high - previousHigh;
+        const lowMove = previousLow - low;
+        plusMove = highMove > 0 && highMove > lowMove ? highMove : 0;
+        minusMove = lowMove > 0 && lowMove > highMove ? lowMove : 0;
+      } else {
+        resetDmiState(state);
+      }
+    }
+    const movement = { trueRange, plusMove, minusMove };
+    state.movementWindow.push(movement);
+    state.trueRangeSum += trueRange;
+    state.plusSum += plusMove;
+    state.minusSum += minusMove;
+    if (state.movementWindow.length > 14) {
+      const expired = state.movementWindow.shift();
+      state.trueRangeSum -= expired.trueRange;
+      state.plusSum -= expired.plusMove;
+      state.minusSum -= expired.minusMove;
+    }
+    if (state.movementWindow.length < 14) return null;
+    const pdi = state.trueRangeSum > 0 ? state.plusSum * 100 / state.trueRangeSum : 0;
+    const mdi = state.trueRangeSum > 0 ? state.minusSum * 100 / state.trueRangeSum : 0;
+    const directionSum = pdi + mdi;
+    const dx = directionSum > 0 ? Math.abs(pdi - mdi) * 100 / directionSum : 0;
+    state.dxWindow.push(dx);
+    state.dxSum += dx;
+    if (state.dxWindow.length > 6) state.dxSum -= state.dxWindow.shift();
+    return { pdi, mdi, dx, adx: state.dxWindow.length === 6 ? state.dxSum / 6 : null, difference: pdi - mdi };
+  }
+
   function dmiSeries(candles) {
     if (!candles?.length) return [];
     const cached = dmiSeriesCache.get(candles);
     if (cached) return cached;
     const result = new Array(candles.length).fill(null);
-    const movementWindow = [];
-    const dxWindow = [];
-    let trueRangeSum = 0, plusSum = 0, minusSum = 0, dxSum = 0;
+    const state = createDmiState();
     for (let index = 0; index < candles.length; index += 1) {
-      const candle = candles[index];
-      const high = Number(candle?.high), low = Number(candle?.low);
-      if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) {
-        movementWindow.length = 0;
-        dxWindow.length = 0;
-        trueRangeSum = 0; plusSum = 0; minusSum = 0; dxSum = 0;
-        continue;
-      }
-      let trueRange = high - low, plusMove = 0, minusMove = 0;
-      if (index > 0) {
-        const previous = candles[index - 1];
-        const previousHigh = Number(previous?.high), previousLow = Number(previous?.low);
-        const previousClose = Number(previous?.close);
-        if (Number.isFinite(previousHigh) && Number.isFinite(previousLow) && Number.isFinite(previousClose)) {
-          trueRange = Math.max(high - low, Math.abs(high - previousClose), Math.abs(previousClose - low));
-          const highMove = high - previousHigh;
-          const lowMove = previousLow - low;
-          plusMove = highMove > 0 && highMove > lowMove ? highMove : 0;
-          minusMove = lowMove > 0 && lowMove > highMove ? lowMove : 0;
-        } else {
-          movementWindow.length = 0;
-          dxWindow.length = 0;
-          trueRangeSum = 0; plusSum = 0; minusSum = 0; dxSum = 0;
-        }
-      }
-      const movement = { trueRange, plusMove, minusMove };
-      movementWindow.push(movement);
-      trueRangeSum += trueRange;
-      plusSum += plusMove;
-      minusSum += minusMove;
-      if (movementWindow.length > 14) {
-        const expired = movementWindow.shift();
-        trueRangeSum -= expired.trueRange;
-        plusSum -= expired.plusMove;
-        minusSum -= expired.minusMove;
-      }
-      if (movementWindow.length < 14) continue;
-      const pdi = trueRangeSum > 0 ? plusSum * 100 / trueRangeSum : 0;
-      const mdi = trueRangeSum > 0 ? minusSum * 100 / trueRangeSum : 0;
-      const directionSum = pdi + mdi;
-      const dx = directionSum > 0 ? Math.abs(pdi - mdi) * 100 / directionSum : 0;
-      dxWindow.push(dx);
-      dxSum += dx;
-      if (dxWindow.length > 6) dxSum -= dxWindow.shift();
-      result[index] = {
-        pdi, mdi, dx, adx: dxWindow.length === 6 ? dxSum / 6 : null,
-        difference: pdi - mdi,
-      };
+      result[index] = dmiPoint(candles, index, state);
     }
     dmiSeriesCache.set(candles, result);
+    return result;
+  }
+
+  function dmiWindow(sourceCandles, displayCandles, startIndex, endIndex, liveIndex = -1) {
+    const baseValues = dmiSeries(sourceCandles);
+    const result = baseValues.slice(startIndex, Math.min(endIndex, baseValues.length));
+    if (liveIndex < startIndex || liveIndex >= endIndex) return result;
+    // 保留一根前置 K 线，计算第一根真实波动幅度时才能使用前收盘价。
+    const from = Math.max(0, liveIndex - DMI_TAIL_BARS);
+    const tail = displayCandles.slice(from, liveIndex + 1);
+    const tailValues = dmiSeries(tail);
+    result[liveIndex - startIndex] = tailValues[tailValues.length - 1] ?? null;
     return result;
   }
 
@@ -525,6 +574,23 @@
 
   function futureOffsetLimit(visibleCount) {
     return Math.max(0, Math.min(visibleCount - 1, Math.floor(visibleCount * 0.75)));
+  }
+
+  function indexedEventWindow(events, startIndex, endIndex) {
+    let low = 0, high = events.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (events[middle].index < startIndex) low = middle + 1;
+      else high = middle;
+    }
+    const first = low;
+    high = events.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (events[middle].index < endIndex) low = middle + 1;
+      else high = middle;
+    }
+    return events.slice(first, low);
   }
 
   function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null, liveBar = null) {
@@ -601,11 +667,22 @@
     const afStochZ = layers?.afStochZ === true ? afStochZSeries(sourceCandles) : { events: [], series: {} };
     const trendlineResult = layers?.trendlines === true
       ? window.OptionScopeTrendlines?.calculate(sourceCandles, frame.strokes || [], cacheSegments, startIndex, endIndex) || null : null;
-    const dmiValues = dmiSeries(candlesForDisplay);
-    const turtleResult = layers?.turtle === true ? window.OptionScopeTurtle?.calculate(candlesForDisplay, dmiValues) || null : null;
-    const granvilleResult = layers?.granville === true ? window.OptionScopeGranville?.calculate(candlesForDisplay) || null : null;
-    const macd = macdSeries(candlesForDisplay).slice(startIndex, endIndex);
-    const dmi = dmiValues.slice(startIndex, endIndex);
+    const turtleEnabled = layers?.turtle === true;
+    const dmiValues = turtleEnabled ? dmiSeries(sourceCandles) : null;
+    const turtleResult = turtleEnabled
+      ? window.OptionScopeTurtle?.calculateWithLiveBar(sourceCandles, candlesForDisplay, dmiValues, liveCandleVisible ? liveDisplayIndex : -1)
+        || window.OptionScopeTurtle?.calculate(candlesForDisplay, dmiValues) || null
+      : null;
+    const granvilleResult = layers?.granville === true
+      ? window.OptionScopeGranville?.calculateWithLiveBar(sourceCandles, candlesForDisplay, liveCandleVisible ? liveDisplayIndex : -1)
+        || window.OptionScopeGranville?.calculate(candlesForDisplay) || null
+      : null;
+    const macd = visibleSubcharts.macd
+      ? macdWindow(sourceCandles, startIndex, dataEndIndex, liveCandleVisible ? candlesForDisplay[liveDisplayIndex] : null, liveDisplayIndex)
+      : [];
+    const dmi = visibleSubcharts.dmi
+      ? dmiWindow(sourceCandles, candlesForDisplay, startIndex, dataEndIndex, liveCandleVisible ? liveDisplayIndex : -1)
+      : [];
     const width = mobile ? 420 : 960;
     // Desktop retains room for the left price labels and current-price badge
     // without carrying the oversized axis gutter from the former right axis.
@@ -675,9 +752,20 @@
       ? (afStochZ.events || []).filter((signal) => signal.date >= firstDate && signal.date <= lastDate)
       : [];
     const visibleTurtleChannels = (turtleResult?.channels || []).slice(startIndex, dataEndIndex);
-    const visibleTurtleEvents = (turtleResult?.events || []).filter((event) => event.index >= startIndex && event.index < dataEndIndex);
+    if (liveCandleVisible && turtleResult?.liveIndex === liveDisplayIndex) {
+      const localIndex = liveDisplayIndex - startIndex;
+      while (visibleTurtleChannels.length <= localIndex) visibleTurtleChannels.push(null);
+      visibleTurtleChannels[localIndex] = turtleResult.liveChannel || null;
+    }
+    const visibleTurtleEvents = indexedEventWindow(turtleResult?.events || [], startIndex, dataEndIndex);
+    if (liveCandleVisible && turtleResult?.liveEvent) visibleTurtleEvents.push(turtleResult.liveEvent);
     const visibleGranvilleAverage = (granvilleResult?.sma || []).slice(startIndex, dataEndIndex);
-    const visibleGranvilleEvents = (granvilleResult?.events || []).filter((event) => event.index >= startIndex && event.index < dataEndIndex);
+    if (liveCandleVisible && granvilleResult?.liveIndex === liveDisplayIndex) {
+      const localIndex = liveDisplayIndex - startIndex;
+      while (visibleGranvilleAverage.length <= localIndex) visibleGranvilleAverage.push(null);
+      visibleGranvilleAverage[localIndex] = granvilleResult.liveSma;
+    }
+    const visibleGranvilleEvents = indexedEventWindow(granvilleResult?.events || [], startIndex, dataEndIndex);
     const legacyRule = "strict-old-bi-v3";
     const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.11";
     let minimum = Infinity, maximum = -Infinity;
@@ -1800,9 +1888,7 @@
     const timestamp = Date.parse(quote?.fetched_at || "");
     if (!Number.isFinite(timestamp)) return "";
     const date = new Date(timestamp);
-    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
-      timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
-    }).formatToParts(date).map((part) => [part.type, part.value]));
+    const parts = Object.fromEntries(quoteEasternDateFormatter.formatToParts(date).map((part) => [part.type, part.value]));
     return `${parts.year}-${parts.month}-${parts.day}`;
   }
 

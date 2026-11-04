@@ -118,7 +118,7 @@ func (s *Service) loadHistoryWithMaxAge(ctx context.Context, symbol, period stri
 			return historyResult(symbol, bars, cached["fetched_at"], "sqlite", nil)
 		}
 		if s.scheduleHistoryRefresh(symbol, period, maxAge) {
-			return historyResult(symbol, bars, cached["fetched_at"], "sqlite", "SQLite 历史行情已先显示，后台正在更新")
+			return historyResult(symbol, bars, cached["fetched_at"], "sqlite", "历史行情已先显示，后台正在更新")
 		}
 		return historyResult(symbol, bars, cached["fetched_at"], "sqlite", nil)
 	}
@@ -214,7 +214,7 @@ func (s *Service) refreshHistory(ctx context.Context, symbol, period string, max
 		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), fetchErr.Error())
 	}
 	if len(result.Bars) == 0 || result.FetchedAt.IsZero() {
-		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), "上游返回空历史行情，继续使用 SQLite 缓存")
+		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), "上游返回空历史行情，继续使用本地缓存")
 	}
 	if err := s.store.WriteHistory(symbol, result.Bars, result.FetchedAt); err != nil {
 		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), err.Error())
@@ -225,7 +225,7 @@ func (s *Service) refreshHistory(ctx context.Context, symbol, period string, max
 	}
 	updatedBars, _ := updated["bars"].([]map[string]any)
 	if len(updatedBars) == 0 {
-		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), "上游历史行情未包含有效收盘价，继续使用 SQLite 缓存")
+		return historyResult(symbol, cached["bars"], cached["fetched_at"], cacheSource(cached["bars"], cached["fetched_at"]), "上游历史行情未包含有效收盘价，继续使用本地缓存")
 	}
 	return historyResult(symbol, updatedBars, updated["fetched_at"], "upstream", nil)
 }

@@ -991,7 +991,7 @@ func TestGammaFinishPersistenceFailureIsVisibleAndRetried(t *testing.T) {
 		t.Fatalf("durable row after forced write failure=%#v found=%v err=%v", durable, found, err)
 	}
 	visible := service.gammaJobStatus("QQQ", 45)
-	if visible["status"] != "completed" || !strings.Contains(fmt.Sprint(visible["error_message"]), "Gamma 状态写入 SQLite 失败") {
+	if visible["status"] != "completed" || !strings.Contains(fmt.Sprint(visible["error_message"]), "Gamma 状态保存失败") {
 		t.Fatalf("in-memory terminal state did not expose persistence failure: %#v", visible)
 	}
 
@@ -1055,7 +1055,7 @@ func TestGammaTimeoutPersistenceFailureIsVisibleAndRetried(t *testing.T) {
 		t.Fatalf("durable row after forced timeout write failure=%#v found=%v err=%v", durable, found, err)
 	}
 	visible := service.gammaJobStatus("QQQ", 45)
-	if visible["status"] != "failed" || !strings.Contains(fmt.Sprint(visible["error_message"]), "Gamma 状态写入 SQLite 失败") {
+	if visible["status"] != "failed" || !strings.Contains(fmt.Sprint(visible["error_message"]), "Gamma 状态保存失败") {
 		t.Fatalf("timeout persistence failure was not visible: %#v", visible)
 	}
 

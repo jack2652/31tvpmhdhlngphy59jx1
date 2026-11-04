@@ -1201,6 +1201,11 @@ func (s *Service) expirations(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": cacheErr.Error()})
 		return
 	}
+	cutoffDates := append(append([]string(nil), values...), cachedExpirations...)
+	respond := func(response model.ExpirationsResponse) {
+		response.ExpirationCutoffs = expirationCutoffMap(cutoffDates)
+		c.JSON(http.StatusOK, response)
+	}
 	values = activeExpirations(values)
 	cachedExpirations = activeExpirations(cachedExpirations)
 	if len(values) > 0 {
@@ -1209,21 +1214,21 @@ func (s *Service) expirations(c *gin.Context) {
 		s.mu.Unlock()
 	}
 	if len(values) > 0 && !refresh {
-		c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "sqlite"})
+		respond(model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "sqlite"})
 		return
 	}
 	if !refresh && (len(values) == 0 || !ok) {
-		c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: []string{}, CachedExpirations: cachedExpirations, Source: "pending"})
+		respond(model.ExpirationsResponse{Symbol: symbol, Expirations: []string{}, CachedExpirations: cachedExpirations, Source: "pending"})
 		return
 	}
 	upstreamValues, upstreamErr := s.provider.Expirations(c.Request.Context(), symbol)
 	if upstreamErr != nil {
 		if len(cachedExpirations) > 0 {
-			c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: cachedExpirations, CachedExpirations: cachedExpirations, Source: "sqlite", Warning: upstreamErr.Error()})
+			respond(model.ExpirationsResponse{Symbol: symbol, Expirations: cachedExpirations, CachedExpirations: cachedExpirations, Source: "sqlite", Warning: upstreamErr.Error()})
 			return
 		}
 		if len(values) > 0 {
-			c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "sqlite", Warning: upstreamErr.Error()})
+			respond(model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "sqlite", Warning: upstreamErr.Error()})
 			return
 		}
 		c.JSON(http.StatusBadGateway, gin.H{"detail": upstreamErr.Error()})
@@ -1236,6 +1241,7 @@ func (s *Service) expirations(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": cacheErr.Error()})
 		return
 	}
+	cutoffDates = append(append([]string(nil), upstreamValues...), cachedExpirations...)
 	cachedExpirations = activeExpirations(cachedExpirations)
 	if len(values) > 0 {
 		if err := s.store.SaveExpirations(symbol, values); err != nil {
@@ -1246,7 +1252,7 @@ func (s *Service) expirations(c *gin.Context) {
 		s.expires[symbol] = values
 		s.mu.Unlock()
 	}
-	c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "upstream"})
+	respond(model.ExpirationsResponse{Symbol: symbol, Expirations: values, CachedExpirations: cachedExpirations, Source: "upstream"})
 }
 
 var expirationPattern = regexp.MustCompile(`^\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}$`)
@@ -1779,6 +1785,7 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	}
 	chainFresh := false
 	chainExpiration := requestedExpiration
+	var cachedChainFetchedAt *time.Time
 	if chainExpiration == "" {
 		// A recent authoritative empty catalogue outranks stale non-empty
 		// catalogues retained for the UI, otherwise restart/new-worker refreshes
@@ -1794,6 +1801,8 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	}
 	if chainExpiration != "" {
 		if chain, found, loadErr := s.store.LatestChain(symbol, chainExpiration); loadErr == nil && found && chain.FetchedAt != nil {
+			fetchedAt := *chain.FetchedAt
+			cachedChainFetchedAt = &fetchedAt
 			chainFresh = time.Since(*chain.FetchedAt) < maxAge && hasTwoSidedQuotes(chain.Data)
 		}
 	}
@@ -1862,7 +1871,7 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 	// Background/SSE refreshes retain cross-process coordination and wait for
 	// the current owner, while respecting cancellation. HTTP calls opted into
 	// background delivery already return before reaching this point.
-	leaseAcquired, _, leaseErr = s.acquireDurableLease(ctx, leaseName, 30*time.Second)
+	leaseAcquired, leaseWaited, leaseErr := s.acquireDurableLease(ctx, leaseName, 30*time.Second)
 	if leaseErr != nil {
 		return model.RefreshResponse{}, fmt.Errorf("acquire snapshot lease: %w", leaseErr)
 	}
@@ -1890,6 +1899,36 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 			log.Printf("release durable snapshot lease %s: %v", leaseName, err)
 		}
 	}()
+	// 其他进程在本请求开始后已写入同一期限快照时，直接复用结果，避免租约串行化后再次请求上游。
+	if leaseWaited && requestedExpiration != "" {
+		chain, found, cacheErr := s.store.LatestChain(symbol, requestedExpiration)
+		if cacheErr != nil {
+			return model.RefreshResponse{}, fmt.Errorf("load refreshed option chain: %w", cacheErr)
+		}
+		updatedByAnotherRequest := found && chain.FetchedAt != nil
+		if updatedByAnotherRequest && cachedChainFetchedAt == nil {
+			updatedByAnotherRequest = !chain.FetchedAt.Before(requestStartedAt)
+		} else if updatedByAnotherRequest {
+			updatedByAnotherRequest = chain.FetchedAt.After(*cachedChainFetchedAt) ||
+				!cachedChainFetchedAt.Before(requestStartedAt)
+		}
+		if updatedByAnotherRequest {
+			coalesced, found, responseErr := s.cachedSnapshotRefreshResponse(symbol, requestedExpiration)
+			if responseErr != nil {
+				return model.RefreshResponse{}, responseErr
+			}
+			if found {
+				coalesced.Skipped = true
+				coalesced.Coalesced = true
+				coalesced.Deferred = false
+				coalesced.Stale = false
+				coalesced.Warning = ""
+				coalesced.Expiration = requestedExpiration
+				refreshSource = "durable_lease_coalesced"
+				return coalesced, nil
+			}
+		}
+	}
 	refreshSource = "upstream"
 	runStartedAt := time.Now()
 	runID, runErr := s.store.StartRefreshRun(symbol)
@@ -2044,7 +2083,7 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 		return model.RefreshResponse{}, err
 	}
 	if !validMarketPrice(quote.Price) {
-		const warning = "上游返回空行情，继续使用 SQLite 缓存"
+		const warning = "上游返回空行情，继续使用本地缓存"
 		fallback, used, fallbackErr := s.staleRefreshResponse(ctx, symbol, requestedExpiration, warning)
 		if fallbackErr != nil {
 			resultErr = fallbackErr
@@ -2285,7 +2324,7 @@ func (s *Service) cachedSnapshotRefreshResponse(symbol, requestedExpiration stri
 	response := model.RefreshResponse{
 		Skipped: true, Stale: true, Deferred: true, Expirations: expirations,
 		FetchedAt: quote.value.FetchedAt, Quote: &quote.value,
-		Warning: "同一标的的快照正在刷新，本次先返回 SQLite 缓存",
+		Warning: "同一标的的快照正在刷新，本次先返回本地缓存",
 	}
 	quoteValue := quote.value
 	quoteValue.Source = "sqlite"
@@ -4261,13 +4300,16 @@ func activeExpirations(values []string) []string {
 }
 
 func activeExpirationsAt(values []string, now time.Time, location *time.Location) []string {
+	if location == nil {
+		location = time.UTC
+	}
 	localNow := now.In(location)
 	today := localNow.Format("2006-01-02")
-	todayExpiry := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 16, 0, 0, 0, location)
-	todayIsActive := localNow.Before(todayExpiry)
+	todayExpiry := expirationCutoffAt(today, location)
+	todayIsActive := todayExpiry != nil && localNow.Before(*todayExpiry)
 	active := make([]string, 0, len(values))
 	for _, value := range values {
-		if value > today || value == today && todayIsActive {
+		if value > today && expirationCutoffAt(value, location) != nil || value == today && todayIsActive {
 			active = append(active, value)
 		}
 	}
@@ -4275,6 +4317,38 @@ func activeExpirationsAt(values []string, now time.Time, location *time.Location
 	// active expiry even when an upstream catalog changes its response order.
 	sort.Strings(active)
 	return active
+}
+
+func expirationCutoffMap(values []string) map[string]*time.Time {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.UTC
+	}
+	today := time.Now().In(location).Format(time.DateOnly)
+	cutoffs := make(map[string]*time.Time, len(values))
+	for _, value := range values {
+		if value < today {
+			continue
+		}
+		if _, exists := cutoffs[value]; exists {
+			continue
+		}
+		cutoffs[value] = expirationCutoffAt(value, location)
+	}
+	return cutoffs
+}
+
+func expirationCutoffAt(value string, location *time.Location) *time.Time {
+	if location == nil {
+		location = time.UTC
+	}
+	date, err := time.ParseInLocation(time.DateOnly, value, location)
+	if err != nil || !marketcalendar.IsTradingDay(date) {
+		return nil
+	}
+	closeMinute := marketcalendar.RegularCloseMinute(date)
+	cutoff := time.Date(date.Year(), date.Month(), date.Day(), closeMinute/60, closeMinute%60, 0, 0, location)
+	return &cutoff
 }
 
 func quoteTime(quote model.Quote) time.Time {

@@ -45,6 +45,8 @@ const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", weekday: "short", year: "numeric", month: "2-digit", day: "2-digit",
   hour: "2-digit", minute: "2-digit", hourCycle: "h23",
 });
+let expirationCutoffCatalog = { symbol: "", values: null };
+let expirationCutoffTimer = null;
 const CHAN_CHART_PREFERENCES_VERSION = 9;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
 const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false };
@@ -156,6 +158,7 @@ const state = {
   },
   chanLoading: false,
   chanPayload: null,
+  chanQuoteRenderKey: "",
   chanStale: false,
   chanRequestId: 0,
   chanInFlightSymbol: "",
@@ -231,6 +234,9 @@ const state = {
   },
   chainFilter: "all",
   chainView: readChainViewPreference(),
+  chainHeatmapRefreshRunning: false,
+  chainHeatmapRefreshProgress: "",
+  chainHeatmapRefreshTarget: "",
   chainRows: [],
   chainSpot: null,
   levelBasisMode: "live",
@@ -1142,8 +1148,10 @@ function applyPushedSnapshotPayload(message) {
     applyExpirations([chain.expiration], chain.expiration);
     request(`/api/expirations/${encodeURIComponent(state.symbol)}`).then((catalog) => {
       if (loadId !== state.loadId || state.symbol !== message.symbol) return;
+      applyExpirationCutoffs(state.symbol, catalog?.expiration_cutoffs);
       const dates = [...new Set([...(catalog?.expirations || []), ...(catalog?.cached_expirations || [])])].sort();
       if (dates.length) applyExpirations(dates, state.expiration);
+      if (state.chainView === "heatmap") void loadChainHeatmapBackground(catalog);
     }).catch(() => {});
   }
   if (!state.analysisReady && chain.data?.length) {
@@ -1362,6 +1370,7 @@ function connectPushStream(symbol = state.symbol) {
       state.chainFetchedAt = null;
       state.chainFetchedSymbol = "";
       loadChain({ loadId: state.loadId, refresh: false, fallbackSnapshot: previousSnapshot });
+      if (state.chainView === "heatmap") void loadChainHeatmapBackground();
     }
   };
   document.addEventListener("visibilitychange", state.pushVisibilityHandler);
@@ -1426,14 +1435,17 @@ function formatOptionQuote(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number.toFixed(2) : "--";
 }
-function formatTime(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { timeZone: "America/New_York", hour12: false }); }
+const EASTERN_DATE_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", { timeZone: "America/New_York", hour12: false });
+const EASTERN_CLOCK_FORMATTER = new Intl.DateTimeFormat("zh-CN", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
+const HEATMAP_EXPIRATION_LABEL_FORMATTER = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", timeZone: "UTC" });
+function formatTime(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : EASTERN_DATE_TIME_FORMATTER.format(date); }
 function formatEasternTime(value) { return value ? `${formatTime(value)} 美东` : "--"; }
 function formatEasternClock(value) {
   if (!value) return "--:--";
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? "--:--"
-    : date.toLocaleTimeString("zh-CN", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false });
+    : EASTERN_CLOCK_FORMATTER.format(date);
 }
 function updateSnapshotStatus() {
   const quoteAt = state.lastQuote?.fetched_at || null;
@@ -1564,7 +1576,7 @@ function gammaSpotBucket(value) {
   return gammaBucketKey;
 }
 
-function gammaAtSpot(spot, row, expiration, spotKey) {
+function gammaAtSpot(spot, row, expiration, spotKey, timeBucketOverride = null) {
   const spotValue = Number(spot);
   const strike = Number(row.strike);
   // 模型 IV 由后端按合约价格反解，优先于数据源里常为占位值的 implied_volatility。
@@ -1575,7 +1587,7 @@ function gammaAtSpot(spot, row, expiration, spotKey) {
   const expiry = optionExpiry(expiryKey);
   if (!expiry) return null;
   // 30 秒一档：同一次渲染里的柱状图和期权链表共用结果，刷新时也不把同一批合约再算一遍。
-  const timeBucket = Math.floor(Date.now() / 30000);
+  const timeBucket = Number.isFinite(timeBucketOverride) ? timeBucketOverride : Math.floor(Date.now() / 30000);
   const bucket = spotKey !== undefined ? spotKey : gammaSpotBucket(spotValue);
   const cacheKey = `${expiryKey}|${strike}|${row.contract_type || ""}|${volatility}|${bucket}|${timeBucket}`;
   if (gammaValueCache.has(cacheKey)) return gammaValueCache.get(cacheKey);
@@ -3707,7 +3719,7 @@ function hydrateTrendFromChan(payload, preferredSpot = null, preserveOptionLevel
     state.view.levels.resistanceEmpty = "现价上方暂无历史观察价位";
     state.view.levels.supportEmpty = "现价下方暂无历史观察价位";
     state.view.levels.addEmpty = addLevels.length ? "" : "暂无可用历史加仓价位";
-    const source = "SQLite 日线计算 · 期权链尚不可用";
+    const source = "本地日线计算 · 期权链尚不可用";
     state.view.levels.resistanceNote = source;
     state.view.levels.supportNote = source;
     if (resistance.length || support.length || !keepCurrentLevels) {
@@ -3748,6 +3760,8 @@ function resetChanAnalysis() {
   state.chanLoading = false;
   state.chanSpotGuideVisible = false;
   state.chanPayload = null;
+  state.chanQuoteRenderKey = "";
+  pendingChanQuoteRender = null;
   state.chanStale = false;
   state.chanMarketPayload = null;
   state.chanViewports = { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } };
@@ -4036,6 +4050,7 @@ function refreshChanAnalysis(force = false) {
     // rebuilt wholesale whenever anything changes.
     state.chanPayload = Object.freeze(OptionScopeChan.withSpot(payload, liveSpot, state.chanPayload, liveQuote));
     state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers, state.chanSubcharts);
+    state.chanQuoteRenderKey = chanQuoteRenderKey(liveQuote, liveSpot);
     // Adjusted Chan results intentionally omit market_analysis. The separate
     // /api/chan request feeds the trend and price-level cards above the chart.
     // SSE normally refreshes history completion immediately. Bounded retry
@@ -4060,6 +4075,41 @@ function refreshChanAnalysis(force = false) {
       refreshChanAnalysis(true);
     }
   });
+}
+
+function chanQuoteRenderKey(quote, spot) {
+  const fetchedAt = Date.parse(quote?.fetched_at || "");
+  const easternDate = Number.isFinite(fetchedAt) ? newYorkIntradayParts(new Date(fetchedAt)).date : "";
+  const bar = quote?.daily_bar || {};
+  const barValues = ["open", "high", "low", "close", "volume"].map((key) => {
+    const value = bar[key];
+    if (value === null || value === undefined || value === "") return "";
+    const number = Number(value);
+    return Number.isFinite(number) ? String(number) : String(value);
+  });
+  return [quote?.symbol || state.symbol, spot == null ? "" : String(spot), quote?.source || "",
+    quote?.market_state || "", easternDate, bar.date || "", ...barValues, bar.is_forming === true ? "1" : "0"].join("|");
+}
+
+let pendingChanQuoteRender = null;
+let chanQuoteRenderScheduled = false;
+function scheduleChanQuoteRender(quote, spot) {
+  pendingChanQuoteRender = { symbol: quote?.symbol || state.symbol, quote, spot };
+  if (chanQuoteRenderScheduled) return;
+  chanQuoteRenderScheduled = true;
+  const render = () => {
+    chanQuoteRenderScheduled = false;
+    const pending = pendingChanQuoteRender;
+    pendingChanQuoteRender = null;
+    if (!pending || pending.symbol !== state.symbol || state.chanPayload?.symbol !== pending.symbol) return;
+    const renderKey = chanQuoteRenderKey(pending.quote, pending.spot);
+    if (renderKey === state.chanQuoteRenderKey) return;
+    state.chanPayload = Object.freeze(OptionScopeChan.withSpot(state.chanPayload, pending.spot, null, pending.quote));
+    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers, state.chanSubcharts);
+    state.chanQuoteRenderKey = renderKey;
+  };
+  if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(render);
+  else window.setTimeout(render, 0);
 }
 
 function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket = false) {
@@ -4140,8 +4190,10 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     }
   }
   if (state.chanPayload?.symbol === state.symbol) {
-    state.chanPayload = Object.freeze(OptionScopeChan.withSpot(state.chanPayload, finitePrice(price), null, quote));
-    state.view.chan = OptionScopeChan.view(state.chanPayload, state.chanScenariosVisible, state.chanMobileChart, 30, state.chanViewports, state.chanChartLayers, state.chanSubcharts);
+    const liveSpot = finitePrice(price);
+    const renderKey = chanQuoteRenderKey(quote, liveSpot);
+    if (renderKey !== state.chanQuoteRenderKey) scheduleChanQuoteRender(quote, liveSpot);
+    else if (pendingChanQuoteRender?.symbol === state.symbol) pendingChanQuoteRender = null;
   }
   if (CHAN_INTRADAY_PERIODS.some((period) => state.chanIntradayPayload[period])) {
     state.chanIntradaySpot = finitePrice(price);
@@ -4555,9 +4607,29 @@ function renderChainTable() {
 }
 
 const CHAIN_HEATMAP_HORIZON_DAYS = 45;
+const CHAIN_HEATMAP_DISCOVERY_BASE_DELAY_MS = 4000;
+const CHAIN_HEATMAP_DISCOVERY_MAX_DELAY_MS = 30000;
 let chainHeatmapLoadToken = 0;
 let chainHeatmapLoadingSymbol = "";
+let chainHeatmapReloadRequested = false;
+let chainHeatmapDiscoveryTimer = null;
+let chainHeatmapDiscoveryDelayMs = CHAIN_HEATMAP_DISCOVERY_BASE_DELAY_MS;
 let chainHeatmapCache = { symbol: "", expirations: new Map(), availableExpirations: new Set() };
+const heatmapGexCache = new WeakMap();
+let chainHeatmapRenderScheduled = false;
+let chainHeatmapViewCache = { key: "", rows: null, empty: "" };
+const heatmapRowsIdentity = new WeakMap();
+let nextHeatmapRowsIdentity = 1;
+
+function heatmapRowsKey(rows) {
+  if (!Array.isArray(rows)) return "";
+  let identity = heatmapRowsIdentity.get(rows);
+  if (!identity) {
+    identity = String(nextHeatmapRowsIdentity++);
+    heatmapRowsIdentity.set(rows, identity);
+  }
+  return identity;
+}
 
 function heatmapExpiryDates(dates) {
   const nowParts = newYorkIntradayParts(new Date(syncedNow()));
@@ -4571,14 +4643,93 @@ function heatmapExpiryDates(dates) {
 
 function isActiveExpiration(expiration, nowParts = newYorkIntradayParts(new Date(syncedNow()))) {
   if (typeof expiration !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(expiration)) return false;
-  return expiration > nowParts.date || expiration === nowParts.date && nowParts.minute < 16 * 60;
+  const cutoffs = expirationCutoffCatalog.symbol === state.symbol ? expirationCutoffCatalog.values : null;
+  const hasCutoff = cutoffs && Object.prototype.hasOwnProperty.call(cutoffs, expiration);
+  if (hasCutoff && !cutoffs[expiration]) return false;
+  if (expiration > nowParts.date) return true;
+  if (expiration < nowParts.date) return false;
+  if (hasCutoff) {
+    const cutoff = cutoffs[expiration] ? Date.parse(cutoffs[expiration]) : NaN;
+    return Number.isFinite(cutoff) && syncedNow() < cutoff;
+  }
+  return nowParts.minute < 16 * 60;
+}
+
+function applyExpirationCutoffs(symbol, values) {
+  if (symbol !== state.symbol || !values || typeof values !== "object" || Array.isArray(values)) return;
+  expirationCutoffCatalog = { symbol, values };
+  state.expirationOptions = activeExpirationDates(state.expirationOptions);
+  if (state.expiration && !isActiveExpiration(state.expiration)) void recoverExpiredExpiration();
+  if (state.chainView === "heatmap") renderChainHeatmap();
+  scheduleExpirationCutoff();
+}
+
+function scheduleExpirationCutoff() {
+  if (expirationCutoffTimer) clearTimeout(expirationCutoffTimer);
+  expirationCutoffTimer = null;
+  const values = expirationCutoffCatalog.symbol === state.symbol ? expirationCutoffCatalog.values : null;
+  if (!values) return;
+  const now = syncedNow();
+  const nextCutoff = Object.values(values)
+    .filter((value) => typeof value === "string")
+    .map((value) => Date.parse(value))
+    .filter((value) => Number.isFinite(value) && value > now)
+    .sort((left, right) => left - right)[0];
+  if (!nextCutoff) return;
+  const maxTimeout = 2147483647;
+  expirationCutoffTimer = setTimeout(() => {
+    expirationCutoffTimer = null;
+    state.expirationOptions = activeExpirationDates(state.expirationOptions);
+    if (state.chainView === "heatmap") renderChainHeatmap();
+    void recoverExpiredExpiration();
+    scheduleExpirationCutoff();
+  }, Math.min(Math.max(nextCutoff - now + 50, 0), maxTimeout));
 }
 
 function activeExpirationDates(dates) {
   return [...new Set((dates || []).filter((date) => isActiveExpiration(date)))].sort();
 }
 
+// 缓存每个行权价的 Gamma×持仓系数，现价变化只需乘以现价平方。
+function heatmapGexByStrike(rows, spot, spotKey, fetchedAt) {
+  const timeBucket = Math.floor(Date.now() / 30000);
+  const cacheKey = `${spotKey}|${timeBucket}|${fetchedAt || ""}`;
+  const cached = heatmapGexCache.get(rows);
+  if (cached?.key === cacheKey) return cached.values;
+  const values = new Map();
+  for (const option of rows) {
+    const strike = Number(option.strike);
+    if (!Number.isFinite(strike)) continue;
+    const gamma = gammaAtSpot(spot, option, undefined, spotKey, timeBucket);
+    const value = gamma == null ? Number(option.gamma) : Number(gamma);
+    if (!Number.isFinite(value)) continue;
+    const exposure = value * (Number(option.open_interest) || 0) * 100 * 0.01;
+    const aggregate = values.get(strike) || { call: 0, put: 0, net: 0 };
+    if (option.contract_type === "call") {
+      aggregate.call += exposure;
+      aggregate.net += exposure;
+    } else if (option.contract_type === "put") {
+      aggregate.net -= exposure;
+      aggregate.put -= exposure;
+    }
+    values.set(strike, aggregate);
+  }
+  heatmapGexCache.set(rows, { key: cacheKey, values });
+  return values;
+}
+
 function renderChainHeatmap() {
+  if (chainHeatmapRenderScheduled) return;
+  chainHeatmapRenderScheduled = true;
+  const render = () => {
+    chainHeatmapRenderScheduled = false;
+    renderChainHeatmapModel();
+  };
+  if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(render);
+  else window.setTimeout(render, 0);
+}
+
+function renderChainHeatmapModel() {
   if (chainHeatmapCache.symbol !== state.symbol) return;
   const source = new Map(chainHeatmapCache.expirations);
   if (state.chainRows?.length && state.chainFetchedSymbol === state.symbol
@@ -4589,6 +4740,12 @@ function renderChainHeatmap() {
   const quoteFetchedAt = state.lastQuote?.fetched_at || null;
   const current = state.expiration;
   const expirations = [...source.keys()].filter((expiration) => isActiveExpiration(expiration)).sort();
+  const heatmapSpotKey = Number.isFinite(spot) && spot > 0 ? gammaSpotBucket(spot) : "";
+  const heatmapKey = [state.symbol, state.chainFilter, state.expiration, spot == null ? "" : String(spot), heatmapSpotKey,
+    ...expirations.flatMap((expiration) => {
+      const entry = source.get(expiration);
+      return [expiration, formatEasternTime(entry?.fetchedAt), heatmapRowsKey(entry?.rows)];
+    })].join("|");
   const columns = expirations.map((expiration) => {
     const entry = source.get(expiration);
     const isSelected = expiration === current;
@@ -4596,7 +4753,7 @@ function renderChainHeatmap() {
     const date = new Date(`${expiration}T12:00:00Z`);
     return {
       expiration,
-      label: Number.isNaN(date.getTime()) ? expiration : new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", timeZone: "UTC" }).format(date),
+      label: Number.isNaN(date.getTime()) ? expiration : HEATMAP_EXPIRATION_LABEL_FORMATTER.format(date),
       source: isSelected ? "行情" : "缓存",
       updatedAt: formatEasternClock(displayTime),
       current: isSelected,
@@ -4606,33 +4763,44 @@ function renderChainHeatmap() {
         : `${expiration} · 缓存参考 · 期权链快照 ${formatEasternTime(entry?.fetchedAt)}`,
     };
   });
+  if (chainHeatmapViewCache.key === heatmapKey && chainHeatmapViewCache.rows) {
+    const view = Object.freeze({ columns, rows: chainHeatmapViewCache.rows });
+    state.view.chainHeatmap = view;
+    state.view.chainHeatmapEmpty = chainHeatmapViewCache.empty;
+    return;
+  }
   if (!Number.isFinite(spot) || spot <= 0 || !columns.length) {
-    state.view.chainHeatmap = { columns, rows: [] };
-    state.view.chainHeatmapEmpty = !Number.isFinite(spot) || spot <= 0 ? "现价暂不可用，无法计算 GEX" : "当前没有可用的期权链缓存";
+    const view = Object.freeze({ columns, rows: [] });
+    const empty = !Number.isFinite(spot) || spot <= 0 ? "现价暂不可用，无法计算 GEX" : "当前没有可用的期权链缓存";
+    chainHeatmapViewCache = { key: heatmapKey, rows: view.rows, empty };
+    state.view.chainHeatmap = view;
+    state.view.chainHeatmapEmpty = empty;
     return;
   }
   const lower = spot * 0.85;
   const upper = spot * 1.15;
   const valuesByExpiration = new Map();
+  const peaksByExpiration = new Map();
   const strikeSet = new Set();
   const gexLabel = state.chainFilter === "call" ? "看涨 GEX" : state.chainFilter === "put" ? "看跌 GEX" : "净 GEX";
-  let peak = 0;
+  const spotSquared = spot * spot;
+  const spotKey = gammaSpotBucket(spot);
   for (const column of columns) {
     const entry = source.get(column.expiration);
     const values = new Map();
     const rows = Array.isArray(entry?.rows) ? entry.rows : [];
-    const spotSquared = spot * spot;
-    const spotKey = gammaSpotBucket(spot);
-    for (const option of rows) {
-      if (state.chainFilter !== "all" && option.contract_type !== state.chainFilter) continue;
-      const strike = Number(option.strike);
+    const aggregates = heatmapGexByStrike(rows, spot, spotKey, entry?.fetchedAt);
+    for (const [strike, aggregate] of aggregates) {
       if (!Number.isFinite(strike) || strike < lower || strike > upper) continue;
-      const gex = contractGex(option, spot, spotSquared, spotKey);
-      if (gex == null) continue;
+      const factor = state.chainFilter === "call" ? aggregate.call
+        : state.chainFilter === "put" ? aggregate.put : aggregate.net;
+      const gex = factor * spotSquared;
       values.set(strike, (values.get(strike) || 0) + gex);
       strikeSet.add(strike);
     }
-    for (const value of values.values()) peak = Math.max(peak, Math.abs(value));
+    let columnPeak = 0;
+    for (const value of values.values()) columnPeak = Math.max(columnPeak, Math.abs(value));
+    peaksByExpiration.set(column.expiration, columnPeak);
     valuesByExpiration.set(column.expiration, values);
   }
   const strikes = [...strikeSet].sort((a, b) => b - a);
@@ -4642,41 +4810,101 @@ function renderChainHeatmap() {
     const distance = Math.abs(strike - spot);
     if (distance < nearestDistance) { nearestStrike = strike; nearestDistance = distance; }
   }
+  const previousRows = new Map((state.view.chainHeatmap?.rows || []).map((row) => [row.key, row]));
   const modelRows = strikes.map((strike) => {
     const currentSpot = strike === nearestStrike;
-    return {
+    const previousRow = previousRows.get(String(strike));
+    const previousCells = new Map((previousRow?.cells || []).map((cell) => [cell.key, cell]));
+    const reuseCell = (cell) => {
+      const previous = previousCells.get(cell.key);
+      return previous && previous.value === cell.value && previous.className === cell.className
+        && previous.style === cell.style && previous.title === cell.title ? previous : cell;
+    };
+    const cells = columns.map((column) => {
+      const spotClass = currentSpot && column.current ? " chain-heatmap-current-spot-cell" : "";
+      const value = valuesByExpiration.get(column.expiration).get(strike);
+      if (value == null) return reuseCell({
+        key: `${column.expiration}|${strike}`,
+        value: "-",
+        className: `chain-heatmap-cell chain-heatmap-cell-empty${spotClass}`,
+        style: "",
+        title: `${column.expiration} · ${formatMoney(strike)} · 无数据`,
+      });
+      // 每个到期日独立归一，刷新一列时不重染其他日期的格子。
+      const columnPeak = peaksByExpiration.get(column.expiration) || 0;
+      const percent = columnPeak > 0 ? Math.round(Math.sqrt(Math.min(Math.abs(value) / columnPeak, 1)) * 100) : 0;
+      return reuseCell({
+        key: `${column.expiration}|${strike}`,
+        value: formatGex(value / 1000000, 1),
+        className: `chain-heatmap-cell ${value > 0 ? "chain-heatmap-cell-positive" : value < 0 ? "chain-heatmap-cell-negative" : "chain-heatmap-cell-zero"}${percent >= 65 ? " chain-heatmap-cell-hot" : ""}${spotClass}`,
+        style: `--heat:${percent}`,
+        title: `${column.expiration} · 行权价 ${formatMoney(strike)} · ${gexLabel} ${formatGex(value / 1000000, 2)} · ${column.selected ? "已选期限，按最新行情估算" : "缓存参考"}`,
+      });
+    });
+    const row = {
       key: String(strike),
       strike: formatMoney(strike),
       currentSpot,
-      cells: columns.map((column) => {
-        const spotClass = currentSpot && column.current ? " chain-heatmap-current-spot-cell" : "";
-        const value = valuesByExpiration.get(column.expiration).get(strike);
-        if (value == null) return { key: `${column.expiration}|${strike}`, value: "-", className: `chain-heatmap-cell chain-heatmap-cell-empty${spotClass}`, style: "", title: `${column.expiration} · ${formatMoney(strike)} · 无数据` };
-        const percent = peak > 0 ? Math.round(Math.sqrt(Math.min(Math.abs(value) / peak, 1)) * 100) : 0;
-        return {
-          key: `${column.expiration}|${strike}`,
-          value: formatGex(value / 1000000, 1),
-          className: `chain-heatmap-cell ${value > 0 ? "chain-heatmap-cell-positive" : value < 0 ? "chain-heatmap-cell-negative" : "chain-heatmap-cell-zero"}${percent >= 65 ? " chain-heatmap-cell-hot" : ""}${spotClass}`,
-          style: `--heat:${percent}`,
-          title: `${column.expiration} · 行权价 ${formatMoney(strike)} · ${gexLabel} ${formatGex(value / 1000000, 2)} · ${column.selected ? "已选期限，按最新行情估算" : "缓存参考"}`,
-        };
-      }),
+      cells,
     };
+    if (previousRow && previousRow.strike === row.strike && previousRow.currentSpot === row.currentSpot
+      && previousRow.cells.length === cells.length && cells.every((cell, index) => cell === previousRow.cells[index])) {
+      return previousRow;
+    }
+    return row;
   });
-  state.view.chainHeatmap = { columns, rows: modelRows };
-  state.view.chainHeatmapEmpty = `当前价 ±15% 区间内暂无可计算 ${gexLabel}`;
+  const view = Object.freeze({ columns, rows: modelRows });
+  const empty = `当前价 ±15% 区间内暂无可计算 ${gexLabel}`;
+  chainHeatmapViewCache = { key: heatmapKey, rows: view.rows, empty };
+  state.view.chainHeatmap = view;
+  state.view.chainHeatmapEmpty = empty;
 }
 
 function updateChainHeatmapMeta(loaded, total) {
   state.view.chainHeatmapMeta = `当前期限随快照更新 · 缓存期限 ${loaded}/${total} · GEX 估算仅供参考`;
 }
 
+function cancelChainHeatmapDiscovery(resetDelay = true) {
+  if (chainHeatmapDiscoveryTimer) clearTimeout(chainHeatmapDiscoveryTimer);
+  chainHeatmapDiscoveryTimer = null;
+  if (resetDelay) chainHeatmapDiscoveryDelayMs = CHAIN_HEATMAP_DISCOVERY_BASE_DELAY_MS;
+}
+
+function scheduleChainHeatmapDiscovery(symbol, loadId, token, pending) {
+  if (token !== chainHeatmapLoadToken || loadId !== state.loadId || symbol !== state.symbol
+    || state.chainView !== "heatmap") return;
+  if (!pending) {
+    cancelChainHeatmapDiscovery();
+    return;
+  }
+  if (chainHeatmapDiscoveryTimer) return;
+  const delay = chainHeatmapDiscoveryDelayMs;
+  chainHeatmapDiscoveryDelayMs = Math.min(Math.round(delay * 1.6), CHAIN_HEATMAP_DISCOVERY_MAX_DELAY_MS);
+  chainHeatmapDiscoveryTimer = setTimeout(() => {
+    chainHeatmapDiscoveryTimer = null;
+    if (token !== chainHeatmapLoadToken || loadId !== state.loadId || symbol !== state.symbol
+      || state.chainView !== "heatmap") return;
+    void loadChainHeatmapBackground();
+  }, delay);
+}
+
 async function loadChainHeatmapBackground(catalogPayload = null) {
   const symbol = state.symbol;
-  if (chainHeatmapLoadingSymbol === symbol) return;
-  if (chainHeatmapCache.symbol !== symbol) chainHeatmapCache = { symbol, expirations: new Map(), availableExpirations: new Set() };
+  if (chainHeatmapLoadingSymbol === symbol) {
+    chainHeatmapReloadRequested = true;
+    return;
+  }
+  const loadId = state.loadId;
+  cancelChainHeatmapDiscovery(false);
+  chainHeatmapReloadRequested = false;
+  if (chainHeatmapCache.symbol !== symbol) {
+    chainHeatmapCache = { symbol, expirations: new Map(), availableExpirations: new Set() };
+    chainHeatmapDiscoveryDelayMs = CHAIN_HEATMAP_DISCOVERY_BASE_DELAY_MS;
+  }
   const token = ++chainHeatmapLoadToken;
   chainHeatmapLoadingSymbol = symbol;
+  const isCurrentLoad = () => token === chainHeatmapLoadToken && loadId === state.loadId
+    && symbol === state.symbol && state.chainView === "heatmap";
   const currentRows = state.chainRows?.length && state.chainFetchedSymbol === symbol
     && state.chainFetchedExpiration === state.expiration ? state.chainRows : [];
   if (currentRows.length) {
@@ -4688,28 +4916,35 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
   state.view.chainHeatmapMeta = currentRows.length
     ? "当前期限随快照更新 · 正在逐个读取其他期限缓存 · GEX 估算仅供参考"
     : "正在载入当前期限快照 · GEX 估算仅供参考";
+  let discoveredExpiration = false;
+  let catalog = catalogPayload;
   try {
-    const catalog = catalogPayload || await request(`/api/expirations/${encodeURIComponent(symbol)}`);
-    if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
+    catalog = catalog || await request(`/api/expirations/${encodeURIComponent(symbol)}`);
+    if (!isCurrentLoad()) return;
+    applyExpirationCutoffs(symbol, catalog?.expiration_cutoffs);
     const cachedCatalogDates = activeExpirationDates(catalog?.cached_expirations || []);
     chainHeatmapCache.availableExpirations = new Set(cachedCatalogDates);
     const availableDates = activeExpirationDates([...(catalog?.expirations || []), ...cachedCatalogDates]);
     if (availableDates.length) applyExpirations(availableDates, state.expiration);
     const dates = heatmapExpiryDates(cachedCatalogDates)
       .filter((expiration) => expiration !== state.expiration);
+    const expectedDates = heatmapExpiryDates([...availableDates, ...state.expirationOptions])
+      .filter((expiration) => expiration !== state.expiration);
     const cachedDates = [...chainHeatmapCache.expirations.keys()]
       .filter((expiration) => isActiveExpiration(expiration) && expiration !== state.expiration);
     const pendingDates = dates.filter((expiration) => !chainHeatmapCache.expirations.has(expiration));
-    const total = cachedDates.length + pendingDates.length;
+    const total = Math.max(expectedDates.length, cachedDates.length + pendingDates.length);
     updateChainHeatmapMeta(cachedDates.length, total);
     renderChainHeatmap();
     for (const expiration of pendingDates) {
-      if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
+      if (!isCurrentLoad()) return;
       try {
         const payload = await request(`/api/chain/${encodeURIComponent(symbol)}?expiration=${encodeURIComponent(expiration)}`);
-        if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
+        if (!isCurrentLoad()) return;
         if (payload?.data?.length && payload?.source === "sqlite") {
+          discoveredExpiration ||= !chainHeatmapCache.expirations.has(expiration);
           chainHeatmapCache.expirations.set(expiration, { rows: payload.data, fetchedAt: payload.fetched_at, current: false });
+          renderChainHeatmap();
         }
         const loaded = [...chainHeatmapCache.expirations.keys()]
           .filter((date) => isActiveExpiration(date) && date !== state.expiration).length;
@@ -4725,14 +4960,69 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
       .filter((date) => isActiveExpiration(date) && date !== state.expiration).length;
     updateChainHeatmapMeta(loaded, total);
     renderChainHeatmap();
+    if (discoveredExpiration) chainHeatmapDiscoveryDelayMs = CHAIN_HEATMAP_DISCOVERY_BASE_DELAY_MS;
+    const pendingDiscovery = expectedDates.some((expiration) => !chainHeatmapCache.expirations.has(expiration))
+      || (!expectedDates.length && catalog?.source === "pending" && state.expirationOptions.length > 0);
+    scheduleChainHeatmapDiscovery(symbol, loadId, token, pendingDiscovery);
   } catch (error) {
-    if (token !== chainHeatmapLoadToken || symbol !== state.symbol) return;
+    if (!isCurrentLoad()) return;
     state.view.chainHeatmapMeta = currentRows.length
       ? "当前期限随快照更新 · 其他期限缓存暂不可用 · GEX 估算仅供参考"
       : `热力图数据暂不可用：${error.message}`;
+    const hasExpectedDates = heatmapExpiryDates(state.expirationOptions)
+      .some((expiration) => expiration !== state.expiration);
+    scheduleChainHeatmapDiscovery(symbol, loadId, token, hasExpectedDates);
   } finally {
-    if (token === chainHeatmapLoadToken) chainHeatmapLoadingSymbol = "";
+    if (token === chainHeatmapLoadToken && loadId === state.loadId) {
+      chainHeatmapLoadingSymbol = "";
+      const reloadRequested = chainHeatmapReloadRequested;
+      chainHeatmapReloadRequested = false;
+      if (reloadRequested && symbol === state.symbol && state.chainView === "heatmap") {
+        void loadChainHeatmapBackground();
+      }
+    }
   }
+}
+
+async function refreshHeatmapExpiration(symbol, expiration, previousFetchedAt) {
+  const chainPath = `/api/chain/${encodeURIComponent(symbol)}?expiration=${encodeURIComponent(expiration)}`;
+  let previousTimestamp = Date.parse(previousFetchedAt || "");
+  if (!Number.isFinite(previousTimestamp)) {
+    const previousPayload = await request(chainPath).catch(() => null);
+    previousTimestamp = Date.parse(previousPayload?.fetched_at || "");
+  }
+  const params = new URLSearchParams({ expiration, max_age: "0" });
+  const refreshResult = await request(
+    `/api/refresh/${encodeURIComponent(symbol)}?${params}`,
+    { method: "POST" },
+  );
+  if (refreshResult?.quote_only) throw new Error("该标的没有可刷新期权链");
+  if (refreshResult?.stale && !refreshResult?.deferred && !refreshResult?.coalesced) {
+    throw new Error(refreshResult.warning || "上游刷新失败，当前仍是旧快照");
+  }
+  const isUpdated = (payload) => payload?.source === "sqlite"
+    && Array.isArray(payload.data) && payload.data.length > 0
+    && Number.isFinite(Date.parse(payload.fetched_at || ""))
+    && (!Number.isFinite(previousTimestamp) || Date.parse(payload.fetched_at) > previousTimestamp);
+  let payload = await request(chainPath);
+  if (refreshResult?.deferred) {
+    const deadline = Date.now() + 180000;
+    let readError = null;
+    while (!isUpdated(payload) && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1200));
+      try {
+        payload = await request(chainPath);
+      } catch (error) {
+        readError = error;
+      }
+    }
+    if (!isUpdated(payload)) {
+      throw new Error(readError?.message || "等待其他刷新完成超时");
+    }
+  } else if (!isUpdated(payload)) {
+    throw new Error(refreshResult?.warning || "刷新后没有读到更新的期权链");
+  }
+  return payload;
 }
 
 function chainViewTitle(symbol, expiration, view = state.chainView) {
@@ -4903,7 +5193,7 @@ async function renderCachedHistoryOnly(loadId, quote = null) {
     && state.displayedChainExpiration === state.expiration
     && state.chainRows?.length) return;
   state.view.chainTitle = chainViewTitle(symbol, state.expiration);
-  state.view.dataSource = "SQLite 行情/日线 · 无期权链缓存";
+  state.view.dataSource = "行情/日线 · 无期权链缓存";
   updateSnapshotStatus();
   state.view.totalCount = "0";
   state.view.callVolume = "0";
@@ -4911,8 +5201,8 @@ async function renderCachedHistoryOnly(loadId, quote = null) {
   state.view.callInterest = "未平仓 0";
   state.view.putInterest = "未平仓 0";
   state.view.chainRows = [];
-  state.view.chainEmpty = "SQLite 目前没有期权合约缓存";
-  state.view.lastStatus = "已读取 SQLite 行情与日线缓存；该标的暂无期权链缓存";
+  state.view.chainEmpty = "目前没有期权合约缓存";
+  state.view.lastStatus = "已读取行情与日线缓存；该标的暂无期权链缓存";
 }
 
 function isCurrentLoad(loadId, expiration) {
@@ -5358,6 +5648,10 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
           return;
         }
         const batchResult = status?.refresh?.result || {};
+        // Gamma 每批可能把新的到期日写入 SQLite，完成后立即补读热力图目录。
+        if (status?.refresh && state.chainView === "heatmap") {
+          void loadChainHeatmapBackground();
+        }
         if (batchResult.has_more) {
           // 中间批次只写入 SQLite 并显示进度，不读取/序列化整个 45 天窗口；
           // 等最后一批完成后再做一次完整零 Gamma 计算。
@@ -5445,7 +5739,7 @@ async function refreshInBackground(loadId) {
         if (!isCurrentLoad(loadId) || await restartIfExpirationChanged(expiration)) return;
         if (refreshResult.deferred && state.expirationPlaceholder !== "无期权缓存") scheduleSnapshotRetry(loadId, 15000);
         if (refreshResult.deferred) {
-          state.view.lastStatus = "已读取 SQLite 行情/日线缓存；期权数据在后台检查";
+          state.view.lastStatus = "已读取行情/日线缓存；期权数据在后台检查";
         }
         return;
       }
@@ -5605,10 +5899,10 @@ async function loadQuoteOnly(loadId) {
   syncPageQuery();
   await renderCachedHistoryOnly(loadId, quote);
   state.view.dataSource = "上游无期权数据";
-  state.view.chainEmpty = "SQLite 目前没有期权合约缓存";
+  state.view.chainEmpty = "目前没有期权合约缓存";
   state.view.lastStatus = expirations?.source === "pending"
-    ? "已读取 SQLite 行情与日线缓存；正在检查期权期限"
-    : "已读取 SQLite 行情与日线缓存；上游没有可用期权合约";
+    ? "已读取行情与日线缓存；正在检查期权期限"
+    : "已读取行情与日线缓存；暂无可用期权合约";
 }
 
 async function loadExpirations(loadId, fallbackSnapshot = null, refresh = false) {
@@ -5619,6 +5913,7 @@ async function loadExpirations(loadId, fallbackSnapshot = null, refresh = false)
     return { expirations: [], source: "pending" };
   });
   if (!isCurrentLoad(loadId)) return;
+  applyExpirationCutoffs(state.symbol, payload?.expiration_cutoffs);
   const retryable = requestError
     ? isTransientRequestError(requestError)
     : payload.source === "pending";
@@ -5801,6 +6096,10 @@ async function loadSymbol() {
   state.analysisBlockUntil = 0;
   state.analysisReady = false;
   const loadId = ++state.loadId;
+  cancelChainHeatmapDiscovery();
+  chainHeatmapLoadToken += 1;
+  chainHeatmapLoadingSymbol = "";
+  chainHeatmapReloadRequested = false;
   if (window.optionScopeApp && state.chanExpanded) window.optionScopeApp.ensureChanIntraday(state.chanPeriod);
   clearQuoteRetry();
   state.quoteRetryInFlightKey = "";
@@ -5951,6 +6250,13 @@ const optionScopeApp = new Vue({
   data: state,
   computed: {
     busy() { return this.loading; },
+    hasHeatmapBatchRefreshTargets() {
+      const dates = this.expirationOptions.length
+        ? this.expirationOptions
+        : (this.view.chainHeatmap?.columns || []).map((column) => column.expiration);
+      return heatmapExpiryDates(dates)
+        .some((expiration) => expiration !== this.expiration);
+    },
     chanFrame() {
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
         const payload = this.chanIntradayPayload[this.chanPeriod];
@@ -6346,6 +6652,65 @@ const optionScopeApp = new Vue({
       this.expiration = expiration;
       return switchExpiration(expiration);
     },
+    async refreshChainHeatmapExpirations() {
+      if (this.chainHeatmapRefreshRunning || this.loading) return;
+      const symbol = state.symbol;
+      const selectedExpiration = state.expiration;
+      const catalogExpirations = this.expirationOptions.length
+        ? this.expirationOptions
+        : (this.view.chainHeatmap?.columns || []).map((column) => column.expiration);
+      const expirations = heatmapExpiryDates(catalogExpirations)
+        .filter((expiration) => expiration !== selectedExpiration);
+      if (!expirations.length) {
+        this.view.chainHeatmapMeta = "没有可批量刷新的其他到期日";
+        return;
+      }
+
+      this.chainHeatmapRefreshRunning = true;
+      this.chainHeatmapRefreshProgress = "0/" + expirations.length;
+      this.chainHeatmapRefreshTarget = "";
+      this.view.chainHeatmapMeta = "准备依次刷新 " + expirations.length + " 个其他到期日";
+      let refreshed = 0;
+      const failed = [];
+      try {
+        for (let index = 0; index < expirations.length; index += 1) {
+          const expiration = expirations[index];
+          this.chainHeatmapRefreshProgress = (index + 1) + "/" + expirations.length;
+          this.chainHeatmapRefreshTarget = expiration;
+          if (state.symbol === symbol) {
+            this.view.chainHeatmapMeta = "正在刷新 " + expiration + " · " + this.chainHeatmapRefreshProgress;
+          }
+          const previousFetchedAt = chainHeatmapCache.symbol === symbol
+            ? chainHeatmapCache.expirations.get(expiration)?.fetchedAt : null;
+          try {
+            const payload = await refreshHeatmapExpiration(symbol, expiration, previousFetchedAt);
+            refreshed += 1;
+            if (state.symbol === symbol) {
+              if (chainHeatmapCache.symbol !== symbol) {
+                chainHeatmapCache = { symbol, expirations: new Map(), availableExpirations: new Set() };
+              }
+              chainHeatmapCache.availableExpirations.add(expiration);
+              chainHeatmapCache.expirations.set(expiration, {
+                rows: payload.data,
+                fetchedAt: payload.fetched_at,
+                current: false,
+              });
+              renderChainHeatmap();
+            }
+          } catch (error) {
+            failed.push(expiration);
+          }
+        }
+        if (state.symbol === symbol) {
+          const failureSummary = failed.length ? " · 失败 " + failed.join("、") : "";
+          this.view.chainHeatmapMeta = "批量刷新完成：成功 " + refreshed + "/" + expirations.length + failureSummary;
+        }
+      } finally {
+        this.chainHeatmapRefreshRunning = false;
+        this.chainHeatmapRefreshProgress = "";
+        this.chainHeatmapRefreshTarget = "";
+      }
+    },
     filterChanged() {
       return this.chainView === "heatmap" ? renderChainHeatmap() : renderChainTable();
     },
@@ -6354,6 +6719,7 @@ const optionScopeApp = new Vue({
       rememberChainViewPreference(this.chainView);
       this.view.chainTitle = chainViewTitle(state.symbol, state.expiration, this.chainView);
       if (this.chainView === "heatmap") loadChainHeatmapBackground();
+      else cancelChainHeatmapDiscovery();
     },
     toggleTheme() {
       const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
