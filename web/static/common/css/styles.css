@@ -797,7 +797,10 @@
 .chain-batch-refresh:disabled{opacity:.55;cursor:not-allowed}
 .chain-heatmap-panel{--chain-heatmap-surface:var(--panel);--chain-heatmap-header:var(--table-head);--chain-heatmap-line:var(--row-line);--chain-heatmap-text:var(--text);--chain-heatmap-muted:var(--muted-2);--chain-heatmap-amber:var(--amber);border-top:1px solid var(--chain-heatmap-line);background:var(--chain-heatmap-surface);color:var(--chain-heatmap-text)}
 .chain-heatmap-meta{padding:10px 18px 7px;color:var(--chain-heatmap-muted);font-size:11px}
-.chain-heatmap-wrap{overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain}
+.chain-heatmap-wrap{overflow-x:auto;overflow-y:hidden;overscroll-behavior-x:contain;scrollbar-width:none;-ms-overflow-style:none;outline:none}
+.chain-heatmap-wrap::-webkit-scrollbar{display:none}
+.chain-heatmap-wrap:focus-visible{outline:2px solid var(--blue);outline-offset:-2px}
+.chain-heatmap-wrap.is-dragging,.chain-heatmap-wrap.is-dragging *{user-select:none}
 .chain-heatmap{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;table-layout:fixed;background:var(--chain-heatmap-surface);color:var(--chain-heatmap-text)}
 .chain-heatmap th,.chain-heatmap td{height:34px;min-width:92px;padding:5px 9px;border-right:1px solid var(--chain-heatmap-line);border-bottom:1px solid var(--chain-heatmap-line);text-align:right;white-space:nowrap}
 .chain-heatmap thead th{position:sticky;top:0;z-index:3;height:42px;background:var(--chain-heatmap-header);text-align:center}

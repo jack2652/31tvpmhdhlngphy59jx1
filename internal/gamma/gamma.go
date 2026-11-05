@@ -25,16 +25,23 @@ var newYork, _ = time.LoadLocation("America/New_York")
 // Annotate estimates one implied volatility per expiry from near-ATM option prices,
 // then adds model_iv/model_gamma to each row. Provider IV is a bounded fallback only.
 func Annotate(rows []model.OptionRow, spot *float64) map[string]any {
+	return AnnotateAt(rows, spot, time.Now())
+}
+
+// AnnotateAt 使用指定估值时点计算期权模型值，便于收盘快照保持稳定口径。
+func AnnotateAt(rows []model.OptionRow, spot *float64, now time.Time) map[string]any {
 	result := map[string]any{}
 	if spot == nil || *spot <= 0 {
 		return result
+	}
+	if now.IsZero() {
+		now = time.Now()
 	}
 	groups := make(map[string][]int)
 	for index := range rows {
 		groups[rows[index].Expiration] = append(groups[rows[index].Expiration], index)
 	}
 	for expiration, indexes := range groups {
-		now := time.Now()
 		years := yearsToExpiry(expiration, now)
 		samples := make([]ivSample, 0, len(indexes))
 		providerIVs := make([]float64, 0, len(indexes))

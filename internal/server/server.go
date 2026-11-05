@@ -787,6 +787,13 @@ func quoteAPIValue(quote model.Quote) any {
 		payload["fair_value_methods_json"] = quote.FairValueMethodsJSON
 		payload["fair_value_historical_valuation_percentiles_json"] = quote.FairValueHistoricalValuationJSON
 	}
+	if !strings.EqualFold(strings.TrimSpace(quote.MarketState), "REGULAR") {
+		if price, valuationTime, closeBased := chainGammaValuation(quote); closeBased && price != nil {
+			payload["gex_valuation"] = map[string]any{
+				"price": *price, "as_of": valuationTime.Format(time.RFC3339),
+			}
+		}
+	}
 	return payload
 }
 
@@ -1514,6 +1521,64 @@ func formatQueryBound(value float64, kind string) string {
 	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
+// 非正常时段统一锚定最近正式收盘，避免标的延长时段报价改写期权 IV 估算。
+func chainGammaValuation(quote model.Quote) (*float64, time.Time, bool) {
+	now := time.Now()
+	if strings.EqualFold(strings.TrimSpace(quote.MarketState), "REGULAR") {
+		return quote.Price, now, false
+	}
+
+	var closePrice *float64
+	closeDate := ""
+	for _, sessionName := range []string{"post", "previous_post", "overnight", "pre"} {
+		session := nestedMap(quote.Sessions, sessionName)
+		if value := positiveNumeric(session["reference_close"]); value != nil {
+			closePrice = value
+			closeDate = stringValue(session["date"])
+			if closeDate == "" {
+				if asOf := stringValue(session["as_of"]); asOf != "" {
+					if parsed, err := time.Parse(time.RFC3339, asOf); err == nil {
+						closeDate = parsed.In(newYorkLocation()).Format(time.DateOnly)
+					}
+				}
+			}
+			break
+		}
+	}
+	if closePrice == nil {
+		closePrice = positiveNumeric(quote.PreviousClose)
+	}
+	if closeDate == "" && quote.DailyBar != nil {
+		closeDate = quote.DailyBar.Date
+	}
+	if closePrice == nil && quote.DailyBar != nil {
+		closePrice = positiveNumeric(quote.DailyBar.Close)
+	}
+	if closeDate == "" && quote.FetchedAt != nil {
+		closeDate = quote.FetchedAt.In(newYorkLocation()).Format(time.DateOnly)
+	}
+	if closePrice == nil || !validTrendBarDate(closeDate) {
+		return quote.Price, now, false
+	}
+
+	location := newYorkLocation()
+	day, err := time.ParseInLocation(time.DateOnly, closeDate, location)
+	if err != nil {
+		return quote.Price, now, false
+	}
+	closeMinute := marketcalendar.RegularCloseMinute(day)
+	valuationTime := time.Date(day.Year(), day.Month(), day.Day(), closeMinute/60, closeMinute%60, 0, 0, location)
+	return closePrice, valuationTime, true
+}
+
+func newYorkLocation() *time.Location {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.FixedZone("ET", -5*60*60)
+	}
+	return location
+}
+
 func (s *Service) chain(c *gin.Context) {
 	if !s.validateQuery(c, patternedStringQueryRule("expiration", true)) {
 		return
@@ -1539,15 +1604,18 @@ func (s *Service) chain(c *gin.Context) {
 	}
 	if found && len(chain.Data) > 0 {
 		var spot *float64
+		var valuationTime time.Time
 		quote, quoteFound, quoteErr := s.store.LatestQuote(symbol)
 		if quoteErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"detail": quoteErr.Error()})
 			return
 		}
 		if quoteFound {
-			spot = quote.Price
+			spot, valuationTime, _ = chainGammaValuation(quote)
+		} else {
+			valuationTime = time.Now()
 		}
-		chain.IVModel = gamma.Annotate(chain.Data, spot)
+		chain.IVModel = gamma.AnnotateAt(chain.Data, spot, valuationTime)
 		// Python always includes iv_model for a non-empty chain, even when no
 		// spot is available and annotation returns an empty map. Avoid omitempty.
 		c.JSON(http.StatusOK, gin.H{
@@ -2195,23 +2263,23 @@ func (s *Service) refreshSnapshotWithOverridesMode(ctx context.Context, symbol, 
 			quote = latest
 		}
 	}
-	if quote.Price != nil {
+	valuationSpot, valuationTime, _ := chainGammaValuation(quote)
+	if valuationSpot != nil {
 		expiry, expiryErr := time.Parse("2006-01-02", selectedExpiration)
 		if expiryErr == nil {
-			now := time.Now().UTC()
 			for index := range rows {
 				row := &rows[index]
 				if row.Gamma != nil || row.Strike == nil || row.ImpliedVolatility == nil {
 					continue
 				}
-				if estimate, ok := gamma.EstimateOptionGamma(*quote.Price, *row.Strike, *row.ImpliedVolatility, expiry, now); ok {
+				if estimate, ok := gamma.EstimateOptionGamma(*valuationSpot, *row.Strike, *row.ImpliedVolatility, expiry, valuationTime); ok {
 					row.Gamma = &estimate
 				}
 			}
 		}
 	}
 	chain := model.ChainResponse{Symbol: symbol, Expiration: selectedExpiration, FetchedAt: fetched, Data: rows, Source: "upstream"}
-	chain.IVModel = gamma.Annotate(rows, quote.Price)
+	chain.IVModel = gamma.AnnotateAt(rows, valuationSpot, valuationTime)
 	if quote.DailyBar == nil {
 		quote.DailyBar = s.intradayDailyBarFallback(symbol, quote)
 	}
@@ -2997,12 +3065,9 @@ func (s *Service) snapshotEventPayload(symbol, expiration string) map[string]any
 	if !quoteOK || !chainOK || len(chain.value.Data) == 0 {
 		return nil
 	}
-	var spot *float64
-	if quote.value.Price != nil {
-		spot = quote.value.Price
-	}
+	spot, valuationTime, _ := chainGammaValuation(quote.value)
 	chainValue := chain.value
-	chainValue.IVModel = gamma.Annotate(chainValue.Data, spot)
+	chainValue.IVModel = gamma.AnnotateAt(chainValue.Data, spot, valuationTime)
 	return map[string]any{
 		"quote": quoteAPIValue(quote.value),
 		"chain": map[string]any{
