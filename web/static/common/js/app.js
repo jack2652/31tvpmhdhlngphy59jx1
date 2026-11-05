@@ -47,10 +47,10 @@ const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 });
 let expirationCutoffCatalog = { symbol: "", values: null };
 let expirationCutoffTimer = null;
-const CHAN_CHART_PREFERENCES_VERSION = 9;
+const CHAN_CHART_PREFERENCES_VERSION = 12;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false };
-const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville"];
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false };
+const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
 const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false };
 function readChainViewPreference() {
   try {
@@ -87,7 +87,7 @@ function readChanChartPreferences() {
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -6699,6 +6699,9 @@ const optionScopeApp = new Vue({
           afStochZ: enabled && layer === "afStochZ",
           turtle: enabled && layer === "turtle",
           granville: enabled && layer === "granville",
+          macdSma200: enabled && layer === "macdSma200",
+          supertrend: enabled && layer === "supertrend",
+          wyckoff: enabled && layer === "wyckoff",
         };
       } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "trendlines") {
         this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };

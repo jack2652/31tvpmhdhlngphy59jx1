@@ -77,7 +77,7 @@ const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
 const client = fs.readFileSync("web/static/common/js/chan-client.js", "utf8");
 const charts = fs.readFileSync("web/static/common/js/charts.js", "utf8");
 assert.match(app, /turtle: false/, "海龟指标默认关闭");
-assert.match(client, /layers\?\.turtle === true \? window\.OptionScopeTurtle\?\.calculate\(candlesForDisplay, dmiValues\)/, "海龟入场复用当前周期 DMI/ADX 数据");
+assert.match(client, /layers\?\.turtle === true[\s\S]*?window\.OptionScopeTurtle\?\.calculateWithLiveBar\(sourceCandles, candlesForDisplay, dmiValues/, "海龟入场复用当前周期 DMI/ADX 数据并支持形成中 K 线");
 assert.match(client, /visibleTurtleChannels\.forEach/, "海龟通道纳入当前视口价格范围");
 assert.match(charts, /model\.layers\?\.turtle === true && model\.turtleChannels\?\.length/, "关闭指标时不绘制海龟图层");
 assert.match(template, /<button class="detail-seg" type="button" :aria-pressed="chanChartLayers\.turtle \? 'true' : 'false'"[\s\S]*?toggleChanChartLayer\('turtle'\)">海龟交易法<\/button>/, "海龟名称按钮直接控制指标图层");

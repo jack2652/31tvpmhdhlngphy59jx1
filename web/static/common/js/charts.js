@@ -797,6 +797,46 @@ function drawChanCanvas(target, binding) {
     if (zone.width > 34 && zone.height > 12) label("第" + (Number(zone.level) + 1) + "层", zone.x + 4, zone.y + 10, { font: "9px Inter, ui-sans-serif, system-ui, sans-serif", color });
     context.globalAlpha = 1;
   }
+  if (model.layers?.wyckoff === true && model.wyckoffRange) {
+    const range = model.wyckoffRange;
+    const phaseColors = {
+      B: { accumulation: "#1ecdcf", distribution: "#aa5ada" },
+      C: { accumulation: "#afcd2d", distribution: "#eb6937" },
+      D: { accumulation: "#78d24b", distribution: "#d74691" },
+      E: { accumulation: "#1ea591", distribution: "#b9374b" },
+    };
+    const color = phaseColors[range.phase]?.[range.bias]
+      || (range.bias === "accumulation" ? colors.up : colors.down);
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    context.fillStyle = color;
+    context.globalAlpha = 0.055;
+    context.fillRect(range.x, range.y, range.width, range.height);
+    context.globalAlpha = 0.72;
+    context.strokeStyle = color;
+    context.lineWidth = model.mobileChart ? 1.4 : 1.1;
+    context.setLineDash([5, 3]);
+    context.strokeRect(range.x, range.y, range.width, range.height);
+    context.setLineDash([]);
+    context.globalAlpha = 1;
+    const phaseLabel = `${range.bias === "accumulation" ? "吸筹" : "派发"} · 阶段 ${range.phase}`;
+    context.font = `650 ${model.mobileChart ? 10 : 9}px Inter, ui-sans-serif, system-ui, sans-serif`;
+    context.textAlign = "left";
+    context.textBaseline = "alphabetic";
+    const labelWidth = context.measureText(phaseLabel).width + 10;
+    const labelHeight = model.mobileChart ? 18 : 16;
+    const labelX = Math.max(model.plotLeft, Math.min(model.historyRight - labelWidth, range.x + 3));
+    const labelY = Math.min(model.plotBottom - 2, Math.max(model.plotTop + labelHeight, range.y + labelHeight + 1));
+    context.globalAlpha = 0.92;
+    context.fillStyle = colors.panel;
+    context.fillRect(labelX, labelY - labelHeight + 2, labelWidth, labelHeight);
+    context.globalAlpha = 1;
+    context.fillStyle = color;
+    context.fillText(phaseLabel, labelX + 5, labelY - 3);
+    context.restore();
+  }
   // Keep each original candle body in its market color. Each merged Chan
   // candle is shown once, anchored at the last source slot in its range, with
   // an identically sized pale column behind that body's real high-low range.
@@ -940,6 +980,230 @@ function drawChanCanvas(target, binding) {
         context.fillStyle = colors.panel;
         context.fillText(event.label, event.x, event.labelY);
       }
+    }
+    context.restore();
+  }
+  if (model.layers?.macdSma200 === true) {
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    const fastAverage = model.macdSma200Averages?.fast || [];
+    const trendAverage = model.macdSma200Averages?.trend || [];
+    let fillSegment = [];
+    const paintAverageFill = () => {
+      if (fillSegment.length > 1) {
+        context.beginPath();
+        context.moveTo(fillSegment[0].fast.x, fillSegment[0].fast.y);
+        for (const point of fillSegment) context.lineTo(point.fast.x, point.fast.y);
+        for (let index = fillSegment.length - 1; index >= 0; index -= 1) {
+          context.lineTo(fillSegment[index].trend.x, fillSegment[index].trend.y);
+        }
+        context.closePath();
+        context.fillStyle = colors.axis;
+        context.globalAlpha = 0.14;
+        context.fill();
+        context.globalAlpha = 1;
+      }
+      fillSegment = [];
+    };
+    for (let index = 0; index < Math.max(fastAverage.length, trendAverage.length); index += 1) {
+      const fast = fastAverage[index], trend = trendAverage[index];
+      if (fast && trend && Number.isFinite(fast.x) && Number.isFinite(fast.y)
+        && Number.isFinite(trend.x) && Number.isFinite(trend.y)) {
+        fillSegment.push({ fast, trend });
+      } else paintAverageFill();
+    }
+    paintAverageFill();
+    const averageTrendColor = (trend) => trend === "up" ? colors.up : trend === "down" ? colors.down : colors.blue;
+    const drawTrendColoredAverage = (series, width) => {
+      let active = false;
+      let activeTrend = "neutral";
+      let previous = null;
+      for (const point of series) {
+        if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+          if (active) context.stroke();
+          active = false;
+          previous = null;
+          continue;
+        }
+        if (!active) {
+          context.beginPath();
+          context.strokeStyle = averageTrendColor(point.trend);
+          context.lineWidth = width;
+          context.moveTo(point.x, point.y);
+          active = true;
+        } else if (point.trend !== activeTrend) {
+          context.stroke();
+          context.beginPath();
+          context.strokeStyle = averageTrendColor(point.trend);
+          context.lineWidth = width;
+          context.moveTo(previous.x, previous.y);
+          context.lineTo(point.x, point.y);
+        } else context.lineTo(point.x, point.y);
+        activeTrend = point.trend || "neutral";
+        previous = point;
+      }
+      if (active) context.stroke();
+    };
+    drawTrendColoredAverage(fastAverage, model.mobileChart ? 1.5 : 1);
+    drawTrendColoredAverage(model.macdSma200Averages?.slow || [], model.mobileChart ? 2.3 : 2);
+    for (let index = 1; index < trendAverage.length; index += 1) {
+      const previous = trendAverage[index - 1], current = trendAverage[index];
+      if (!previous || !current || !Number.isFinite(previous.x) || !Number.isFinite(previous.y)
+        || !Number.isFinite(current.x) || !Number.isFinite(current.y)) continue;
+      line(previous.x, previous.y, current.x, current.y, current.rising ? colors.up : colors.down, [], model.mobileChart ? 3 : 4);
+    }
+    for (const event of model.macdSma200Events || []) {
+      const color = event.side === "buy" ? colors.up : colors.down;
+      const radius = Number.isFinite(event.markerRadius) ? event.markerRadius : (model.mobileChart ? 5 : 4);
+      context.beginPath();
+      context.moveTo(event.x, event.y + (event.upMarker ? -radius : radius));
+      context.lineTo(event.x - radius, event.y + (event.upMarker ? radius : -radius));
+      context.lineTo(event.x + radius, event.y + (event.upMarker ? radius : -radius));
+      context.closePath();
+      context.fillStyle = color;
+      context.fill();
+      if (event.labelConnector && event.labelVisible !== false) {
+        const labelBelowMarker = event.labelY > event.y;
+        const labelEdgeY = labelBelowMarker ? event.labelY - event.fontSize - 2 : event.labelY + 2;
+        context.beginPath();
+        context.moveTo(event.x, event.y + (labelBelowMarker ? radius + 1 : -radius - 1));
+        context.lineTo(event.x, labelEdgeY);
+        context.strokeStyle = color;
+        context.lineWidth = 1;
+        context.globalAlpha = 0.62;
+        context.stroke();
+        context.globalAlpha = 1;
+      }
+      if (event.labelVisible !== false) {
+        const labelHalfWidth = Array.from(event.label).length * event.fontSize / 2 + 3;
+        const labelTop = event.labelY - event.fontSize - 2;
+        context.globalAlpha = 0.96;
+        context.fillStyle = color;
+        context.fillRect(event.x - labelHalfWidth, labelTop, labelHalfWidth * 2, event.fontSize + 4);
+        context.globalAlpha = 1;
+        context.font = `650 ${event.fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`;
+        context.textAlign = "center";
+        context.textBaseline = "alphabetic";
+        context.fillStyle = colors.panel;
+        context.fillText(event.label, event.x, event.labelY);
+      }
+    }
+    context.restore();
+  }
+  if (model.layers?.supertrend === true) {
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    const drawHighlight = (series, color) => {
+      let segment = [];
+      const fillSegment = () => {
+        if (segment.length < 2) { segment = []; return; }
+        context.beginPath();
+        context.moveTo(segment[0].x, segment[0].y);
+        for (let index = 1; index < segment.length; index += 1) context.lineTo(segment[index].x, segment[index].y);
+        for (let index = segment.length - 1; index >= 0; index -= 1) context.lineTo(segment[index].x, segment[index].highlightY);
+        context.closePath();
+        context.fillStyle = color;
+        context.globalAlpha = 0.08;
+        context.fill();
+        context.globalAlpha = 1;
+        segment = [];
+      };
+      for (const point of series || []) {
+        if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y) || !Number.isFinite(point.highlightY)) {
+          fillSegment();
+          continue;
+        }
+        segment.push(point);
+      }
+      fillSegment();
+    };
+    const drawTrend = (series, color) => {
+      context.beginPath();
+      context.strokeStyle = color;
+      context.lineWidth = model.mobileChart ? 2.3 : 1.9;
+      let active = false;
+      for (const point of series || []) {
+        if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+          active = false;
+          continue;
+        }
+        if (active) context.lineTo(point.x, point.y);
+        else context.moveTo(point.x, point.y);
+        active = true;
+      }
+      context.stroke();
+    };
+    drawHighlight(model.supertrendLines?.up, colors.up);
+    drawHighlight(model.supertrendLines?.down, colors.down);
+    drawTrend(model.supertrendLines?.up, colors.up);
+    drawTrend(model.supertrendLines?.down, colors.down);
+    for (const event of model.supertrendEvents || []) {
+      const color = event.side === "buy" ? colors.up : colors.down;
+      context.beginPath();
+      context.arc(event.x, event.y, model.mobileChart ? 3.8 : 3.2, 0, Math.PI * 2);
+      context.fillStyle = color;
+      context.fill();
+      if (event.labelConnector && event.labelVisible !== false) {
+        const labelBelowMarker = event.labelY > event.y;
+        context.beginPath();
+        context.moveTo(event.x, event.y + (labelBelowMarker ? 5 : -5));
+        context.lineTo(event.x, labelBelowMarker ? event.labelY - event.fontSize - 2 : event.labelY + 2);
+        context.strokeStyle = color;
+        context.lineWidth = 1;
+        context.globalAlpha = 0.62;
+        context.stroke();
+        context.globalAlpha = 1;
+      }
+      if (event.labelVisible === false) continue;
+      context.font = `650 ${event.fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`;
+      context.textAlign = "center";
+      context.textBaseline = "alphabetic";
+      context.lineWidth = 3;
+      context.lineJoin = "round";
+      context.strokeStyle = colors.panel;
+      context.strokeText(event.label, event.x, event.labelY);
+      context.fillStyle = color;
+      context.fillText(event.label, event.x, event.labelY);
+    }
+    context.restore();
+  }
+  if (model.layers?.wyckoff === true) {
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    for (const event of model.wyckoffEvents || []) {
+      const color = event.side === "buy" ? colors.up : colors.down;
+      const radius = model.mobileChart ? 3.8 : 3.2;
+      context.beginPath();
+      context.arc(event.x, event.y, radius, 0, Math.PI * 2);
+      context.fillStyle = color;
+      context.fill();
+      if (event.labelVisible === false) continue;
+      if (event.labelConnector) {
+        const labelBelowMarker = event.labelY > event.y;
+        context.beginPath();
+        context.moveTo(event.x, event.y + (labelBelowMarker ? radius + 1 : -radius - 1));
+        context.lineTo(event.x, labelBelowMarker ? event.labelY - event.fontSize - 2 : event.labelY + 2);
+        context.strokeStyle = color;
+        context.lineWidth = 1;
+        context.globalAlpha = 0.62;
+        context.stroke();
+        context.globalAlpha = 1;
+      }
+      context.font = `650 ${event.fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`;
+      context.textAlign = "center";
+      context.textBaseline = "alphabetic";
+      context.lineWidth = 3;
+      context.lineJoin = "round";
+      context.strokeStyle = colors.panel;
+      context.strokeText(event.label, event.x, event.labelY);
+      context.fillStyle = color;
+      context.fillText(event.label, event.x, event.labelY);
     }
     context.restore();
   }

@@ -634,7 +634,7 @@
       ? frame.recursive_levels.flatMap((level) => level.segments || []) : (frame.segments || []);
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
-    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, layers?.turtle === true ? 1 : 0, layers?.granville === true ? 1 : 0, recursiveCenterVisibility].join(":");
+    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, layers?.turtle === true ? 1 : 0, layers?.granville === true ? 1 : 0, layers?.macdSma200 === true ? 1 : 0, layers?.supertrend === true ? 1 : 0, layers?.wyckoff === true ? 1 : 0, recursiveCenterVisibility].join(":");
     const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
     const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("");
     // Only reserve the scenario lane when there is a path to draw. Reserving
@@ -676,6 +676,18 @@
     const granvilleResult = layers?.granville === true
       ? window.OptionScopeGranville?.calculateWithLiveBar(sourceCandles, candlesForDisplay, liveCandleVisible ? liveDisplayIndex : -1)
         || window.OptionScopeGranville?.calculate(candlesForDisplay) || null
+      : null;
+    const macdSma200Result = layers?.macdSma200 === true
+      ? window.OptionScopeMacdSma200?.calculateWithLiveBar(sourceCandles, candlesForDisplay, liveCandleVisible ? liveDisplayIndex : -1)
+        || window.OptionScopeMacdSma200?.calculate(candlesForDisplay) || null
+      : null;
+    const supertrendResult = layers?.supertrend === true
+      ? window.OptionScopeSuperTrend?.calculateWithLiveBar(sourceCandles, candlesForDisplay, liveCandleVisible ? liveDisplayIndex : -1)
+        || window.OptionScopeSuperTrend?.calculate(candlesForDisplay) || null
+      : null;
+    const wyckoffResult = layers?.wyckoff === true
+      ? window.OptionScopeWyckoff?.calculateWithLiveBar(sourceCandles, candlesForDisplay, liveCandleVisible ? liveDisplayIndex : -1)
+        || window.OptionScopeWyckoff?.calculate(sourceCandles) || null
       : null;
     const macd = visibleSubcharts.macd
       ? macdWindow(sourceCandles, startIndex, dataEndIndex, liveCandleVisible ? candlesForDisplay[liveDisplayIndex] : null, liveDisplayIndex)
@@ -766,6 +778,32 @@
       visibleGranvilleAverage[localIndex] = granvilleResult.liveSma;
     }
     const visibleGranvilleEvents = indexedEventWindow(granvilleResult?.events || [], startIndex, dataEndIndex);
+    const visibleMacdSma200Averages = {
+      fast: (macdSma200Result?.smaFast || []).slice(startIndex, dataEndIndex),
+      slow: (macdSma200Result?.smaSlow || []).slice(startIndex, dataEndIndex),
+      trend: (macdSma200Result?.smaTrend || []).slice(startIndex, dataEndIndex),
+    };
+    if (liveCandleVisible && macdSma200Result?.liveIndex === liveDisplayIndex) {
+      const localIndex = liveDisplayIndex - startIndex;
+      for (const [name, resultName] of [["fast", "smaFast"], ["slow", "smaSlow"], ["trend", "smaTrend"]]) {
+        while (visibleMacdSma200Averages[name].length <= localIndex) visibleMacdSma200Averages[name].push(null);
+        visibleMacdSma200Averages[name][localIndex] = macdSma200Result.liveValues?.[resultName] ?? null;
+      }
+    }
+    const visibleMacdSma200Events = indexedEventWindow(macdSma200Result?.events || [], startIndex, dataEndIndex);
+    const visibleSupertrendUp = (supertrendResult?.upTrend || []).slice(startIndex, dataEndIndex);
+    const visibleSupertrendDown = (supertrendResult?.downTrend || []).slice(startIndex, dataEndIndex);
+    if (liveCandleVisible && supertrendResult?.liveIndex === liveDisplayIndex && supertrendResult.live) {
+      const localIndex = liveDisplayIndex - startIndex;
+      while (visibleSupertrendUp.length <= localIndex) visibleSupertrendUp.push(null);
+      while (visibleSupertrendDown.length <= localIndex) visibleSupertrendDown.push(null);
+      visibleSupertrendUp[localIndex] = supertrendResult.live.upTrend;
+      visibleSupertrendDown[localIndex] = supertrendResult.live.downTrend;
+    }
+    const visibleSupertrendEvents = indexedEventWindow(supertrendResult?.events || [], startIndex, dataEndIndex);
+    const visibleWyckoffEvents = indexedEventWindow(wyckoffResult?.events || [], startIndex, dataEndIndex);
+    const wyckoffSnapshotIndex = Math.min(dataEndIndex - 1, sourceCandles.length - 1);
+    const wyckoffWindowSnapshot = wyckoffResult?.snapshots?.[wyckoffSnapshotIndex] || null;
     const legacyRule = "strict-old-bi-v3";
     const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.11";
     let minimum = Infinity, maximum = -Infinity;
@@ -804,6 +842,29 @@
     visibleGranvilleAverage.forEach((price) => {
       if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
     });
+    Object.values(visibleMacdSma200Averages).forEach((averages) => averages.forEach((price) => {
+      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
+    }));
+    visibleMacdSma200Events.forEach((event) => {
+      const price = Number(event.price);
+      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
+    });
+    for (const series of [visibleSupertrendUp, visibleSupertrendDown]) {
+      series.forEach((price) => {
+        if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
+      });
+    }
+    visibleSupertrendEvents.forEach((event) => {
+      const price = Number(event.price);
+      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
+    });
+    if (wyckoffWindowSnapshot?.rangeReady === true) {
+      const rangeLow = Number(wyckoffWindowSnapshot.rangeLow), rangeHigh = Number(wyckoffWindowSnapshot.rangeHigh);
+      if (Number.isFinite(rangeLow) && Number.isFinite(rangeHigh) && rangeLow < rangeHigh) {
+        minimum = Math.min(minimum, rangeLow);
+        maximum = Math.max(maximum, rangeHigh);
+      }
+    }
     // Keep the daily/weekly scale tied to bars and structure. Intraday charts
     // include the live quote because their scenario paths follow it.
     if (Number.isFinite(liveScenarioPrice) && liveScenarioPrice > 0) scenarioLevels.push(liveScenarioPrice);
@@ -817,6 +878,21 @@
     const y = (price) => top + (maximum - price) / (maximum - minimum) * plotHeight;
     const slot = historyWidth / visibleCount;
     const x = (index) => left + (index + 0.5) * slot;
+    const wyckoffRangeLayout = layers?.wyckoff === true && wyckoffWindowSnapshot?.rangeReady === true
+      && Number.isFinite(wyckoffWindowSnapshot.rangeHigh) && Number.isFinite(wyckoffWindowSnapshot.rangeLow)
+      && wyckoffWindowSnapshot.rangeHigh > wyckoffWindowSnapshot.rangeLow
+      ? (() => {
+        const firstIndex = Math.max(startIndex, Number(wyckoffWindowSnapshot.startIndex));
+        const lastIndex = dataEndIndex - 1;
+        if (!Number.isFinite(firstIndex) || firstIndex > lastIndex) return null;
+        const upperY = y(wyckoffWindowSnapshot.rangeHigh), lowerY = y(wyckoffWindowSnapshot.rangeLow);
+        return {
+          x: x(firstIndex - startIndex), y: upperY, width: Math.max(1, x(lastIndex - startIndex) - x(firstIndex - startIndex)),
+          height: Math.max(1, lowerY - upperY), phase: wyckoffWindowSnapshot.phase, bias: wyckoffWindowSnapshot.bias,
+          rangeHigh: wyckoffWindowSnapshot.rangeHigh, rangeLow: wyckoffWindowSnapshot.rangeLow,
+          title: `威科夫 ${wyckoffWindowSnapshot.phase} 阶段 · ${wyckoffWindowSnapshot.bias === "accumulation" ? "吸筹区间" : "派发区间"} · ${money(wyckoffWindowSnapshot.rangeLow)}–${money(wyckoffWindowSnapshot.rangeHigh)}`,
+        };
+      })() : null;
     const turtleChannelLayouts = visibleTurtleChannels.map((channel, index) => channel ? ({
       x: x(index),
       entryUpperY: y(channel.entryUpper), entryLowerY: y(channel.entryLower),
@@ -863,14 +939,56 @@
     });
     const granvilleAverageLayouts = visibleGranvilleAverage.map((price, index) => Number.isFinite(price)
       ? ({ x: x(index), y: y(price) }) : null);
-    const granvilleEventsBeforePlacement = visibleGranvilleEvents.map((event) => {
+    const macdSma200TrendStateAt = (index) => {
+      const fast = visibleMacdSma200Averages.fast[index];
+      const slow = visibleMacdSma200Averages.slow[index];
+      const currentTrend = visibleMacdSma200Averages.trend[index];
+      const previousTrend = index > 0
+        ? visibleMacdSma200Averages.trend[index - 1]
+        : macdSma200Result?.smaTrend?.[startIndex - 1];
+      const close = Number(bars[index]?.close);
+      if (!Number.isFinite(fast) || !Number.isFinite(slow) || !Number.isFinite(close)
+        || !Number.isFinite(currentTrend) || !Number.isFinite(previousTrend)) return "neutral";
+      if (fast > slow && currentTrend > previousTrend && close > slow) return "up";
+      if (fast < slow && currentTrend < previousTrend && close < slow) return "down";
+      return "neutral";
+    };
+    const macdSma200AverageLayouts = {
+      fast: visibleMacdSma200Averages.fast.map((price, index) => Number.isFinite(price)
+        ? ({ x: x(index), y: y(price), trend: macdSma200TrendStateAt(index) }) : null),
+      slow: visibleMacdSma200Averages.slow.map((price, index) => Number.isFinite(price)
+        ? ({ x: x(index), y: y(price), trend: macdSma200TrendStateAt(index) }) : null),
+      trend: visibleMacdSma200Averages.trend.map((price, index) => {
+        if (!Number.isFinite(price)) return null;
+        const previous = index > 0 ? visibleMacdSma200Averages.trend[index - 1] : macdSma200Result?.smaTrend?.[startIndex - 1];
+        return { x: x(index), y: y(price), rising: Number.isFinite(previous) && price > previous };
+      }),
+    };
+    const supertrendLineLayouts = {
+      up: visibleSupertrendUp.map((price, index) => Number.isFinite(price) ? ({
+        x: x(index), y: y(price), highlightY: y((bars[index].open + bars[index].high + bars[index].low + bars[index].close) / 4),
+      }) : null),
+      down: visibleSupertrendDown.map((price, index) => Number.isFinite(price) ? ({
+        x: x(index), y: y(price), highlightY: y((bars[index].open + bars[index].high + bars[index].low + bars[index].close) / 4),
+      }) : null),
+    };
+    const indicatorEvents = [
+      ...visibleGranvilleEvents.map((event) => ({ ...event, indicator: "granville" })),
+      ...visibleMacdSma200Events.map((event) => ({ ...event, indicator: "macdSma200" })),
+      ...visibleSupertrendEvents.map((event) => ({ ...event, indicator: "supertrend" })),
+      ...visibleWyckoffEvents.map((event) => ({ ...event, indicator: "wyckoff" })),
+    ];
+    const indicatorEventsBeforePlacement = indicatorEvents.map((event) => {
       const localIndex = event.index - startIndex;
       const candle = bars[localIndex];
       const upMarker = event.side === "buy";
       const markerRadius = mobile ? 5 : 4;
       const markerGap = mobile ? 3 : 2;
       const fontSize = mobile ? 11 : 8;
-      const label = `${upMarker ? "买" : "卖"}${event.rule}`;
+      const label = event.indicator === "granville" ? `${upMarker ? "买" : "卖"}${event.rule}`
+        : event.indicator === "supertrend" ? (upMarker ? "趋势转多" : "趋势转空")
+          : event.indicator === "wyckoff" ? event.label
+            : upMarker ? "多头条件" : "空头条件";
       const labelHalfWidth = Array.from(label).length * fontSize / 2 + 3;
       const labelGap = mobile ? 3 : 2;
       const lowerMarkerY = y(candle.low) + markerRadius + markerGap;
@@ -889,13 +1007,16 @@
       const alternateFits = upMarker
         ? fitsSide(upperMarkerY, upperLabelY)
         : fitsSide(lowerMarkerY, lowerLabelY);
-      const markerBelowCandle = upMarker
-        ? preferredFits || !alternateFits
-        : !preferredFits && alternateFits;
-      const markerY = Math.max(markerMinY, Math.min(markerMaxY, markerBelowCandle ? lowerMarkerY : upperMarkerY));
-      const labelY = Math.max(labelMinY, Math.min(labelMaxY, markerBelowCandle ? lowerLabelY : upperLabelY));
+      const markerBelowCandle = event.indicator === "supertrend" ? upMarker
+        : upMarker ? preferredFits || !alternateFits : !preferredFits && alternateFits;
+      const markerY = event.indicator === "supertrend"
+        ? Math.max(markerMinY, Math.min(markerMaxY, y(event.price)))
+        : Math.max(markerMinY, Math.min(markerMaxY, markerBelowCandle ? lowerMarkerY : upperMarkerY));
+      const labelY = event.indicator === "supertrend"
+        ? Math.max(labelMinY, Math.min(labelMaxY, markerY + (markerBelowCandle ? 1 : -1) * (markerRadius + labelGap + fontSize)))
+        : Math.max(labelMinY, Math.min(labelMaxY, markerBelowCandle ? lowerLabelY : upperLabelY));
       return {
-        key: `${event.date}-${event.rule}`, date: event.date, rule: event.rule, side: event.side,
+        key: `${event.indicator}-${event.date}-${event.rule ?? event.side}`, indicator: event.indicator, date: event.date, rule: event.rule, side: event.side,
         price: event.price, x: Math.max(left + labelHalfWidth, Math.min(historyRight - labelHalfWidth, x(localIndex))),
         y: markerY, markerRadius, upMarker, label, labelY, labelDirection: markerBelowCandle ? 1 : -1, fontSize,
       };
@@ -913,7 +1034,7 @@
     const overlapsGranvilleBox = (box) => occupiedGranvilleLabels.some((other) =>
       box.left < other.right + 2 && box.right + 2 > other.left
       && box.top < other.bottom + 2 && box.bottom + 2 > other.top);
-    if (granvilleEventsBeforePlacement.length) {
+    if (indicatorEventsBeforePlacement.length) {
       const mergedCandleRanges = new Map();
       if (layers?.chanCandles !== false) {
         for (const merged of frame.merged_candles || []) {
@@ -945,13 +1066,13 @@
         });
       });
     }
-    // 先保留原始及合并 K 线与已绘制信号，再为葛兰碧文字寻找空位。
+    // 先保留原始及合并 K 线与所有已绘制信号，再为指标文字寻找空位。
     for (const event of turtleEventLayouts) {
       reserveGranvilleBox(labelBox(event));
       reserveGranvilleBox(markerBox(event));
     }
-    granvilleEventsBeforePlacement.forEach((event) => reserveGranvilleBox(markerBox(event)));
-    const granvilleEventLayouts = granvilleEventsBeforePlacement.map((event) => {
+    indicatorEventsBeforePlacement.forEach((event) => reserveGranvilleBox(markerBox(event)));
+    const indicatorEventLayouts = indicatorEventsBeforePlacement.map((event) => {
       const labelMinY = top + event.fontSize;
       const labelMaxY = priceBottom - 2;
       const step = event.fontSize + 4;
@@ -975,6 +1096,10 @@
         labelConnector: labelVisible && Math.abs(placedLabelY - event.labelY) > 2,
       };
     });
+    const granvilleEventLayouts = indicatorEventLayouts.filter((event) => event.indicator === "granville");
+    const macdSma200EventLayouts = indicatorEventLayouts.filter((event) => event.indicator === "macdSma200");
+    const supertrendEventLayouts = indicatorEventLayouts.filter((event) => event.indicator === "supertrend");
+    const wyckoffEventLayouts = indicatorEventLayouts.filter((event) => event.indicator === "wyckoff");
     const trendlineLayouts = (() => {
       if (!trendlineResult?.length) return null;
       const toX = (rawIndex) => left + (rawIndex - startIndex + 0.5) * slot;
@@ -1188,7 +1313,7 @@
       ],
       // `segments` here is the Canvas paint gate: the mapped segment list is
       // already filtered by the global default and any per-level overrides.
-      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
+      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
       // Keep per-level controls stable while users pan and zoom; their options
       // should describe the loaded structure, not only the current viewport.
       availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
@@ -1221,6 +1346,12 @@
       turtleEvents: turtleEventLayouts,
       granvilleAverage: granvilleAverageLayouts,
       granvilleEvents: granvilleEventLayouts,
+      macdSma200Averages: macdSma200AverageLayouts,
+      macdSma200Events: macdSma200EventLayouts,
+      supertrendLines: supertrendLineLayouts,
+      supertrendEvents: supertrendEventLayouts,
+      wyckoffRange: wyckoffRangeLayout,
+      wyckoffEvents: wyckoffEventLayouts,
       // Count only signals that can actually be drawn. The visible signal list
       // is intentionally limited to the current chart window so panning does
       // not pull off-screen markers onto the plot edge.
@@ -1300,6 +1431,27 @@
         ? `当前窗口信号：${granvilleEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
         : "当前窗口暂无葛兰碧信号。";
       chart.description += `葛兰碧规则使用当前周期 200 期 SMA，20 期斜率判断趋势；回踩阈值约 0.3 ATR(14)，乖离阈值约 2 ATR(14)。交叉、回踩与乖离回归信号是八条定性规则的量化近似，仅在 K 线收盘后确认；${eventDescription}`;
+    }
+    if (layers?.macdSma200 === true) {
+      const eventDescription = macdSma200EventLayouts.length
+        ? `当前窗口条件：${macdSma200EventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
+        : "当前窗口暂无 MACD 多头/空头条件。";
+      chart.description += `MACD + SMA 200 使用 SMA(12/26) 与 SMA(9) 信号线；条件还要求 MACD 方向、快慢均线关系及 26 根前收盘价相对 SMA200 符合策略。标记仅表示收盘条件成立，不代表挂单已成交；${eventDescription}`;
+    }
+    if (layers?.supertrend === true) {
+      const eventDescription = supertrendEventLayouts.length
+        ? `当前窗口翻转：${supertrendEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
+        : "当前窗口暂无 SuperTrend 趋势翻转。";
+      chart.description += `SuperTrend 按默认参数 HL2、Wilder ATR(10)、乘数 3.0 计算上下趋势带。形成中的 K 线会更新趋势线，买卖标记仅在收盘后确认；标记表示趋势翻转条件，不代表策略订单已成交，也未应用源码中的日期回测窗口；${eventDescription}`;
+    }
+    if (layers?.wyckoff === true) {
+      const phaseDescription = wyckoffRangeLayout
+        ? `当前窗口识别为 ${wyckoffRangeLayout.bias === "accumulation" ? "吸筹" : "派发"} ${wyckoffRangeLayout.phase} 阶段，区间 ${money(wyckoffRangeLayout.rangeLow)}–${money(wyckoffRangeLayout.rangeHigh)}。`
+        : "当前窗口尚未形成可确认的 Wyckoff 交易区间。";
+      const eventDescription = wyckoffEventLayouts.length
+        ? `当前窗口事件：${wyckoffEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
+        : "当前窗口暂无已确认的 Wyckoff 事件。";
+      chart.description += `威科夫阶段按成交量、波幅、价格区间和收盘确认进行项目适配，识别 A–E 阶段及抛售高潮、买入高潮、自动反弹/回落、二次测试、弹簧探底、派发冲高、回测、强势/弱势信号、最后支撑/供给点。形成中的 K 线不产生确认事件；不包含可拖动示意图及源码的高周期覆盖；${phaseDescription}${eventDescription}`;
     }
     if (!liveCandleVisible) {
       const layouts = cachedLayouts || new Map();

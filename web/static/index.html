@@ -287,6 +287,15 @@
                     <div class="chan-indicator-option">
                       <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.granville ? 'true' : 'false'" :aria-expanded="chanChartLayers.granville ? 'true' : 'false'" aria-controls="chan-granville-help" @click="toggleChanChartLayer('granville')">葛兰碧法则</button>
                     </div>
+                    <div class="chan-indicator-option">
+                      <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.wyckoff ? 'true' : 'false'" :aria-expanded="chanChartLayers.wyckoff ? 'true' : 'false'" aria-controls="chan-wyckoff-help" @click="toggleChanChartLayer('wyckoff')">威科夫阶段</button>
+                    </div>
+                    <div class="chan-indicator-option">
+                      <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.supertrend ? 'true' : 'false'" :aria-expanded="chanChartLayers.supertrend ? 'true' : 'false'" aria-controls="chan-supertrend-help" @click="toggleChanChartLayer('supertrend')">超级趋势</button>
+                    </div>
+                    <div class="chan-indicator-option">
+                      <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.macdSma200 ? 'true' : 'false'" :aria-expanded="chanChartLayers.macdSma200 ? 'true' : 'false'" aria-controls="chan-macd-sma200-help" @click="toggleChanChartLayer('macdSma200')">异同移动平均线 + 200期简单均线</button>
+                    </div>
                     <div id="chan-af-stochz-help" class="chan-indicator-description-body" role="region" aria-label="指标买卖与背离说明" v-show="chanChartLayers.afStochZ">
                       <small>结合指标强弱和价格转折提示买卖；两者走势不一致时标记背离（指标买卖与背离）。</small>
                     </div>
@@ -303,6 +312,31 @@
                       <div class="chan-granville-legend" role="list" aria-label="葛兰碧法则图例">
                         <span role="listitem"><i class="chan-granville-swatch" aria-hidden="true"></i>200 期 SMA</span>
                         <small><span class="chan-granville-buy">买1-买4</span> · <span class="chan-granville-sell">卖5-卖8</span></small>
+                      </div>
+                    </div>
+                    <div id="chan-macd-sma200-help" class="chan-indicator-description-body" role="region" aria-label="MACD + SMA 200 策略说明" v-show="chanChartLayers.macdSma200">
+                      <small>按源码使用 SMA(12/26) 计算 MACD、SMA(9) 信号线和 SMA(200) 趋势线。柱体上穿/下穿零轴后，结合 MACD 方向、均线关系和 26 根前收盘价过滤；标记只表示收盘确认的多头/空头条件，不模拟 low/high 止损挂单成交。</small>
+                      <div class="chan-macd-sma200-legend" role="list" aria-label="MACD + SMA 200 图例">
+                        <span role="listitem"><i class="chan-macd-sma200-swatch chan-macd-sma200-fast" aria-hidden="true"></i>12 期 SMA</span>
+                        <span role="listitem"><i class="chan-macd-sma200-swatch chan-macd-sma200-slow" aria-hidden="true"></i>26 期 SMA</span>
+                        <span role="listitem"><i class="chan-macd-sma200-swatch chan-macd-sma200-trend" aria-hidden="true"></i>200 期 SMA</span>
+                        <span role="listitem"><i class="chan-macd-sma200-swatch chan-macd-sma200-fill" aria-hidden="true"></i>均线间填充</span>
+                        <small>12/26 期线共用源码趋势色：满足多头条件为绿、空头条件为红，其余为蓝；200 期线随斜率变色。50% 日内亏损限制属于回测风控，不参与图表指标计算。</small>
+                      </div>
+                    </div>
+                    <div id="chan-supertrend-help" class="chan-indicator-description-body" role="region" aria-label="SuperTrend 说明" v-show="chanChartLayers.supertrend">
+                      <small>按源码默认参数计算：HL2、ATR(10) Wilder RMA、乘数 3.0。趋势线随当前价格更新，买入/卖出标记只在 K 线收盘确认趋势翻转；标记是指标条件，不代表策略订单已成交。</small>
+                      <div class="chan-supertrend-legend" role="list" aria-label="SuperTrend 图例">
+                        <span role="listitem"><i class="chan-supertrend-swatch" aria-hidden="true"></i>上升趋势</span>
+                        <span role="listitem"><i class="chan-supertrend-swatch chan-supertrend-down" aria-hidden="true"></i>下降趋势</span>
+                      </div>
+                    </div>
+                    <div id="chan-wyckoff-help" class="chan-indicator-description-body" role="region" aria-label="威科夫阶段说明" v-show="chanChartLayers.wyckoff">
+                      <small>结合成交量、波幅、区间与收盘位置自动识别 A–E 阶段，并标记抛售高潮、买入高潮、自动反弹/回落、二次测试、弹簧探底、派发冲高、回测、强势/弱势信号、最后支撑/供给点。事件只在已收盘 K 线上确认；这是项目适配版，不包含可拖动示意图和源码中的高周期扫描。</small>
+                      <div class="chan-wyckoff-legend" role="list" aria-label="威科夫阶段图例">
+                        <span role="listitem"><i class="chan-wyckoff-swatch" aria-hidden="true"></i>吸筹区间</span>
+                        <span role="listitem"><i class="chan-wyckoff-swatch chan-wyckoff-down" aria-hidden="true"></i>派发区间</span>
+                        <span role="listitem">阶段 A–E · 事件标签</span>
                       </div>
                     </div>
                   </div>
@@ -570,6 +604,9 @@
   <script src="/static/common/js/chan-trendlines.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-turtle.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-granville.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-macd-sma.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-supertrend.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-wyckoff.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/app.js?v=__ASSET_VERSION__"></script>
 </body>

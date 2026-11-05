@@ -67,6 +67,9 @@ assert.ok(Number.isFinite(intraday.macdTop), "盘中图表使用相同的副图�
 assert.ok(Number.isNaN(intraday.volumeTop) && Number.isNaN(intraday.dmiTop), "盘中图表隐藏未开启的副图");
 
 window.OptionScopeGranville = {
+  calculateWithLiveBar(candles) {
+    return this.calculate(candles);
+  },
   calculate(candles) {
     return {
       sma: new Array(candles.length).fill(null),
@@ -144,21 +147,45 @@ assert.match(template, /<details class="chan-subchart-menu"[\s\S]*?<\/details>[\
 assert.match(template, /<summary aria-label="技术指标设置">指标<\/summary>/, "指标菜单有明确的可访问名称");
 assert.doesNotMatch(template, /<details class="chan-indicator-description"/, "指标名称不使用下拉式 disclosure");
 assert.doesNotMatch(app, /chanIndicatorHelp|toggleChanIndicatorHelp/, "不维护与图层状态重复的说明状态");
-assert.match(template, /<div class="chan-indicator-options">[\s\S]*?aria-controls="chan-af-stochz-help" @click="toggleChanChartLayer\('afStochZ'\)">AF StochZ<\/button>[\s\S]*?aria-controls="chan-turtle-help" @click="toggleChanChartLayer\('turtle'\)">海龟交易法<\/button>[\s\S]*?aria-controls="chan-granville-help" @click="toggleChanChartLayer\('granville'\)">葛兰碧法则<\/button>/, "AF StochZ、海龟和葛兰碧按顺序位于指标菜单并直接切换图层");
+assert.match(template, /<div class="chan-indicator-options">[\s\S]*?aria-controls="chan-af-stochz-help" @click="toggleChanChartLayer\('afStochZ'\)">AF StochZ<\/button>[\s\S]*?aria-controls="chan-turtle-help" @click="toggleChanChartLayer\('turtle'\)">海龟交易法<\/button>[\s\S]*?aria-controls="chan-granville-help" @click="toggleChanChartLayer\('granville'\)">葛兰碧法则<\/button>[\s\S]*?aria-controls="chan-macd-sma200-help" @click="toggleChanChartLayer\('macdSma200'\)">MACD \+ SMA 200<\/button>[\s\S]*?aria-controls="chan-supertrend-help" @click="toggleChanChartLayer\('supertrend'\)">SuperTrend<\/button>/, "AF StochZ、海龟、葛兰碧、MACD + SMA200 和 SuperTrend 按顺序位于指标菜单");
 const signalMarkerSection = template.match(/<section class="chan-layer-menu-signals">[\s\S]*?<\/section>/)?.[0] || "";
 assert.doesNotMatch(signalMarkerSection, />AF StochZ<\/button>/, "AF StochZ 不再归入缠论信号标记");
 assert.match(template, /id="chan-turtle-help" class="chan-indicator-description-body"[^>]*v-show="chanChartLayers\.turtle"[\s\S]*?class="chan-turtle-legend"/, "海龟图层开启时在按钮下方显示说明和图例");
 assert.match(template, /id="chan-granville-help" class="chan-indicator-description-body"[^>]*v-show="chanChartLayers\.granville"[\s\S]*?class="chan-granville-legend"/, "葛兰碧图层开启时在按钮下方显示说明和图例");
+assert.match(template, /id="chan-macd-sma200-help" class="chan-indicator-description-body"[^>]*v-show="chanChartLayers\.macdSma200"[\s\S]*?class="chan-macd-sma200-legend"/, "MACD + SMA200 图层开启时在按钮下方显示说明和图例");
 assert.match(template, /id="chan-af-stochz-help" class="chan-indicator-description-body"[^>]*v-show="chanChartLayers\.afStochZ"/, "AF StochZ 图层开启时显示对应说明");
 assert.match(template, /结合指标强弱和价格转折提示买卖；两者走势不一致时标记背离（指标买卖与背离）。/, "AF StochZ 说明显示用户指定的指标名称");
 assert.doesNotMatch(template, /aria-label="显示海龟交易法指标"|aria-label="显示葛兰碧法则指标"/, "不再显示独立指标复选框");
 assert.match(template, /20 根前序 K 线突破入场，10 根反向通道退出/, "海龟菜单保留入场与退出说明");
 assert.ok(template.indexOf("/static/common/js/chan-turtle.js") < template.indexOf("/static/common/js/chan-client.js"), "海龟计算脚本先于图表客户端加载");
+assert.ok(template.indexOf("/static/common/js/chan-macd-sma.js") < template.indexOf("/static/common/js/chan-client.js"), "MACD + SMA200 计算脚本先于图表客户端加载");
 assert.match(styles, /\.chan-layer-menu>summary,\.chan-subchart-menu>summary,\.chan-period-menu>summary,\.chan-indicator-menu>summary\{min-height:44px\}/, "移动端菜单按钮统一为 44px 触控高度");
 assert.match(styles, /\.chan-period-menu-panel\{grid-template-areas:"display";grid-template-columns:minmax\(0,1fr\);width:min\(330px,calc\(100vw - 40px\)\)/, "周期面板按四个选项收窄");
 assert.match(styles, /\.chan-indicator-options\{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px\}/, "指标按钮紧凑排列且窄屏可换行");
 assert.match(styles, /\.chan-indicator-description-body\{flex:0 0 100%;/, "指标说明在按钮下方占满面板宽度");
 assert.match(styles, /\.chan-indicator-menu-panel\{grid-template-areas:"display";grid-template-columns:minmax\(0,1fr\)/, "窄屏指标面板与说明内容保持单列");
+
+let macdCalculationCalls = 0;
+window.OptionScopeMacdSma200 = {
+  calculateWithLiveBar(candles) {
+    macdCalculationCalls += 1;
+    return {
+      smaFast: candles.map((bar) => bar.close - 0.1),
+      smaSlow: candles.map((bar) => bar.close - 0.2),
+      smaTrend: candles.map((bar) => bar.close - 0.3),
+      events: [{ index: 30, date: candles[30].date, side: "buy", price: candles[30].close }],
+    };
+  },
+};
+window.OptionScopeChan.view(payload, true, false, 30, null, { macdSma200: false });
+assert.equal(macdCalculationCalls, 0, "关闭 MACD + SMA200 时不运行计算器");
+const macdSma200Chart = window.OptionScopeChan.view(payload, true, false, 30, null, { macdSma200: true }).daily.chart;
+assert.equal(macdCalculationCalls, 2, "打开 MACD + SMA200 时日线与周线各计算一次");
+assert.equal(macdSma200Chart.macdSma200Averages.fast.length, macdSma200Chart.candles.length, "主图模型包含当前视口内的 12 期 SMA");
+assert.equal(macdSma200Chart.macdSma200Averages.slow.length, macdSma200Chart.candles.length, "主图模型包含当前视口内的 26 期 SMA");
+assert.equal(macdSma200Chart.macdSma200Averages.trend.length, macdSma200Chart.candles.length, "主图模型包含当前视口内的 200 期 SMA");
+assert.equal(macdSma200Chart.macdSma200Events.length, 1, "主图模型包含视口内的 MACD 策略条件信号");
+assert.match(macdSma200Chart.description, /收盘条件成立，不代表挂单已成交/, "图表说明区分策略条件与成交");
 assert.match(styles, /\.chan-indicator-menu-panel>\.chan-layer-menu-close\{grid-area:display;grid-column:1\/-1;justify-self:end/, "窄屏指标面板的关闭按钮与标题并排并保持可见");
 assert.match(styles, /@media\(max-width:760px\)\{[\s\S]*?\.chan-indicator-menu-panel\{position:absolute;top:calc\(100% \+ 8px\);right:auto;left:0;bottom:auto;transform:none;[\s\S]*?width:min\(360px,100%\)/, "窄屏指标面板靠左展开且不超出控制区宽度");
 assert.match(app, /closest\("\.chan-layer-menu, \.chan-subchart-menu, \.chan-period-menu, \.chan-indicator-menu"\)/, "指标面板支持统一关闭处理");

@@ -4,6 +4,10 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_GOOS="${TARGET_GOOS:-${GOOS:-linux}}"
 TARGET_GOARCH="${TARGET_GOARCH:-${GOARCH:-amd64}}"
+GO_BUILD_TAGS="${GO_BUILD_TAGS:-}"
+# 项目未使用 Gin MsgPack；自定义标签通过 GO_BUILD_TAGS 追加。
+BUILD_TAGS="nomsgpack"
+if [ -n "$GO_BUILD_TAGS" ]; then BUILD_TAGS="$BUILD_TAGS,$GO_BUILD_TAGS"; fi
 if [ "$#" -gt 2 ]; then
   printf 'usage: bash %s [goos] [goarch]\n' "${BASH_SOURCE[0]}" >&2
   exit 2
@@ -30,8 +34,8 @@ cleanup() { rm -f "$TEMP_BINARY"; }
 trap cleanup EXIT
 build_env=(env CGO_ENABLED=0 GOOS="$TARGET_GOOS" GOARCH="$TARGET_GOARCH")
 if [ "$TARGET_GOARCH" = arm ]; then build_env+=(GOARM="$TARGET_GOARM"); fi
-printf '[build] target=%s/%s cgo=disabled flags=-trimpath -ldflags="-s -w"\n' "$TARGET_GOOS" "$TARGET_GOARCH"
-if ! (cd "$PROJECT_DIR" && "${build_env[@]}" go build -trimpath -ldflags='-s -w' -o "$TEMP_BINARY" ./cmd/go-server); then fail "Go build failed for $TARGET_GOOS/$TARGET_GOARCH"; fi
+printf '[build] target=%s/%s cgo=disabled tags=%s flags=-trimpath -buildvcs=false -ldflags="-s -w -buildid="\n' "$TARGET_GOOS" "$TARGET_GOARCH" "$BUILD_TAGS"
+if ! (cd "$PROJECT_DIR" && "${build_env[@]}" go build -trimpath -buildvcs=false -tags="$BUILD_TAGS" -ldflags='-s -w -buildid=' -o "$TEMP_BINARY" ./cmd/go-server); then fail "Go build failed for $TARGET_GOOS/$TARGET_GOARCH"; fi
 chmod 0755 "$TEMP_BINARY"
 mv "$TEMP_BINARY" "$OUTPUT_BINARY"
 TEMP_BINARY=""

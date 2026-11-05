@@ -108,6 +108,27 @@
 .chan-granville-swatch{display:inline-block;flex:0 0 20px;height:0;border-top:2px solid var(--amber)}
 .chan-granville-buy{color:var(--up)}
 .chan-granville-sell{color:var(--down)}
+.chan-macd-sma200-legend{display:grid;grid-template-columns:repeat(2,minmax(0,max-content));align-items:center;gap:7px 14px;margin-top:12px;padding-top:10px;border-top:1px solid var(--row-line);color:var(--muted);font-size:11px;line-height:1.45}
+.chan-macd-sma200-legend>span{display:flex;align-items:center;gap:8px}
+.chan-macd-sma200-legend>small{grid-column:1/-1;color:var(--muted);font-size:11px;line-height:1.5}
+.chan-macd-sma200-swatch{position:relative;display:inline-block;flex:0 0 20px;height:4px;background:var(--blue)}
+.chan-macd-sma200-swatch::before,.chan-macd-sma200-swatch::after{position:absolute;top:1px;width:6px;height:1px;content:"";background:var(--down)}
+.chan-macd-sma200-swatch::before{left:0}
+.chan-macd-sma200-swatch::after{right:0;background:var(--up)}
+.chan-macd-sma200-slow{height:5px}
+.chan-macd-sma200-slow::before,.chan-macd-sma200-slow::after{top:1px;height:2px}
+.chan-macd-sma200-trend{background:var(--up)}
+.chan-macd-sma200-trend::after{content:none}
+.chan-macd-sma200-fill{height:8px;background:var(--axis);opacity:.25}
+.chan-macd-sma200-fill::before,.chan-macd-sma200-fill::after{content:none}
+.chan-supertrend-legend{display:flex;flex-wrap:wrap;align-items:center;gap:7px 14px;margin-top:12px;padding-top:10px;border-top:1px solid var(--row-line);color:var(--muted);font-size:11px;line-height:1.45}
+.chan-supertrend-legend>span{display:flex;align-items:center;gap:8px}
+.chan-supertrend-swatch{display:inline-block;flex:0 0 20px;height:0;border-top:2px solid var(--up)}
+.chan-supertrend-down{border-color:var(--down)}
+.chan-wyckoff-legend{display:flex;flex-wrap:wrap;align-items:center;gap:7px 14px;margin-top:12px;padding-top:10px;border-top:1px solid var(--row-line);color:var(--muted);font-size:11px;line-height:1.45}
+.chan-wyckoff-legend>span{display:flex;align-items:center;gap:8px}
+.chan-wyckoff-swatch{display:inline-block;flex:0 0 20px;height:10px;border:1px solid var(--up);background:color-mix(in srgb,var(--up) 12%,transparent)}
+.chan-wyckoff-down{border-color:var(--down);background:color-mix(in srgb,var(--down) 12%,transparent)}
 .chan-layer-menu-panel>.chan-layer-menu-close:hover{border-color:var(--blue);color:var(--blue)}
 .chan-layer-menu-panel>.chan-layer-menu-close:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 .chan-layer-menu-panel section{min-width:0}

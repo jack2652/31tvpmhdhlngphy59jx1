@@ -150,6 +150,44 @@ assert.ok(context.strokes.some((stroke) => stroke.start[0] === 120 && stroke.sta
 
 context.strokes = [];
 context.texts = [];
+context.rects = [];
+context.fills = 0;
+window.OptionScopeCharts.renderChanCanvas(target, {
+  chart: {
+    width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300,
+    historyRight: 940, grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [],
+    keyLevels: [], signals: [], dates: [], segments: [],
+    macdSma200Averages: {
+      fast: [{ x: 100, y: 180, trend: "up" }, { x: 120, y: 170, trend: "up" }],
+      slow: [{ x: 100, y: 190, trend: "neutral" }, { x: 120, y: 185, trend: "neutral" }],
+      trend: [{ x: 100, y: 210, rising: true }, { x: 120, y: 205, rising: true }],
+    },
+    macdSma200Events: [{ side: "buy", x: 180, y: 220, markerRadius: 4, upMarker: true, label: "多头条件", labelY: 244, fontSize: 8, labelVisible: true }],
+  },
+  layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, macdSma200: true },
+});
+assert.ok(context.strokes.some((stroke) => stroke.color === "#19bd83"), "MACD + SMA200 paints the trend-colored 12-period average");
+assert.ok(context.strokes.some((stroke) => stroke.color === "#69b7ff"), "MACD + SMA200 paints the neutral-colored 26-period average");
+assert.equal(context.strokes.some((stroke) => stroke.color === "#e7b45c"), false, "MACD + SMA200 does not use a fixed amber color for its 26-period average");
+assert.ok(context.strokes.some((stroke) => stroke.color === "#19bd83"), "MACD + SMA200 colors a rising 200-period average with the up color");
+assert.ok(context.fills >= 2, "MACD + SMA200 fills the area between its 12- and 200-period averages");
+assert.ok(context.texts.some((text) => text.text === "多头条件"), "MACD + SMA200 paints condition labels when enabled");
+context.strokes = [];
+context.texts = [];
+window.OptionScopeCharts.renderChanCanvas(target, {
+  chart: {
+    width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300,
+    historyRight: 940, grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [],
+    keyLevels: [], signals: [], dates: [], segments: [],
+    macdSma200Averages: { fast: [{ x: 100, y: 180 }, { x: 120, y: 170 }], slow: [], trend: [] },
+    macdSma200Events: [{ side: "buy", x: 180, y: 220, markerRadius: 4, upMarker: true, label: "多头条件", labelY: 244, fontSize: 8, labelVisible: true }],
+  },
+  layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, macdSma200: false },
+});
+assert.equal(context.texts.some((text) => text.text === "多头条件"), false, "hidden MACD + SMA200 layer does not paint its conditions");
+
+context.strokes = [];
+context.texts = [];
 window.OptionScopeCharts.renderChanCanvas(target, {
   chart: {
     ...indicatorChart, mobileChart: true,
