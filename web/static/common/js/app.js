@@ -1552,7 +1552,7 @@ function formatFlowStrike(value) {
 }
 // 回溯的未平仓量只展示到日期，避免角标里塞入完整时间。
 function formatDay(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? "--" : date.toLocaleDateString("zh-CN"); }
-// GEX 数值内部按「百万美元」存储，展示时换算成中文单位：≥1 亿用「亿」，其余用「万」，不足万元的显示原值。
+// GEX 以百万美元存储；按量级换算中文单位，digits 表示最多保留的小数位。
 function formatGex(value, digits = 2) {
   if (value === null || value === undefined || value === "") return "--";
   const millions = Number(value);
@@ -1560,9 +1560,8 @@ function formatGex(value, digits = 2) {
   const sign = millions < 0 ? "-" : "";
   const absolute = Math.abs(millions);
   if (absolute >= 100) return `${sign}${formatNumber(absolute / 100, digits)}亿`;
-  if (absolute >= 1) return `${sign}${formatNumber(absolute * 100, 0)}万`;
-  if (absolute >= 0.01) return `${sign}${formatNumber(absolute * 100, 1)}万`;
-  return `${sign}${formatNumber(absolute * 1000000, 0)}`;
+  if (absolute >= 0.01) return `${sign}${formatNumber(absolute * 100, digits)}万`;
+  return `${sign}${formatNumber(absolute * 1000000, digits)}`;
 }
 // 图表数值统一入口：GEX 走中文单位，成交量/持仓量保持千分位原样。
 // 成交量/持仓量按「万/亿」显示，不足一万保留千分位原值。
@@ -4884,13 +4883,16 @@ function renderChainHeatmapModel() {
   }
   const quote = state.lastQuote?.symbol === state.symbol ? state.lastQuote : null;
   const valuation = heatmapValuationBasis(quote, state.chainSpot);
+  // GEX 盘后继续使用正式收盘估值；现价附近和可见行权价范围跟随夜盘行情。
   const spot = valuation.price;
+  const marketSpot = finitePrice(quote?.price ?? state.chainSpot) ?? spot;
   const quoteFetchedAt = state.lastQuote?.fetched_at || null;
   const current = state.expiration;
   const expirations = [...source.keys()].filter((expiration) => isActiveExpiration(expiration)).sort();
   const heatmapSpotKey = Number.isFinite(spot) && spot > 0 ? gammaSpotBucket(spot) : "";
   const valuationBucket = Number.isFinite(valuation.valuationTime) ? Math.floor(valuation.valuationTime / 30000) : "";
-  const heatmapKey = [state.symbol, state.chainFilter, state.expiration, spot == null ? "" : String(spot), heatmapSpotKey, valuationBucket,
+  const marketSpotKey = Number.isFinite(marketSpot) && marketSpot > 0 ? gammaSpotBucket(marketSpot) : "";
+  const heatmapKey = [state.symbol, state.chainFilter, state.expiration, spot == null ? "" : String(spot), marketSpot == null ? "" : String(marketSpot), heatmapSpotKey, marketSpotKey, valuationBucket,
     ...expirations.flatMap((expiration) => {
       const entry = source.get(expiration);
       return [expiration, formatEasternTime(entry?.fetchedAt), heatmapRowsKey(entry?.rows)];
@@ -4927,8 +4929,8 @@ function renderChainHeatmapModel() {
     state.view.chainHeatmapEmpty = empty;
     return;
   }
-  const lower = spot * 0.85;
-  const upper = spot * 1.15;
+  const lower = marketSpot * 0.85;
+  const upper = marketSpot * 1.15;
   const valuesByExpiration = new Map();
   const peaksByExpiration = new Map();
   const strikeSet = new Set();
@@ -4957,7 +4959,7 @@ function renderChainHeatmapModel() {
   let nearestStrike = null;
   let nearestDistance = Infinity;
   for (const strike of strikes) {
-    const distance = Math.abs(strike - spot);
+    const distance = Math.abs(strike - marketSpot);
     if (distance < nearestDistance) { nearestStrike = strike; nearestDistance = distance; }
   }
   const previousRows = new Map((state.view.chainHeatmap?.rows || []).map((row) => [row.key, row]));
@@ -4985,7 +4987,7 @@ function renderChainHeatmapModel() {
       const percent = columnPeak > 0 ? Math.round(Math.sqrt(Math.min(Math.abs(value) / columnPeak, 1)) * 100) : 0;
       return reuseCell({
         key: `${column.expiration}|${strike}`,
-        value: formatGex(value / 1000000, 1),
+        value: formatGex(value / 1000000, 2),
         className: `chain-heatmap-cell ${value > 0 ? "chain-heatmap-cell-positive" : value < 0 ? "chain-heatmap-cell-negative" : "chain-heatmap-cell-zero"}${percent >= 65 ? " chain-heatmap-cell-hot" : ""}${spotClass}`,
         style: `--heat:${percent}`,
         title: `${column.expiration} · 行权价 ${formatMoney(strike)} · ${gexLabel} ${formatGex(value / 1000000, 2)} · ${column.selected ? (valuation.closeBased ? "已选期限，按正式收盘基准估算" : "已选期限，按最新行情估算") : "缓存参考"}`,
