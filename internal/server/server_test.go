@@ -241,7 +241,7 @@ func TestMarketAPIRoutesMatchPythonSymbolValidation(t *testing.T) {
 		{http.MethodGet, "/api/status/%s"},
 		{http.MethodGet, "/api/levels/%s?expiration=2030-01-18"},
 	}
-	for _, invalid := range []string{"^GSPC", "ABCDEFGHIJK", "A=B"} {
+	for _, invalid := range []string{"ABCDEFGHIJK", "A=B"} {
 		for _, test := range paths {
 			path := fmt.Sprintf(test.path, invalid)
 			t.Run(test.method+" "+path, func(t *testing.T) {
@@ -262,6 +262,50 @@ func TestMarketAPIRoutesMatchPythonSymbolValidation(t *testing.T) {
 					t.Fatalf("response = status %d, body %#v; want Python-compatible 422 detail", response.StatusCode, body)
 				}
 			})
+		}
+	}
+}
+
+func TestNormalizeAPISymbolSupportsYahooIndexAliases(t *testing.T) {
+	for raw, want := range map[string]string{
+		".NDX":  "^NDX",
+		".SPX":  "^GSPC",
+		".DJI":  "^DJI",
+		".IXIC": "^IXIC",
+		"^NDX":  "^NDX",
+	} {
+		if got, err := normalizeAPISymbol(raw); err != nil || got != want {
+			t.Errorf("normalizeAPISymbol(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+}
+
+func TestIndexExpirationsRouteUsesProvider(t *testing.T) {
+	service, ts := testService(t, "")
+	fake := &testMarketProvider{expirations: []string{"2099-01-16"}}
+	service.provider = fake
+
+	response, err := http.Get(ts.URL + "/api/expirations/%5EGSPC?refresh=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload model.ExpirationsResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || len(payload.Expirations) != 1 || payload.Expirations[0] != "2099-01-16" {
+		t.Fatalf("index expirations response status=%d payload=%#v; want provider expiry", response.StatusCode, payload)
+	}
+	if got := fake.expirationCalls.Load(); got != 1 {
+		t.Fatalf("index expiration provider calls=%d, want 1", got)
+	}
+}
+
+func TestNormalizeAPISymbolSupportsYahooFutures(t *testing.T) {
+	for _, raw := range []string{"ES=F", "NQ=F", "CL=F", "GC=F"} {
+		if got, err := normalizeAPISymbol(raw); err != nil || got != raw {
+			t.Errorf("normalizeAPISymbol(%q) = %q, %v; want valid futures ticker", raw, got, err)
 		}
 	}
 }
@@ -426,6 +470,22 @@ func TestHeadMatchesFastAPIGetRouteAvailability(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFuturesPageServesEmbeddedMarketView(t *testing.T) {
+	_, ts := testService(t, "")
+	response, err := http.Get(ts.URL + "/futures?symbol=ES%3DF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "期货行情") || !strings.Contains(string(body), "common/js/futures.js") {
+		t.Fatalf("futures page status=%d body contains page=%t script=%t", response.StatusCode, strings.Contains(string(body), "期货行情"), strings.Contains(string(body), "common/js/futures.js"))
 	}
 }
 
@@ -1005,6 +1065,37 @@ func TestGammaResponseIncludesOIFallbackMetadata(t *testing.T) {
 	}
 }
 
+func TestGammaResponseSupportsIndexOptionSnapshots(t *testing.T) {
+	service, ts := testService(t, "")
+	spot, strike, iv, gammaValue := 6000.0, 6000.0, 0.2, 0.01
+	openInterest := int64(100)
+	fetched := time.Now().UTC()
+	expiration := fetched.AddDate(0, 0, 30).Format("2006-01-02")
+	if err := service.store.SaveQuote(model.Quote{Symbol: "^GSPC", Price: &spot, Provider: "cboe-delayed", FetchedAt: &fetched, Sessions: map[string]any{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.store.SaveExpirations("^GSPC", []string{expiration}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.store.SaveChain(model.ChainResponse{Symbol: "^GSPC", Expiration: expiration, FetchedAt: &fetched, Data: []model.OptionRow{
+		{ContractSymbol: "SPX-cboe", Provider: "cboe-delayed", ContractType: "call", Strike: &strike, OpenInterest: &openInterest, ImpliedVolatility: &iv, Gamma: &gammaValue, Expiration: expiration},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Get(ts.URL + "/api/gamma/%5EGSPC?include_rows=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("index gamma status=%d decode=%v body=%#v", response.StatusCode, err, body)
+	}
+	if body["source"] == "not_applicable" || body["contract_count"] != float64(1) {
+		t.Fatalf("index gamma response=%#v, want one analyzed contract", body)
+	}
+}
+
 func TestGammaLowMemoryDegradedWarningMatchesPython(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gamma-low-memory.db")
 	repository, err := store.Open(path)
@@ -1409,6 +1500,19 @@ type statusTrackingProvider struct {
 type chanAdjustedRecordingProvider struct {
 	*testMarketProvider
 	requests chan string
+}
+
+type chanMfiBenchmarkProvider struct {
+	*testMarketProvider
+	requests chan string
+}
+
+func (p *chanMfiBenchmarkProvider) ChanAdjustedHistory(_ context.Context, symbol, period string) (provider.ChanAdjustedHistoryResult, error) {
+	p.requests <- symbol + "|" + period
+	return provider.ChanAdjustedHistoryResult{
+		Symbol: symbol, Timeframe: "1d", AdjustmentType: "split_dividend_auto", Source: "go-yfinance",
+		FetchedAt: time.Now().UTC(), Bars: adjustedHistoryRows(220, 1000),
+	}, nil
 }
 
 func (p *chanAdjustedRecordingProvider) ChanAdjustedHistory(_ context.Context, symbol, period string) (provider.ChanAdjustedHistoryResult, error) {
@@ -3877,6 +3981,266 @@ func TestAttachMissingSP500EnvironmentKeepsSignalUnfiltered(t *testing.T) {
 
 func adjustedHistoryRow(day string, close float64) map[string]any {
 	return map[string]any{"date": day, "open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 1000.0, "raw_open": close, "raw_high": close + 1, "raw_low": close - 1, "raw_close": close, "raw_volume": 1000.0, "adjustment_factor": 1.0}
+}
+
+func adjustedHistoryRows(count int, volume float64) []map[string]any {
+	rows := make([]map[string]any, 0, count)
+	day := time.Date(2025, 1, 2, 0, 0, 0, 0, marketLocation())
+	for len(rows) < count {
+		if marketcalendar.IsTradingDay(day) {
+			close := 100 + float64(len(rows))*0.1
+			row := adjustedHistoryRow(day.Format(time.DateOnly), close)
+			row["volume"], row["raw_volume"] = volume, volume
+			rows = append(rows, row)
+		}
+		day = day.AddDate(0, 0, 1)
+	}
+	return rows
+}
+
+func TestChanAdjustedEndpointUsesSPYForMfiBenchmarkWhenIndexHasNoVolume(t *testing.T) {
+	service, ts := testService(t, "")
+	now := time.Now().UTC()
+	if err := service.store.WriteChanAdjustedHistory("^GSPC", "1d", "split_dividend_auto", "go-yfinance", adjustedHistoryRows(220, 0), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.store.WriteChanAdjustedHistory("SPY", "1d", "split_dividend_auto", "go-yfinance", adjustedHistoryRows(220, 1000), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.store.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", adjustedHistoryRows(220, 1000), now); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Get(ts.URL + "/api/chan/QQQ/adjusted?spot=150")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d payload=%#v", response.StatusCode, payload)
+	}
+	marketHistory, ok := payload["market_history"].(map[string]any)
+	if !ok || marketHistory["symbol"] != "SPY" {
+		t.Fatalf("MFI market history=%#v, want SPY proxy", payload["market_history"])
+	}
+	daily, ok := marketHistory["daily"].([]any)
+	if !ok || len(daily) < 15 {
+		t.Fatalf("SPY MFI daily history=%#v, want at least 15 rows", marketHistory["daily"])
+	}
+	first, firstOK := daily[0].(map[string]any)
+	last, lastOK := daily[len(daily)-1].(map[string]any)
+	if !firstOK || !lastOK || first["date"].(string) >= last["date"].(string) {
+		t.Fatalf("SPY MFI daily history dates must be ascending: first=%#v last=%#v", daily[0], daily[len(daily)-1])
+	}
+	marketEnvironment, ok := payload["market_environment"].(map[string]any)
+	if !ok || marketEnvironment["benchmark"] != "^GSPC" {
+		t.Fatalf("market environment=%#v, want ^GSPC benchmark", payload["market_environment"])
+	}
+}
+
+func TestChanEndpointIncludesMfiBenchmarkOnlyWhenRequested(t *testing.T) {
+	service, ts := testService(t, "")
+	now := time.Now().UTC()
+	for symbol, volume := range map[string]float64{"^GSPC": 0, "SPY": 1000} {
+		if err := service.store.WriteChanAdjustedHistory(symbol, "1d", "split_dividend_auto", "go-yfinance", adjustedHistoryRows(220, volume), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := func(query string) map[string]any {
+		t.Helper()
+		response, err := http.Get(ts.URL + "/api/chan/ES%3DF?light=true" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var payload map[string]any
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d payload=%#v", response.StatusCode, payload)
+		}
+		return payload
+	}
+
+	if payload := request(""); payload["market_history"] != nil {
+		t.Fatalf("default Chan response unexpectedly includes MFI market history: %#v", payload["market_history"])
+	}
+	payload := request("&include_mfi_market_history=true")
+	marketHistory, ok := payload["market_history"].(map[string]any)
+	if !ok || marketHistory["symbol"] != "SPY" {
+		t.Fatalf("MFI market history=%#v, want SPY proxy", payload["market_history"])
+	}
+	daily, ok := marketHistory["daily"].([]any)
+	if !ok || len(daily) < 15 {
+		t.Fatalf("SPY MFI daily history=%#v, want at least 15 rows", marketHistory["daily"])
+	}
+	first, _ := daily[0].(map[string]any)
+	last, _ := daily[len(daily)-1].(map[string]any)
+	if first["date"].(string) >= last["date"].(string) || last["volume"].(float64) <= 0 {
+		t.Fatalf("SPY MFI history must be ascending and have volume: first=%#v last=%#v", first, last)
+	}
+}
+
+func TestChanEndpointIncludesFutureTradingDatesForFutures(t *testing.T) {
+	service, ts := testService(t, "")
+	now := time.Now().UTC()
+	if err := service.store.WriteHistory("ES=F", adjustedHistoryRows(45, 1000), now); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := http.Get(ts.URL + "/api/chan/ES%3DF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var payload map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d payload=%#v", response.StatusCode, payload)
+	}
+	daily, ok := payload["daily"].(map[string]any)
+	if !ok {
+		t.Fatalf("daily frame type=%T", payload["daily"])
+	}
+	candles, ok := daily["candles"].([]any)
+	if !ok || len(candles) == 0 {
+		t.Fatalf("daily candles=%#v", daily["candles"])
+	}
+	lastCandle := candles[len(candles)-1].(map[string]any)
+	lastDate, _ := lastCandle["date"].(string)
+	futureDates, ok := daily["future_trading_dates"].([]any)
+	if !ok || len(futureDates) == 0 {
+		t.Fatalf("future trading dates=%#v", daily["future_trading_dates"])
+	}
+	firstFutureDate, _ := futureDates[0].(string)
+	if firstFutureDate <= lastDate {
+		t.Fatalf("first future date=%s must be after last candle=%s", firstFutureDate, lastDate)
+	}
+}
+
+func TestChanAdjustedEndpointFetchesSPYBenchmarkWithoutPersistedQuote(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chan-mfi-spy-history.db")
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	benchmarkProvider := &chanMfiBenchmarkProvider{testMarketProvider: &testMarketProvider{}, requests: make(chan string, 2)}
+	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamTimeout: time.Second}, repository, benchmarkProvider)
+	defer service.Close()
+	now := time.Now().UTC()
+	for symbol, volume := range map[string]float64{"^GSPC": 0, "QQQ": 1000} {
+		if err := repository.WriteChanAdjustedHistory(symbol, "1d", "split_dividend_auto", "go-yfinance", adjustedHistoryRows(220, volume), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ts := httptest.NewServer(service.Router())
+	defer ts.Close()
+	request := func() map[string]any {
+		t.Helper()
+		response, requestErr := http.Get(ts.URL + "/api/chan/QQQ/adjusted?spot=150")
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		defer response.Body.Close()
+		var payload map[string]any
+		if decodeErr := json.NewDecoder(response.Body).Decode(&payload); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d payload=%#v", response.StatusCode, payload)
+		}
+		return payload
+	}
+
+	payload := request()
+	select {
+	case request := <-benchmarkProvider.requests:
+		if request != "SPY|5y" {
+			t.Fatalf("benchmark history request=%q, want SPY|5y", request)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SPY benchmark history was not fetched without a persisted SPY quote")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		marketHistory, _ := payload["market_history"].(map[string]any)
+		if marketHistory["symbol"] == "SPY" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+		payload = request()
+	}
+	marketHistory, _ := payload["market_history"].(map[string]any)
+	if marketHistory["symbol"] != "SPY" {
+		t.Fatalf("MFI market history=%#v, want fetched SPY proxy", marketHistory)
+	}
+	daily, ok := marketHistory["daily"].([]any)
+	if !ok || len(daily) < 15 {
+		t.Fatalf("SPY MFI daily history=%#v, want at least 15 rows", marketHistory["daily"])
+	}
+	first, _ := daily[0].(map[string]any)
+	last, _ := daily[len(daily)-1].(map[string]any)
+	if first["date"].(string) >= last["date"].(string) {
+		t.Fatalf("SPY MFI daily dates are not ascending: first=%#v last=%#v", first, last)
+	}
+	if _, found, quoteErr := repository.LatestQuote("SPY"); quoteErr != nil || found {
+		t.Fatalf("SPY test must not have a persisted quote: found=%t err=%v", found, quoteErr)
+	}
+}
+
+func TestMfiHistoryHelpersRequireEnoughPositiveVolume(t *testing.T) {
+	rows := make([]map[string]any, 0, 16)
+	for index := 0; index < 16; index++ {
+		rows = append(rows, map[string]any{
+			"date":   fmt.Sprintf("2026-01-%02d", index+1),
+			"open":   100.0,
+			"high":   101.0,
+			"low":    99.0,
+			"close":  100.0,
+			"volume": 1000.0,
+		})
+	}
+	if !hasMfiVolume(rows) {
+		t.Fatal("16 positive-volume rows should be a usable MFI benchmark")
+	}
+	rows[13]["volume"] = 0.0
+	rows[14]["volume"] = 0.0
+	if hasMfiVolume(rows) {
+		t.Fatal("14 positive-volume rows should not be a usable MFI benchmark")
+	}
+	compact := compactMfiHistoryBars(rows)
+	if len(compact) != len(rows) {
+		t.Fatalf("compact MFI history rows=%d, want %d", len(compact), len(rows))
+	}
+	if _, exists := compact[0]["volume"]; !exists {
+		t.Fatalf("compact MFI history dropped volume: %#v", compact[0])
+	}
+}
+
+func TestCompactMfiHistoryBarsSortsByDate(t *testing.T) {
+	rows := []map[string]any{
+		{"date": "2026-01-03", "open": 103.0, "high": 104.0, "low": 102.0, "close": 103.5, "volume": 3000.0},
+		{"date": "2026-01-02", "open": 102.0, "high": 103.0, "low": 101.0, "close": 102.5, "volume": 2000.0},
+		{"date": "2026-01-01", "open": 101.0, "high": 102.0, "low": 100.0, "close": 101.5, "volume": 1000.0},
+	}
+
+	compact := compactMfiHistoryBars(rows)
+	if len(compact) != len(rows) {
+		t.Fatalf("compact MFI history rows=%d, want %d", len(compact), len(rows))
+	}
+	if compact[0]["date"] != "2026-01-01" || compact[1]["date"] != "2026-01-02" || compact[2]["date"] != "2026-01-03" {
+		t.Fatalf("compact MFI history dates=%#v, want ascending order", compact)
+	}
+	if compact[0]["volume"] != 1000.0 || compact[2]["volume"] != 3000.0 {
+		t.Fatalf("compact MFI history reordered fields incorrectly: %#v", compact)
+	}
 }
 
 func TestChanIntradayEndpointDeclaresPreviewVersionAndRawPriceBasis(t *testing.T) {

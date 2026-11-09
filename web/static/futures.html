@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="option-scope-access-required" content="__ACCESS_KEY_REQUIRED__">
+  <title>期货行情 · Option Scope</title>
+  <script>/* 首屏主题引导：沿用股票页的本地主题偏好。 */(function(){var theme="light";try{var stored=localStorage.getItem("option-scope-theme");if(stored==="dark"||stored==="light")theme=stored;}catch(error){}document.documentElement.dataset.theme=theme;})();</script>
+  <link rel="icon" type="image/svg+xml" href="/static/common/img/option-scope-favicon.svg?v=__ASSET_VERSION__">
+  <link rel="stylesheet" href="/static/element-ui@2.15.14/css/index.min.css">
+  <link rel="stylesheet" href="/static/common/css/styles.css?v=__ASSET_VERSION__">
+</head>
+<body>
+  <div id="futures-app" v-cloak>
+    <header class="topbar">
+      <div class="topbar-left">
+        <a class="futures-favorite-link" href="/" title="返回股票行情分析" aria-label="返回股票行情分析">‹</a>
+        <div class="brand"><img class="brand-mark" src="/static/common/img/option-scope-mark.svg?v=__ASSET_VERSION__" alt="Option Scope" width="34" height="34"><div><strong>期货行情</strong><small>OPTION SCOPE</small></div></div>
+        <nav class="market-nav" aria-label="市场导航">
+          <a href="/" class="market-nav-link">股票行情</a>
+          <a href="/futures" class="market-nav-link is-active" aria-current="page">期货行情</a>
+        </nav>
+      </div>
+      <div class="top-actions">
+        <div class="top-meta"><span class="live-dot"></span><span>{{ marketLabel }}</span><span class="divider"></span><span>{{ clock }}</span></div>
+        <button class="theme-toggle futures-theme-toggle" type="button" :title="themeLabel" :aria-label="themeLabel" @click="toggleTheme"><span aria-hidden="true">{{ theme === 'dark' ? '☀' : '◐' }}</span></button>
+      </div>
+    </header>
+
+    <main class="shell futures-shell">
+      <section class="futures-market-strip futures-market-overview" aria-label="期货市场工作区">
+        <section class="toolbar futures-toolbar futures-command-bar">
+          <div class="control symbol-control"><label for="future-symbol-input">标的</label><div class="input-wrap"><span>$</span><el-input id="future-symbol-input" v-model.trim="symbolInput" maxlength="12" autocomplete="off" @keyup.enter.native="loadSymbol"></el-input><el-button id="future-load-button" type="primary" size="small" @click="loadSymbol" :loading="loading" :disabled="loading">载入</el-button></div></div>
+          <div class="control futures-presets"><span class="control-label">常用品种</span><div class="futures-preset-list"><button v-for="item in presets" :key="item.symbol" type="button" :class="{ 'is-active': item.symbol === symbol }" @click="selectPreset(item.symbol)">{{ item.label }} <small>{{ item.symbol }}</small></button></div></div>
+          <div class="futures-market-status"><span class="live-dot"></span><span>{{ marketState }}</span><span class="futures-status-divider"></span><span>{{ fetchedLabel }}</span></div>
+        </section>
+
+        <div v-if="error" class="error-box" role="alert">{{ error }}</div>
+
+        <section class="headline-grid futures-headline-grid futures-quote-overview">
+          <article class="quote futures-quote-card futures-quote-primary"><div class="futures-symbol-line"><span class="eyebrow">{{ symbol }} · FUTURES</span><span class="futures-quote-state">{{ marketState }}</span></div><div class="quote-line"><span>{{ displaySymbol }}</span><span :class="changeClass">{{ priceLabel }}</span></div><div class="quote-sub"><span :class="changeClass">{{ changeLabel }}</span><span>Yahoo 行情 · 可能延迟</span></div></article>
+          <article class="metric futures-stat futures-stat-close"><span class="eyebrow">最新收盘</span><strong>{{ closeLabel }}</strong><span>完成 K 线参考</span></article>
+          <article class="metric futures-stat futures-stat-position"><span class="eyebrow">缠论位置</span><strong class="metric-text">{{ positionLabel }}</strong><span>{{ chartAsOf }}</span></article>
+          <article class="metric futures-stat futures-stat-structure"><span class="eyebrow">结构状态</span><strong class="metric-text">{{ structureLabel }}</strong><span>{{ barCountLabel }}</span></article>
+        </section>
+      </section>
+
+      <section class="detail-group panel chan-panel futures-chart-workspace">
+        <header class="detail-header">
+          <button class="detail-toggle" type="button" :aria-expanded="chanExpanded ? 'true' : 'false'" aria-controls="futures-chan-body" @click="toggleChanPanel">
+            <span class="detail-caret" aria-hidden="true"></span>
+            <span class="detail-text"><span class="eyebrow">CHAN STRUCTURE · INDICATOR ANALYSIS</span><span class="detail-title">缠论结构 · 技术指标分析</span></span>
+            <span class="detail-action">{{ chanExpanded ? '收起' : '展开' }}</span>
+          </button>
+        </header>
+        <div v-if="chanExpanded" class="detail-body chan-body futures-chan-body" id="futures-chan-body">
+          <div class="chan-summary">
+            <div class="chan-summary-read"><span class="chan-section-label">缠论结构 · {{ periodLabel }}概况</span><h2>{{ guidanceTitle }}</h2><p>{{ guidanceFocus }}</p></div>
+            <div class="chan-meta"><strong class="chan-summary-spot">现价 {{ priceLabel }}</strong><span class="chan-status-line" role="status">{{ marketState }}</span><span class="chan-quality" :class="'chan-quality-' + (frame?.recursive?.qualityClass || 'unknown')">行情{{ frame?.recursive?.quality || '等待中' }}</span></div>
+          </div>
+          <section class="chan-recursive" aria-labelledby="futures-chan-recursive-title">
+            <header class="chan-recursive-header">
+              <button class="chan-recursive-toggle" type="button" :aria-expanded="chanStatsExpanded ? 'true' : 'false'" aria-controls="futures-chan-recursive-body" @click="toggleChanStats">
+                <span class="chan-section-label" id="futures-chan-recursive-title">当前周期结构统计</span>
+                <span class="chan-recursive-toggle-action">{{ chanStatsExpanded ? '收起' : '展开' }}</span>
+              </button>
+            </header>
+            <div v-show="chanStatsExpanded" class="chan-recursive-body" id="futures-chan-recursive-body">
+              <dl class="chan-recursive-stats">
+                <div><dt>已确认线段</dt><dd>{{ frame?.recursive?.confirmedSegments || 0 }}</dd><small v-if="frame?.recursive?.formingSegments">另有 {{ frame.recursive.formingSegments }} 条形成中</small></div>
+                <div><dt>已闭合中枢</dt><dd>{{ frame?.recursive?.closedCenters || 0 }}</dd><small v-if="frame?.recursive?.formingCenters">另有 {{ frame.recursive.formingCenters }} 个形成中</small></div>
+                <div><dt>分析行情</dt><dd>{{ frame?.recursive?.acceptedBars || frame?.bars || 0 }}<small>/ {{ frame?.recursive?.inputBars || frame?.bars || 0 }} 根有效</small></dd></div>
+              </dl>
+            </div>
+          </section>
+          <div class="chan-controls futures-chan-controls">
+            <div class="chan-chart-controls"><h3>价格图表</h3><div class="chan-control-options">
+              <details class="chan-period-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+                <summary aria-label="周期设置">周期</summary>
+                <div class="chan-layer-menu-panel chan-period-menu-panel">
+                  <button class="chan-layer-menu-close" type="button" aria-label="关闭周期面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                  <section class="chan-layer-menu-display"><h4>周期选择</h4><div class="detail-segmented chan-layer-switches chan-period-switches" role="group" aria-label="K 线周期">
+                    <button v-for="item in periods" :key="item.value" class="detail-seg" type="button" :aria-pressed="period === item.value ? 'true' : 'false'" @click="selectPeriod(item.value)">{{ item.label }}</button>
+                  </div></section>
+                </div>
+              </details>
+              <details class="chan-layer-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+                <summary aria-label="图层设置">图层</summary>
+                <div class="chan-layer-menu-panel">
+                  <button class="chan-layer-menu-close" type="button" aria-label="关闭图层面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                  <section class="chan-layer-menu-signals"><h4>信号标记</h4><div class="chan-layer-signal-items" role="group" aria-label="信号标记图层">
+                    <div class="chan-layer-signal-item"><button class="detail-seg" type="button" :aria-pressed="chartLayers.signals ? 'true' : 'false'" @click="toggleChartLayer('signals')">结构买卖点</button><small>多级走势结构确认后，标记买入/卖出点。</small></div>
+                    <div class="chan-layer-signal-item"><button class="detail-seg" type="button" :aria-pressed="chartLayers.legacySignals ? 'true' : 'false'" @click="toggleChartLayer('legacySignals')">笔转折预警</button><small>笔出现转向迹象时先提醒，后续走势可能变化。</small></div>
+                  </div></section>
+                  <section class="chan-layer-menu-display"><h4>价格图层</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="价格图层">
+                    <button class="detail-seg" type="button" :aria-pressed="chartLayers.chanCandles ? 'true' : 'false'" @click="toggleChartLayer('chanCandles')">缠论K线</button>
+                    <button class="detail-seg" type="button" :aria-pressed="chartLayers.supportResistance ? 'true' : 'false'" @click="toggleChartLayer('supportResistance')">支撑/压力线</button>
+                    <button class="detail-seg" type="button" :aria-pressed="chartLayers.trendlines ? 'true' : 'false'" @click="toggleChartLayer('trendlines')">结构趋势线</button>
+                  </div></section>
+                  <section class="chan-layer-menu-recursive" aria-label="结构层级"><div class="chan-recursive-layer-groups">
+                    <div class="chan-recursive-layer-group"><h5>线段与走势</h5><div class="detail-segmented chan-layer-switches" role="group" aria-label="线段图层">
+                      <button v-for="level in (frame?.chart?.segmentLevels || [])" :key="'segment-' + level" class="detail-seg" type="button" :aria-pressed="isSegmentLevelVisible(level) ? 'true' : 'false'" @click="toggleSegmentLevel(level)">{{ level === 0 ? '第1层线段' : '第' + (level + 1) + '层走势' }}</button>
+                    </div></div>
+                    <div class="chan-recursive-layer-group"><h5>中枢</h5><div class="detail-segmented chan-layer-switches" role="group" aria-label="中枢图层">
+                      <button v-for="level in (frame?.chart?.layerLevels || [])" :key="'center-' + level" class="detail-seg" type="button" :aria-pressed="isRecursiveCenterLevelVisible(level) ? 'true' : 'false'" @click="toggleChartLayer(level)">第{{ level + 1 }}层中枢</button>
+                      <span v-if="!(frame?.chart?.layerLevels || []).length" class="chan-layer-empty">等待结构形成</span>
+                    </div></div>
+                  </div></section>
+                  <section class="chan-layer-menu-pens"><h4>笔结构</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="笔结构图层">
+                    <button class="detail-seg" type="button" :aria-pressed="chartLayers.pens ? 'true' : 'false'" @click="toggleChartLayer('pens')">笔</button>
+                    <button class="detail-seg" type="button" :aria-pressed="chartLayers.penCenters ? 'true' : 'false'" @click="toggleChartLayer('penCenters')">笔中枢</button>
+                  </div></section>
+                </div>
+              </details>
+              <details class="chan-subchart-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+                <summary aria-label="副图设置">副图</summary>
+                <div class="chan-layer-menu-panel chan-subchart-menu-panel">
+                  <button class="chan-layer-menu-close" type="button" aria-label="关闭副图面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                  <section class="chan-layer-menu-display"><h4>副图显示</h4><div class="detail-segmented chan-layer-switches chan-subchart-switches" role="group" aria-label="副图显示选项">
+                    <button class="detail-seg" type="button" :aria-pressed="subcharts.volume ? 'true' : 'false'" @click="toggleSubchart('volume')">成交量</button>
+                    <button class="detail-seg" type="button" :aria-pressed="subcharts.macd ? 'true' : 'false'" @click="toggleSubchart('macd')">MACD</button>
+                    <button class="detail-seg" type="button" :aria-pressed="subcharts.dmi ? 'true' : 'false'" @click="toggleSubchart('dmi')">DMI</button>
+                    <button class="detail-seg" type="button" :aria-pressed="subcharts.mfi ? 'true' : 'false'" @click="toggleSubchart('mfi')">MFI</button>
+                  </div></section>
+                </div>
+              </details>
+              <details class="chan-indicator-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+                <summary aria-label="技术指标设置">指标</summary>
+                <div class="chan-layer-menu-panel chan-indicator-menu-panel">
+                  <button class="chan-layer-menu-close" type="button" aria-label="关闭指标面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                  <section class="chan-layer-menu-display"><h4>价格指标（同时只能启用一个）</h4><div class="chan-indicator-options">
+                    <div v-for="item in indicators.slice(1)" :key="item.value" class="chan-indicator-option"><button class="detail-seg" type="button" :aria-pressed="chartLayers[item.value] ? 'true' : 'false'" @click="toggleChartLayer(item.value)">{{ item.label }}</button></div>
+                  </div></section>
+                </div>
+              </details>
+            </div></div>
+          <span>{{ frame?.bars || frame?.recursive?.acceptedBars || 0 }} 根行情 · {{ chartAsOf }}</span>
+          <div v-if="frame?.chart && frame.chart.keyLevels.length" class="chan-key-level-summary" role="list" aria-label="缠论关键观察价位">
+            <div v-for="level in frame.chart.keyLevels" :key="level.key" class="chan-key-level-chip" :class="'chan-key-level-chip-' + level.tone" role="listitem" :title="level.title"><span>{{ level.label }}</span><strong>{{ level.priceLabel }}</strong></div>
+          </div>
+          </div>
+        <div v-if="frame && frame.chart" class="chan-chart" v-chan-chart-canvas="canvasBinding" v-chan-chart-hover="hoverBinding" v-chan-chart-interaction="interactionBinding">
+          <canvas class="chan-chart-canvas" aria-hidden="true"></canvas>
+          <button type="button" class="chan-scenario-toggle-canvas" :style="{ left: (frame.chart.historyRight - (mobileChart ? 25 : 19)) / frame.chart.width * 100 + '%', top: (frame.chart.plotBottom - (mobileChart ? 25 : 19)) / frame.chart.height * 100 + '%', width: (mobileChart ? 22 : 16) / frame.chart.width * 100 + '%', height: (mobileChart ? 22 : 16) / frame.chart.height * 100 + '%' }" :aria-pressed="chanScenariosVisible ? 'true' : 'false'" :aria-label="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" :title="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" @click.stop="toggleChanScenarios" @keydown.enter.stop.prevent="toggleChanScenarios" @keydown.space.stop.prevent="toggleChanScenarios"></button>
+          <svg preserveAspectRatio="none" :view-box.camel="'0 0 ' + frame.chart.width + ' ' + frame.chart.height" role="img" :aria-label="frame.chart.title"><desc>{{ frame.chart.description }}</desc><g v-pre class="chan-crosshair-layer" aria-hidden="true" visibility="hidden"><line class="chart-crosshair"></line><line class="chart-crosshair-h chart-crosshair-price"></line><line class="chart-crosshair-h chart-crosshair-volume"></line><line class="chart-crosshair-h chart-crosshair-macd"></line><line class="chart-crosshair-h chart-crosshair-dmi"></line><line class="chart-crosshair-h chart-crosshair-mfi"></line><g class="chart-tag chart-tag-x"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-y"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-volume"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-macd"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-dmi"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-mfi"><rect rx="2" height="18"></rect><text></text></g></g></svg>
+          <div v-pre class="chart-tooltip chan-chart-tooltip" hidden></div>
+          <template v-if="chanScenariosVisible && frame.chart.projections">
+            <article v-for="route in frame.chart.projections" v-if="chanHoveredScenario === route.key" :id="'chan-scenario-card-' + route.key" :key="route.key + '-card'" class="chan-projection-float-card" :class="'chan-projection-' + route.tone" :style="{ left: chanScenarioCardX + 'px' }" aria-live="polite">
+              <header><h4><span class="chan-scenario-title">{{ route.label }}</span><span class="chan-route-meta"><strong>倾向 {{ route.tiltScore }}/100</strong><span>{{ route.status }}</span></span></h4></header>
+              <p class="chan-tilt-note">综合结构位置、确认笔与有效信号的规则倾向分 · 非历史胜率</p>
+              <dl><div><dt>观察</dt><dd>{{ route.expectation }}</dd></div><div><dt>条件</dt><dd>{{ route.condition }}</dd></div><div><dt>失效</dt><dd>{{ route.invalidation }}</dd></div></dl>
+            </article>
+          </template>
+        </div>
+        <div v-else class="levels-empty">{{ loading ? '正在读取 Yahoo 历史行情…' : '暂无可用历史行情' }}</div>
+        <div v-if="frame && frame.chart" class="chan-chart-navigation" role="group" aria-label="K 线图缩放与移动">
+          <span class="chan-chart-navigation-spacer"></span>
+          <button type="button" aria-label="放大 K 线图" title="放大" :disabled="!frame.chart.canZoomIn" @click="changeViewport('zoom-in')">＋</button>
+          <button type="button" aria-label="缩小 K 线图" title="缩小" :disabled="!frame.chart.canZoomOut" @click="changeViewport('zoom-out')">−</button>
+          <span class="chan-chart-range">{{ frame.chart.visibleBars }} / {{ frame.chart.totalBars }} 根</span>
+          <button type="button" aria-label="向左移动 K 线" title="向左移动" class="chan-chart-navigation-pan" :disabled="!frame.chart.canPanLeft" @click="changeViewport('left')">‹</button>
+          <button type="button" aria-label="向右移动 K 线" title="向右移动" class="chan-chart-navigation-pan" :disabled="!frame.chart.canPanRight" @click="changeViewport('right')">›</button>
+          <button type="button" aria-label="重置 K 线范围" title="重置范围并回到最新" class="chan-chart-navigation-reset" :disabled="!frame.chart.canResetViewport" @click="changeViewport('reset')">重置</button>
+          <p class="chan-chart-gesture-help">鼠标按住左右拖动；Ctrl 或 ⌘ + 滚轮缩放。手机单指左右拖动、双指捏合缩放。</p>
+        </div>
+        </div>
+        <details class="chan-compatibility chan-analysis-more" :open="chanMoreExpanded">
+          <summary @click.prevent="toggleChanMore">更多分析<span>缠论观察 · 指标信号</span></summary>
+          <div class="chan-compatibility-body">
+            <section class="futures-summary-grid futures-observation-grid">
+              <article class="panel futures-summary-card futures-observation-card"><span class="eyebrow">缠论观察</span><h2>{{ guidanceTitle }}</h2><p>{{ guidanceFocus }}</p><dl><div><dt>位置</dt><dd>{{ positionLabel }}</dd></div><div><dt>中枢</dt><dd>{{ centerLabel }}</dd></div><div><dt>最近走势</dt><dd>{{ strokeLabel }}</dd></div></dl></article>
+              <article class="panel futures-summary-card futures-signal-card"><span class="eyebrow">指标信号</span><h2>{{ indicatorTitle }}</h2><p>{{ indicatorSummary }}</p><ul class="futures-signal-list"><li v-for="signal in signals" :key="signal.key"><span :class="signal.tone">{{ signal.label }}</span><small>{{ signal.dateLabel }}</small></li><li v-if="!signals.length" class="muted">当前窗口暂无已确认信号</li></ul></article>
+            </section>
+          </div>
+        </details>
+      </section>
+    </main>
+    <footer class="futures-footer"><span>期货数据来自 Yahoo Finance，可能存在延迟；图表结构仅供研究参考。</span><a href="/">返回股票行情分析</a></footer>
+  </div>
+  <script src="/static/jquery@3.7.1/jquery.min.js"></script>
+  <script src="/static/vue@2.7.16/vue.min.js"></script>
+  <script src="/static/common/js/request.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/charts.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-plan.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-stochz.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-trendlines.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-turtle.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-granville.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-macd-sma.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-supertrend.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-wyckoff.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-mfi.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/futures.js?v=__ASSET_VERSION__"></script>
+</body>
+</html>

@@ -11,6 +11,7 @@ import (
 
 	"option-scope-go/internal/gamma"
 	"option-scope-go/internal/model"
+	"option-scope-go/internal/provider"
 )
 
 const (
@@ -126,6 +127,49 @@ func cachedTechnicalLevels(bars []map[string]any, spot float64) []cachedLevel {
 	levels := cachedFibonacciLevels(bars)
 	levels = append(levels, cachedChipPeaks(bars)...)
 	levels = append(levels, cachedAbsorptionLevels(bars, spot)...)
+	return levels
+}
+
+// 用五根日线窗口确认指数的局部高低点，补充压力位、支撑位和更深一档加仓候选。
+func cachedIndexSwingLevels(bars []map[string]any) []cachedLevel {
+	start := len(bars) - cachedFibonacciWindow
+	if start < 0 {
+		start = 0
+	}
+	window := bars[start:]
+	if len(window) < 5 {
+		return nil
+	}
+	levels := make([]cachedLevel, 0, len(window)/3)
+	for index := 2; index+2 < len(window); index++ {
+		high, highOK := numericHistoryValue(window[index]["high"])
+		low, lowOK := numericHistoryValue(window[index]["low"])
+		if !highOK || !lowOK || high <= 0 || low <= 0 {
+			continue
+		}
+		highPivot, lowPivot := true, true
+		for offset := -2; offset <= 2; offset++ {
+			if offset == 0 {
+				continue
+			}
+			otherHigh, otherHighOK := numericHistoryValue(window[index+offset]["high"])
+			otherLow, otherLowOK := numericHistoryValue(window[index+offset]["low"])
+			if otherHighOK && (high < otherHigh || (high == otherHigh && offset > 0)) {
+				highPivot = false
+			}
+			if otherLowOK && (low > otherLow || (low == otherLow && offset > 0)) {
+				lowPivot = false
+			}
+		}
+		age := float64(len(window)-1-index) / float64(len(window)-1)
+		score := .55 + .25*(1-age)
+		if highPivot {
+			levels = append(levels, cachedLevel{price: high, score: score, factor: "历史摆动高点", factors: []string{"历史摆动高点"}})
+		}
+		if lowPivot {
+			levels = append(levels, cachedLevel{price: low, score: score, factor: "历史摆动低点", factors: []string{"历史摆动低点"}})
+		}
+	}
 	return levels
 }
 
@@ -1840,6 +1884,9 @@ func buildCachedLevelsAt(symbol, expiration string, bars []map[string]any, rows 
 	levelsBySide := map[string][]cachedLevel{"above": {}, "below": {}}
 	optionLevels, metric := cachedOptionLevelsAt(rows, *anchor, now)
 	technical := cachedTechnicalLevels(bars, *anchor)
+	if provider.IsIndexSymbol(symbol) {
+		technical = append(technical, cachedIndexSwingLevels(bars)...)
+	}
 	technical = append(technical, optionLevels...)
 	trend := cachedTrend(bars)
 	resistanceWeight, supportWeight := 1.0, 1.0

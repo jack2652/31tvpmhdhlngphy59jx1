@@ -110,6 +110,11 @@ func NewDefaultHybridWithMemoryProfile(timeout time.Duration, concurrency int, p
 	return newDefaultHybrid(timeout, 15*time.Second, concurrency, proxy, alpacaKey, alpacaSecret, lowMemory, waitValues...)
 }
 
+// NewDefaultHybridWithCboeTimeout 使用运行配置中的 Cboe 超时。
+func NewDefaultHybridWithCboeTimeout(timeout, cboeTimeout time.Duration, concurrency int, proxy, alpacaKey, alpacaSecret string, lowMemory bool, waitValues ...time.Duration) (*Hybrid, error) {
+	return newDefaultHybrid(timeout, cboeTimeout, concurrency, proxy, alpacaKey, alpacaSecret, lowMemory, waitValues...)
+}
+
 func newDefaultHybrid(timeout, cboeTimeout time.Duration, concurrency int, proxyAddress, alpacaKey, alpacaSecret string, lowMemory bool, waitValues ...time.Duration) (*Hybrid, error) {
 	if err := outboundhttp.ValidateProxy(proxyAddress); err != nil {
 		return nil, err
@@ -180,7 +185,8 @@ func (h *Hybrid) Quote(ctx context.Context, rawSymbol string) (model.Quote, erro
 	// During the overnight session Alpaca's overnight snapshot is the current
 	// price, so the Yahoo regular quote is not fetched. When Alpaca is not
 	// configured (or is in an authentication cooldown) Yahoo takes over.
-	if isNYSEOvernightSession(h.marketNow()) && h.Overnight != nil && h.Overnight.CanRequest() {
+	// 指数没有可交易的夜盘期权，始终使用 Yahoo 指数行情，避免向 Alpaca 请求无效标的。
+	if !IsIndexSymbol(symbol) && !IsFutureSymbol(symbol) && isNYSEOvernightSession(h.marketNow()) && h.Overnight != nil && h.Overnight.CanRequest() {
 		overnight, overnightErr := h.Overnight.Quote(ctx, symbol)
 		if err := ctx.Err(); err != nil {
 			return model.Quote{}, err
@@ -205,6 +211,11 @@ func (h *Hybrid) Quote(ctx context.Context, rawSymbol string) (model.Quote, erro
 	quote, err := h.Regular.Quote(ctx, symbol)
 	if err != nil {
 		return quote, err
+	}
+	// 连续期货的 Chart 已经包含夜盘分钟数据；不要再走股票专用的
+	// previous_post 查询，否则会重新初始化 Yahoo SDK 并增加无意义的等待。
+	if IsFutureSymbol(symbol) {
+		return quote, nil
 	}
 	// Pre-market and closed quotes carry the prior regular close in
 	// sessions.post.reference_close but no after-hours price. Attach the last
@@ -355,11 +366,18 @@ func (h *Hybrid) SnapshotQuote(ctx context.Context, rawSymbol string) (model.Quo
 	if h == nil || h.Regular == nil {
 		return model.Quote{}, errors.New("hybrid quote provider is unavailable")
 	}
+	symbol, err := NormalizeSymbol(rawSymbol)
+	if err != nil {
+		return model.Quote{}, err
+	}
+	if IsIndexSymbol(symbol) || IsFutureSymbol(symbol) {
+		return h.Quote(ctx, symbol)
+	}
 	if !h.usesDelayedOptions() {
-		return h.Quote(ctx, rawSymbol)
+		return h.Quote(ctx, symbol)
 	}
 
-	quote, quoteErr := h.Quote(ctx, rawSymbol)
+	quote, quoteErr := h.Quote(ctx, symbol)
 	if err := ctx.Err(); err != nil {
 		return model.Quote{}, err
 	}
@@ -369,7 +387,7 @@ func (h *Hybrid) SnapshotQuote(ctx context.Context, rawSymbol string) (model.Quo
 	if h.Delayed == nil {
 		return quote, quoteErr
 	}
-	delayed, err := h.Delayed.Quote(ctx, rawSymbol)
+	delayed, err := h.Delayed.Quote(ctx, symbol)
 	if err != nil {
 		return model.Quote{}, err
 	}
@@ -387,16 +405,32 @@ func (h *Hybrid) Expirations(ctx context.Context, symbol string) ([]string, erro
 	if h == nil {
 		return nil, errors.New("hybrid provider is unavailable")
 	}
+	normalized, err := NormalizeSymbol(symbol)
+	if err != nil {
+		return nil, err
+	}
+	if IsFutureSymbol(normalized) {
+		return []string{}, nil
+	}
+	if IsIndexSymbol(normalized) {
+		if h.Delayed == nil {
+			return nil, errors.New("Cboe delayed index options provider is unavailable")
+		}
+		if _, ok := CboeOptionSymbol(normalized); !ok {
+			return nil, fmt.Errorf("指数 %s 暂无可用期权根代码", normalized)
+		}
+		return h.Delayed.Expirations(ctx, normalized)
+	}
 	if h.usesDelayedOptions() {
 		if h.Delayed == nil {
 			return nil, errors.New("Cboe delayed options provider is unavailable")
 		}
-		return h.Delayed.Expirations(ctx, symbol)
+		return h.Delayed.Expirations(ctx, normalized)
 	}
 	if h.Regular == nil {
 		return nil, errors.New("Yahoo options provider is unavailable")
 	}
-	return h.Regular.Expirations(ctx, symbol)
+	return h.Regular.Expirations(ctx, normalized)
 }
 
 // NearestChain keeps the regular/delayed selection used by Expirations and
@@ -405,32 +439,64 @@ func (h *Hybrid) NearestChain(ctx context.Context, symbol string) ([]string, []m
 	if h == nil {
 		return nil, nil, nil, errors.New("hybrid provider is unavailable")
 	}
+	normalized, err := NormalizeSymbol(symbol)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if IsFutureSymbol(normalized) {
+		return []string{}, []model.OptionRow{}, nil, nil
+	}
+	if IsIndexSymbol(normalized) {
+		if h.Delayed == nil {
+			return nil, nil, nil, errors.New("Cboe delayed index options provider is unavailable")
+		}
+		if _, ok := CboeOptionSymbol(normalized); !ok {
+			return nil, nil, nil, fmt.Errorf("指数 %s 暂无可用期权根代码", normalized)
+		}
+		return h.Delayed.NearestChain(ctx, normalized)
+	}
 	if h.usesDelayedOptions() {
 		if h.Delayed == nil {
 			return nil, nil, nil, errors.New("Cboe delayed options provider is unavailable")
 		}
-		return h.Delayed.NearestChain(ctx, symbol)
+		return h.Delayed.NearestChain(ctx, normalized)
 	}
 	if h.Regular == nil {
 		return nil, nil, nil, errors.New("Yahoo options provider is unavailable")
 	}
-	return h.Regular.NearestChain(ctx, symbol)
+	return h.Regular.NearestChain(ctx, normalized)
 }
 
 func (h *Hybrid) Chain(ctx context.Context, symbol, expiration string) ([]model.OptionRow, *time.Time, error) {
 	if h == nil {
 		return nil, nil, errors.New("hybrid provider is unavailable")
 	}
+	normalized, err := NormalizeSymbol(symbol)
+	if err != nil {
+		return nil, nil, err
+	}
+	if IsFutureSymbol(normalized) {
+		return []model.OptionRow{}, nil, nil
+	}
+	if IsIndexSymbol(normalized) {
+		if h.Delayed == nil {
+			return nil, nil, errors.New("Cboe delayed index options provider is unavailable")
+		}
+		if _, ok := CboeOptionSymbol(normalized); !ok {
+			return nil, nil, fmt.Errorf("指数 %s 暂无可用期权根代码", normalized)
+		}
+		return h.Delayed.Chain(ctx, normalized, expiration)
+	}
 	if h.usesDelayedOptions() {
 		if h.Delayed == nil {
 			return nil, nil, errors.New("Cboe delayed options provider is unavailable")
 		}
-		return h.Delayed.Chain(ctx, symbol, expiration)
+		return h.Delayed.Chain(ctx, normalized, expiration)
 	}
 	if h.Regular == nil {
 		return nil, nil, errors.New("Yahoo options provider is unavailable")
 	}
-	return h.Regular.Chain(ctx, symbol, expiration)
+	return h.Regular.Chain(ctx, normalized, expiration)
 }
 
 func isNYSERegularSession(moment time.Time) bool {
@@ -537,6 +603,13 @@ func (h *Hybrid) IntradayHistory(ctx context.Context, symbol, interval string) (
 	client, ok := h.HistoryClient.(IntradayHistoryClient)
 	if !ok {
 		return HistoryResult{}, errors.New("Yahoo history client does not support intraday history")
+	}
+	// 指数和期货没有 Alpaca 股票历史 K 线；仅使用 Yahoo，避免夜盘或休市时
+	// 对不可用的股票历史接口发起请求。普通股票继续走两路合并与回退逻辑。
+	if normalized, err := NormalizeSymbol(symbol); err == nil {
+		if IsIndexSymbol(normalized) || IsFutureSymbol(normalized) {
+			return client.FetchIntraday(ctx, normalized, interval)
+		}
 	}
 	if h.Overnight == nil || !h.Overnight.CanRequest() {
 		return client.FetchIntraday(ctx, symbol, interval)

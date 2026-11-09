@@ -264,10 +264,56 @@ func TestNormalizeCboeSymbolMatchesPythonProviderBoundaries(t *testing.T) {
 			t.Errorf("normalizeCboeSymbol(%q) = %q, %v; want %q", symbol, got, err, symbol)
 		}
 	}
-	for _, symbol := range []string{"", "^GSPC", "ABCDEFGHIJK", "-QQQ", ".QQQ"} {
+	for _, test := range []struct{ input, want string }{{"^GSPC", "_SPX"}, {"^NDX", "_NDX"}} {
+		got, err := normalizeCboeSymbol(test.input)
+		if err != nil || got != test.want {
+			t.Errorf("normalizeCboeSymbol(%q) = %q, %v; want %q", test.input, got, err, test.want)
+		}
+	}
+	for _, symbol := range []string{"", "^IXIC", "^DJI", "ABCDEFGHIJK", "-QQQ", ".QQQ"} {
 		if _, err := normalizeCboeSymbol(symbol); err == nil {
 			t.Errorf("normalizeCboeSymbol(%q) error = nil, want invalid-symbol error", symbol)
 		}
+	}
+}
+
+func TestCboeIndexOptionsUseMappedSnapshotPathAndOCCRoot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_SPX" {
+			t.Errorf("path=%q, want /_SPX", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":{"current_price":6000,"options":[{"option":"SPX300118C06000000","bid":10,"ask":11,"volume":2,"open_interest":3,"iv":0.2,"gamma":0.01}]}}`))
+	}))
+	defer server.Close()
+
+	client := NewCboeOptionsClient(server.Client(), server.URL+"/{symbol}")
+	expirations, err := client.Expirations(context.Background(), "^GSPC")
+	if err != nil || !reflect.DeepEqual(expirations, []string{"2030-01-18"}) {
+		t.Fatalf("Expirations() = %#v, %v; want SPX expiry", expirations, err)
+	}
+	rows, _, err := client.Chain(context.Background(), "^GSPC", "2030-01-18")
+	if err != nil || len(rows) != 1 || rows[0].ContractSymbol != "SPX300118C06000000" {
+		t.Fatalf("Chain() = %#v, %v; want SPX contract", rows, err)
+	}
+}
+
+func TestCboeIndexOptionsIncludeWeeklyRoots(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_NDX" {
+			t.Errorf("path=%q, want /_NDX", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":{"current_price":20000,"options":[{"option":"NDX300118C20000000"},{"option":"NDXP300125P20000000"},{"option":"QQQ300118C00200000"}]}}`))
+	}))
+	defer server.Close()
+
+	client := NewCboeOptionsClient(server.Client(), server.URL+"/{symbol}")
+	expirations, err := client.Expirations(context.Background(), "^NDX")
+	if err != nil || !reflect.DeepEqual(expirations, []string{"2030-01-18", "2030-01-25"}) {
+		t.Fatalf("Expirations() = %#v, %v; want standard and weekly NDX expirations", expirations, err)
+	}
+	rows, _, err := client.Chain(context.Background(), "^NDX", "2030-01-25")
+	if err != nil || len(rows) != 1 || rows[0].ContractSymbol != "NDXP300125P20000000" {
+		t.Fatalf("Chain() = %#v, %v; want NDXP weekly contract", rows, err)
 	}
 }
 

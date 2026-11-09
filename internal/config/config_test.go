@@ -34,7 +34,7 @@ func TestLoadUsesDotEnvBelowProcessEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded := LoadFromDir(temporary)
-	if loaded.Host != "127.0.0.1" || loaded.Port != "8002" || loaded.DefaultSymbol != "AAPL" || loaded.AccessKey != "file-key" || loaded.DatabasePath != filepath.Join(temporary, "temporary.db") || loaded.MarketProxy != "http://proxy.example:3128" || loaded.RawRetentionDays != 45 || loaded.UpstreamTimeout != 12*time.Second || loaded.CboeTimeout != 15*time.Second {
+	if loaded.Host != "127.0.0.1" || loaded.Port != "8002" || loaded.DefaultSymbol != "AAPL" || loaded.AccessKey != "file-key" || loaded.DatabasePath != filepath.Join(temporary, "temporary.db") || loaded.MarketProxy != "http://proxy.example:3128" || loaded.RawRetentionDays != 45 || loaded.UpstreamTimeout != 12*time.Second || loaded.CboeTimeout != 45*time.Second {
 		t.Fatalf("Load() did not honor dotenv values and process precedence: %#v", loaded)
 	}
 }

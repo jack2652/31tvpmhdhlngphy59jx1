@@ -112,7 +112,7 @@ assert.equal(tooltip.children[0].textContent, "2026-10-15");
 const changeRow = tooltip.children.find((child) => child.className.includes("chan-ohlc-change-row"));
 assert.ok(changeRow, "tooltip must include the close-change row");
 assert.equal(changeRow.children[1].textContent, "+5.00%");
-assert.deepEqual(Array.from(tooltip.children.filter((child) => child.className.includes("chan-ohlc-row") && !child.className.includes("change")).map((row) => row.children[1].textContent)), ["$100.00", "$105.00", "$107.00", "$99.00"]);
+assert.deepEqual(Array.from(tooltip.children.filter((child) => child.className.includes("chan-ohlc-row") && !child.className.includes("change")).map((row) => row.children[1].textContent)), ["100.00", "105.00", "107.00", "99.00"]);
 
 // Projection routes live on the canvas; hover hit testing must still open and
 // close the scenario card without any per-route SVG nodes.
@@ -125,6 +125,8 @@ directive.componentUpdated(target, { value: {
 } });
 targetListeners.get("pointermove")({ clientX: 400, clientY: 78, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
 assert.deepEqual(scenarioEvents, [["show", "up"]], "moving onto a canvas projection route must open its scenario card");
+assert.equal(layer.attributes.visibility, "hidden", "scenario lane must not show the candle crosshair");
+assert.equal(tooltip.hidden, true, "scenario lane must not show a pending-candle tooltip");
 targetListeners.get("pointermove")({ clientX: 150, clientY: 110, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
 assert.deepEqual(scenarioEvents, [["show", "up"], ["hide"]], "leaving the projection route must close the scenario card");
 
@@ -144,6 +146,28 @@ assert.ok(!horizontalVolume.attributes.visibility, "the volume pane must show it
 assert.equal(horizontalMacd.attributes.visibility, "hidden", "the MACD crosshair must hide while hovering volume");
 assert.equal(tagVolume.querySelector("text").textContent, "100.00万", "the volume tag must show the value at the cursor");
 assert.equal(tagMacd.attributes.visibility, "hidden", "the MACD tag must hide while hovering volume");
+
+// The empty future area must expose a pending daily candle, including its date
+// card, horizontal price guide, and left axis readout.
+directive.componentUpdated(target, { value: {
+  chart: {
+    ...model,
+    historyRight: 450,
+    plotRight: 450,
+    visibleBars: 2,
+    endOffset: -1,
+    pendingOpenDates: ["2026-11-11"],
+    pendingSlotCount: 1,
+  },
+} });
+targetListeners.get("pointermove")({ clientX: 300, clientY: 110, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.equal(layer.attributes.visibility, "visible", "future area must show crosshair guides");
+assert.equal(tooltip.hidden, false, "future area must show a pending candle tooltip");
+assert.equal(tooltip.children[0].textContent, "2026-11-11", "future tooltip must use the next trading date");
+assert.equal(tooltip.children[1].textContent, "日线 · 待开盘 K 线", "future tooltip must identify the pending daily candle");
+assert.deepEqual(Array.from(tooltip.children.filter((child) => child.className.includes("chan-ohlc-row")).map((row) => row.children[1].textContent)), ["-", "-", "-", "-"], "pending OHLC values must use dashes");
+assert.ok(!horizontal.attributes.visibility, "future price pane must show its horizontal guide");
+assert.ok(!tagY.attributes.visibility, "future price pane must show the left price tag");
 
 targetListeners.get("pointerleave")();
 assert.equal(layer.attributes.visibility, "hidden", "leaving the chart must hide crosshair guides");

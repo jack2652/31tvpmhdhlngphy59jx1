@@ -256,7 +256,7 @@ type Service struct {
 }
 
 func New(cfg config.Config) (*Service, error) {
-	marketProvider, err := provider.NewDefaultHybridWithMemoryProfile(cfg.UpstreamTimeout, cfg.UpstreamConcurrency, cfg.MarketProxy, cfg.AlpacaAPIKey, cfg.AlpacaAPISecret, cfg.LowMemory, cfg.UpstreamWait)
+	marketProvider, err := provider.NewDefaultHybridWithCboeTimeout(cfg.UpstreamTimeout, cfg.CboeTimeout, cfg.UpstreamConcurrency, cfg.MarketProxy, cfg.AlpacaAPIKey, cfg.AlpacaAPISecret, cfg.LowMemory, cfg.UpstreamWait)
 	if err != nil {
 		return nil, err
 	}
@@ -466,6 +466,7 @@ func (s *Service) Router() *gin.Engine {
 	router.GET("/redoc", s.redocDocs)
 	router.HEAD("/redoc", s.redocDocs)
 	router.GET("/", s.index)
+	router.GET("/futures", s.futuresIndex)
 	staticRoot := func(c *gin.Context) { c.JSON(http.StatusNotFound, gin.H{"detail": "Not Found"}) }
 	router.GET("/static", staticRoot)
 	router.HEAD("/static", staticRoot)
@@ -801,6 +802,9 @@ func expireFormingQuoteDailyBar(quote model.Quote, now time.Time) model.Quote {
 	if quote.DailyBar == nil || !quote.DailyBar.IsForming {
 		return quote
 	}
+	if provider.IsFutureSymbol(quote.Symbol) {
+		return quote
+	}
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		location = time.FixedZone("EST", -5*60*60)
@@ -895,6 +899,27 @@ func (s *Service) index(c *gin.Context) {
 	}
 	version := hex.EncodeToString(versionHash.Sum(nil))
 	content = strings.ReplaceAll(content, "__ASSET_VERSION__", version)
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(content))
+}
+
+func (s *Service) futuresIndex(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	assets := web.Static()
+	page, err := fs.ReadFile(assets, "futures.html")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "futures.html unavailable"})
+		return
+	}
+	defaultSymbol := "ES=F"
+	content := strings.ReplaceAll(string(page), "__DEFAULT_FUTURE__", defaultSymbol)
+	content = strings.ReplaceAll(content, "__ACCESS_KEY_REQUIRED__", strconv.FormatBool(s.cfg.AccessKey != ""))
+	versionHash := sha256.New()
+	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-plan.js", "common/js/chan-stochz.js", "common/js/chan-trendlines.js", "common/js/chan-turtle.js", "common/js/chan-granville.js", "common/js/chan-macd-sma.js", "common/js/chan-supertrend.js", "common/js/chan-wyckoff.js", "common/js/chan-client.js", "common/js/futures.js"} {
+		if contents, err := fs.ReadFile(assets, asset); err == nil {
+			_, _ = versionHash.Write(contents)
+		}
+	}
+	content = strings.ReplaceAll(content, "__ASSET_VERSION__", hex.EncodeToString(versionHash.Sum(nil)))
 	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(content))
 }
 
@@ -1193,6 +1218,10 @@ func (s *Service) expirations(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
 		return
 	}
+	if provider.IsFutureSymbol(symbol) {
+		c.JSON(http.StatusOK, model.ExpirationsResponse{Symbol: symbol, Expirations: []string{}, CachedExpirations: []string{}, Source: "not_applicable"})
+		return
+	}
 	refresh, err := queryBool(c, "refresh", false)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
@@ -1263,10 +1292,20 @@ func (s *Service) expirations(c *gin.Context) {
 }
 
 var expirationPattern = regexp.MustCompile(`^\p{Nd}{4}-\p{Nd}{2}-\p{Nd}{2}$`)
-var apiSymbolPattern = regexp.MustCompile(`^[A-Z0-9][A-Z0-9.-]*$`)
+var apiSymbolPattern = regexp.MustCompile(`^(?:\^[A-Z0-9][A-Z0-9.-]*|[A-Z0-9][A-Z0-9.-]*|[A-Z0-9]+(?:-[A-Z0-9]+)?=F)$`)
 
 func normalizeAPISymbol(raw string) (string, error) {
 	symbol := strings.ToUpper(strings.TrimSpace(raw))
+	switch symbol {
+	case ".NDX":
+		symbol = "^NDX"
+	case ".SPX":
+		symbol = "^GSPC"
+	case ".DJI":
+		symbol = "^DJI"
+	case ".IXIC":
+		symbol = "^IXIC"
+	}
 	if symbol == "" || len(symbol) > 10 || !apiSymbolPattern.MatchString(symbol) {
 		return "", errors.New("标的代码格式无效")
 	}
@@ -1592,6 +1631,10 @@ func (s *Service) chain(c *gin.Context) {
 	expiration, err := strictExpiration(expirationRaw)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	if provider.IsFutureSymbol(symbol) {
+		c.JSON(http.StatusOK, model.ChainResponse{Symbol: symbol, Expiration: expiration, Data: []model.OptionRow{}, Source: "not_applicable"})
 		return
 	}
 	// Read the persisted batch on every lightweight request. The upstream cache
@@ -3373,6 +3416,10 @@ func (s *Service) flow(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
 		return
 	}
+	if provider.IsIndexSymbol(symbol) || provider.IsFutureSymbol(symbol) {
+		c.JSON(http.StatusOK, gin.H{"symbol": symbol, "expiration": expiration, "available": false, "reason": "指数期权快照不提供可确认的主动成交方向", "data": []any{}})
+		return
+	}
 	result, err := s.store.OptionFlow(symbol, expiration)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
@@ -3393,6 +3440,10 @@ func (s *Service) gamma(c *gin.Context) {
 	symbol, err := normalizeAPISymbol(c.Param("symbol"))
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	if provider.IsFutureSymbol(symbol) {
+		c.JSON(http.StatusOK, gin.H{"symbol": symbol, "source": "not_applicable", "refresh": nil, "data": []any{}, "contract_count": 0, "iv_model": map[string]any{}, "zero_gamma": nil, "status_only": false})
 		return
 	}
 	horizon := 45
@@ -3959,7 +4010,7 @@ func gammaAnalysisCacheKey(symbol string, horizon int, includeRows bool, fetched
 
 // Bump when level classification changes so durable SQLite analysis results
 // are rebuilt instead of serving tiers produced by the previous rule set.
-const levelsAnalysisCacheVersion = "levels-v25"
+const levelsAnalysisCacheVersion = "levels-v26"
 
 func levelsAnalysisCacheKey(symbol, expiration string, bars []map[string]any, rows []model.OptionRow, quote model.Quote, spot, candidateSpot *float64, historyFetchedAt, profileFetchedAt any, extremes, beta, _ map[string]any) string {
 	input := struct {

@@ -23,7 +23,8 @@ const fastAPIOpenAPIFrozenSchema = `
         "description": "日线与周线缠论笔结构：严格旧笔、笔中枢、当前位置、力度衰减线索和条件式走势推演。只读取历史缓存，缺失或过期时后台更新；spot 可传页面现价。未收盘日线、未完成周线和形成中的笔不用于中枢确认。笔中枢不代表递归级别；第三类位置只标记候选。",
         "parameters": [
           {"name": "stock_symbol", "in": "path", "required": true, "schema": {"type": "string", "title": "Stock Symbol"}},
-          {"name": "spot", "in": "query", "required": false, "schema": {"anyOf": [{"type": "number", "exclusiveMinimum": 0}, {"type": "null"}], "title": "Spot"}}
+          {"name": "spot", "in": "query", "required": false, "schema": {"anyOf": [{"type": "number", "exclusiveMinimum": 0}, {"type": "null"}], "title": "Spot"}},
+          {"name": "include_mfi_market_history", "in": "query", "required": false, "schema": {"type": "boolean", "default": false, "title": "Include MFI Market History"}}
         ],
         "responses": {
           "200": {"description": "Successful Response", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true, "title": "Response Chan Api Chan  Stock Symbol  Get"}}}},

@@ -1,5 +1,28 @@
 /* SVG 图表模块：只负责绘制与交互，行情状态和接口请求由 app.js / request.js 管理。 */
 (function (window) {
+// 图表层独立格式化价格，避免依赖股票页才会加载的 app.js。
+function moneyDecimals(value) {
+  const number = Math.abs(Number(value));
+  if (!Number.isFinite(number)) return 2;
+  if (number >= 1) return 2;
+  if (number >= 0.1) return 3;
+  if (number >= 0.01) return 4;
+  if (number >= 0.001) return 5;
+  if (number >= 0.0001) return 6;
+  if (number >= 0.00001) return 7;
+  return 8;
+}
+
+function formatMoney(value) {
+  if (value == null) return "--";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  const fixed = number.toFixed(moneyDecimals(number));
+  if (!fixed.includes(".")) return fixed;
+  const compact = fixed.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
+  return compact.includes(".") ? compact : `${compact}.00`;
+}
+
 // 按价格在有序执行价数组中的位置插值，供零 Gamma 与关键位图表共用。
 function strikePosition(points, strike) {
   if (!points.length || strike < points[0].strike || strike > points[points.length - 1].strike) return null;
@@ -142,11 +165,13 @@ function bindChanChartHover(target, initialBinding) {
   const horizontalVolume = layer.querySelector(".chart-crosshair-volume");
   const horizontalMacd = layer.querySelector(".chart-crosshair-macd");
   const horizontalDmi = layer.querySelector(".chart-crosshair-dmi");
+  const horizontalMfi = layer.querySelector(".chart-crosshair-mfi");
   const tagX = layer.querySelector(".chart-tag-x");
   const tagY = layer.querySelector(".chart-tag-y");
   const tagVolume = layer.querySelector(".chart-tag-volume");
   const tagMacd = layer.querySelector(".chart-tag-macd");
   const tagDmi = layer.querySelector(".chart-tag-dmi");
+  const tagMfi = layer.querySelector(".chart-tag-mfi");
   let model = initial.chart;
   let scenariosVisible = initial.scenariosVisible !== false;
   let onScenarioHover = initial.onScenarioHover;
@@ -257,6 +282,8 @@ function bindChanChartHover(target, initialBinding) {
       && localY >= model.macdTop && localY <= model.macdBottom;
     const inDmiPane = Number.isFinite(model.dmiTop) && Number.isFinite(model.dmiBottom)
       && localY >= model.dmiTop && localY <= model.dmiBottom;
+    const inMfiPane = Number.isFinite(model.mfiTop) && Number.isFinite(model.mfiBottom)
+      && localY >= model.mfiTop && localY <= model.mfiBottom;
     const plotHeight = model.plotBottom - model.plotTop;
     const priceRange = model.maximum - model.minimum;
     const cursorY = Math.max(model.plotTop, Math.min(model.plotBottom, localY));
@@ -288,6 +315,12 @@ function bindChanChartHover(target, initialBinding) {
         horizontalDmi.removeAttribute("visibility");
       } else horizontalDmi.setAttribute("visibility", "hidden");
     }
+    if (horizontalMfi) {
+      if (inMfiPane) {
+        setLine(horizontalMfi, model.plotLeft, localY, model.plotRight, localY);
+        horizontalMfi.removeAttribute("visibility");
+      } else horizontalMfi.setAttribute("visibility", "hidden");
+    }
     const displayDate = candle.displayDate || candle.date;
     const axisDate = displayDate.includes(" ") ? displayDate.slice(5) : displayDate;
     const dateWidth = Math.max(84, axisDate.length * 7 + 12);
@@ -312,9 +345,12 @@ function bindChanChartHover(target, initialBinding) {
       ? model.macdMax - (localY - model.macdTop) / Math.max(1, model.macdBottom - model.macdTop) * (model.macdMax - model.macdMin) : null;
     const dmiAtCursor = inDmiPane
       ? 100 * (model.dmiBottom - localY) / Math.max(1, model.dmiBottom - model.dmiTop) : null;
+    const mfiAtCursor = inMfiPane
+      ? 100 * (model.mfiBottom - localY) / Math.max(1, model.mfiBottom - model.mfiTop) : null;
     setPaneTag(tagVolume, inVolumePane, volumeAtCursor == null ? "" : formatVolume(Math.max(0, volumeAtCursor)), localY);
     setPaneTag(tagMacd, inMacdPane, macdAtCursor == null ? "" : formatIndicator(macdAtCursor), localY);
     setPaneTag(tagDmi, inDmiPane, dmiAtCursor == null ? "" : formatIndicator(dmiAtCursor), localY);
+    setPaneTag(tagMfi, inMfiPane, mfiAtCursor == null ? "" : formatIndicator(mfiAtCursor), localY);
     if (candle.pending ? shownCandle?.key !== candle.key : shownCandle !== candle) {
       title.textContent = displayDate;
       subtitle.textContent = `${model.periodLabel} · ${candle.pending ? "待开盘 K 线" : candle.isForming ? "形成中 K 线" : "已收盘 K 线"}`;
@@ -406,11 +442,9 @@ function bindChanChartHover(target, initialBinding) {
     const historyRight = model.historyRight ?? model.plotRight;
     const slot = (historyRight - model.plotLeft) / visibleBars;
     if (point.x > historyRight) {
-      if (Number(model.endOffset) > 0) { hide(); return; }
-      const pendingIndex = Number(model.pendingSlotCount) || 0;
-      const pendingDate = model.pendingOpenDates?.[pendingIndex];
-      if (!pendingDate) { hide(); return; }
-      show(model.candles.length + pendingIndex, point.y, point.x, pendingDate);
+      // 右侧预留区用于条件情景路径；它没有对应的 K 线日期。
+      // 真正的未来槽会在 historyRight 以内按时间轴索引命中。
+      hide();
       return;
     }
     const index = Math.floor((point.x - model.plotLeft) / slot);
@@ -528,9 +562,7 @@ function chanPaleCandleColor(color, amount = 0.54) {
   return "rgb(" + channel(16) + ", " + channel(8) + ", " + channel(0) + ")";
 }
 
-// The scenario toggle is painted into the canvas, but its glyph comes from the
-// Element UI icon font. Load that font explicitly and repaint once it arrives;
-// until then a plain question mark keeps the control legible.
+// 条件情景开关使用 Element UI 的帮助图标字体；字体载入后重绘图表。
 let elementIconFontReady = false;
 let elementIconFontAttempted = false;
 function ensureElementIconFont(render) {
@@ -540,7 +572,7 @@ function ensureElementIconFont(render) {
   document.fonts.load("11px element-icons").then(() => {
     elementIconFontReady = document.fonts.check("11px element-icons");
     render();
-  }).catch(() => { /* Keep the plain question-mark fallback. */ });
+  }).catch(() => { /* 字体载入失败时使用普通字符兜底。 */ });
 }
 
 // Chart-local volume shorthand: keeps the indicator header and tooltip compact
@@ -555,6 +587,7 @@ function formatVolume(value) {
 }
 
 function formatIndicator(value) {
+  if (value == null || value === "") return "--";
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
   return `${number > 0 ? "+" : ""}${number.toFixed(2)}`;
@@ -595,11 +628,13 @@ function indicatorHeaderText(candle) {
       volume: "成交量  -",
       macd: "MACD  -", macdCompact: "MACD -", macdInterpretation: "", macdCompactInterpretation: "",
       dmi: "DMI  -", dmiCompact: "DMI -", dmiStatus: "", dmiInterpretation: "",
+      mfi: "MFI  -", mfiCompact: "MFI -", mfiStatus: "", mfiInterpretation: "",
     };
   }
   const volume = candle && Number.isFinite(Number(candle.volume)) ? formatVolume(candle.volume) : "--";
   const macd = candle?.macd;
   const dmi = candle?.dmi;
+  const mfi = candle?.mfi;
   const balanced = dmi && Math.abs(dmi.difference) < 0.01;
   const dmiLeader = !dmi ? "" : balanced
     ? "多空均衡" : dmi.difference > 0 ? "多头" : "空头";
@@ -630,6 +665,20 @@ function indicatorHeaderText(candle) {
       : "DMI(14,6) 预热中",
     dmiStatus,
     dmiInterpretation,
+    mfi: Number.isFinite(mfi?.value)
+      ? `MFI ${formatIndicator(mfi.value)} · 均线 ${formatIndicator(mfi.average)} · 标普 ${formatIndicator(mfi.benchmark)}`
+      : "MFI（14）预热中",
+    mfiCompact: Number.isFinite(mfi?.value)
+      ? `MFI ${compactIndicatorValue(mfi.value)} · 均线 ${compactIndicatorValue(mfi.average)} · 标普 ${compactIndicatorValue(mfi.benchmark)}`
+      : "MFI 预热中",
+    mfiStatus: !Number.isFinite(mfi?.value) ? "预热中"
+      : mfi.value >= 80 ? "超买区"
+        : mfi.value <= 20 ? "超卖区"
+          : Number.isFinite(mfi.benchmark) ? (mfi.value > mfi.benchmark ? "个股强于标普" : mfi.value < mfi.benchmark ? "个股弱于标普" : "与标普接近") : "标普数据暂缺",
+    mfiInterpretation: !Number.isFinite(mfi?.value) ? "MFI指标预热中"
+      : mfi.value >= 80 ? "MFI高于80，资金流处于超买区"
+        : mfi.value <= 20 ? "MFI低于20，资金流处于超卖区"
+          : Number.isFinite(mfi.benchmark) ? (mfi.value > mfi.benchmark ? "个股资金强于标普" : "个股资金弱于标普") : "等待标普MFI对比",
   };
 }
 
@@ -684,7 +733,7 @@ function drawChanIndicatorHeaders(target, model, candle) {
   const canvas = target.querySelector("canvas.chan-chart-canvas");
   const context = canvas?.getContext("2d");
   if (!context || !model || !(canvas.width > 0) || !(canvas.height > 0)
-    || (![model.volumeTop, model.macdTop, model.dmiTop].some(Number.isFinite))) return;
+    || (![model.volumeTop, model.macdTop, model.dmiTop, model.mfiTop].some(Number.isFinite))) return;
   const svg = target.querySelector("svg");
   const chartWidth = typeof svg?.getBoundingClientRect === "function" ? svg.getBoundingClientRect().width || 0 : 0;
   const leftBleed = Number(canvas.dataset?.leftBleed) || 0;
@@ -710,7 +759,16 @@ function drawChanIndicatorHeaders(target, model, candle) {
     drawInlineIndicatorHeader(context, model, model.plotLeft, model.macdTop - 6, width,
       header.macd, header.macdInterpretation, header.macdCompact, header.macdCompactInterpretation, color, macdColor);
   }
-  if (!Number.isFinite(model.dmiTop)) return;
+  if (!Number.isFinite(model.dmiTop)) {
+    if (Number.isFinite(model.mfiTop)) {
+      context.clearRect(model.plotLeft - 2, model.mfiTop - 18, width, 16);
+      const value = Number(candle?.mfi?.value);
+      const mfiColor = Number.isFinite(value) ? (value >= 80 ? bearishColor : value <= 20 ? bullishColor : color) : color;
+      drawInlineIndicatorHeader(context, model, model.plotLeft, model.mfiTop - 6, width,
+        header.mfi, header.mfiInterpretation, header.mfiCompact, header.mfiStatus, color, mfiColor);
+    }
+    return;
+  }
   context.clearRect(model.plotLeft - 2, model.dmiTop - 18, width, 16);
   // 美股图表使用绿色表示上涨、红色表示下跌。
   const dmiDifference = Number(candle?.dmi?.difference);
@@ -718,6 +776,13 @@ function drawChanIndicatorHeaders(target, model, candle) {
     ? color : dmiDifference > 0 ? bullishColor : bearishColor;
   drawInlineIndicatorHeader(context, model, model.plotLeft, model.dmiTop - 6, width,
     header.dmi, header.dmiInterpretation, header.dmiCompact, header.dmiStatus, color, dmiColor);
+  if (Number.isFinite(model.mfiTop)) {
+    context.clearRect(model.plotLeft - 2, model.mfiTop - 18, width, 16);
+    const value = Number(candle?.mfi?.value);
+    const mfiColor = Number.isFinite(value) ? (value >= 80 ? bearishColor : value <= 20 ? bullishColor : color) : color;
+    drawInlineIndicatorHeader(context, model, model.plotLeft, model.mfiTop - 6, width,
+      header.mfi, header.mfiInterpretation, header.mfiCompact, header.mfiStatus, color, mfiColor);
+  }
 }
 
 function drawChanCanvas(target, binding) {
@@ -1561,6 +1626,82 @@ function drawChanCanvas(target, binding) {
       header.dmiCompact, header.dmiStatus, colors.text, dmiColor);
     line(model.plotLeft, model.dmiBottom, model.plotRight, model.dmiBottom, colors.axis, [], 1);
   }
+  // MFI 固定使用 0–100 范围，白线为个股，淡粉线为标普，均线按方向变色。
+  if (Number.isFinite(model.mfiTop) && Number.isFinite(model.mfiBottom)) {
+    const mfiHeight = model.mfiBottom - model.mfiTop;
+    const mfiY = (value) => model.mfiTop + (100 - value) / 100 * mfiHeight;
+    line(model.plotLeft, model.mfiTop, model.plotRight, model.mfiTop, colors.grid, [2, 4], 1);
+    for (const value of [20, 50, 80]) {
+      const y = mfiY(value);
+      line(model.plotLeft, y, model.plotRight, y, value === 50 ? colors.fieldLine : colors.amber, [4, 3], value === 50 ? 0.8 : 1.1);
+      label(String(value), model.plotLeft - 8, y + 3, {
+        align: "right", font: `${model.mobileChart ? 11 : 9}px Inter, ui-sans-serif, system-ui, sans-serif`,
+        color: value === 50 ? colors.text : colors.amber,
+      });
+    }
+    const drawMfiLine = (key, color, lineWidth = 1.5) => {
+      context.beginPath();
+      let started = false;
+      for (const candle of model.candles || []) {
+        const rawValue = candle.mfi?.[key];
+        if (rawValue == null || rawValue === "") { started = false; continue; }
+        const value = Number(rawValue);
+        if (!Number.isFinite(value)) { started = false; continue; }
+        const y = mfiY(value);
+        if (started) context.lineTo(candle.x, y);
+        else { context.moveTo(candle.x, y); started = true; }
+      }
+      if (!started) return;
+      context.strokeStyle = color;
+      context.lineWidth = lineWidth;
+      context.setLineDash([]);
+      context.stroke();
+    };
+    drawMfiLine("value", colors.textPrimary, model.mobileChart ? 2 : 1.5);
+    drawMfiLine("benchmark", "#d58aa6", 1.1);
+    let previousTrend = null;
+    for (const candle of model.candles || []) {
+      const rawValue = candle.mfi?.average;
+      if (rawValue == null || rawValue === "") { previousTrend = null; continue; }
+      const value = Number(rawValue);
+      if (!Number.isFinite(value)) { previousTrend = null; continue; }
+      const current = { x: candle.x, y: mfiY(value), trend: candle.mfi?.trend };
+      if (previousTrend && previousTrend.trend === current.trend) {
+        context.beginPath();
+        context.moveTo(previousTrend.x, previousTrend.y);
+        context.lineTo(current.x, current.y);
+        context.strokeStyle = current.trend === "up" ? colors.down : current.trend === "down" ? colors.up : colors.axis;
+        context.lineWidth = model.mobileChart ? 2 : 1.4;
+        context.stroke();
+      }
+      previousTrend = current;
+    }
+    for (const event of model.mfiEvents || []) {
+      const color = event.side === "buy" ? colors.down : colors.up;
+      const radius = model.mobileChart ? 4 : 3;
+      context.beginPath();
+      if (event.side === "buy") {
+        context.moveTo(event.x, event.y - radius);
+        context.lineTo(event.x - radius, event.y + radius);
+        context.lineTo(event.x + radius, event.y + radius);
+      } else {
+        context.moveTo(event.x, event.y + radius);
+        context.lineTo(event.x - radius, event.y - radius);
+        context.lineTo(event.x + radius, event.y - radius);
+      }
+      context.closePath();
+      context.fillStyle = color;
+      context.fill();
+    }
+    const latestCandle = latestIndicatorCandle(model);
+    const header = indicatorHeaderText(latestCandle);
+    const value = Number(latestCandle?.mfi?.value);
+    const mfiColor = Number.isFinite(value) ? (value >= 80 ? colors.down : value <= 20 ? colors.up : colors.text) : colors.text;
+    drawInlineIndicatorHeader(context, model, model.plotLeft, model.mfiTop - 6,
+      Math.max(1, model.plotRight - model.plotLeft), header.mfi, header.mfiInterpretation,
+      header.mfiCompact, header.mfiStatus, colors.text, mfiColor);
+    line(model.plotLeft, model.mfiBottom, model.plotRight, model.mfiBottom, colors.axis, [], 1);
+  }
   // Bottom axis and the three visible date anchors.
   line(model.plotLeft, model.plotBottom, model.plotRight, model.plotBottom, colors.axis, [], 1);
   for (const date of model.dates || []) {
@@ -1623,8 +1764,7 @@ function drawChanCanvas(target, binding) {
     }
     context.restore();
   }
-  // Scenario visibility control. The glyph is painted here; a transparent
-  // HTML button above the canvas keeps focus, keyboard and tooltip behavior.
+  // 按钮保持透明覆盖层，以保留键盘聚焦与原生点击行为。
   const toggle = target.querySelector(".chan-scenario-toggle-canvas");
   const toggleActive = Boolean(toggle?.matches?.(":hover, :focus-visible"));
   const toggleSize = model.mobileChart ? 22 : 16;
@@ -1642,7 +1782,7 @@ function drawChanCanvas(target, binding) {
   context.textBaseline = "middle";
   if (elementIconFontReady) {
     context.font = `${model.mobileChart ? 13 : 11}px element-icons`;
-    context.fillText("\ue7b3", toggleX + toggleSize / 2, toggleY + toggleSize / 2);
+    context.fillText("\ue73d", toggleX + toggleSize / 2, toggleY + toggleSize / 2);
   } else {
     context.font = `700 ${model.mobileChart ? 12 : 10}px Inter, ui-sans-serif, system-ui, sans-serif`;
     context.fillText("?", toggleX + toggleSize / 2, toggleY + toggleSize / 2 + 0.5);

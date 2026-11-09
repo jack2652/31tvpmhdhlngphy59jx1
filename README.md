@@ -211,7 +211,7 @@ go run cmd/go-server/main.go
 | `SCHEDULER_ENABLED` | `true` | 是否启用定时历史清理和数据库维护；不控制行情刷新 |
 | `RESOURCE_MODE` | `auto` | 统一资源开关，只接受 `auto` / `off`。`auto` 启动时检测物理 RAM、cgroup v1/v2（含可见父级）上限和 CPU，自动计算 Go GC 软上限、低内存保护、上游并发与槽位等待时间；`off` 不做任何限制（关闭 Go 软上限，上游并发使用默认上限 6，槽位等待 20 秒） |
 | `UPSTREAM_TIMEOUT_SECONDS` | `12` | Yahoo / Alpaca 请求超时秒数 |
-| `CBOE_TIMEOUT_SECONDS` | `15` | Cboe 期权请求超时秒数 |
+| `CBOE_TIMEOUT_SECONDS` | `45` | Cboe 期权请求超时秒数；指数期权快照体积较大，默认留出更长读取时间 |
 | `GOMEMLIMIT` | 未设置 | 标准 Go 运行时配置；仅 `RESOURCE_MODE=auto` 时作为显式的软上限覆盖，`off` 会关闭软上限。此变量不支持 `auto` |
 | `ANALYSIS_CACHE_ENTRIES` | `128` | 压力位/支撑位分析缓存条目数；低内存模式固定为 8，`.env.example` 面向小磁盘预设为 512 |
 | `SIZE_CLEANUP_TIME_BUDGET_SECONDS` | `120` | 数据库超限清理每次运行的时间预算；`0` 表示不限制 |

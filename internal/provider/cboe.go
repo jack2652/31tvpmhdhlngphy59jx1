@@ -30,8 +30,24 @@ const (
 
 var (
 	occContractPattern = regexp.MustCompile(`^(?P<root>.+?)(?P<date>[0-9]{6})(?P<type>[CP])(?P<strike>[0-9]{8})$`)
-	cboeSymbolPattern  = regexp.MustCompile(`^[A-Z0-9][A-Z0-9.\-]{0,9}$`)
+	cboeSymbolPattern  = regexp.MustCompile(`^_?[A-Z0-9][A-Z0-9.\-]{0,9}$`)
 )
+
+// CboeOptionSymbol maps Yahoo market-index symbols to Cboe's option snapshot roots.
+func CboeOptionSymbol(raw string) (string, bool) {
+	symbol, err := NormalizeSymbol(raw)
+	if err != nil {
+		return "", false
+	}
+	switch symbol {
+	case "^GSPC", "^SPX", "SPX":
+		return "_SPX", true
+	case "^NDX", "NDX":
+		return "_NDX", true
+	default:
+		return "", false
+	}
+}
 
 // CboeOptionDTO represents one delayed quote row returned by Cboe's public
 // options endpoint. Values remain raw JSON because the endpoint can encode
@@ -508,7 +524,7 @@ func cboeExpirationsFromPayload(symbol string, payload CboeOptionsPayloadDTO) ([
 			continue
 		}
 		contract, parseErr := ParseOCCOption(row.Option)
-		if parseErr != nil || normalizeOCCRoot(contract.Root) != normalizeOCCRoot(symbol) {
+		if parseErr != nil || !cboeOCCRootsMatch(symbol, contract.Root) {
 			continue
 		}
 		values[contract.Expiration] = struct{}{}
@@ -571,7 +587,7 @@ func cboeChainRowsFromPayload(symbol, expiration string, payload CboeOptionsPayl
 			continue
 		}
 		contract, parseErr := ParseOCCOption(row.Option)
-		if parseErr != nil || contract.Expiration != expiration || normalizeOCCRoot(contract.Root) != normalizeOCCRoot(symbol) {
+		if parseErr != nil || contract.Expiration != expiration || !cboeOCCRootsMatch(symbol, contract.Root) {
 			continue
 		}
 		itm := false
@@ -632,11 +648,32 @@ func cboeMarketState(moment time.Time) string {
 func normalizeOCCRoot(value string) string {
 	// Python matches Cboe roots with root.replace('.', '') only; it does not
 	// remove embedded OCC padding spaces. Preserve those spaces here too.
-	return strings.ReplaceAll(strings.ToUpper(value), ".", "")
+	return strings.TrimPrefix(strings.ReplaceAll(strings.ToUpper(value), ".", ""), "_")
+}
+
+// cboeOCCRootsMatch 同时接受指数的标准与周度 OCC 根。
+// Cboe 的 _SPX/_NDX 快照分别包含 SPX/SPXW 与 NDX/NDXP，精确匹配会漏掉周度到期日。
+func cboeOCCRootsMatch(symbol, root string) bool {
+	want := normalizeOCCRoot(symbol)
+	got := normalizeOCCRoot(root)
+	if want == got {
+		return true
+	}
+	switch want {
+	case "SPX":
+		return got == "SPXW"
+	case "NDX":
+		return got == "NDXP"
+	default:
+		return false
+	}
 }
 
 func normalizeCboeSymbol(raw string) (string, error) {
 	symbol := strings.ToUpper(strings.TrimSpace(raw))
+	if optionSymbol, ok := CboeOptionSymbol(symbol); ok {
+		symbol = optionSymbol
+	}
 	if !cboeSymbolPattern.MatchString(symbol) {
 		return "", fmt.Errorf("invalid Cboe symbol: %s", raw)
 	}

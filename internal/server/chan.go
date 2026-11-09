@@ -12,6 +12,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	chananalysis "option-scope-go/internal/chan"
 	"option-scope-go/internal/marketcalendar"
 	"option-scope-go/internal/model"
+	"option-scope-go/internal/provider"
 	"option-scope-go/internal/store"
 )
 
@@ -398,6 +400,7 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 		adjustedIntraday, skippedIntraday = adjustedIntradayBars(intradayBars(intradayEntry), bars)
 	}
 	marketHistory, marketSource, marketWarning, marketRefreshing := s.chanMarketHistory()
+	mfiHistory, mfiSource, mfiFetchedAt, mfiSymbol, mfiRefreshing, marketWarning := s.chanMfiHistory(marketHistory, marketSource, marketWarning, marketRefreshing)
 	marketBars := adjustedAnalysisBars(marketHistory.bars, cutoff)
 	marketSeries := chananalysis.ClassifyMarketEnvironment(marketBars)
 	keyDailyBars := completedChanDailyBarsForCache(bars, cutoff)
@@ -463,12 +466,12 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	if rawSpot != nil && adjustedSpot == nil && factor != nil {
 		result.Warnings = append(result.Warnings, "当前现价无效；未与复权结构比较")
 	}
-	result.Daily.FutureTradingDates = futureTradingDates(result.Daily)
+	result.Daily.FutureTradingDates = futureTradingDates(result.Daily, provider.IsFutureSymbol(symbol))
 	if marketWarning != "" {
 		result.Warnings = append(result.Warnings, marketWarning)
 	}
 	c.Header("X-Chan-Analysis-Cache", analysisCache)
-	response := gin.H{"symbol": symbol, "ready": true, "analysis_cache": analysisCache, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": "^GSPC", "source": marketSource, "fetched_at": marketHistory.fetchedAt, "refreshing": marketRefreshing}, "price_coordinate": priceCoordinate, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}}
+	response := gin.H{"symbol": symbol, "ready": true, "analysis_cache": analysisCache, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": mfiSymbol, "source": mfiSource, "fetched_at": mfiFetchedAt, "refreshing": mfiRefreshing, "daily": compactMfiHistoryBars(mfiHistory.bars)}, "price_coordinate": priceCoordinate, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}}
 	if compact {
 		response["daily"] = compactChanFrame{Frame: result.Daily}
 		response["weekly"] = compactChanFrame{Frame: result.Weekly}
@@ -478,7 +481,40 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
-func futureTradingDates(frame chananalysis.Frame) []string {
+// compactMfiHistoryBars 只输出 MFI 所需的日线 OHLCV，避免把市场结构缓存复制到响应中。
+func compactMfiHistoryBars(rows []map[string]any) []gin.H {
+	result := make([]gin.H, 0, len(rows))
+	for _, row := range rows {
+		date, _ := row["date"].(string)
+		if date == "" {
+			continue
+		}
+		item := gin.H{"date": date}
+		for _, field := range []string{"open", "high", "low", "close", "volume"} {
+			if value, ok := historyMapNumber(row, field); ok {
+				item[field] = value
+			}
+		}
+		result = append(result, item)
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		return result[i]["date"].(string) < result[j]["date"].(string)
+	})
+	return result
+}
+
+func hasMfiVolume(rows []map[string]any) bool {
+	positive := 0
+	for _, row := range rows {
+		volume, ok := historyMapNumber(row, "volume")
+		if ok && volume > 0 {
+			positive++
+		}
+	}
+	return positive >= 15
+}
+
+func futureTradingDates(frame chananalysis.Frame, isFuture bool) []string {
 	if frame.Period != "1d" || len(frame.Candles) == 0 {
 		return nil
 	}
@@ -494,7 +530,16 @@ func futureTradingDates(frame chananalysis.Frame) []string {
 	count := len(frame.Candles)*3/4 + 1
 	dates := make([]string, 0, count)
 	for index := 0; index < count; index++ {
-		days = marketcalendar.NextTradingDayOrdinal(days)
+		for {
+			days++
+			weekday := marketcalendar.WeekdayOrdinal(days)
+			if weekday == 0 || weekday == 6 {
+				continue
+			}
+			if isFuture || marketcalendar.IsTradingDayOrdinal(days) {
+				break
+			}
+		}
 		dates = append(dates, marketcalendar.FormatDateOnly(days))
 	}
 	return dates
@@ -863,6 +908,37 @@ func attachMarketEnvironment(frame *chananalysis.Frame, series []chananalysis.Ma
 // with the S&P 500 ticker. It never falls back to raw OHLC.
 func (s *Service) chanMarketHistory() (chanAdjustedHistoryCacheEntry, string, string, bool) {
 	return s.chanAdjustedHistory("^GSPC")
+}
+
+func (s *Service) chanMfiHistory(indexHistory chanAdjustedHistoryCacheEntry, source, warning string, refreshing bool) (chanAdjustedHistoryCacheEntry, string, time.Time, string, bool, string) {
+	history, historySource, fetchedAt, symbol := indexHistory, source, indexHistory.fetchedAt, "^GSPC"
+	if hasMfiVolume(indexHistory.bars) {
+		return history, historySource, fetchedAt, symbol, refreshing, warning
+	}
+
+	// 指数本身通常没有成交量，不能直接计算 MFI。优先用 SPY 作为标普
+	// 的可交易代理，只影响副图资金流对比，不改变 ^GSPC 市场环境判断。
+	s.ensureChanAdjustedHistory("SPY")
+	spyHistory, spySource, _, spyRefreshing := s.chanAdjustedHistory("SPY")
+	spyRefreshing = spyRefreshing || s.chanAdjustedJobActive("SPY")
+	refreshing = refreshing || spyRefreshing
+	if hasMfiVolume(spyHistory.bars) {
+		history, historySource, fetchedAt, symbol = spyHistory, spySource, spyHistory.fetchedAt, "SPY"
+		if spyRefreshing {
+			warning = strings.TrimSpace(strings.TrimSuffix(warning, "；"))
+			if warning != "" {
+				warning += "；"
+			}
+			warning += "标普 MFI 使用 SPY 代理数据并在后台更新"
+		}
+	} else if spyRefreshing {
+		warning = strings.TrimSpace(strings.TrimSuffix(warning, "；"))
+		if warning != "" {
+			warning += "；"
+		}
+		warning += "标普 MFI 代理数据正在后台获取"
+	}
+	return history, historySource, fetchedAt, symbol, refreshing, warning
 }
 
 func recordChanStructureFrame(repository *store.SQLite, symbol, timeframe, ruleVersion string, bars []chananalysis.Bar, frame *chananalysis.Frame) {
@@ -1238,7 +1314,7 @@ func rawChanHistoryBars(adjusted []map[string]any) []map[string]any {
 // chanAnalysis shares the existing daily history cache and asynchronous
 // prefetch. It never fetches upstream history on the foreground request.
 func (s *Service) chanAnalysis(c *gin.Context) {
-	if !s.validateQuery(c, positiveFloatQueryRule("spot"), boolQueryRule("light")) {
+	if !s.validateQuery(c, positiveFloatQueryRule("spot"), boolQueryRule("light"), boolQueryRule("include_mfi_market_history")) {
 		return
 	}
 	symbol, err := normalizeAPISymbol(c.Param("symbol"))
@@ -1247,6 +1323,11 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 		return
 	}
 	light, err := queryBool(c, "light", false)
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	includeMfiMarketHistory, err := queryBool(c, "include_mfi_market_history", false)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
 		return
@@ -1327,6 +1408,9 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 	}
 	warnings := append([]string(nil), result.Warnings...)
 	warnings = append(warnings, "历史沿用现有未复权日线；拆股和除息跳空可能改变笔与中枢，请结合公司行动核对")
+	if !light {
+		result.Daily.FutureTradingDates = futureTradingDates(result.Daily, provider.IsFutureSymbol(symbol))
+	}
 	expected := chanExpectedHistoryDay(now)
 	asOf := result.Daily.AsOf
 	if light {
@@ -1355,6 +1439,14 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 		"trend": trend, "trend_market": trendMarketData, "extremes": extremes["extremes"],
 		"beta": beta["beta"], "trend_stop_loss": stopLoss, "market_analysis": marketAnalysis,
 		"history": gin.H{"source": cacheSource(history["bars"], history["fetched_at"]), "fetched_at": history["fetched_at"], "refreshing": refreshing, "bars": len(rawBars)},
+	}
+	if includeMfiMarketHistory {
+		indexHistory, marketSource, marketWarning, marketRefreshing := s.chanMarketHistory()
+		mfiHistory, mfiSource, mfiFetchedAt, mfiSymbol, mfiRefreshing, marketWarning := s.chanMfiHistory(indexHistory, marketSource, marketWarning, marketRefreshing)
+		response["market_history"] = gin.H{"symbol": mfiSymbol, "source": mfiSource, "fetched_at": mfiFetchedAt, "refreshing": mfiRefreshing, "daily": compactMfiHistoryBars(mfiHistory.bars)}
+		if marketWarning != "" {
+			response["warnings"] = append(warnings, marketWarning)
+		}
 	}
 	if light {
 		response["symbol"], response["spot"], response["generated_at"] = symbol, analysisSpot, now

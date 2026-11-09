@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,6 +25,36 @@ func (s hybridIntradayHistoryStub) FetchAdjusted(context.Context, string, string
 
 func (s hybridIntradayHistoryStub) FetchIntraday(context.Context, string, string) (HistoryResult, error) {
 	return s.result, s.err
+}
+
+func TestHybridIntradayHistorySkipsAlpacaForIndexesAndFutures(t *testing.T) {
+	var alpacaRequests atomic.Int32
+	alpacaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		alpacaRequests.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer alpacaServer.Close()
+
+	yahoo := HistoryResult{
+		Source: "go-yfinance",
+		Bars:   []map[string]any{{"date": "2026-11-06 09:30", "close": 100.0}},
+	}
+	hybrid := &Hybrid{
+		HistoryClient: hybridIntradayHistoryStub{result: yahoo},
+		Overnight:     NewAlpaca("test-key", "test-secret", alpacaServer.URL, alpacaServer.Client()),
+	}
+	for _, symbol := range []string{".NDX", "^NDX", "ES=F"} {
+		result, err := hybrid.IntradayHistory(context.Background(), symbol, "15m")
+		if err != nil {
+			t.Fatalf("IntradayHistory(%q) error = %v", symbol, err)
+		}
+		if result.Source != yahoo.Source || len(result.Bars) != len(yahoo.Bars) {
+			t.Fatalf("IntradayHistory(%q) = %+v, want Yahoo result", symbol, result)
+		}
+	}
+	if got := alpacaRequests.Load(); got != 0 {
+		t.Fatalf("Alpaca requests = %d, want none for indexes and futures", got)
+	}
 }
 
 func TestHybridIntradayHistoryMergesSourcesWithYahooPrecedence(t *testing.T) {

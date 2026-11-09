@@ -4,6 +4,7 @@ const vm = require("node:vm");
 
 const window = {};
 vm.runInNewContext(fs.readFileSync("web/static/common/js/chan-plan.js", "utf8"), { window });
+vm.runInNewContext(fs.readFileSync("web/static/common/js/chan-mfi.js", "utf8"), { window });
 vm.runInNewContext(fs.readFileSync("web/static/common/js/chan-client.js", "utf8"), { window });
 
 function frame(period = "1d") {
@@ -37,14 +38,14 @@ function frame(period = "1d") {
   };
 }
 
-const payload = { daily: frame(), weekly: frame("1w"), spot: 13, summary: {} };
+const payload = { daily: frame(), weekly: frame("1w"), spot: 13, summary: {}, market_history: { symbol: "^GSPC", daily: frame().candles } };
 const hidden = window.OptionScopeChan.view(payload).daily.chart;
-assert.ok([hidden.volumeTop, hidden.macdTop, hidden.dmiTop].every(Number.isNaN), "副图默认全部隐藏");
+assert.ok([hidden.volumeTop, hidden.macdTop, hidden.dmiTop, hidden.mfiTop].every(Number.isNaN), "副图默认全部隐藏");
 assert.equal(hidden.height, hidden.priceBottom + 38, "隐藏所有副图时画布不保留空白区域");
 
-for (const name of ["volume", "macd", "dmi"]) {
+for (const name of ["volume", "macd", "dmi", "mfi"]) {
   const chart = window.OptionScopeChan.view(payload, true, false, 30, null, null, { [name]: true }).daily.chart;
-  assert.equal([chart.volumeTop, chart.macdTop, chart.dmiTop].filter(Number.isFinite).length, 1, `${name} 单独开启时只显示自己的副图`);
+  assert.equal([chart.volumeTop, chart.macdTop, chart.dmiTop, chart.mfiTop].filter(Number.isFinite).length, 1, `${name} 单独开启时只显示自己的副图`);
   assert.ok(Number.isFinite(chart[`${name}Top`]), `${name} 单独开启时应获得绘图区`);
   assert.equal(chart.crosshairBottom, chart[`${name}Bottom`], `${name} 单独开启时十字线延伸到副图底部`);
   assert.equal(chart.height, chart[`${name}Bottom`] + 38, `${name} 单独开启时画布高度包含副图`);
@@ -65,6 +66,12 @@ assert.ok(Number.isFinite(allSubcharts.weekly.chart.volumeTop), "日线与周线
 const intraday = window.OptionScopeChan.intradayView({ period: "15m", frame: frame("15m"), spot: 13 }, true, null, false, 30, null, null, { macd: true }).chart;
 assert.ok(Number.isFinite(intraday.macdTop), "盘中图表使用相同的副图偏好");
 assert.ok(Number.isNaN(intraday.volumeTop) && Number.isNaN(intraday.dmiTop), "盘中图表隐藏未开启的副图");
+
+const mfiChart = window.OptionScopeChan.view(payload, true, false, 30, null, null, { mfi: true }).daily.chart;
+assert.ok(Number.isFinite(mfiChart.mfiTop) && Number.isFinite(mfiChart.mfiBottom), "MFI 指标开启时显示专用副图");
+assert.equal(mfiChart.mfiValues.mfi.length, mfiChart.candles.length, "MFI 个股序列与视口 K 线长度一致");
+assert.equal(mfiChart.mfiValues.benchmarkMfi.length, mfiChart.candles.length, "MFI 标普序列与视口 K 线长度一致");
+assert.match(mfiChart.description, /MFI（14）/, "图表说明列出 MFI 副图");
 
 window.OptionScopeGranville = {
   calculateWithLiveBar(candles) {
@@ -122,6 +129,8 @@ for (const mobileChart of [false, true]) {
 }
 
 const template = fs.readFileSync("web/static/index.html", "utf8");
+const futuresTemplate = fs.readFileSync("web/static/futures.html", "utf8");
+const futuresApp = fs.readFileSync("web/static/common/js/futures.js", "utf8");
 const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
 const client = fs.readFileSync("web/static/common/js/chan-client.js", "utf8");
 const charts = fs.readFileSync("web/static/common/js/charts.js", "utf8");
@@ -134,11 +143,11 @@ assert.match(template, /<summary>递归买卖点/, "递归买卖点使用明确�
 assert.match(template, /<summary>笔级转折预警/, "笔级转折预警使用明确折叠标题");
 assert.match(template, /<div class="chan-layer-menu-panel chan-period-menu-panel">[\s\S]*aria-label="K 线周期"/, "点击周期按钮后显示四个周期选项");
 assert.doesNotMatch(template, /chan-period-control-group/, "周期不再使用常驻分段控件");
-for (const [name, label] of [["volume", "成交量"], ["macd", "MACD"], ["dmi", "DMI"]]) {
+for (const [name, label] of [["volume", "成交量"], ["macd", "MACD"], ["dmi", "DMI"], ["mfi", "MFI"]]) {
   assert.ok(template.includes(`:aria-pressed="chanSubcharts.${name} ? 'true' : 'false'"`), `${label} 按钮提供 pressed 状态`);
   assert.ok(template.includes(`@click="toggleChanSubchart('${name}')">${label}</button>`), `${label} 按钮独立切换`);
 }
-assert.match(app, /const DEFAULT_CHAN_SUBCHARTS = \{ volume: false, macd: false, dmi: false \}/, "副图默认全部隐藏");
+assert.match(app, /const DEFAULT_CHAN_SUBCHARTS = \{ volume: false, macd: false, dmi: false, mfi: false \}/, "副图默认全部隐藏");
 assert.match(app, /toggleChanSubchart\(name\) \{[\s\S]*?rememberChanChartPreferences\(this\.chanPeriod, this\.chanChartLayers, this\.chanSubcharts\)/, "切换副图后保存到当前偏好");
 assert.match(client, /const subchartCacheKey = \["volume", "macd", "dmi"\][\s\S]*?\$\{subchartCacheKey\}/, "图表布局缓存区分副图组合");
 assert.match(charts, /Array\.isArray\(model\.indicatorDividers\)[\s\S]*?for \(const dividerY of dividerPositions\)/, "画布只绘制已启用副图之间的分隔线");
@@ -147,18 +156,24 @@ assert.match(template, /<details class="chan-subchart-menu"[\s\S]*?<\/details>[\
 assert.match(template, /<summary aria-label="技术指标设置">指标<\/summary>/, "指标菜单有明确的可访问名称");
 assert.doesNotMatch(template, /<details class="chan-indicator-description"/, "指标名称不使用下拉式 disclosure");
 assert.doesNotMatch(app, /chanIndicatorHelp|toggleChanIndicatorHelp/, "不维护与图层状态重复的说明状态");
-assert.match(template, /<div class="chan-indicator-options">[\s\S]*?aria-controls="chan-af-stochz-help" @click="toggleChanChartLayer\('afStochZ'\)">AF StochZ<\/button>[\s\S]*?aria-controls="chan-turtle-help" @click="toggleChanChartLayer\('turtle'\)">海龟交易法<\/button>[\s\S]*?aria-controls="chan-granville-help" @click="toggleChanChartLayer\('granville'\)">葛兰碧法则<\/button>[\s\S]*?aria-controls="chan-macd-sma200-help" @click="toggleChanChartLayer\('macdSma200'\)">MACD \+ SMA 200<\/button>[\s\S]*?aria-controls="chan-supertrend-help" @click="toggleChanChartLayer\('supertrend'\)">SuperTrend<\/button>/, "AF StochZ、海龟、葛兰碧、MACD + SMA200 和 SuperTrend 按顺序位于指标菜单");
+assert.match(futuresApp, /\{ value: "afStochZ", label: "AF StochZ" \}[\s\S]*?\{ value: "turtle", label: "海龟交易法" \}[\s\S]*?\{ value: "granville", label: "葛兰碧法则" \}[\s\S]*?\{ value: "wyckoff", label: "威科夫阶段" \}[\s\S]*?\{ value: "supertrend", label: "超级趋势" \}[\s\S]*?\{ value: "macdSma200", label: "异同移动平均线 \+ 200期简单均线" \}/, "期货页指标按钮顺序与股票行情页保持一致");
+assert.match(futuresApp, /function signalTimestamp\(signal\)[\s\S]*?signal\?\.confirmed_at \|\| signal\?\.observed_at \|\| signal\?\.date/, "期货指标信号使用确认、观察、结构日期判断时间");
+assert.match(futuresApp, /signals\(\) \{[\s\S]*?\.sort\(\(left, right\) => signalTimestamp\(right\) - signalTimestamp\(left\)\)\.slice\(0, 8\)/, "期货指标信号按最近时间降序并限制显示数量");
+assert.match(template, /<div class="chan-indicator-options">[\s\S]*?aria-controls="chan-af-stochz-help" @click="toggleChanChartLayer\('afStochZ'\)">AF StochZ<\/button>[\s\S]*?aria-controls="chan-turtle-help" @click="toggleChanChartLayer\('turtle'\)">海龟交易法<\/button>[\s\S]*?aria-controls="chan-granville-help" @click="toggleChanChartLayer\('granville'\)">葛兰碧法则<\/button>[\s\S]*?aria-controls="chan-wyckoff-help" @click="toggleChanChartLayer\('wyckoff'\)">威科夫阶段<\/button>[\s\S]*?aria-controls="chan-supertrend-help" @click="toggleChanChartLayer\('supertrend'\)">超级趋势<\/button>[\s\S]*?aria-controls="chan-macd-sma200-help" @click="toggleChanChartLayer\('macdSma200'\)">异同移动平均线 \+ 200期简单均线<\/button>/, "价格指标按钮按当前菜单顺序渲染");
 const signalMarkerSection = template.match(/<section class="chan-layer-menu-signals">[\s\S]*?<\/section>/)?.[0] || "";
 assert.doesNotMatch(signalMarkerSection, />AF StochZ<\/button>/, "AF StochZ 不再归入缠论信号标记");
 assert.match(template, /id="chan-turtle-help" class="chan-indicator-description-body"[^>]*v-show="chanChartLayers\.turtle"[\s\S]*?class="chan-turtle-legend"/, "海龟图层开启时在按钮下方显示说明和图例");
 assert.match(template, /id="chan-granville-help" class="chan-indicator-description-body"[^>]*v-show="chanChartLayers\.granville"[\s\S]*?class="chan-granville-legend"/, "葛兰碧图层开启时在按钮下方显示说明和图例");
 assert.match(template, /id="chan-macd-sma200-help" class="chan-indicator-description-body"[^>]*v-show="chanChartLayers\.macdSma200"[\s\S]*?class="chan-macd-sma200-legend"/, "MACD + SMA200 图层开启时在按钮下方显示说明和图例");
 assert.match(template, /id="chan-af-stochz-help" class="chan-indicator-description-body"[^>]*v-show="chanChartLayers\.afStochZ"/, "AF StochZ 图层开启时显示对应说明");
+assert.doesNotMatch(template, /chan-mfi-help|MFI 资金流量指标说明/, "MFI 菜单不再显示额外说明");
+assert.match(futuresTemplate, /@click="toggleSubchart\('mfi'\)">MFI<\/button>/, "期货页 MFI 按钮使用简洁名称");
 assert.match(template, /结合指标强弱和价格转折提示买卖；两者走势不一致时标记背离（指标买卖与背离）。/, "AF StochZ 说明显示用户指定的指标名称");
 assert.doesNotMatch(template, /aria-label="显示海龟交易法指标"|aria-label="显示葛兰碧法则指标"/, "不再显示独立指标复选框");
 assert.match(template, /20 根前序 K 线突破入场，10 根反向通道退出/, "海龟菜单保留入场与退出说明");
 assert.ok(template.indexOf("/static/common/js/chan-turtle.js") < template.indexOf("/static/common/js/chan-client.js"), "海龟计算脚本先于图表客户端加载");
 assert.ok(template.indexOf("/static/common/js/chan-macd-sma.js") < template.indexOf("/static/common/js/chan-client.js"), "MACD + SMA200 计算脚本先于图表客户端加载");
+assert.ok(template.indexOf("/static/common/js/chan-mfi.js") < template.indexOf("/static/common/js/chan-client.js"), "MFI 计算脚本先于图表客户端加载");
 assert.match(styles, /\.chan-layer-menu>summary,\.chan-subchart-menu>summary,\.chan-period-menu>summary,\.chan-indicator-menu>summary\{min-height:44px\}/, "移动端菜单按钮统一为 44px 触控高度");
 assert.match(styles, /\.chan-period-menu-panel\{grid-template-areas:"display";grid-template-columns:minmax\(0,1fr\);width:min\(330px,calc\(100vw - 40px\)\)/, "周期面板按四个选项收窄");
 assert.match(styles, /\.chan-indicator-options\{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px\}/, "指标按钮紧凑排列且窄屏可换行");

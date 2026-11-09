@@ -485,8 +485,8 @@ func TestCachedPayloadAvailableRejectsMalformedShapes(t *testing.T) {
 
 func TestLevelsAnalysisCacheVersionInvalidatesPreviousAlgorithmResults(t *testing.T) {
 	key := levelsAnalysisCacheKey("ORCL", "2026-10-16", nil, nil, model.Quote{}, nil, nil, nil, nil, nil, nil, nil)
-	if !strings.HasPrefix(key, "levels-v25:") {
-		t.Fatalf("levels cache key=%q, want current v21 namespace", key)
+	if !strings.HasPrefix(key, levelsAnalysisCacheVersion+":") {
+		t.Fatalf("levels cache key=%q, want current %s namespace", key, levelsAnalysisCacheVersion)
 	}
 	if strings.HasPrefix(key, "levels-v20:") {
 		t.Fatalf("levels cache key reused stale v20 namespace: %q", key)

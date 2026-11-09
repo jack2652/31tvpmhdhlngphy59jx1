@@ -289,6 +289,66 @@ func TestYahooInteractiveRequestsBypassSaturatedSharedGate(t *testing.T) {
 	}
 }
 
+func TestYahooFutureQuoteUsesChartWithoutSDKAuthentication(t *testing.T) {
+	now := time.Date(2026, time.November, 6, 15, 0, 0, 0, time.FixedZone("EST", -5*60*60))
+	stamp := now.Add(-time.Minute).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chart/ES=F" {
+			t.Errorf("chart path = %q, want /chart/ES=F", r.URL.Path)
+		}
+		if r.URL.Query().Get("interval") != "1m" || r.URL.Query().Get("includePrePost") != "true" {
+			t.Errorf("chart query = %v, want 1m pre/post request", r.URL.Query())
+		}
+		_, _ = fmt.Fprintf(w, `{"chart":{"result":[{"meta":{"symbol":"ES=F","currency":"USD","previousClose":99},"timestamp":[%d],"indicators":{"quote":[{"open":[99],"high":[101],"low":[98],"close":[100],"volume":[12]}]}}],"error":null}}`, stamp)
+	}))
+	defer server.Close()
+
+	yahoo := NewYahoo(time.Second, 1)
+	t.Cleanup(func() { _ = yahoo.Close() })
+	yahoo.client = outboundhttp.UsingTransport(server.Client().Transport, time.Second)
+	yahoo.chartURL = server.URL + "/chart/%s"
+	yahoo.now = func() time.Time { return now }
+	yahoo.tickerFactory = func(string) (yahooTicker, error) {
+		t.Fatal("future chart quote unexpectedly initialized go-yfinance ticker")
+		return nil, nil
+	}
+	quote, err := yahoo.Quote(context.Background(), "ES=F")
+	if err != nil {
+		t.Fatalf("future Quote() error = %v", err)
+	}
+	if quote.Price == nil || *quote.Price != 100 {
+		t.Fatalf("future quote price = %v, want 100", quote.Price)
+	}
+	if quote.PreviousClose == nil || *quote.PreviousClose != 99 {
+		t.Fatalf("future previous close = %v, want 99", quote.PreviousClose)
+	}
+	if quote.DailyBar == nil || quote.DailyBar.High != 101 || quote.DailyBar.Low != 98 {
+		t.Fatalf("future daily bar = %#v, want chart OHLC", quote.DailyBar)
+	}
+}
+
+func TestYahooFutureSessionStateDoesNotUseNYSECalendar(t *testing.T) {
+	location := time.FixedZone("EST", -5*60*60)
+	now := time.Date(2026, time.November, 6, 22, 0, 0, 0, location)
+	latest := now.Add(-time.Minute)
+	if got := yahooFutureSessionState(now, latest, ""); got != "OVERNIGHT" {
+		t.Fatalf("future session at 22:00 = %q, want OVERNIGHT", got)
+	}
+	if got := yahooFutureSessionState(now, latest, "REGULAR"); got != "REGULAR" {
+		t.Fatalf("future session with Yahoo REGULAR state = %q, want REGULAR", got)
+	}
+	maintenance := time.Date(2026, time.November, 6, 17, 30, 0, 0, location)
+	if got := yahooFutureSessionState(maintenance, maintenance.Add(-time.Minute), ""); got != "CLOSED" {
+		t.Fatalf("future session during maintenance = %q, want CLOSED", got)
+	}
+	if got := yahooFutureSessionState(now, now.Add(-time.Hour), ""); got != "CLOSED" {
+		t.Fatalf("stale future session = %q, want CLOSED", got)
+	}
+	if got := yahooFutureSessionState(now, now.Add(-time.Hour), "REGULAR"); got != "CLOSED" {
+		t.Fatalf("stale Yahoo REGULAR future session = %q, want CLOSED", got)
+	}
+}
+
 func TestNewYahooWithProxy(t *testing.T) {
 	proxyHit := make(chan struct{}, 1)
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -424,15 +484,36 @@ func useLocalYahooOptionsAuth(t *testing.T, yahoo *Yahoo) {
 }
 
 func TestNormalizeSymbolMatchesPythonBoundaries(t *testing.T) {
-	for _, raw := range []string{"qqq", "BRK.B", "A-B", "A123456789"} {
+	for _, raw := range []string{"qqq", "BRK.B", "A-B", "A123456789", "ES=F", "NQ=F", "BTC-USD=F"} {
 		if got, err := NormalizeSymbol(raw); err != nil || got != strings.ToUpper(raw) {
 			t.Errorf("NormalizeSymbol(%q) = %q, %v; want normalized valid symbol", raw, got, err)
 		}
 	}
-	for _, raw := range []string{"", "^GSPC", "A=B", "ABCDEFGHIJK", ".QQQ", "-QQQ"} {
+	for _, raw := range []string{"", "A=B", "ABCDEFGHIJK", ".QQQ", "-QQQ"} {
 		if got, err := NormalizeSymbol(raw); err == nil {
 			t.Errorf("NormalizeSymbol(%q) = %q, want validation error", raw, got)
 		}
+	}
+	for raw, want := range map[string]string{"^GSPC": "^GSPC", ".SPX": "^GSPC", ".NDX": "^NDX", ".DJI": "^DJI", ".IXIC": "^IXIC"} {
+		if got, err := NormalizeSymbol(raw); err != nil || got != want {
+			t.Errorf("NormalizeSymbol(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"^NDX", "^GSPC", "^DJI", "^IXIC", ".SPX"} {
+		if !IsIndexSymbol(raw) {
+			t.Errorf("IsIndexSymbol(%q) = false, want true", raw)
+		}
+	}
+	for _, raw := range []string{"ES=F", "NQ=F", "CL=F"} {
+		if !IsFutureSymbol(raw) {
+			t.Errorf("IsFutureSymbol(%q) = false, want true", raw)
+		}
+	}
+	if IsFutureSymbol("ES") || IsFutureSymbol("ES=G") {
+		t.Fatal("IsFutureSymbol accepted a non-Yahoo futures ticker")
+	}
+	if IsIndexSymbol("QQQ") {
+		t.Fatal("IsIndexSymbol(\"QQQ\") = true, want false")
 	}
 }
 

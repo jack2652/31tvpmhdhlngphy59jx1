@@ -5,7 +5,7 @@ const vm = require("node:vm");
 const window = { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} };
 const context = {
   dash: [], strokes: [], texts: [], rects: [], fills: 0,
-  setTransform() {}, clearRect() {}, beginPath() {}, moveTo(x, y) { this.start = [x, y]; },
+  setTransform() {}, clearRect() {}, beginPath() { this.start = null; this.end = null; }, moveTo(x, y) { this.start = [x, y]; },
   lineTo(x, y) { this.end = [x, y]; }, stroke() { this.strokes.push({ start: this.start, end: this.end, dash: [...this.dash], width: this.lineWidth, color: this.strokeStyle }); },
   setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font }); }, arc() {}, fill() { this.fills += 1; }, strokeText() {},
   save() {}, restore() {}, translate() {}, rotate() {}, closePath() {}, rect() {}, clip() {},
@@ -22,7 +22,7 @@ function render(segments, enabled) {
     chart: { width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, historyRight: 940, grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels: [], signals: [], dates: [], segments },
     layers: { pens: false, penCenters: false, segments: enabled, recursiveCenters: {}, signals: false },
   });
-  return context.strokes.filter((stroke) => stroke.start[0] === 10 && stroke.start[1] === 20 && stroke.end[0] === 30 && stroke.end[1] === 40);
+  return context.strokes.filter((stroke) => stroke.start && stroke.end && stroke.start[0] === 10 && stroke.start[1] === 20 && stroke.end[0] === 30 && stroke.end[1] === 40);
 }
 
 function renderScenarios(visible) {
@@ -35,7 +35,7 @@ function renderScenarios(visible) {
     layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false },
     scenariosVisible: visible,
   });
-  return context.strokes.filter((stroke) => stroke.start[0] === 708 && stroke.start[1] === 120 && stroke.end[0] === 932 && stroke.end[1] === 40);
+  return context.strokes.filter((stroke) => stroke.start && stroke.end && stroke.start[0] === 708 && stroke.start[1] === 120 && stroke.end[0] === 932 && stroke.end[1] === 40);
 }
 
 const indicatorChart = {
@@ -76,7 +76,7 @@ assert.deepEqual(projections[0].dash, [6, 5], "scenario routes keep their dashed
 assert.equal(projections[0].width, 1.8);
 const toggleGlyph = context.texts.find((text) => Math.abs(text.x - 689) < 0.01 && Math.abs(text.y - 289.5) < 0.01);
 assert.ok(toggleGlyph, "the scenario toggle glyph must be painted on the canvas");
-assert.match(toggleGlyph.text, /^[?\ue7b3]$/, "toggle falls back to ? until the icon font is ready");
+assert.match(toggleGlyph.text, /^[?\ue73d]$/, "toggle falls back to ? until the icon font is ready");
 
 const indicator = renderIndicators();
 assert.ok(indicator.rects.some((rect) => Math.abs(rect.x - 97) < 0.01 && rect.width === 6), "volume and MACD bars must follow candle slots");
@@ -92,11 +92,38 @@ assert.ok(macdHeader, "MACD pane must be labelled");
 assert.equal(macdHeader.x, 50, "MACD title and latest values must sit on the left");
 assert.match(macdHeader.text, /DIF -1\.00 · DEA -0\.50 · 柱 -1\.00/, "latest DIF/DEA/histogram values must follow the MACD title");
 const dividerY = 392 + (412 - 392) / 3;
-const paneDivider = indicator.strokes.find((stroke) => Math.abs(stroke.start[0] - 50) < 0.01
+const paneDivider = indicator.strokes.find((stroke) => stroke.start && stroke.end && Math.abs(stroke.start[0] - 50) < 0.01
   && Math.abs(stroke.end[0] - 940) < 0.01
   && Math.abs(stroke.start[1] - dividerY) < 0.01
   && Math.abs(stroke.end[1] - dividerY) < 0.01);
 assert.ok(paneDivider, "volume and MACD panes must be separated by a divider line");
+
+function renderMfiBenchmark(benchmarkValues) {
+  context.strokes = [];
+  context.texts = [];
+  window.OptionScopeCharts.renderChanCanvas(target, {
+    chart: {
+      width: 960, height: 578, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, priceBottom: 300,
+      mfiTop: 520, mfiBottom: 560, historyRight: 940, grid: [], strokes: [], points: [], centers: [],
+      recursiveCenters: [], keyLevels: [], signals: [], dates: [], segments: [],
+      candles: benchmarkValues.map((benchmark, index) => ({
+        x: 100 + index * 20, bodyWidth: 6, direction: "up", volume: 500,
+        mfi: { value: 30, average: 28, benchmark },
+      })),
+    },
+    layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false },
+  });
+  return context;
+}
+
+const missingBenchmark = renderMfiBenchmark([null, null]);
+const missingMfiHeader = missingBenchmark.texts.find((text) => text.text.startsWith("MFI "));
+assert.match(missingMfiHeader.text, /标普 --/, "missing benchmark MFI must not be formatted as zero");
+assert.equal(missingBenchmark.strokes.some((stroke) => stroke.color === "#d58aa6"), false, "missing benchmark values must not draw a false zero line");
+const zeroBenchmark = renderMfiBenchmark([0, 0]);
+const zeroMfiHeader = zeroBenchmark.texts.find((text) => text.text.startsWith("MFI "));
+assert.match(zeroMfiHeader.text, /标普 \+?0\.00/, "a real benchmark MFI of zero must remain visible");
+assert.ok(zeroBenchmark.strokes.some((stroke) => stroke.color === "#d58aa6"), "a real zero benchmark MFI must still draw");
 
 function renderAFStochZ(enabled) {
   context.strokes = [];
@@ -146,7 +173,7 @@ window.OptionScopeCharts.renderChanCanvas(target, {
 });
 assert.ok(context.rects.some((rect) => rect.x === 109 && rect.y === 70 && rect.width === 22 && rect.height === 12), "葛兰碧标签使用信号色底框");
 assert.ok(context.texts.some((text) => text.text === "卖8"), "可见的葛兰碧标签绘制文字");
-assert.ok(context.strokes.some((stroke) => stroke.start[0] === 120 && stroke.start[1] === 95 && stroke.end[0] === 120 && stroke.end[1] === 82), "葛兰碧引线从三角尖端连到标签框边缘");
+assert.ok(context.strokes.some((stroke) => stroke.start && stroke.end && stroke.start[0] === 120 && stroke.start[1] === 95 && stroke.end[0] === 120 && stroke.end[1] === 82), "葛兰碧引线从三角尖端连到标签框边缘");
 
 context.strokes = [];
 context.texts = [];

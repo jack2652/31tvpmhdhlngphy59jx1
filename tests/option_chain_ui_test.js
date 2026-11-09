@@ -5,6 +5,18 @@ const vm = require("node:vm");
 const template = fs.readFileSync("web/static/index.html", "utf8");
 const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
 
+assert.match(template, /<article v-if="!indexSymbol \|\| indexOptionsAvailable" class="metric panel">[\s\S]*?id="total-count"/, "supported indices must show the active expiry contract count");
+assert.match(template, /<article v-if="!indexSymbol \|\| indexOptionsAvailable" class="metric call-metric panel">[\s\S]*?id="call-volume"/, "supported indices must show call volume");
+assert.match(template, /<article v-if="!indexSymbol \|\| indexOptionsAvailable" class="metric put-metric panel">[\s\S]*?id="put-volume"/, "supported indices must show put volume");
+assert.match(template, /<section v-show="!indexSymbol \|\| indexOptionsAvailable" class="detail-group panel" id="chart-group"/, "supported indices must show the GEX and distribution charts");
+assert.match(template, /<section v-show="!indexSymbol \|\| indexOptionsAvailable" class="detail-group panel option-analysis-group" id="option-analysis-group"/, "supported indices must show the option analysis panel");
+assert.match(template, /id="chain-title"[^>]*>GEX 热力图/, "supported indices must show the option-chain heatmap panel");
+assert.match(app, /resetOptionFlow\("指数期权延迟快照无法确认主动成交方向"\)/, "index flow must explain why trade direction is unavailable");
+assert.match(app, /available === false && payload\.reason[\s\S]*?signalLabel: "暂不可用"[\s\S]*?signalDetail: payload\.reason/, "an unavailable index flow response must remain visible in the panel");
+const symbolLoad = app.slice(app.indexOf("async function loadSymbol()"), app.indexOf("let expirationSwitchToken"));
+assert.match(symbolLoad, /await loadExpirations\(loadId, previousSnapshot\)/, "index expiry discovery must first reuse its cached catalog");
+assert.doesNotMatch(symbolLoad, /await loadExpirations\(loadId, previousSnapshot, isIndexMarketSymbol\(symbol\)\)/, "loading an index must not force a slow upstream catalog refresh");
+
 assert.match(app, /const CHAIN_VIEW_STORAGE_KEY = "option-scope-chain-view"/, "the selected option-chain view must use its own preference key");
 assert.match(app, /function readChainViewPreference\(\)[\s\S]*?localStorage\.getItem\(CHAIN_VIEW_STORAGE_KEY\)[\s\S]*?stored === "table" \|\| stored === "heatmap" \? stored : "heatmap"[\s\S]*?catch \(error\) \{ return "heatmap"; \}/, "only supported view values may be restored, with heatmap as the fallback");
 assert.match(app, /function rememberChainViewPreference\(view\)[\s\S]*?localStorage\.setItem\(CHAIN_VIEW_STORAGE_KEY, view\)[\s\S]*?catch \(error\)/, "the view preference write must tolerate unavailable storage");
@@ -78,6 +90,8 @@ assert.match(selectHeatmapExpiration, /this\.expiration = expiration;\s*return s
 const switchCalls = [];
 const selectMethodContext = {
   state: { symbol: "TEST" },
+  isIndexMarketSymbol() { return false; },
+  supportsIndexOptions() { return false; },
   chainHeatmapCache: { symbol: "TEST", availableExpirations: new Set(["2026-11-20"]) },
   isActiveExpiration() { return true; },
   switchExpiration(expiration) { switchCalls.push(expiration); return expiration; },
@@ -117,6 +131,8 @@ async function verifyHeatmapDirectoryRefreshCoalescing() {
   let catalogRequests = 0;
   const context = {
     state: testState,
+    isIndexMarketSymbol() { return false; },
+    supportsIndexOptions() { return false; },
     CHAIN_HEATMAP_DISCOVERY_BASE_DELAY_MS: 4000,
     chainHeatmapLoadToken: 0,
     chainHeatmapLoadingSymbol: "",

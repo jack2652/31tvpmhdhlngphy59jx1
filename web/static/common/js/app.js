@@ -1,5 +1,21 @@
+// 页面使用 Yahoo 的原始指数代码请求数据，同时接受常见行情软件里的指数别名。
+const SYMBOL_ALIASES = Object.freeze({ ".NDX": "^NDX", ".SPX": "^GSPC", ".DJI": "^DJI", ".IXIC": "^IXIC" });
+const INDEX_SYMBOLS = new Set(["^NDX", "^GSPC", "^DJI", "^IXIC"]);
+const INDEX_OPTION_SYMBOLS = new Set(["^NDX", "^GSPC"]);
+const SYMBOL_PATTERN = /^(?:\^?[A-Z0-9][A-Z0-9.-]{0,9})$/;
+function canonicalSymbol(raw) {
+  const symbol = String(raw || "").trim().toUpperCase();
+  return SYMBOL_ALIASES[symbol] || symbol;
+}
+function isValidSymbol(symbol) { return SYMBOL_PATTERN.test(symbol); }
+function isIndexMarketSymbol(raw) {
+  return INDEX_SYMBOLS.has(canonicalSymbol(raw));
+}
+function supportsIndexOptions(raw) {
+  return INDEX_OPTION_SYMBOLS.has(canonicalSymbol(raw));
+}
 const defaultSymbolValue = (document.getElementById("symbol-input")?.getAttribute("value") || "").trim().toUpperCase();
-const defaultSymbol = /^[A-Z0-9][A-Z0-9.-]{0,9}$/.test(defaultSymbolValue) ? defaultSymbolValue : "QQQ";
+const defaultSymbol = isValidSymbol(canonicalSymbol(defaultSymbolValue)) ? canonicalSymbol(defaultSymbolValue) : "QQQ";
 const GAMMA_ESTIMATE_TITLE = "Black-Scholes 估算：看涨为正、看跌为负，假设客户买入期权、做市商方向相反。不是真实做市商库存，也不是成交价。";
 // 压力位/支撑位各展示的条数。骨架行数也用这个上限，避免加载时表格先塌掉。
 const LEVEL_COUNT = 10;
@@ -29,6 +45,9 @@ const CHAN_FOLD_KEYS = {
 const CHAN_SCENARIOS_STORAGE_KEY = "option-scope-chan-scenarios-visible";
 const CHAN_CHART_PREFERENCES_KEY = "option-scope-chan-chart-preferences";
 const CHAIN_VIEW_STORAGE_KEY = "option-scope-chain-view";
+const FAVORITE_SYMBOLS_STORAGE_KEY = "option-scope-favorite-symbols";
+const MAX_FAVORITE_SYMBOLS = 50;
+let favoriteSortSession = null;
 const CHAN_INTRADAY_PERIODS = ["15m", "4h"];
 const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "4h"];
 const CHAN_ANALYSIS_RETRY_LIMIT = 60;
@@ -47,11 +66,11 @@ const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 });
 let expirationCutoffCatalog = { symbol: "", values: null };
 let expirationCutoffTimer = null;
-const CHAN_CHART_PREFERENCES_VERSION = 12;
+const CHAN_CHART_PREFERENCES_VERSION = 13;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false };
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
 const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
-const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false };
+const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false, mfi: false };
 function readChainViewPreference() {
   try {
     const stored = localStorage.getItem(CHAIN_VIEW_STORAGE_KEY);
@@ -61,6 +80,54 @@ function readChainViewPreference() {
 function rememberChainViewPreference(view) {
   if (view !== "table" && view !== "heatmap") return;
   try { localStorage.setItem(CHAIN_VIEW_STORAGE_KEY, view); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
+}
+function readFavoriteSymbols(seedSymbol) {
+  let raw = null;
+  try {
+    raw = localStorage.getItem(FAVORITE_SYMBOLS_STORAGE_KEY);
+  } catch (error) { return []; }
+  if (raw === null) {
+    const seededSymbol = canonicalSymbol(seedSymbol);
+    const seeded = isValidSymbol(seededSymbol) ? [seededSymbol] : [];
+    rememberFavoriteSymbols(seeded);
+    return seeded;
+  }
+  try {
+    const stored = JSON.parse(raw);
+    if (!Array.isArray(stored)) throw new TypeError("收藏列表格式无效");
+    const seen = new Set();
+    const symbols = [];
+    for (const item of stored) {
+      if (typeof item !== "string") continue;
+      const symbol = canonicalSymbol(item);
+      if (!isValidSymbol(symbol) || seen.has(symbol)) continue;
+      seen.add(symbol);
+      symbols.push(symbol);
+      if (symbols.length === MAX_FAVORITE_SYMBOLS) break;
+    }
+    return symbols;
+  } catch (error) {
+    const seededSymbol = canonicalSymbol(seedSymbol);
+    const seeded = isValidSymbol(seededSymbol) ? [seededSymbol] : [];
+    rememberFavoriteSymbols(seeded);
+    return seeded;
+  }
+}
+function rememberFavoriteSymbols(symbols) {
+  try { localStorage.setItem(FAVORITE_SYMBOLS_STORAGE_KEY, JSON.stringify(symbols.slice(0, MAX_FAVORITE_SYMBOLS))); } catch (error) { /* 存储不可用时保留当前页面列表。 */ }
+}
+function clearFavoriteSortSessionListeners(session) {
+  window.removeEventListener("pointermove", session.move);
+  window.removeEventListener("pointerup", session.end);
+  window.removeEventListener("pointercancel", session.cancel);
+}
+function finishFavoriteSortSession(event, canceled = false) {
+  const session = favoriteSortSession;
+  if (!session || (event && event.pointerId !== session.pointerId)) return;
+  clearFavoriteSortSessionListeners(session);
+  favoriteSortSession = null;
+  if (!canceled && session.dragging) session.app.commitFavoriteSort(session.symbol, session.overIndex);
+  session.app.favoriteSort = { symbol: "", active: false, overIndex: -1 };
 }
 function copyDefaultChanChartLayers() {
   return { ...DEFAULT_CHAN_CHART_LAYERS, segmentLevels: {}, recursiveCenters: {} };
@@ -87,7 +154,7 @@ function readChanChartPreferences() {
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "mfi"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -101,6 +168,12 @@ function readChanChartPreferences() {
     for (const key of Object.keys(DEFAULT_CHAN_SUBCHARTS)) {
       if (typeof sourceSubcharts[key] === "boolean") subcharts[key] = sourceSubcharts[key];
     }
+    // MFI was previously persisted as a price-indicator layer. Migrate that
+    // choice to the subchart group and keep the renderer flag synchronized.
+    if (typeof sourceSubcharts.mfi !== "boolean" && typeof sourceLayers.mfi === "boolean") {
+      subcharts.mfi = sourceLayers.mfi;
+    }
+    layers.mfi = subcharts.mfi;
     const storedVersion = Number(stored.version) || 1;
     // Earlier builds persisted their defaults immediately, so upgrade an untouched
     // old default set while keeping any explicitly customized layer choices.
@@ -125,6 +198,9 @@ const initialChanChartPreferences = readChanChartPreferences();
 const state = {
   symbol: defaultSymbol,
   symbolInput: defaultSymbol,
+  favoriteSymbols: readFavoriteSymbols((new URLSearchParams(location.search).get("symbol") || defaultSymbol).trim().toUpperCase()),
+  favoritesOpen: false,
+  favoriteSort: { symbol: "", active: false, overIndex: -1 },
   expiration: null,
   expirationOptions: [],
   expirationPlaceholder: "先载入标的",
@@ -848,11 +924,11 @@ function setOptionAnalysisView(view) {
 
 function parsePageQuery(search) {
   const params = new URLSearchParams(search || "");
-  const symbol = (params.get("symbol") || "").trim().toUpperCase();
+  const symbol = canonicalSymbol(params.get("symbol"));
   const expiration = (params.get("expiration") || "").trim();
   const key = (params.get("key") || "").trim();
   return {
-    symbol: /^[A-Z0-9][A-Z0-9.-]{0,9}$/.test(symbol) ? symbol : "",
+    symbol: isValidSymbol(symbol) ? symbol : "",
     expiration: /^\d{4}-\d{2}-\d{2}$/.test(expiration) ? expiration : "",
     key,
   };
@@ -1193,6 +1269,10 @@ function setExpirationMenuOpen(open) {
 }
 
 function applyPendingSnapshotRefresh() {
+  if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) {
+    state.pendingSnapshotRefresh = false;
+    return;
+  }
   if (!state.pendingSnapshotRefresh || document.hidden || refreshWorkPending()) return;
   state.pendingSnapshotRefresh = false;
   const previousSnapshot = displayedClientSnapshotRef();
@@ -1208,6 +1288,10 @@ function applyPushedSnapshotPayload(message) {
   const payload = message?.payload || {};
   const quote = payload.quote;
   const chain = payload.chain;
+  if (message?.symbol === state.symbol && isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) {
+    if (quote) renderQuote(quote);
+    return true;
+  }
   if (!quote || !chain?.data?.length || message.symbol !== state.symbol) return false;
   if (chain.expiration && !isActiveExpiration(chain.expiration)) {
     renderQuote(quote);
@@ -1241,7 +1325,7 @@ function applyPushedSnapshotPayload(message) {
   syncPageQuery();
   // Flow requires two adjacent snapshots and is intentionally kept as the
   // only small REST read on this push path.
-  if (state.expiration) {
+  if (state.expiration && !isIndexMarketSymbol(state.symbol)) {
     request(`/api/flow/${encodeURIComponent(state.symbol)}?expiration=${encodeURIComponent(state.expiration)}`)
       .then((flow) => {
         if (loadId === state.loadId && state.symbol === message.symbol) renderOptionFlow(flow);
@@ -1251,6 +1335,10 @@ function applyPushedSnapshotPayload(message) {
 }
 
 async function applyPushedGammaUpdate() {
+  if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) {
+    state.pendingGammaRefresh = null;
+    return;
+  }
   const pending = state.pendingGammaRefresh;
   if (!pending || pending.symbol !== state.symbol || pending.loadId !== state.loadId || refreshWorkPending()) return;
   state.pendingGammaRefresh = null;
@@ -1397,6 +1485,7 @@ function connectPushStream(symbol = state.symbol) {
       return;
     }
     if (message.kind === "gamma") {
+      if (isIndexMarketSymbol(symbol) && !supportsIndexOptions(symbol)) return;
       state.pendingGammaRefresh = { symbol, loadId: state.loadId };
       if (!state.analysisRefreshSymbol && !refreshWorkPending()) applyPushedGammaUpdate();
       return;
@@ -1435,7 +1524,11 @@ function connectPushStream(symbol = state.symbol) {
         if (symbol === state.symbol && loadId === state.loadId && quote?.symbol === symbol) renderQuote(quote, true);
       }).catch(() => {});
     }
-    if (symbol === state.symbol && !document.hidden && !state.loading && !state.refreshInFlight) {
+    if ((!isIndexMarketSymbol(symbol) || supportsIndexOptions(symbol))
+      && symbol === state.symbol
+      && !document.hidden
+      && !state.loading
+      && !state.refreshInFlight) {
       const previousSnapshot = displayedClientSnapshotRef();
       state.chainFetchedAt = null;
       state.chainFetchedSymbol = "";
@@ -1443,7 +1536,10 @@ function connectPushStream(symbol = state.symbol) {
     }
   });
   state.pushVisibilityHandler = () => {
-    if (!document.hidden && symbol === state.symbol && state.pushSource === source) {
+    if ((!isIndexMarketSymbol(symbol) || supportsIndexOptions(symbol))
+      && !document.hidden
+      && symbol === state.symbol
+      && state.pushSource === source) {
       const previousSnapshot = displayedClientSnapshotRef();
       state.chainFetchedAt = null;
       state.chainFetchedSymbol = "";
@@ -1460,7 +1556,9 @@ function connectPushStream(symbol = state.symbol) {
       if (symbol === state.symbol && source.readyState === EventSource.CLOSED) {
         closePushStream();
         connectPushStream(symbol);
-        if (!state.loading && !state.refreshInFlight) loadChain({ loadId: state.loadId });
+        if ((!isIndexMarketSymbol(symbol) || supportsIndexOptions(symbol)) && !state.loading && !state.refreshInFlight) {
+          loadChain({ loadId: state.loadId });
+        }
       }
     }, 30000);
   });
@@ -1469,6 +1567,7 @@ function connectPushStream(symbol = state.symbol) {
 function scheduleAutoRefresh() {
   if (document.body.classList.contains("access-denied-page")) return;
   connectPushStream(state.symbol);
+  if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) return;
   // Automatic snapshot refresh is server-side and active only while this SSE subscription exists.
   if (!expirationMenuOpen && !refreshWorkPending()) {
     if (state.pendingSnapshotRefresh) setTimeout(applyPendingSnapshotRefresh, 0);
@@ -1969,7 +2068,9 @@ function buildLevelView(level, index, spot, side, isAdd = false) {
     range: formatLevelRange(normalized),
     gap: gap == null ? "--" : `${gap >= 0 ? "+" : ""}${gap.toFixed(2)}%`,
     gapClass: gap == null ? "" : (gap >= 0 ? "up" : "down"),
-    probability: formatProbability(normalized.probability),
+    probability: isIndexMarketSymbol(state.symbol) && normalized.probability == null
+      ? "不适用"
+      : formatProbability(normalized.probability),
     factors,
     strengthTag,
     className: levelStrengthClass(normalized, side, isAdd),
@@ -3278,19 +3379,22 @@ function renderFactorLevels(payload) {
   if (payload?.expiration && state.expiration && payload.expiration !== state.expiration) return;
   const spot = Number(payload?.spot);
   state.view.chart.levelsBasis = Number.isFinite(spot) && spot > 0 ? `基准 ${formatMoney(spot)}` : "基准 --";
+  const indexSymbol = isIndexMarketSymbol(state.symbol);
   const expiration = payload?.expiration || state.expiration || "--";
   const metric = payload?.options_metric === "volume" ? "成交量" : "Gamma 敞口";
   const hasHistory = Number(payload?.history?.bars) > 0;
   const optionExpirations = payload?.options_expirations || [];
   const optionScope = optionExpirations.length ? `多期限 ${optionExpirations.length} 个到期日` : "多期限暂无数据";
-  const scope = hasHistory
-    ? `斐波那契 · 筹码密集 · 承接位 · 期权持仓（${metric}，${optionScope}）综合 · 选中期限 ${expiration}`
-    : `历史行情不可用，按期权持仓（${metric}，${optionScope}）计算 · 选中期限 ${expiration}`;
-  const detail = [hasHistory ? `日线 ${payload.history.bars} 根` : null, payload?.history?.warning ? `历史行情降级：${payload.history.warning}` : null, "触及概率：按选中期限隐含波动率与剩余期限的零漂移首次触及概率", "Gamma、成交量和持仓量图表仍按当前选中期限绘制"].filter(Boolean).join(" · ");
+  const scope = indexSymbol
+    ? "指数日线结构与期权持仓 · 摆动高低点 · 斐波那契与历史回踩综合"
+    : hasHistory
+      ? `斐波那契 · 筹码密集 · 承接位 · 期权持仓（${metric}，${optionScope}）综合 · 选中期限 ${expiration}`
+      : `历史行情不可用，按期权持仓（${metric}，${optionScope}）计算 · 选中期限 ${expiration}`;
   const basisNote = Number.isFinite(spot) && spot > 0 ? ` · 基准 ${formatMoney(spot)}` : "";
+  const indexNote = indexSymbol ? " · 指数期权链用于补充行权价持仓参考；触及概率暂不估算" : "";
   state.view.levels.placeholder = false;
-  state.view.levels.resistanceNote = scope + basisNote;
-  state.view.levels.supportNote = scope + basisNote;
+  state.view.levels.resistanceNote = scope + basisNote + indexNote;
+  state.view.levels.supportNote = scope + basisNote + indexNote;
   const completeLevels = serverLevelsHasCompleteFields(payload);
   const keepCurrentLevels = sameDisplayedLevelContext();
   const resistanceViews = buildFactorViews(payload?.resistance || [], spot, "resistance");
@@ -4255,12 +4359,12 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.lastQuote = quote || null;
   updateSnapshotStatus();
   void recoverExpiredExpiration();
-  if (state.chainView === "heatmap") renderChainHeatmap();
+  if ((!isIndexMarketSymbol(state.symbol) || supportsIndexOptions(state.symbol)) && state.chainView === "heatmap") renderChainHeatmap();
   scheduleQuoteRecovery(state.lastQuote);
   // 行情可能晚于期权链到达。现价档位变化后重新触发一次价位计算，否则
   // 触达概率、强化色、最佳买卖点和止损会一直停在无 IV 的客户端回退结果，
   // 只能等下一次快照或 analytics 事件。
-  if (state.lastAnalysis?.points?.length && state.expiration) {
+  if (!isIndexMarketSymbol(state.symbol) && state.lastAnalysis?.points?.length && state.expiration) {
     const basis = activeBasis(quote);
     const levelSpot = finitePrice(basis?.price ?? quote?.price);
     if (levelSpot != null) {
@@ -4366,7 +4470,7 @@ function clearFairValuePoll() {
 }
 
 function scheduleFairValuePoll(quote) {
-  if (quoteIsETF(quote)) {
+  if (isIndexMarketSymbol(state.symbol) || quoteIsETF(quote)) {
     clearFairValuePoll();
     return;
   }
@@ -4510,8 +4614,19 @@ function hasOptionFlowData(payload) {
 function renderOptionFlow(payload) {
   // 无新增成交、接口暂不可用或迟到的旧期限响应都不覆盖当前有效流向；
   // 换标的/期限时由相应加载流程显式 resetOptionFlow。
-  if (!payload || (payload.expiration && state.expiration && payload.expiration !== state.expiration)
-    || !hasOptionFlowData(payload)) return;
+  if (!payload || (payload.expiration && state.expiration && payload.expiration !== state.expiration)) return;
+  if (payload.available === false && payload.reason) {
+    state.view.flow = {
+      ...state.view.flow,
+      available: false,
+      signalLabel: "暂不可用",
+      signalClass: "waiting",
+      signalDetail: payload.reason,
+      windowLabel: "快照窗口 --",
+    };
+    return;
+  }
+  if (!hasOptionFlowData(payload)) return;
   const signal = payload.signal || {};
   const hasWindow = Boolean(payload.current_fetched_at && payload.previous_fetched_at);
   const windowLabel = hasWindow
@@ -4840,15 +4955,31 @@ function heatmapGexByStrike(rows, spot, spotKey, fetchedAt, valuationTime) {
   const timeBucket = Math.floor(modelTime / 30000);
   const cacheKey = `${spotKey}|${timeBucket}|${fetchedAt || ""}`;
   const cached = heatmapGexCache.get(rows);
-  if (cached?.key === cacheKey) return cached.values;
+  if (cached?.key === cacheKey) return cached.result;
   const values = new Map();
+  const incomplete = new Map();
   for (const option of rows) {
     const strike = Number(option.strike);
     if (!Number.isFinite(strike)) continue;
     const gamma = gammaAtSpot(spot, option, undefined, spotKey, timeBucket, modelTime);
-    const value = gamma == null ? Number(option.gamma) : Number(gamma);
-    if (!Number.isFinite(value)) continue;
-    const exposure = value * (Number(option.open_interest) || 0) * 100 * 0.01;
+    const rawGamma = gamma == null ? option.gamma : gamma;
+    const value = rawGamma == null || rawGamma === "" ? NaN : Number(rawGamma);
+    if (!Number.isFinite(value)) {
+      if (option.contract_type === "call" || option.contract_type === "put") {
+        if (!incomplete.has(strike)) incomplete.set(strike, new Set());
+        incomplete.get(strike).add(option.contract_type);
+      }
+      continue;
+    }
+    const openInterest = option.open_interest == null || option.open_interest === "" ? NaN : Number(option.open_interest);
+    if (!Number.isFinite(openInterest) || openInterest < 0) {
+      if (option.contract_type === "call" || option.contract_type === "put") {
+        if (!incomplete.has(strike)) incomplete.set(strike, new Set());
+        incomplete.get(strike).add(option.contract_type);
+      }
+      continue;
+    }
+    const exposure = value * openInterest * 100 * 0.01;
     const aggregate = values.get(strike) || { call: 0, put: 0, net: 0 };
     if (option.contract_type === "call") {
       aggregate.call += exposure;
@@ -4859,11 +4990,13 @@ function heatmapGexByStrike(rows, spot, spotKey, fetchedAt, valuationTime) {
     }
     values.set(strike, aggregate);
   }
-  heatmapGexCache.set(rows, { key: cacheKey, values });
-  return values;
+  const result = { values, incomplete };
+  heatmapGexCache.set(rows, { key: cacheKey, result });
+  return result;
 }
 
 function renderChainHeatmap() {
+  if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) return;
   if (chainHeatmapRenderScheduled) return;
   chainHeatmapRenderScheduled = true;
   const render = () => {
@@ -4932,6 +5065,8 @@ function renderChainHeatmapModel() {
   const lower = marketSpot * 0.85;
   const upper = marketSpot * 1.15;
   const valuesByExpiration = new Map();
+  const incompleteByExpiration = new Map();
+  const listedByExpiration = new Map();
   const peaksByExpiration = new Map();
   const strikeSet = new Set();
   const gexLabel = state.chainFilter === "call" ? "看涨 GEX" : state.chainFilter === "put" ? "看跌 GEX" : "净 GEX";
@@ -4941,19 +5076,45 @@ function renderChainHeatmapModel() {
     const entry = source.get(column.expiration);
     const values = new Map();
     const rows = Array.isArray(entry?.rows) ? entry.rows : [];
-    const aggregates = heatmapGexByStrike(rows, spot, spotKey, entry?.fetchedAt, valuation.valuationTime);
-    for (const [strike, aggregate] of aggregates) {
+    const exposureByStrike = heatmapGexByStrike(rows, spot, spotKey, entry?.fetchedAt, valuation.valuationTime);
+    const listedStrikes = new Map();
+    for (const option of rows) {
+      const strike = Number(option.strike);
       if (!Number.isFinite(strike) || strike < lower || strike > upper) continue;
+      if (state.chainFilter !== "all" && option.contract_type !== state.chainFilter) continue;
+      if (!listedStrikes.has(strike)) listedStrikes.set(strike, new Set());
+      listedStrikes.get(strike).add(option.contract_type);
+      strikeSet.add(strike);
+    }
+    for (const [strike, aggregate] of exposureByStrike.values) {
+      if (!Number.isFinite(strike) || strike < lower || strike > upper) continue;
+      const missingTypes = exposureByStrike.incomplete.get(strike);
       const factor = state.chainFilter === "call" ? aggregate.call
         : state.chainFilter === "put" ? aggregate.put : aggregate.net;
-      const gex = factor * spotSquared;
-      values.set(strike, (values.get(strike) || 0) + gex);
-      strikeSet.add(strike);
+      const gexValue = factor * spotSquared;
+      const listedTypes = listedStrikes.get(strike) || new Set();
+      const relevantMissing = state.chainFilter === "all"
+        ? [...(missingTypes || [])].some((type) => listedTypes.has(type))
+        : Boolean(missingTypes?.has(state.chainFilter));
+      if (!relevantMissing) {
+        values.set(strike, (values.get(strike) || 0) + gexValue);
+        strikeSet.add(strike);
+      }
+    }
+    for (const [strike, missingTypes] of exposureByStrike.incomplete) {
+      if (strike < lower || strike > upper) continue;
+      const listedTypes = listedStrikes.get(strike) || new Set();
+      const incomplete = state.chainFilter === "all"
+        ? [...missingTypes].some((type) => listedTypes.has(type))
+        : missingTypes.has(state.chainFilter);
+      if (incomplete) strikeSet.add(strike);
     }
     let columnPeak = 0;
     for (const value of values.values()) columnPeak = Math.max(columnPeak, Math.abs(value));
     peaksByExpiration.set(column.expiration, columnPeak);
     valuesByExpiration.set(column.expiration, values);
+    incompleteByExpiration.set(column.expiration, exposureByStrike.incomplete);
+    listedByExpiration.set(column.expiration, listedStrikes);
   }
   const strikes = [...strikeSet].sort((a, b) => b - a);
   let nearestStrike = null;
@@ -4975,12 +5136,20 @@ function renderChainHeatmapModel() {
     const cells = columns.map((column) => {
       const spotClass = currentSpot && column.current ? " chain-heatmap-current-spot-cell" : "";
       const value = valuesByExpiration.get(column.expiration).get(strike);
-      if (value == null) return reuseCell({
+      const incompleteTypes = incompleteByExpiration.get(column.expiration).get(strike);
+      const isIncomplete = state.chainFilter === "all"
+        ? Boolean(incompleteTypes?.size)
+        : Boolean(incompleteTypes?.has(state.chainFilter));
+      const listedTypes = listedByExpiration.get(column.expiration).get(strike) || new Set();
+      const isListed = state.chainFilter === "all" ? listedTypes.size > 0 : listedTypes.has(state.chainFilter);
+      if (value == null || isIncomplete) return reuseCell({
         key: `${column.expiration}|${strike}`,
-        value: "-",
-        className: `chain-heatmap-cell chain-heatmap-cell-empty${spotClass}`,
+        value: isListed ? "--" : "0",
+        className: `chain-heatmap-cell ${isListed ? "chain-heatmap-cell-empty chain-heatmap-cell-unavailable" : "chain-heatmap-cell-zero"}${spotClass}`,
         style: "",
-        title: `${column.expiration} · ${formatMoney(strike)} · 无数据`,
+        title: isListed
+          ? `${column.expiration} · 行权价 ${formatMoney(strike)} · 存在对应合约，但缺少可用的 Gamma、IV 或持仓量，无法估算 GEX`
+          : `${column.expiration} · 行权价 ${formatMoney(strike)} · 该期限未挂牌此行权价的${state.chainFilter === "call" ? "看涨" : state.chainFilter === "put" ? "看跌" : "期权"}合约，GEX 按 0 计`,
       });
       // 每个到期日独立归一，刷新一列时不重染其他日期的格子。
       const columnPeak = peaksByExpiration.get(column.expiration) || 0;
@@ -5050,6 +5219,7 @@ function scheduleChainHeatmapDiscovery(symbol, loadId, token, pending) {
 
 async function loadChainHeatmapBackground(catalogPayload = null) {
   const symbol = state.symbol;
+  if (isIndexMarketSymbol(symbol) && !supportsIndexOptions(symbol)) return;
   if (chainHeatmapLoadingSymbol === symbol) {
     chainHeatmapReloadRequested = true;
     return;
@@ -5145,6 +5315,7 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
 }
 
 async function refreshHeatmapExpiration(symbol, expiration, previousFetchedAt) {
+  if (isIndexMarketSymbol(symbol) && !supportsIndexOptions(symbol)) return;
   const chainPath = `/api/chain/${encodeURIComponent(symbol)}?expiration=${encodeURIComponent(expiration)}`;
   let previousTimestamp = Date.parse(previousFetchedAt || "");
   if (!Number.isFinite(previousTimestamp)) {
@@ -5268,7 +5439,10 @@ function renderChain(payload, quote, analysisPayload) {
   const snapshotAge = payload.fetched_at ? (Date.now() - new Date(payload.fetched_at).getTime()) / 1000 : null;
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
   const oiFallback = payload.oi_fallback || {};
-  state.view.dataSource = (snapshotAge != null && snapshotAge >= 0 && snapshotAge < SNAPSHOT_FRESH_SECONDS ? "上游新快照" : "本地缓存") + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
+  const snapshotSource = isIndexMarketSymbol(state.symbol)
+    ? "指数期权延迟快照"
+    : snapshotAge != null && snapshotAge >= 0 && snapshotAge < SNAPSHOT_FRESH_SECONDS ? "上游新快照" : "本地缓存";
+  state.view.dataSource = snapshotSource + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
   state.view.totalCount = formatNumber(rows.length);
   let callVolume = 0, putVolume = 0, callInterest = 0, putInterest = 0;
   for (const row of rows) {
@@ -5668,6 +5842,7 @@ function refreshAnalysisWindow(loadId, payload, quote) {
 
 function refreshAnalysisWindowBatch(loadId, payload, quote, continueBatch = false) {
   const symbol = state.symbol;
+  if (isIndexMarketSymbol(symbol) && !supportsIndexOptions(symbol)) return;
   if (state.analysisRefreshSymbol === symbol) return;
   const lastStartedAt = analysisWindowLastStartedAt.get(symbol) || 0;
   const lastAppliedAt = analysisWindowLastAppliedAt.get(symbol) || 0;
@@ -5851,6 +6026,7 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
 
 async function refreshInBackground(loadId) {
   const symbol = state.symbol;
+  if (isIndexMarketSymbol(symbol) && !supportsIndexOptions(symbol)) return;
   const expiration = state.expiration;
   const encodedSymbol = encodeURIComponent(symbol);
   // 回源后的补读必须看到新快照，不能复用回源前那一次读取。
@@ -6066,6 +6242,7 @@ async function loadQuoteOnly(loadId) {
 }
 
 async function loadExpirations(loadId, fallbackSnapshot = null, refresh = false) {
+  if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) return;
   const encodedSymbol = encodeURIComponent(state.symbol);
   let requestError = null;
   const payload = await request(`/api/expirations/${encodedSymbol}${refresh ? "?refresh=true" : ""}`).catch((error) => {
@@ -6166,6 +6343,7 @@ function displayedSnapshotIsCurrent(fetchedAt) {
 }
 
 async function loadChain(options = {}) {
+  if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) return;
   try {
     const loadId = options.loadId || state.loadId;
     if (!isCurrentLoad(loadId)) return;
@@ -6229,7 +6407,7 @@ async function loadChain(options = {}) {
 
 async function loadSymbol() {
   const previousSnapshot = displayedClientSnapshotRef();
-  const symbol = (state.symbolInput || byId("symbol-input").value).trim().toUpperCase();
+  const symbol = canonicalSymbol(state.symbolInput || byId("symbol-input").value);
   if (!symbol) {
     state.loading = false;
     scheduleAutoRefresh();
@@ -6278,26 +6456,44 @@ async function loadSymbol() {
   fetchQuoteForDisplay(symbol, loadId);
   if (state.chanExpanded) refreshChanAnalysis();
   else refreshChanMarketAnalysis(true);
-  // Opening the stream starts the server-side snapshot worker immediately;
-  // loadChain owns any follow-up read after expiry discovery.
-  try {
-    await loadExpirations(loadId, previousSnapshot);
-  } catch (error) {
-    if (!isCurrentLoad(loadId)) return;
-    state.expirationOptions = [];
-    state.expirationPlaceholder = "加载失败";
-    if (!markApiUnavailable(error.message) && !restoreDisplayedClientSnapshot(previousSnapshot, error.message)) {
-      showPending("暂无数据");
-      setError(error.message);
-    }
-  } finally {
-    state.loading = false;
-    if (state.chainView === "heatmap" && chainHeatmapCache.symbol !== state.symbol) void loadChainHeatmapBackground();
-    // 首次进入新标的时行情/期权链可能先完成，估值仍在后端线程计算；
-    // 在 loading 解除后启动独立轻量轮询，避免必须手动刷新整页才能看到估值。
-    if (state.lastQuote) scheduleFairValuePoll(state.lastQuote);
-    scheduleAutoRefresh();
+  if (isIndexMarketSymbol(symbol) && supportsIndexOptions(symbol)) {
+    resetOptionFlow("指数期权延迟快照无法确认主动成交方向");
   }
+  if (isIndexMarketSymbol(symbol) && !supportsIndexOptions(symbol)) {
+    state.expiration = null;
+    state.expirationOptions = [];
+    state.expirationPlaceholder = "该指数暂不支持期权链";
+    resetOptionFlow("指数不适用期权分析");
+    await renderCachedHistoryOnly(loadId);
+    if (isCurrentLoad(loadId)) {
+      state.view.chainTitle = `指数行情 · ${symbol}`;
+      state.view.dataSource = "行情/日线 · 指数";
+      state.view.chainEmpty = "该指数暂无可用期权链";
+      state.view.chainHeatmapEmpty = "该指数暂无可用 GEX 热力图";
+      state.view.lastStatus = "指数仅显示行情与技术分析";
+      syncPageQuery();
+    }
+  } else {
+    // Opening the stream starts the server-side snapshot worker immediately;
+    // loadChain owns any follow-up read after expiry discovery.
+    try {
+      await loadExpirations(loadId, previousSnapshot);
+    } catch (error) {
+      if (!isCurrentLoad(loadId)) return;
+      state.expirationOptions = [];
+      state.expirationPlaceholder = "加载失败";
+      if (!markApiUnavailable(error.message) && !restoreDisplayedClientSnapshot(previousSnapshot, error.message)) {
+        showPending("暂无数据");
+        setError(error.message);
+      }
+    }
+  }
+  state.loading = false;
+  if (state.chainView === "heatmap" && chainHeatmapCache.symbol !== state.symbol) void loadChainHeatmapBackground();
+  // 首次进入新标的时行情/期权链可能先完成，估值仍在后端线程计算；
+  // 在 loading 解除后启动独立轻量轮询，避免必须手动刷新整页才能看到估值。
+  if (state.lastQuote) scheduleFairValuePoll(state.lastQuote);
+  scheduleAutoRefresh();
 }
 
 // 切换到期日：请求在飞时禁用下拉框（连点也切不出第二组请求），数据落地后再放开。
@@ -6377,9 +6573,10 @@ async function switchExpiration(expiration) {
 
 // 载入按钮与输入框回车都改为真实跳转：地址栏即状态，刷新、前进后退与分享链接都能复现同一视图。
 function navigateToSymbol() {
-  const symbol = (state.symbolInput || byId("symbol-input").value).trim().toUpperCase();
+  const enteredSymbol = (state.symbolInput || byId("symbol-input").value).trim().toUpperCase();
+  const symbol = canonicalSymbol(enteredSymbol);
   if (!symbol) return;
-  if (!/^[A-Z0-9][A-Z0-9.-]{0,9}$/.test(symbol)) { setError(`标的代码 ${symbol} 无效`); return; }
+  if (!isValidSymbol(symbol)) { setError(`标的代码 ${enteredSymbol} 无效`); return; }
   setError("");
   // 换标的时清空 URL 里的到期日参数：各标的的到期日序列不同（有的每周五、有的每天、有的半月），
   // 统一回到列表第一个（最近）到期日；同一标的重复载入则保留当前选择。
@@ -6410,7 +6607,12 @@ const optionScopeApp = new Vue({
   data: state,
   computed: {
     busy() { return this.loading; },
+    indexSymbol() { return isIndexMarketSymbol(this.symbol); },
+    indexOptionsAvailable() { return supportsIndexOptions(this.symbol); },
+    currentSymbolFavorited() { return this.favoriteSymbols.includes(this.symbol); },
+    favoriteLimitReached() { return this.favoriteSymbols.length >= MAX_FAVORITE_SYMBOLS; },
     hasHeatmapBatchRefreshTargets() {
+      if (isIndexMarketSymbol(this.symbol) && !supportsIndexOptions(this.symbol)) return false;
       const dates = this.expirationOptions.length
         ? this.expirationOptions
         : (this.view.chainHeatmap?.columns || []).map((column) => column.expiration);
@@ -6492,6 +6694,115 @@ const optionScopeApp = new Vue({
     },
   },
   methods: {
+    toggleFavorites() {
+      this.favoritesOpen = !this.favoritesOpen;
+    },
+    closeFavorites() {
+      this.favoritesOpen = false;
+      this.$nextTick(() => document.getElementById("favorites-toggle")?.focus());
+    },
+    isFavoriteSymbol(symbol) {
+      const normalized = canonicalSymbol(symbol);
+      return Boolean(normalized && this.favoriteSymbols.includes(normalized));
+    },
+    addCurrentFavorite() {
+      const symbol = String(this.symbol || "").trim().toUpperCase();
+      const canonical = canonicalSymbol(symbol);
+      if (!isValidSymbol(canonical) || this.isFavoriteSymbol(canonical) || this.favoriteSymbols.length >= MAX_FAVORITE_SYMBOLS) return;
+      this.favoriteSymbols = [canonical, ...this.favoriteSymbols].slice(0, MAX_FAVORITE_SYMBOLS);
+      rememberFavoriteSymbols(this.favoriteSymbols);
+    },
+    selectFavoriteSymbol(symbol) {
+      const normalized = canonicalSymbol(symbol);
+      if (!isValidSymbol(normalized)) return;
+      this.symbolInput = normalized;
+      this.favoritesOpen = false;
+      if (normalized === this.symbol) return;
+      this.navigateToSymbol();
+    },
+    removeFavoriteSymbol(symbol, event) {
+      event?.stopPropagation();
+      const normalized = canonicalSymbol(symbol);
+      this.favoriteSymbols = this.favoriteSymbols.filter((item) => item !== normalized);
+      rememberFavoriteSymbols(this.favoriteSymbols);
+    },
+    beginFavoriteSort(symbol, event) {
+      if (!event || (event.pointerType === "mouse" && event.button !== 0)) return;
+      const normalized = canonicalSymbol(symbol);
+      if (!isValidSymbol(normalized) || !this.favoriteSymbols.includes(normalized)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (favoriteSortSession) finishFavoriteSortSession(null, true);
+      const session = {
+        app: this,
+        symbol: normalized,
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        dragging: false,
+        overIndex: this.favoriteSymbols.indexOf(normalized),
+        move: null,
+        end: null,
+        cancel: null,
+      };
+      session.move = (moveEvent) => this.updateFavoriteSort(moveEvent);
+      session.end = (endEvent) => finishFavoriteSortSession(endEvent);
+      session.cancel = (cancelEvent) => finishFavoriteSortSession(cancelEvent, true);
+      favoriteSortSession = session;
+      this.favoriteSort = { symbol: normalized, active: false, overIndex: session.overIndex };
+      window.addEventListener("pointermove", session.move, { passive: false });
+      window.addEventListener("pointerup", session.end);
+      window.addEventListener("pointercancel", session.cancel);
+    },
+    updateFavoriteSort(event) {
+      const session = favoriteSortSession;
+      if (!session || event.pointerId !== session.pointerId) return;
+      const deltaX = event.clientX - session.startX;
+      const deltaY = event.clientY - session.startY;
+      if (!session.dragging) {
+        if (Math.max(Math.abs(deltaX), Math.abs(deltaY)) < 5) return;
+        session.dragging = true;
+        this.favoriteSort = { symbol: session.symbol, active: true, overIndex: session.overIndex };
+      }
+      event.preventDefault();
+      const list = document.querySelector("#favorites-panel .favorite-list");
+      const items = list ? Array.from(list.querySelectorAll(".favorite-item")) : [];
+      const currentIndex = this.favoriteSymbols.indexOf(session.symbol);
+      if (!list || currentIndex < 0 || !items.length) return;
+      const insertionIndex = items.findIndex((item) => {
+        const rect = item.getBoundingClientRect();
+        return event.clientY < rect.top + rect.height / 2;
+      });
+      const rawIndex = insertionIndex < 0 ? items.length : insertionIndex;
+      const overIndex = Math.max(0, Math.min(this.favoriteSymbols.length - 1, rawIndex > currentIndex ? rawIndex - 1 : rawIndex));
+      if (overIndex === session.overIndex) return;
+      session.overIndex = overIndex;
+      this.favoriteSort = { symbol: session.symbol, active: true, overIndex };
+    },
+    commitFavoriteSort(symbol, targetIndex) {
+      const normalized = String(symbol || "").trim().toUpperCase();
+      const currentIndex = this.favoriteSymbols.indexOf(normalized);
+      if (currentIndex < 0) return;
+      const nextIndex = Math.max(0, Math.min(this.favoriteSymbols.length - 1, Number(targetIndex)));
+      if (currentIndex === nextIndex) return;
+      const next = this.favoriteSymbols.slice();
+      const [item] = next.splice(currentIndex, 1);
+      next.splice(nextIndex, 0, item);
+      this.favoriteSymbols = next;
+      rememberFavoriteSymbols(next);
+    },
+    moveFavoriteByKeyboard(symbol, event) {
+      if (!event || !["ArrowUp", "ArrowDown"].includes(event.key)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const normalized = String(symbol || "").trim().toUpperCase();
+      const currentIndex = this.favoriteSymbols.indexOf(normalized);
+      if (currentIndex < 0) return;
+      const direction = event.key === "ArrowUp" ? -1 : 1;
+      const nextIndex = Math.max(0, Math.min(this.favoriteSymbols.length - 1, currentIndex + direction));
+      this.commitFavoriteSort(normalized, nextIndex);
+      this.$nextTick(() => document.querySelector(`[data-favorite-sort="${normalized}"]`)?.focus());
+    },
     closeChanLayerMenu(event) {
       const menu = event?.currentTarget?.closest(".chan-layer-menu, .chan-subchart-menu, .chan-period-menu, .chan-indicator-menu");
       if (!menu) return;
@@ -6500,7 +6811,9 @@ const optionScopeApp = new Vue({
     },
     toggleChanSubchart(name) {
       if (!Object.prototype.hasOwnProperty.call(DEFAULT_CHAN_SUBCHARTS, name)) return;
-      this.chanSubcharts = { ...this.chanSubcharts, [name]: !this.chanSubcharts[name] };
+      const enabled = !this.chanSubcharts[name];
+      this.chanSubcharts = { ...this.chanSubcharts, [name]: enabled };
+      if (name === "mfi") this.chanChartLayers = { ...this.chanChartLayers, mfi: enabled };
       rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers, this.chanSubcharts);
       if (!CHAN_INTRADAY_PERIODS.includes(this.chanPeriod) && this.chanPayload) {
         this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
@@ -6692,6 +7005,10 @@ const optionScopeApp = new Vue({
       if (this.chanPayload) this.view.chan = OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30, this.chanViewports, this.chanChartLayers, this.chanSubcharts);
     },
     toggleChanChartLayer(layer) {
+      if (layer === "mfi") {
+        this.toggleChanSubchart("mfi");
+        return;
+      }
       if (EXCLUSIVE_CHAN_INDICATOR_LAYERS.includes(layer)) {
         const enabled = !this.chanChartLayers[layer];
         this.chanChartLayers = {
@@ -6805,6 +7122,7 @@ const optionScopeApp = new Vue({
     expirationChanged() { return switchExpiration(this.expiration); },
     expirationMenuChanged(open) { return setExpirationMenuOpen(open); },
     selectHeatmapExpiration(expiration) {
+      if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) return;
       if (!isActiveExpiration(expiration)) return;
       const availableFromCache = chainHeatmapCache.symbol === state.symbol
         && chainHeatmapCache.availableExpirations.has(expiration);
@@ -6816,7 +7134,7 @@ const optionScopeApp = new Vue({
       return switchExpiration(expiration);
     },
     async refreshChainHeatmapExpirations() {
-      if (this.chainHeatmapRefreshRunning || this.loading) return;
+      if ((isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) || this.chainHeatmapRefreshRunning || this.loading) return;
       const symbol = state.symbol;
       const selectedExpiration = state.expiration;
       const catalogExpirations = this.expirationOptions.length
@@ -6878,6 +7196,7 @@ const optionScopeApp = new Vue({
       return this.chainView === "heatmap" ? renderChainHeatmap() : renderChainTable();
     },
     toggleChainView() {
+      if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) return;
       this.chainView = this.chainView === "heatmap" ? "table" : "heatmap";
       rememberChainViewPreference(this.chainView);
       this.view.chainTitle = chainViewTitle(state.symbol, state.expiration, this.chainView);
@@ -6947,7 +7266,7 @@ window.addEventListener("resize", () => {
 const initialQuery = parsePageQuery(location.search);
 const initialAccessKey = initializeAccessKey();
 // 页面默认标的由服务端按 DEFAULT_SYMBOLS 注入到输入框，这里只在注入缺失时兜底。
-state.symbol = initialQuery.symbol || byId("symbol-input").value.trim().toUpperCase() || "QQQ";
+state.symbol = canonicalSymbol(initialQuery.symbol || byId("symbol-input").value) || "QQQ";
 state.symbolInput = state.symbol;
 if (accessKeyRequired() && !initialAccessKey) {
   showAccessDenied();

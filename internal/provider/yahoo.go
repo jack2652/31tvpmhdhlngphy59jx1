@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -26,17 +27,19 @@ import (
 
 const (
 	optionsURL                     = "https://query1.finance.yahoo.com/v7/finance/options/%s"
+	futuresChartURL                = "https://query1.finance.yahoo.com/v8/finance/chart/%s"
 	lowMemoryQuoteTickerCacheLimit = 128
 	defaultQuoteTickerCacheLimit   = 512
 )
 
-var symbolPattern = regexp.MustCompile(`^[A-Z0-9][A-Z0-9.\-]{0,9}$`)
+var symbolPattern = regexp.MustCompile(`^(?:\^[A-Z0-9][A-Z0-9.\-]{0,8}|[A-Z0-9][A-Z0-9.\-]{0,9}|[A-Z0-9]+(?:-[A-Z0-9]+)?=F)$`)
 
 type Yahoo struct {
 	client        *http.Client
 	authClient    *yahooauth.Client
 	optionsAuth   yahooCrumbGetter
 	optionsURL    string
+	chartURL      string
 	fundamentals  *FundamentalsClient
 	earnings      *YahooEarningsClient
 	tickerFactory yahooTickerFactory
@@ -106,7 +109,7 @@ func NewYahoo(timeout time.Duration, concurrency int) *Yahoo {
 	fundamentals.Gate, fundamentals.GateWait = semaphore, timeout
 	earnings := NewYahooEarningsClient(client)
 	earnings.Gate, earnings.GateWait = semaphore, timeout
-	return &Yahoo{client: client, optionsURL: optionsURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTickerCacheEntry), quoteTickerInit: make(map[string]*yahooTickerInit), quoteTickerCacheMax: boundedQuoteTickerCacheEntries(false), interactiveGate: interactiveGate}
+	return &Yahoo{client: client, optionsURL: optionsURL, chartURL: futuresChartURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTickerCacheEntry), quoteTickerInit: make(map[string]*yahooTickerInit), quoteTickerCacheMax: boundedQuoteTickerCacheEntries(false), interactiveGate: interactiveGate}
 }
 
 func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress string) (*Yahoo, error) {
@@ -156,6 +159,7 @@ func newYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress stri
 		authClient:          authClient,
 		optionsAuth:         optionsAuth,
 		optionsURL:          optionsURL,
+		chartURL:            futuresChartURL,
 		fundamentals:        fundamentals,
 		earnings:            earnings,
 		tickerFactory:       tickerFactory,
@@ -283,10 +287,43 @@ func (y *Yahoo) Earnings(ctx context.Context, symbol string) ([]string, error) {
 
 func NormalizeSymbol(raw string) (string, error) {
 	symbol := strings.ToUpper(strings.TrimSpace(raw))
+	switch symbol {
+	case ".NDX":
+		symbol = "^NDX"
+	case ".SPX":
+		symbol = "^GSPC"
+	case ".DJI":
+		symbol = "^DJI"
+	case ".IXIC":
+		symbol = "^IXIC"
+	}
 	if !symbolPattern.MatchString(symbol) {
 		return "", fmt.Errorf("invalid symbol: %s", raw)
 	}
 	return symbol, nil
+}
+
+// IsIndexSymbol reports whether a symbol is a Yahoo market-index ticker.
+func IsIndexSymbol(raw string) bool {
+	symbol, err := NormalizeSymbol(raw)
+	if err != nil {
+		return false
+	}
+	switch symbol {
+	case "^NDX", "^GSPC", "^DJI", "^IXIC":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsFutureSymbol reports whether a symbol is a Yahoo continuous futures ticker.
+func IsFutureSymbol(raw string) bool {
+	symbol, err := NormalizeSymbol(raw)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(symbol, "=F")
 }
 
 func NormalizeExpiration(raw string) (string, error) {
@@ -415,6 +452,54 @@ func yahooSessionState(now time.Time, latest *time.Time) string {
 	return map[string]string{"pre": "PRE", "regular": "REGULAR", "post": "POST", "overnight": "OVERNIGHT"}[yahooSessionOf(now)]
 }
 
+// yahooFutureSessionState 不使用 NYSE 交易日历判断期货是否活跃。
+// CME 连续期货在美股收盘后仍会交易，只有日间维护窗口和无新成交时才应标记为 CLOSED。
+func yahooFutureSessionState(now, latest time.Time, marketState string) string {
+	if !latest.IsZero() && math.Abs(now.Sub(latest).Seconds()) > (30*time.Minute).Seconds() {
+		return "CLOSED"
+	}
+	switch strings.ToUpper(strings.TrimSpace(marketState)) {
+	case "REGULAR":
+		return "REGULAR"
+	case "PRE", "PREPRE":
+		return "PRE"
+	case "POST", "POSTPOST":
+		return "POST"
+	case "OVERNIGHT":
+		return "OVERNIGHT"
+	case "CLOSED":
+		return "CLOSED"
+	}
+	if latest.IsZero() {
+		return "CLOSED"
+	}
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	local := now.In(location)
+	minute := local.Hour()*60 + local.Minute()
+	if minute >= 17*60 && minute < 18*60 {
+		return "CLOSED"
+	}
+	if minute >= 9*60+30 && minute < 16*60 {
+		return "REGULAR"
+	}
+	return "OVERNIGHT"
+}
+
+func yahooFutureTradingDate(at time.Time, location *time.Location) string {
+	local := at.In(location)
+	date := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, location)
+	if local.Hour()*60+local.Minute() >= 18*60 {
+		date = date.AddDate(0, 0, 1)
+	}
+	for date.Weekday() == time.Saturday || date.Weekday() == time.Sunday {
+		date = date.AddDate(0, 0, 1)
+	}
+	return date.Format(time.DateOnly)
+}
+
 func yahooCurrentSessionTime(at, now time.Time) bool {
 	if at.IsZero() || at.Unix() <= 0 {
 		return false
@@ -515,10 +600,176 @@ func yahooHasCurrentPreMarketPrice(quote *yahooQuoteModel, now time.Time) bool {
 	return ok && !quote.PreMarketTime.Before(*params.Start) && !quote.PreMarketTime.After(*params.End)
 }
 
+// quoteFutureFromChart 使用 Yahoo chart 接口读取连续期货的最新分钟 K 线。
+// 期货报价不需要 quoteSummary 的完整字段，也不需要先获取 cookie/crumb；
+// 直接走 chart 可以避免 go-yfinance 首次认证和失败重试造成的长时间等待。
+func (y *Yahoo) quoteFutureFromChart(ctx context.Context, symbol string) (model.Quote, error) {
+	if y == nil || y.client == nil {
+		return model.Quote{}, errors.New("Yahoo chart client is unavailable")
+	}
+	template := y.chartURL
+	if strings.TrimSpace(template) == "" {
+		template = futuresChartURL
+	}
+	endpoint := fmt.Sprintf(template, url.PathEscape(symbol))
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return model.Quote{}, errors.New("invalid Yahoo futures chart URL")
+	}
+	query := parsed.Query()
+	query.Set("range", "1d")
+	query.Set("interval", "1m")
+	query.Set("includePrePost", "true")
+	query.Set("events", "div,splits")
+	parsed.RawQuery = query.Encode()
+
+	release, err := acquireGateTimeout(ctx, y.interactiveUpstreamGate(), y.gateWait)
+	if err != nil {
+		return model.Quote{}, err
+	}
+	defer release()
+	startedAt := time.Now()
+	request, err := outboundhttp.NewRequest(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return model.Quote{}, fmt.Errorf("build Yahoo futures chart request: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("User-Agent", "option-scope-go/1.0")
+	response, err := outboundhttp.Do(y.client, request)
+	if err != nil {
+		if ctx.Err() != nil {
+			return model.Quote{}, ctx.Err()
+		}
+		return model.Quote{}, errors.New("Yahoo futures chart request failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return model.Quote{}, fmt.Errorf("Yahoo futures chart returned HTTP %d", response.StatusCode)
+	}
+	var payload chartEnvelope
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 4<<20))
+	if err := decoder.Decode(&payload); err != nil {
+		return model.Quote{}, fmt.Errorf("decode Yahoo futures chart response: %w", err)
+	}
+	if payload.Chart.Error != nil {
+		return model.Quote{}, payload.Chart.Error
+	}
+	if len(payload.Chart.Result) == 0 {
+		return model.Quote{}, errors.New("Yahoo futures chart returned no data")
+	}
+	quote, quoteErr := futureQuoteFromChartResult(symbol, payload.Chart.Result[0], y.marketNow())
+	if elapsed := time.Since(startedAt); elapsed >= time.Second {
+		log.Printf("slow Yahoo futures chart symbol=%s total=%s", symbol, elapsed.Round(time.Millisecond))
+	}
+	return quote, quoteErr
+}
+
+func futureQuoteFromChartResult(symbol string, result yahooChartResult, now time.Time) (model.Quote, error) {
+	if len(result.Indicators.Quote) == 0 {
+		return model.Quote{}, errors.New("Yahoo futures chart returned no quote bars")
+	}
+	bars := result.Indicators.Quote[0]
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	latestAt := time.Time{}
+	latestPrice := 0.0
+	for index, stamp := range result.Timestamp {
+		if stamp == nil || index >= len(bars.Close) || bars.Close[index] == nil || !validYahooPrice(*bars.Close[index]) {
+			continue
+		}
+		at := time.Unix(*stamp, 0)
+		if at.After(now.Add(5 * time.Minute)) {
+			continue
+		}
+		if latestAt.IsZero() || at.After(latestAt) {
+			latestAt, latestPrice = at, *bars.Close[index]
+		}
+	}
+	if latestAt.IsZero() && validYahooPrice(result.Meta.RegularMarketPrice) {
+		latestPrice = result.Meta.RegularMarketPrice
+		if result.Meta.RegularMarketTime > 0 {
+			latestAt = time.Unix(result.Meta.RegularMarketTime, 0)
+		}
+	}
+	if !validYahooPrice(latestPrice) {
+		return model.Quote{}, errors.New("Yahoo futures chart returned no valid price")
+	}
+	previous := result.Meta.PreviousClose
+	if !validYahooPrice(previous) {
+		previous = result.Meta.ChartPreviousClose
+	}
+	priceAt := latestAt
+	if priceAt.IsZero() {
+		priceAt = now
+	}
+	state := yahooFutureSessionState(now, latestAt, result.Meta.MarketState)
+	date := yahooFutureTradingDate(priceAt, location)
+	open, high, low, volume := 0.0, 0.0, 0.0, int64(0)
+	haveOHLC := false
+	for index, stamp := range result.Timestamp {
+		if stamp == nil || yahooFutureTradingDate(time.Unix(*stamp, 0), location) != date {
+			continue
+		}
+		if index < len(bars.Open) && bars.Open[index] != nil && validYahooPrice(*bars.Open[index]) && !validYahooPrice(open) {
+			open = *bars.Open[index]
+		}
+		if index < len(bars.High) && bars.High[index] != nil && validYahooPrice(*bars.High[index]) && (!haveOHLC || *bars.High[index] > high) {
+			high = *bars.High[index]
+		}
+		if index < len(bars.Low) && bars.Low[index] != nil && validYahooPrice(*bars.Low[index]) && (!haveOHLC || low == 0 || *bars.Low[index] < low) {
+			low = *bars.Low[index]
+		}
+		if index < len(bars.Volume) && bars.Volume[index] != nil && *bars.Volume[index] > 0 {
+			volume += *bars.Volume[index]
+		}
+		haveOHLC = haveOHLC || validYahooPrice(open) || validYahooPrice(high) || validYahooPrice(low)
+	}
+	var dailyBar *model.DailyBar
+	if haveOHLC {
+		if !validYahooPrice(open) {
+			open = latestPrice
+		}
+		if !validYahooPrice(high) {
+			high = latestPrice
+		}
+		if !validYahooPrice(low) {
+			low = latestPrice
+		}
+		if high >= math.Max(open, latestPrice) && low <= math.Min(open, latestPrice) && low <= high {
+			dailyBar = &model.DailyBar{Date: date, Open: open, High: high, Low: low, Close: latestPrice, Volume: float64(volume), IsForming: state != "CLOSED"}
+		}
+	}
+	var change *float64
+	if validYahooPrice(previous) {
+		value := (latestPrice - previous) / previous * 100
+		change = &value
+	}
+	sessions := map[string]any{}
+	sessionName := strings.ToLower(state)
+	if sessionName == "closed" {
+		sessionName = "regular"
+	}
+	summary := map[string]any{"price": latestPrice, "as_of": priceAt.Format(time.RFC3339), "date": date}
+	if validYahooPrice(previous) {
+		summary["reference_close"] = previous
+		if change != nil {
+			summary["change_percent"] = *change
+		}
+	}
+	sessions[sessionName] = summary
+	fetched := now.UTC()
+	return model.Quote{Symbol: symbol, Price: &latestPrice, ChangePercent: change, TodayOpen: optionalFloat(open), PreviousClose: optionalFloat(previous), DailyBar: dailyBar, Currency: stringOr(result.Meta.Currency, "USD"), MarketState: strings.ToUpper(state), Provider: "yahoo-chart", Source: "upstream", FetchedAt: &fetched, Sessions: sessions, FairValuePending: true}, nil
+}
+
 func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 	symbol, err := NormalizeSymbol(symbol)
 	if err != nil {
 		return model.Quote{}, err
+	}
+	if IsFutureSymbol(symbol) {
+		return y.quoteFutureFromChart(ctx, symbol)
 	}
 	now := y.marketNow()
 	state := yahooSessionState(now, nil)

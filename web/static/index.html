@@ -13,7 +13,24 @@
 <body>
   <div id="app" v-cloak>
   <header class="topbar">
-    <div class="brand"><img class="brand-mark" src="/static/common/img/option-scope-mark.svg?v=__ASSET_VERSION__" alt="Option Scope" width="34" height="34"><div><strong>美股行情与期权分析</strong><small>OPTION SCOPE</small></div></div>
+    <div class="topbar-left">
+      <div class="favorite-menu">
+        <button id="favorites-toggle" class="favorite-toggle" type="button" :aria-expanded="favoritesOpen ? 'true' : 'false'" aria-controls="favorites-panel" :aria-label="favoritesOpen ? '隐藏收藏标的' : '显示收藏标的'" :title="favoritesOpen ? '隐藏收藏标的' : '显示收藏标的'" @click.stop="toggleFavorites" @keydown.esc.stop.prevent="closeFavorites"><i class="el-icon-menu" aria-hidden="true"></i></button>
+        <div v-show="favoritesOpen" id="favorites-panel" class="favorite-panel panel" role="region" aria-label="收藏的标的" @click.stop @keydown.esc.stop.prevent="closeFavorites">
+          <div class="favorite-panel-head"><div><strong>收藏的标的</strong><small>点击切换行情 · 拖动排序</small></div><button class="favorite-add" type="button" :disabled="currentSymbolFavorited || favoriteLimitReached" :title="currentSymbolFavorited ? '当前标的已收藏' : favoriteLimitReached ? '最多收藏 50 个标的' : '收藏当前标的'" @click="addCurrentFavorite"><i :class="currentSymbolFavorited ? 'el-icon-check' : 'el-icon-plus'" aria-hidden="true"></i><span>{{ currentSymbolFavorited ? '已收藏' : favoriteLimitReached ? '已达上限' : '收藏当前' }}</span></button></div>
+          <ul v-if="favoriteSymbols.length" class="favorite-list">
+            <li v-for="(favorite, index) in favoriteSymbols" :key="favorite" class="favorite-item" :class="{ 'is-current': favorite === symbol, 'is-dragging': favoriteSort.active && favoriteSort.symbol === favorite, 'is-drop-target': favoriteSort.active && favoriteSort.overIndex === index && favoriteSort.symbol !== favorite }">
+              <button class="favorite-sort-handle" type="button" :data-favorite-sort="favorite" :aria-label="'调整收藏顺序 ' + favorite" aria-keyshortcuts="ArrowUp ArrowDown" :aria-grabbed="favoriteSort.active && favoriteSort.symbol === favorite ? 'true' : 'false'" title="拖动排序，使用上下方向键调整" @pointerdown.stop="beginFavoriteSort(favorite, $event)" @keydown="moveFavoriteByKeyboard(favorite, $event)"><i class="el-icon-sort" aria-hidden="true"></i></button>
+              <button class="favorite-symbol" type="button" :aria-current="favorite === symbol ? 'true' : null" @click="selectFavoriteSymbol(favorite)"><span class="favorite-symbol-mark">$</span><strong>{{ favorite }}</strong><small v-if="favorite === symbol">当前</small></button>
+              <button class="favorite-remove" type="button" :aria-label="'移除收藏 ' + favorite" title="移除收藏" @click="removeFavoriteSymbol(favorite, $event)"><i class="el-icon-delete" aria-hidden="true"></i></button>
+            </li>
+          </ul>
+          <p v-else class="favorite-empty" aria-live="polite">暂无收藏标的</p>
+        </div>
+      </div>
+      <div class="brand"><img class="brand-mark" src="/static/common/img/option-scope-mark.svg?v=__ASSET_VERSION__" alt="Option Scope" width="34" height="34"><div><strong>美股行情与期权分析</strong><small>OPTION SCOPE</small></div></div>
+      <nav class="market-nav" aria-label="市场导航"><a href="/" class="market-nav-link is-active" aria-current="page">股票行情</a><a href="/futures" class="market-nav-link">期货行情</a></nav>
+    </div>
     <div class="top-actions">
       <div class="top-meta"><span class="live-dot"></span><span id="market-state" v-text="view.marketState">等待数据</span><span class="divider"></span><span id="clock">--:--:--</span></div>
       <el-button id="theme-toggle" class="theme-toggle" type="text" circle :title="view.themeLabel" aria-pressed="false" @click="toggleTheme"><i :class="view.themeIcon" aria-hidden="true"></i></el-button>
@@ -29,16 +46,16 @@
   <main class="shell">
     <section class="toolbar panel">
       <div class="control symbol-control"><label for="symbol-input">标的</label><div class="input-wrap"><span>$</span><el-input id="symbol-input" value="__DEFAULT_SYMBOL__" v-model.trim="symbolInput" maxlength="10" autocomplete="off" @keyup.enter.native="navigateToSymbol"></el-input><el-button id="load-button" type="primary" size="small" @click="navigateToSymbol" :loading="loading" :disabled="busy">载入</el-button></div></div>
-      <div class="control"><label for="expiration-select">到期日</label><el-select id="expiration-select" v-model="expiration" @change="expirationChanged" @visible-change="expirationMenuChanged" :disabled="busy || !expirationOptions.length" :placeholder="expirationPlaceholder" filterable><el-option v-for="date in expirationOptions" :key="date" :value="date" :label="date"></el-option></el-select></div>
+      <div v-if="!indexSymbol || indexOptionsAvailable" class="control"><label for="expiration-select">到期日</label><el-select id="expiration-select" v-model="expiration" @change="expirationChanged" @visible-change="expirationMenuChanged" :disabled="busy || !expirationOptions.length" :placeholder="expirationPlaceholder" filterable><el-option v-for="date in expirationOptions" :key="date" :value="date" :label="date"></el-option></el-select></div>
     </section>
 
     <section class="headline-grid">
       <article class="quote panel"><div class="eyebrow">标的现货</div><div class="quote-line"><span id="quote-symbol" v-text="view.quoteSymbol">__DEFAULT_SYMBOL__</span><span id="quote-price" v-text="view.quotePrice">--</span></div><div class="quote-sub"><span id="quote-change" :style="{color: view.quoteChangeColor}" v-text="view.quoteChange">涨跌 --</span><span id="quote-reference" :title="view.quoteReferenceTitle" v-text="view.quoteReference">昨收 --</span><span id="quote-currency" v-text="view.quoteCurrency">USD</span><span id="quote-market" v-text="view.quoteMarket">--</span></div></article>
-      <article class="metric panel"><div class="eyebrow">合约总数</div><strong id="total-count" v-text="view.totalCount">--</strong><span>当前到期日</span></article>
-      <article class="metric call-metric panel"><div class="eyebrow">看涨成交量</div><strong id="call-volume" v-text="view.callVolume">--</strong><span id="call-interest" v-text="view.callInterest">未平仓 --</span></article>
-      <article class="metric put-metric panel"><div class="eyebrow">看跌成交量</div><strong id="put-volume" v-text="view.putVolume">--</strong><span id="put-interest" v-text="view.putInterest">未平仓 --</span></article>
-      <article class="metric fair-value-metric fair-defensive-metric panel" :title="view.fairDefensiveTitle"><div class="eyebrow">保守情景估值</div><strong id="fair-defensive" v-text="view.fairDefensive">--</strong><span id="fair-defensive-source" v-text="view.fairDefensiveSource">等待估值计算</span></article>
-      <article class="metric fair-value-metric fair-optimistic-metric panel" :title="view.fairOptimisticTitle"><div class="eyebrow">乐观情景估值</div><strong id="fair-optimistic" v-text="view.fairOptimistic">--</strong><span id="fair-optimistic-source" v-text="view.fairOptimisticSource">等待估值计算</span></article>
+      <article v-if="!indexSymbol || indexOptionsAvailable" class="metric panel"><div class="eyebrow">合约总数</div><strong id="total-count" v-text="view.totalCount">--</strong><span>当前到期日</span></article>
+      <article v-if="!indexSymbol || indexOptionsAvailable" class="metric call-metric panel"><div class="eyebrow">看涨成交量</div><strong id="call-volume" v-text="view.callVolume">--</strong><span id="call-interest" v-text="view.callInterest">未平仓 --</span></article>
+      <article v-if="!indexSymbol || indexOptionsAvailable" class="metric put-metric panel"><div class="eyebrow">看跌成交量</div><strong id="put-volume" v-text="view.putVolume">--</strong><span id="put-interest" v-text="view.putInterest">未平仓 --</span></article>
+      <article class="metric fair-value-metric fair-defensive-metric panel" :title="indexSymbol ? '指数暂不适用公司估值模型' : view.fairDefensiveTitle"><div class="eyebrow">保守情景估值</div><strong id="fair-defensive" v-text="indexSymbol ? '--' : view.fairDefensive">--</strong><span id="fair-defensive-source" v-text="indexSymbol ? '指数暂不适用估值' : view.fairDefensiveSource">等待估值计算</span></article>
+      <article class="metric fair-value-metric fair-optimistic-metric panel" :title="indexSymbol ? '指数暂不适用公司估值模型' : view.fairOptimisticTitle"><div class="eyebrow">乐观情景估值</div><strong id="fair-optimistic" v-text="indexSymbol ? '--' : view.fairOptimistic">--</strong><span id="fair-optimistic-source" v-text="indexSymbol ? '指数暂不适用估值' : view.fairOptimisticSource">等待估值计算</span></article>
     </section>
 
     <section class="detail-group panel" id="analysis-detail">
@@ -80,9 +97,9 @@
             </div>
           </article>
           <article class="panel plan-panel levels-panel-support">
-            <div class="analysis-heading"><div><span class="eyebrow">ADD</span><h2>加仓价位</h2><p>更深一档的最多 10 个支撑</p><p class="level-strength-hint"><span class="level-strength-swatch support"></span>强化色=模型强度达标且历史表现通过；严格识别的期权墙可在样本不足时保留重点色 · 颜色越深，综合强度越高</p></div></div>
+            <div class="analysis-heading"><div><span class="eyebrow">ADD</span><h2>加仓价位</h2><p>更深一档的最多 10 个支撑</p><p v-if="!indexSymbol" class="level-strength-hint"><span class="level-strength-swatch support"></span>强化色=模型强度达标且历史表现通过；严格识别的期权墙可在样本不足时保留重点色 · 颜色越深，综合强度越高</p><p v-else class="level-strength-hint"><span class="level-strength-swatch support"></span>指数价格参考位 · 依据日线结构与历史回踩</p></div></div>
             <div class="levels" id="add-levels">
-              <div class="level-row level-head level-plan-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>
+              <div class="level-row level-head level-plan-row"><span>价位区间</span><span>距现价</span><span :title="indexSymbol ? (indexOptionsAvailable ? '指数期权链已接入；触及概率模型暂不适用于指数期权' : '该指数暂未接入期权链，因此不计算触及概率') : '在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算'">{{ indexSymbol ? '期权概率' : '触及概率' }}</span><span>综合依据</span></div>
               <div v-if="!view.levels.add.length" class="levels-empty">{{ view.levels.addEmpty }}</div>
               <div v-for="level in view.levels.add" :key="level.key" class="level-item"><div class="level-row level-plan-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-support">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></div>
             </div>
@@ -91,17 +108,17 @@
 
           <section class="levels-grid">
           <article class="panel levels-panel levels-panel-support">
-            <div class="analysis-heading"><div><span class="eyebrow">SUPPORT</span><h2>支撑位</h2><p id="support-note" v-text="view.levels.supportNote">等待数据</p><p class="level-strength-hint"><span class="level-strength-swatch support"></span>强化色=模型强度达标且历史表现通过；严格识别的期权墙可在样本不足时保留重点色 · 颜色越深，综合强度越高</p></div></div>
+            <div class="analysis-heading"><div><span class="eyebrow">SUPPORT</span><h2>支撑位</h2><p id="support-note" v-text="view.levels.supportNote">等待数据</p><p v-if="!indexSymbol" class="level-strength-hint"><span class="level-strength-swatch support"></span>强化色=模型强度达标且历史表现通过；严格识别的期权墙可在样本不足时保留重点色 · 颜色越深，综合强度越高</p><p v-else class="level-strength-hint"><span class="level-strength-swatch support"></span>指数价格参考位 · 依据日线结构与历史回踩</p></div></div>
             <div class="levels" id="support-levels">
-              <div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>
+              <div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span><span :title="indexSymbol ? (indexOptionsAvailable ? '指数期权链已接入；触及概率模型暂不适用于指数期权' : '该指数暂未接入期权链，因此不计算触及概率') : '在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算'">{{ indexSymbol ? '期权概率' : '触及概率' }}</span><span>综合依据</span></div>
               <div v-if="!view.levels.support.length" class="levels-empty">{{ view.levels.supportEmpty }}</div>
               <div v-for="level in view.levels.support" :key="level.key" class="level-item"><div class="level-row level-factor-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-support">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></div>
             </div>
           </article>
           <article class="panel levels-panel levels-panel-resistance">
-            <div class="analysis-heading"><div><span class="eyebrow">RESISTANCE</span><h2>压力位</h2><p id="resistance-note" v-text="view.levels.resistanceNote">等待数据</p><p class="level-strength-hint"><span class="level-strength-swatch resistance"></span>强化色=模型强度达标且历史表现通过；严格识别的期权墙可在样本不足时保留重点色 · 颜色越深，综合强度越高</p></div></div>
+            <div class="analysis-heading"><div><span class="eyebrow">RESISTANCE</span><h2>压力位</h2><p id="resistance-note" v-text="view.levels.resistanceNote">等待数据</p><p v-if="!indexSymbol" class="level-strength-hint"><span class="level-strength-swatch resistance"></span>强化色=模型强度达标且历史表现通过；严格识别的期权墙可在样本不足时保留重点色 · 颜色越深，综合强度越高</p><p v-else class="level-strength-hint"><span class="level-strength-swatch resistance"></span>指数价格参考位 · 依据日线结构与历史回踩</p></div></div>
             <div class="levels" id="resistance-levels">
-              <div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span><span title="在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算">触及概率</span><span>综合依据</span></div>
+              <div class="level-row level-head level-factor-row"><span>价位区间</span><span>距现价</span><span :title="indexSymbol ? (indexOptionsAvailable ? '指数期权链已接入；触及概率模型暂不适用于指数期权' : '该指数暂未接入期权链，因此不计算触及概率') : '在所选到期日之前触及该价位的概率：按该到期日隐含波动率、零漂移的首次触及模型估算'">{{ indexSymbol ? '期权概率' : '触及概率' }}</span><span>综合依据</span></div>
               <div v-if="!view.levels.resistance.length" class="levels-empty">{{ view.levels.resistanceEmpty }}</div>
               <div v-for="level in view.levels.resistance" :key="level.key" class="level-item"><div class="level-row level-factor-row" :class="level.className" :title="level.title"><span class="level-strike">{{ level.range }}</span><span class="level-gap" :class="level.gapClass">{{ level.gap }}</span><span class="level-prob">{{ level.probability }}</span><span class="level-factors"><span class="level-factor-text">{{ level.factors }}</span></span></div><div class="level-note-row"><span class="level-note-content"><span v-if="level.strengthTag" class="level-note-strength level-note-strength-resistance">{{ level.strengthTag }}</span><span v-if="level.strengthTag" class="level-note-divider"> · </span><span>{{ level.detail }}</span></span></div></div>
             </div>
@@ -112,7 +129,7 @@
       </div>
     </section>
 
-    <section class="detail-group panel" id="chart-group">
+    <section v-show="!indexSymbol || indexOptionsAvailable" class="detail-group panel" id="chart-group">
       <div class="detail-header" id="chart-header">
         <button class="detail-toggle" id="chart-toggle" type="button" aria-expanded="true" aria-controls="chart-fold">
           <span class="detail-caret" aria-hidden="true"></span>
@@ -155,7 +172,7 @@
           <span class="detail-action">{{ chanExpanded ? '收起' : '展开' }}</span>
         </button>
       </div>
-      <div class="detail-body chan-body" id="chan-body" v-show="chanExpanded">
+      <div v-if="chanExpanded" class="detail-body chan-body" id="chan-body">
         <div class="chan-summary">
           <div class="chan-summary-read"><span class="chan-section-label">缠论结构 · {{ chanFrame.label }}概况</span><h2>{{ chanFrame.recursive.heading }}</h2><p>{{ chanFrame.recursive.trend }}</p></div>
           <div class="chan-meta"><strong class="chan-summary-spot">现价 {{ view.chan.spot }}</strong><span class="chan-status-line" role="status">{{ chanStatusLine }}</span><span class="chan-summary-quality chan-quality" :class="'chan-quality-' + chanFrame.recursive.qualityClass">行情{{ chanFrame.recursive.quality }}</span></div>
@@ -268,7 +285,9 @@
                   <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.volume ? 'true' : 'false'" @click="toggleChanSubchart('volume')">成交量</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.macd ? 'true' : 'false'" @click="toggleChanSubchart('macd')">MACD</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.dmi ? 'true' : 'false'" @click="toggleChanSubchart('dmi')">DMI</button>
-                </div></section>
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.mfi ? 'true' : 'false'" @click="toggleChanSubchart('mfi')">MFI</button>
+                </div>
+                </section>
               </div>
             </details>
             <details class="chan-indicator-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
@@ -364,11 +383,13 @@
               <line class="chart-crosshair-h chart-crosshair-volume"></line>
               <line class="chart-crosshair-h chart-crosshair-macd"></line>
               <line class="chart-crosshair-h chart-crosshair-dmi"></line>
+              <line class="chart-crosshair-h chart-crosshair-mfi"></line>
               <g class="chart-tag chart-tag-x"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-y"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-volume"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-macd"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-dmi"><rect rx="2" height="18"></rect><text></text></g>
+              <g class="chart-tag chart-tag-mfi"><rect rx="2" height="18"></rect><text></text></g>
             </g>
           </svg>
           <button v-if="chanFrame.chart.spot" type="button" class="chan-spot-canvas-hitbox" :style="{ left: (chanFrame.chart.plotLeft / chanFrame.chart.width * 100) + '%', top: (chanFrame.chart.spot.y / chanFrame.chart.height * 100) + '%' }" aria-label="现价，点击切换结构观察" :aria-expanded="chanSpotGuideVisible ? 'true' : 'false'" :aria-describedby="chanSpotGuideVisible ? 'chan-spot-guide-card' : null" @click.stop="toggleChanSpotGuide($event)" @keydown.esc.stop.prevent="dismissChanSpotGuide"></button>
@@ -494,7 +515,7 @@
       </div>
     </section>
 
-    <section class="detail-group panel option-analysis-group" id="option-analysis-group">
+    <section v-show="!indexSymbol || indexOptionsAvailable" class="detail-group panel option-analysis-group" id="option-analysis-group">
       <div class="detail-header" id="option-analysis-header">
         <button class="detail-toggle" id="option-analysis-toggle" type="button" aria-expanded="false" aria-controls="option-analysis-fold">
           <span class="detail-caret" aria-hidden="true"></span>
@@ -511,7 +532,7 @@
       <div class="detail-body option-analysis-fold" id="option-analysis-fold" hidden>
     <div class="option-flow-fold" id="option-flow-fold" data-option-view-panel="flow">
         <div class="option-flow-panel">
-          <div class="flow-overview"><div><span class="flow-kicker">相邻快照</span><p>用成交量增量和买卖价位置判断主动买卖</p></div><div class="flow-signal" :class="`flow-signal-${view.flow.signalClass}`"><strong v-text="view.flow.signalLabel">等待相邻快照</strong><span v-text="view.flow.signalDetail">需要两份相邻期权链快照才能估算流向</span></div></div>
+          <div class="flow-overview"><div><span class="flow-kicker">相邻快照</span><p>{{ indexSymbol ? '指数期权快照不提供可确认的主动成交方向' : '用成交量增量和买卖价位置判断主动买卖' }}</p></div><div class="flow-signal" :class="`flow-signal-${view.flow.signalClass}`"><strong v-text="view.flow.signalLabel">等待相邻快照</strong><span v-text="view.flow.signalDetail">需要两份相邻期权链快照才能估算流向</span></div></div>
           <div class="flow-window"><span v-text="view.flow.windowLabel">快照窗口 --</span><span v-text="view.flow.methodLabel">成交量增量 · 买卖价方向估算 · 中性单列</span></div>
           <div class="flow-kpi-strip" aria-label="期权流向汇总">
             <div><span>新增成交量</span><strong v-text="view.flow.summary.totalVolume">--</strong><small>看涨 + 看跌</small></div>
@@ -570,7 +591,7 @@
       </div>
     </section>
 
-    <section class="data-panel panel">
+    <section v-show="!indexSymbol || indexOptionsAvailable" class="data-panel panel">
       <div class="detail-header" id="chain-header">
         <button class="detail-toggle" id="chain-toggle" type="button" aria-expanded="false" aria-controls="chain-fold" aria-label="GEX 热力图明细"><span class="detail-caret" aria-hidden="true"></span></button>
         <div class="detail-text"><span class="eyebrow">GEX HEATMAP</span><h1 id="chain-title" v-text="view.chainTitle">GEX 热力图 · 选择到期日查看</h1></div>
@@ -607,6 +628,7 @@
   <script src="/static/common/js/chan-macd-sma.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-supertrend.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-wyckoff.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-mfi.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/app.js?v=__ASSET_VERSION__"></script>
 </body>

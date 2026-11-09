@@ -131,7 +131,7 @@ func LoadFromDir(baseDir string) Config {
 		HistoryMaxAge:        time.Duration(envInt("HISTORY_MAX_AGE_SECONDS", 3600)) * time.Second,
 		ExtremesMaxAge:       time.Duration(envInt("EXTREMES_MAX_AGE_SECONDS", 86400)) * time.Second,
 		UpstreamTimeout:      time.Duration(envInt("UPSTREAM_TIMEOUT_SECONDS", 12)) * time.Second,
-		CboeTimeout:          time.Duration(envInt("CBOE_TIMEOUT_SECONDS", 15)) * time.Second,
+		CboeTimeout:          time.Duration(envInt("CBOE_TIMEOUT_SECONDS", 45)) * time.Second,
 		UpstreamWait:         upstreamWaitDuration(lowMemory),
 		UpstreamConcurrency:  effectiveConcurrency(upstreamMemory, lowMemory),
 		MemoryLimitBytes:     memoryLimit,

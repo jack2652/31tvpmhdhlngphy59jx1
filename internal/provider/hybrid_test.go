@@ -174,6 +174,63 @@ func TestHybridOvernightQuoteFallsBackToAlpacaWithoutCboe(t *testing.T) {
 	}
 }
 
+func TestHybridIndexUsesCboeOptionsAndSkipsOvernightProvider(t *testing.T) {
+	var cboeRequests, alpacaRequests atomic.Int64
+	cboeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cboeRequests.Add(1)
+		if r.URL.Path != "/_NDX" {
+			t.Errorf("Cboe path=%q, want mapped NDX root", r.URL.Path)
+		}
+		_, _ = fmt.Fprint(w, `{"data":{"current_price":27100,"options":[{"option":"NDX300118C27000000","bid":1,"ask":2,"volume":3,"open_interest":4,"iv":0.2,"gamma":0.01}]}}`)
+	}))
+	defer cboeServer.Close()
+	alpacaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		alpacaRequests.Add(1)
+		_, _ = fmt.Fprint(w, `{"^NDX":{"latestTrade":{"p":101},"prevDailyBar":{"c":100}}}`)
+	}))
+	defer alpacaServer.Close()
+
+	yahoo := NewYahoo(time.Second, 2)
+	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{
+		quote: &models.Quote{Symbol: "^NDX", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"},
+	})
+	delayed := NewCboeOptionsClient(cboeServer.Client(), cboeServer.URL+"/{symbol}")
+	alpaca := NewAlpaca("key", "secret", alpacaServer.URL, alpacaServer.Client())
+	hybrid := NewHybrid(yahoo, delayed, alpaca)
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hybrid.now = func() time.Time { return time.Date(2026, time.October, 7, 20, 0, 0, 0, newYork) }
+
+	quote, err := hybrid.Quote(context.Background(), ".NDX")
+	if err != nil || quote.Price == nil || *quote.Price != 100 || quote.Symbol != "^NDX" {
+		t.Fatalf("index Quote() = %#v, %v; want Yahoo index quote", quote, err)
+	}
+	snapshot, err := hybrid.SnapshotQuote(context.Background(), "^NDX")
+	if err != nil || snapshot.Price == nil || *snapshot.Price != 100 {
+		t.Fatalf("index SnapshotQuote() = %#v, %v; want Yahoo index quote", snapshot, err)
+	}
+	expirations, err := hybrid.Expirations(context.Background(), ".NDX")
+	if err != nil || len(expirations) != 1 || expirations[0] != "2030-01-18" {
+		t.Fatalf("index Expirations() = %#v, %v; want delayed NDX expiry", expirations, err)
+	}
+	nearestExpirations, rows, fetched, err := hybrid.NearestChain(context.Background(), "^NDX")
+	if err != nil || len(nearestExpirations) != 1 || len(rows) != 1 || fetched == nil {
+		t.Fatalf("index NearestChain() = %#v, %#v, %v, %v; want delayed NDX chain", nearestExpirations, rows, fetched, err)
+	}
+	chain, fetched, err := hybrid.Chain(context.Background(), ".NDX", "2030-01-18")
+	if err != nil || len(chain) != 1 || fetched == nil {
+		t.Fatalf("index Chain() = %#v, %v, %v; want delayed NDX chain", chain, fetched, err)
+	}
+	if got := cboeRequests.Load(); got != 1 {
+		t.Fatalf("Cboe requests = %d, want one shared index snapshot", got)
+	}
+	if got := alpacaRequests.Load(); got != 0 {
+		t.Fatalf("Alpaca requests = %d, want none for an index", got)
+	}
+}
+
 func TestOvernightOnlyQuoteKeepsAlpacaPriceAndDerivesChange(t *testing.T) {
 	overnightPrice, previous, open := 101.0, 100.0, 100.5
 	overnight := model.Quote{Symbol: "QQQ", Price: &overnightPrice, PreviousClose: &previous, TodayOpen: &open, Provider: "alpaca-overnight", MarketState: "OVERNIGHT", Sessions: map[string]any{"overnight": map[string]any{"price": overnightPrice}}}
@@ -357,6 +414,41 @@ func TestHybridPreMarketQuoteAttachesPreviousPostSessionFromChart(t *testing.T) 
 	}
 }
 
+func TestHybridFutureQuoteDoesNotStartPreviousPostSDKLookup(t *testing.T) {
+	newYork, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := time.Date(2026, time.November, 6, 22, 0, 0, 0, newYork)
+	stamp := frozen.Add(-time.Minute).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chart/ES=F" {
+			t.Errorf("chart path = %q, want /chart/ES=F", r.URL.Path)
+		}
+		_, _ = fmt.Fprintf(w, `{"chart":{"result":[{"meta":{"symbol":"ES=F","currency":"USD","previousClose":99,"marketState":"CLOSED"},"timestamp":[%d],"indicators":{"quote":[{"open":[99],"high":[101],"low":[98],"close":[100],"volume":[12]}]}}],"error":null}}`, stamp)
+	}))
+	defer server.Close()
+
+	yahoo := NewYahoo(time.Second, 1)
+	t.Cleanup(func() { _ = yahoo.Close() })
+	yahoo.client = server.Client()
+	yahoo.chartURL = server.URL + "/chart/%s"
+	yahoo.now = func() time.Time { return frozen }
+	yahoo.tickerFactory = func(string) (yahooTicker, error) {
+		t.Fatal("future quote started the stock previous-post SDK lookup")
+		return nil, nil
+	}
+	hybrid := NewHybrid(yahoo, nil, nil)
+	hybrid.now = func() time.Time { return frozen }
+	quote, err := hybrid.Quote(context.Background(), "ES=F")
+	if err != nil {
+		t.Fatalf("future Hybrid.Quote() error = %v", err)
+	}
+	if quote.Price == nil || *quote.Price != 100 {
+		t.Fatalf("future Hybrid.Quote() price = %v, want 100", quote.Price)
+	}
+}
+
 func TestHybridOvernightQuoteDoesNotReturnFallbackAfterCancellation(t *testing.T) {
 	requestStarted := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -488,6 +580,16 @@ func TestDefaultHybridUsesPythonProviderTimeouts(t *testing.T) {
 	}
 	if got := defaults.Delayed.Client.Timeout; got != 15*time.Second {
 		t.Errorf("default Cboe timeout=%s, want Python's 15s", got)
+	}
+}
+
+func TestDefaultHybridAcceptsConfiguredCboeTimeout(t *testing.T) {
+	hybrid, err := NewDefaultHybridWithCboeTimeout(12*time.Second, 45*time.Second, 2, "", "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hybrid.Delayed.Client.Timeout; got != 45*time.Second {
+		t.Fatalf("Cboe timeout=%s, want configured 45s", got)
 	}
 }
 

@@ -130,7 +130,7 @@ func TestFastAPIOpenAPIBusinessRouteContracts(t *testing.T) {
 			path: "/api/chan/{stock_symbol}", method: "get", operationID: "chan_api_chan__stock_symbol__get", summary: "Chan Structure",
 			description:   "日线与周线缠论笔结构：严格旧笔、笔中枢、当前位置、力度衰减线索和条件式走势推演。只读取历史缓存，缺失或过期时后台更新；spot 可传页面现价。未收盘日线、未完成周线和形成中的笔不用于中枢确认。笔中枢不代表递归级别；第三类位置只标记候选。",
 			responseTitle: "Response Chan Api Chan  Stock Symbol  Get",
-			parameters:    []map[string]any{pathSymbol, query("spot", false, spotSchema)}, validation: true,
+			parameters:    []map[string]any{pathSymbol, query("spot", false, spotSchema), query("include_mfi_market_history", false, boolSchema("Include MFI Market History", false))}, validation: true,
 		},
 	}
 

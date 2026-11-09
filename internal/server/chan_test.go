@@ -4,8 +4,23 @@ import (
 	"testing"
 	"time"
 
+	chananalysis "option-scope-go/internal/chan"
 	"option-scope-go/internal/model"
 )
+
+func TestFutureTradingDatesUseMarketCalendar(t *testing.T) {
+	frame := chananalysis.Frame{Period: "1d", Candles: []chananalysis.Bar{{Date: "2026-11-25"}}}
+
+	futuresDates := futureTradingDates(frame, true)
+	if len(futuresDates) != 1 || futuresDates[0] != "2026-11-26" {
+		t.Fatalf("futures future dates = %v, want weekday 2026-11-26 even though XNYS is closed", futuresDates)
+	}
+
+	stockDates := futureTradingDates(frame, false)
+	if len(stockDates) != 1 || stockDates[0] != "2026-11-27" {
+		t.Fatalf("stock future dates = %v, want next XNYS session 2026-11-27", stockDates)
+	}
+}
 
 func TestIntradayDailyBarFallbackKeepsIntradayOpenWhenQuoteOpenConflicts(t *testing.T) {
 	location, err := time.LoadLocation("America/New_York")

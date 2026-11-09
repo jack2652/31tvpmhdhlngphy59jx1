@@ -593,7 +593,7 @@
     return events.slice(first, low);
   }
 
-  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null, liveBar = null) {
+  function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null, liveBar = null, dataContext = null) {
     const sourceCandles = frame.candles || [];
     let candlesForDisplay = sourceCandles;
     let liveDisplayIndex = -1;
@@ -634,9 +634,10 @@
       ? frame.recursive_levels.flatMap((level) => level.segments || []) : (frame.segments || []);
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
-    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, layers?.turtle === true ? 1 : 0, layers?.granville === true ? 1 : 0, layers?.macdSma200 === true ? 1 : 0, layers?.supertrend === true ? 1 : 0, layers?.wyckoff === true ? 1 : 0, recursiveCenterVisibility].join(":");
+    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, layers?.turtle === true ? 1 : 0, layers?.granville === true ? 1 : 0, layers?.macdSma200 === true ? 1 : 0, layers?.supertrend === true ? 1 : 0, layers?.wyckoff === true ? 1 : 0, layers?.mfi === true ? 1 : 0, recursiveCenterVisibility].join(":");
     const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
-    const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("");
+    const mfiEnabled = layers?.mfi === true || subcharts?.mfi === true;
+    const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("") + (mfiEnabled ? "1" : "0");
     // Only reserve the scenario lane when there is a path to draw. Reserving
     // it unconditionally leaves a large blank gutter on mobile charts whose
     // current structure produced no projection.
@@ -689,12 +690,30 @@
       ? window.OptionScopeWyckoff?.calculateWithLiveBar(sourceCandles, candlesForDisplay, liveCandleVisible ? liveDisplayIndex : -1)
         || window.OptionScopeWyckoff?.calculate(sourceCandles) || null
       : null;
+    const mfiResult = mfiEnabled
+      ? window.OptionScopeMfi?.calculateWithLiveBar(sourceCandles, candlesForDisplay, dataContext?.marketHistory?.daily || [], liveCandleVisible ? liveDisplayIndex : -1)
+        || window.OptionScopeMfi?.calculate(candlesForDisplay, dataContext?.marketHistory?.daily || []) || null
+      : null;
     const macd = visibleSubcharts.macd
       ? macdWindow(sourceCandles, startIndex, dataEndIndex, liveCandleVisible ? candlesForDisplay[liveDisplayIndex] : null, liveDisplayIndex)
       : [];
     const dmi = visibleSubcharts.dmi
       ? dmiWindow(sourceCandles, candlesForDisplay, startIndex, dataEndIndex, liveCandleVisible ? liveDisplayIndex : -1)
       : [];
+    const visibleMfi = mfiEnabled ? {
+      mfi: (mfiResult?.mfi || []).slice(startIndex, dataEndIndex),
+      benchmarkMfi: (mfiResult?.benchmarkMfi || []).slice(startIndex, dataEndIndex),
+      average: (mfiResult?.average || []).slice(startIndex, dataEndIndex),
+      trend: (mfiResult?.trend || []).slice(startIndex, dataEndIndex),
+    } : null;
+    if (mfiEnabled && liveCandleVisible && mfiResult?.liveIndex === liveDisplayIndex) {
+      const localIndex = liveDisplayIndex - startIndex;
+      for (const [name, key] of [["mfi", "mfi"], ["benchmarkMfi", "benchmarkMfi"], ["average", "average"], ["trend", "trend"]]) {
+        while (visibleMfi[name].length <= localIndex) visibleMfi[name].push(null);
+        visibleMfi[name][localIndex] = mfiResult.liveValues?.[key] ?? null;
+      }
+    }
+    const visibleMfiEvents = mfiEnabled ? indexedEventWindow(mfiResult?.events || [], startIndex, dataEndIndex) : [];
     const width = mobile ? 420 : 960;
     // Desktop retains room for the left price labels and current-price badge
     // without carrying the oversized axis gutter from the former right axis.
@@ -714,11 +733,13 @@
     let paneBottom = priceBottom;
     const panes = [];
     const indicatorDividers = [];
-    for (const name of ["volume", "macd", "dmi"]) {
-      if (!visibleSubcharts[name]) continue;
+    for (const name of ["volume", "macd", "dmi", "mfi"]) {
+      if (name !== "mfi" && !visibleSubcharts[name]) continue;
+      if (name === "mfi" && !mfiEnabled) continue;
       const gap = panes.length ? indicatorGap : panelGap;
       const paneTop = paneBottom + gap;
-      const paneHeight = name === "volume" ? volumeHeight : name === "macd" ? macdHeight : dmiHeight;
+      const mfiHeight = mobile ? 126 : 108;
+      const paneHeight = name === "volume" ? volumeHeight : name === "macd" ? macdHeight : name === "dmi" ? dmiHeight : mfiHeight;
       const pane = { name, top: paneTop, bottom: paneTop + paneHeight };
       if (panes.length) {
         pane.dividerY = paneBottom + Math.round(gap / 3);
@@ -736,6 +757,7 @@
     const volumeTop = paneEdge("volume", "top"), volumeBottom = paneEdge("volume", "bottom");
     const macdTop = paneEdge("macd", "top"), macdBottom = paneEdge("macd", "bottom");
     const dmiTop = paneEdge("dmi", "top"), dmiBottom = paneEdge("dmi", "bottom");
+    const mfiTop = paneEdge("mfi", "top"), mfiBottom = paneEdge("mfi", "bottom");
     const indicatorDividerY = dividerBetween("volume", "macd");
     const dmiDividerY = dividerBetween("macd", "dmi");
     const height = paneBottom + bottom;
@@ -1133,6 +1155,7 @@
     macdMin -= macdPadding;
     macdMax += macdPadding;
     const macdY = (value) => macdTop + (macdMax - value) / (macdMax - macdMin) * macdHeight;
+    const mfiY = (value) => mfiTop + (100 - value) / 100 * (mfiBottom - mfiTop);
     const macdZeroY = macdY(0);
     const chanCandles = bars.map((bar, index) => ({
       candleIndex: index, high: y(bar.high), low: y(bar.low),
@@ -1266,15 +1289,15 @@
       const labelY = Math.max(top + labelHeight / 2 + 2, Math.min(priceBottom - labelHeight / 2 - 2, preferredLabelY));
       return { ...signal, key: `${signal.key}-${index}`, type: label.replace("\n", " · "), label, labelLines, labelHeight, labelFontSize, x: xPosition, y: yPosition, markerY: yPosition, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, endPrice: price, start: signal.date, confirmed: true };
     });
-    const activeIndicatorLabels = [visibleSubcharts.volume ? "成交量" : "", visibleSubcharts.macd ? "MACD（12、26、9）" : "", visibleSubcharts.dmi ? "DMI（14、6）" : ""].filter(Boolean);
+    const activeIndicatorLabels = [visibleSubcharts.volume ? "成交量" : "", visibleSubcharts.macd ? "MACD（12、26、9）" : "", visibleSubcharts.dmi ? "DMI（14、6）" : "", mfiEnabled ? "MFI（14）" : ""].filter(Boolean);
     const indicatorDescription = activeIndicatorLabels.length
       ? `价格图下方显示${activeIndicatorLabels.join("、")}，与 K 线共用同一时间轴。`
-      : "副图默认隐藏，可通过“副图”菜单分别开启成交量、MACD 与 DMI。";
+      : "副图默认隐藏，可通过“副图”菜单分别开启成交量、MACD 与 DMI；MFI 由指标菜单控制。";
     const chart = {
       width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: priceBottom,
       priceBottom, volumeTop, volumeBottom, volumeMax, indicatorDividerY,
       macdTop, macdBottom, macdMin, macdMax, macdZeroY,
-      dmiTop, dmiBottom, dmiDividerY, indicatorDividers,
+      dmiTop, dmiBottom, dmiDividerY, mfiTop, mfiBottom, indicatorDividers,
       crosshairBottom: paneBottom, interactionBottom: paneBottom, axisBottom: paneBottom,
       totalBars, visibleBars: visibleCount, windowStart: startIndex, windowEnd: endIndex, endOffset,
       maxOffset, maxFutureOffset,
@@ -1313,7 +1336,7 @@
       ],
       // `segments` here is the Canvas paint gate: the mapped segment list is
       // already filtered by the global default and any per-level overrides.
-      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
+      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, mfi: mfiEnabled, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
       // Keep per-level controls stable while users pan and zoom; their options
       // should describe the loaded structure, not only the current viewport.
       availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
@@ -1352,6 +1375,8 @@
       supertrendEvents: supertrendEventLayouts,
       wyckoffRange: wyckoffRangeLayout,
       wyckoffEvents: wyckoffEventLayouts,
+      mfiEvents: visibleMfiEvents.map((event) => ({ ...event, x: x(event.index - startIndex), y: mfiY(event.mfi), averageY: mfiY(event.average) })),
+      mfiValues: visibleMfi,
       // Count only signals that can actually be drawn. The visible signal list
       // is intentionally limited to the current chart window so panning does
       // not pull off-screen markers onto the plot edge.
@@ -1393,6 +1418,12 @@
         return { key: bar.date, index, date: bar.date, displayDate, x: x(index),
         prices: { open: bar.open, high: bar.high, low: bar.low, close: bar.close }, previousClose, closeChangePercent,
         volume: Number(bar.volume) || 0, isForming: Boolean(bar.is_forming), macd: macd[index] || null, dmi: dmi[index] || null,
+        mfi: mfiEnabled ? {
+          value: visibleMfi?.mfi[index] ?? null,
+          benchmark: visibleMfi?.benchmarkMfi[index] ?? null,
+          average: visibleMfi?.average[index] ?? null,
+          trend: visibleMfi?.trend[index] ?? null,
+        } : null,
         high: y(bar.high), low: y(bar.low), body: Math.min(y(bar.open), y(bar.close)),
         bodyHeight: Math.max(1, Math.abs(y(bar.close) - y(bar.open))), bodyWidth: Math.max(1, slot * 0.56),
         direction: bar.close >= bar.open ? "up" : "down",
@@ -1452,6 +1483,12 @@
         ? `当前窗口事件：${wyckoffEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
         : "当前窗口暂无已确认的 Wyckoff 事件。";
       chart.description += `威科夫阶段按成交量、波幅、价格区间和收盘确认进行项目适配，识别 A–E 阶段及抛售高潮、买入高潮、自动反弹/回落、二次测试、弹簧探底、派发冲高、回测、强势/弱势信号、最后支撑/供给点。形成中的 K 线不产生确认事件；不包含可拖动示意图及源码的高周期覆盖；${phaseDescription}${eventDescription}`;
+    }
+    if (layers?.mfi === true) {
+      const eventDescription = mfiResult?.events?.length
+        ? `当前窗口交叉：${visibleMfiEvents.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.side === "buy" ? "低位金叉" : "高位死叉"}`).join("；")}。`
+        : "当前窗口暂无已确认的 MFI 金叉/死叉。";
+      chart.description += `MFI 使用 14 周期资金流量和 9 周期均线；低于 20 为超卖，高于 80 为超买，白线为个股、淡粉线为 S&P 500，均线向上为红色、向下为绿色。形成中的 K 线只更新数值，不确认交叉事件；${eventDescription}`;
     }
     if (!liveCandleVisible) {
       const layouts = cachedLayouts || new Map();
@@ -1819,7 +1856,7 @@
     const last = frame.strokes?.[frame.strokes.length - 1];
     const fixed = (frame.strokes || []).filter((stroke) => stroke.confirmed);
     const guidance = frameGuidance(frame, spot, weekly);
-    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars, viewport, layers, ruleVersion, subcharts, liveBar);
+    const chart = chartModel(frame, spot, guidance.scenarios, showScenarios, mobileChart, mobileBars, viewport, layers, ruleVersion, subcharts, liveBar, dataContext);
     if (chart) {
       chart.layerLevels = chart.availableRecursiveLevels || [];
       chart.segmentLevels = chart.availableSegmentLevels || [];
@@ -1875,8 +1912,10 @@
       ratioLabel: signal.strength_ratio == null ? "" : `同向 MACD 面积比 ${(signal.strength_ratio * 100).toFixed(0)}%`,
       evidenceLabel: v4SignalEvidence(signal), marketAndLevelLabel: `${marketEnvironmentLabel(signal.market_environment)} · ${v4MarketFilterLabels[signal.market_filter] || signal.market_filter || "未过滤"} · 下级别确认：${v4LowerLevelLabels[signal.lower_level_status] || signal.lower_level_status || "未提供"} · ${timeframeConfirmationLabel(signal.timeframe_confirmation)}`,
     }));
+    const lastHistoryDate = frame.candles?.[frame.candles.length - 1]?.date || "";
+    const addsLiveBar = Boolean(liveBar && liveBar.date > lastHistoryDate && ["1d", "daily"].includes(frame.period));
     return {
-      label: frame.label, available: frame.bar_count > 0, asOf: displayBarTime(frame.as_of, frame.period) || "--", bars: frame.bar_count,
+      label: frame.label, available: frame.bar_count > 0, asOf: liveBar ? displayBarTime(liveBar.date, frame.period) : displayBarTime(frame.as_of, frame.period) || "--", bars: frame.bar_count + (addsLiveBar ? 1 : 0),
       position: frame.position?.label || "等待中枢形成", detail: frame.position?.detail || "历史数据不足",
       center: center ? `${money(center.lower)}–${money(center.upper)}` : "尚未形成",
       boundary: center ? `下沿 ${money(center.lower)} · 上沿 ${money(center.upper)}` : "等待三根已确认笔重叠",
@@ -1898,7 +1937,7 @@
       const date = new Date(payload.history.fetched_at);
       if (!Number.isNaN(date.getTime())) historyTime = date.toLocaleString("zh-CN", { hour12: false });
     }
-    const dataContext = { priceCoordinate: payload.price_coordinate, history: payload.history, parameters: payload.parameters };
+    const dataContext = { priceCoordinate: payload.price_coordinate, history: payload.history, parameters: payload.parameters, marketHistory: payload.market_history };
     const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version, dataContext, subcharts, payload.live_daily_bar), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version, dataContext, subcharts);
     const weeklyReady = Boolean(payload.weekly?.position?.center);
     const weeklyContext = weeklyReady ? `周线：${weekly.position}。` : `周线已有 ${weekly.bars} 根收盘 K 线、${weekly.confirmed} 根已确认笔，尚未形成中枢，不能给日线方向增加确认。`;
@@ -2063,7 +2102,8 @@
     const source = quote?.symbol === payload.symbol ? quote.daily_bar : null;
     if (!source || !/^\d{4}-\d{2}-\d{2}$/.test(String(source.date || ""))) return null;
     const marketState = String(quote.market_state || "").toUpperCase();
-    if (source.is_forming && (marketState !== "REGULAR" || quoteEasternDate(quote) !== source.date)) return null;
+    const isFuture = /(?:=F)$/i.test(String(payload.symbol || ""));
+    if (source.is_forming && (isFuture ? marketState === "CLOSED" : marketState !== "REGULAR" || quoteEasternDate(quote) !== source.date)) return null;
     const coordinate = payload.price_coordinate || {};
     let factor = 1;
     if (coordinate.basis === "split_dividend_adjusted") {
@@ -2074,7 +2114,7 @@
         // 最新复权因子为 1 时，较新的临时日 K 与原始价格处于同一坐标。
         if (!factorDate || source.date <= factorDate || Math.abs(factor - 1) > 1e-8) return null;
       }
-    } else if (coordinate.basis !== "raw" && coordinate.basis !== "unadjusted") {
+    } else if (coordinate.basis !== "raw" && coordinate.basis !== "unadjusted" && !(isFuture && !coordinate.basis)) {
       return null;
     }
     const sourceCandles = payload.daily?.candles || [];
@@ -2082,7 +2122,7 @@
     if (lastDate && (source.is_forming ? source.date < lastDate : source.date <= lastDate)) return null;
     const open = Number(source.open) * factor;
     let close = Number(source.close) * factor;
-    const forming = Boolean(source.is_forming) && marketState === "REGULAR";
+    const forming = Boolean(source.is_forming) && (isFuture ? marketState !== "CLOSED" : marketState === "REGULAR");
     if (forming && Number.isFinite(Number(adjustedSpot)) && Number(adjustedSpot) > 0) close = Number(adjustedSpot);
     const high = Math.max(Number(source.high) * factor, open, close);
     const low = Math.min(Number(source.low) * factor, open, close);
