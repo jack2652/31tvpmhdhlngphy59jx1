@@ -48,8 +48,8 @@ const CHAIN_VIEW_STORAGE_KEY = "option-scope-chain-view";
 const FAVORITE_SYMBOLS_STORAGE_KEY = "option-scope-favorite-symbols";
 const MAX_FAVORITE_SYMBOLS = 50;
 let favoriteSortSession = null;
-const CHAN_INTRADAY_PERIODS = ["15m", "4h"];
-const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "4h"];
+const CHAN_INTRADAY_PERIODS = ["15m", "1h", "2h", "4h"];
+const CHAN_CHART_PERIODS = ["daily", "weekly", "15m", "1h", "2h", "4h"];
 const CHAN_ANALYSIS_RETRY_LIMIT = 60;
 const CHAN_INTRADAY_RETRY_LIMIT = 60;
 const CHAN_INTRADAY_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
@@ -208,14 +208,14 @@ const state = {
   loadId: 0,
   chanPeriod: initialChanChartPreferences.period,
   chanMobileChart: window.matchMedia ? window.matchMedia("(max-width: 600px)").matches : false,
-  chanViewports: { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } },
+  chanViewports: { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "1h": { visibleBars: 0, endOffset: 0 }, "2h": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } },
   chanChartLayers: initialChanChartPreferences.layers,
   chanSubcharts: initialChanChartPreferences.subcharts,
   chanScenariosVisible: readChanScenarioVisibility(),
-  chanIntradayPayload: { "15m": null, "4h": null },
-  chanIntradayLoading: { "15m": false, "4h": false },
-  chanIntradayRetryTimers: { "15m": null, "4h": null },
-  chanIntradayRetryAttempts: { "15m": 0, "4h": 0 },
+  chanIntradayPayload: { "15m": null, "1h": null, "2h": null, "4h": null },
+  chanIntradayLoading: { "15m": false, "1h": false, "2h": false, "4h": false },
+  chanIntradayRetryTimers: { "15m": null, "1h": null, "2h": null, "4h": null },
+  chanIntradayRetryAttempts: { "15m": 0, "1h": 0, "2h": 0, "4h": 0 },
   chanIntradaySpot: null,
   chanHoveredScenario: null,
   chanScenarioCardX: 0,
@@ -1946,7 +1946,7 @@ function activeBasis(quote) {
   if (quote?.market_state === "OVERNIGHT") {
     const close = overnightCloseQuote(quote);
     if (close) {
-      const label = quote?.sessions?.overnight?.provider === "alpaca-overnight" ? "夜盘" : "收盘";
+      const label = isOvernightQuote(quote) ? "夜盘" : "收盘";
       return { price: close.price, label };
     }
   }
@@ -3696,19 +3696,19 @@ async function request(path, options = {}) {
   });
 }
 
-// 夜盘优先展示 Alpaca 夜盘价；未配置或失效时沿用主行情适配器返回的价格。
+// 夜盘优先展示上游夜盘价；没有有效夜盘价时沿用主行情适配器返回的价格。
 function overnightCloseQuote(quote) {
   const sessions = quote?.sessions || {};
-  const alpacaOvernight = sessions.overnight?.provider === "alpaca-overnight";
+  const overnightProvider = isOvernightQuote(quote);
   // 未配置 Alpaca 时，主行情的 price/change_percent 才是原有行为。
   // 不能再用盘后 reference_close 覆盖它，否则 132.60 会被替换成 132.63，
   // 页面就会把昨收和当前价显示成同一个数，涨跌固定为 0.00%。
-  if (!alpacaOvernight) {
+  if (!overnightProvider) {
     const price = finitePrice(quote?.price);
     return price == null ? null : { ...quote, price };
   }
   // Alpaca 夜盘快照提供参考价时优先展示它；没有夜盘价时才回退正式收盘。
-  const overnightPrice = alpacaOvernight ? finitePrice(sessions.overnight?.price) : null;
+  const overnightPrice = overnightProvider ? finitePrice(sessions.overnight?.price) : null;
   const reference = Number(sessions.post?.reference_close ?? sessions.overnight?.reference_close);
   const previous = Number(quote?.previous_close);
   const price = overnightPrice ?? (Number.isFinite(reference) && reference > 0
@@ -3726,7 +3726,7 @@ function overnightCloseQuote(quote) {
   return { ...quote, price, change_percent: change };
 }
 
-// 现价按时段动态取值：盘前显示盘前价，盘后显示盘后价，夜盘优先显示 Alpaca 夜盘价，
+// 现价按时段动态取值：盘前显示盘前价，盘后显示盘后价，夜盘优先显示上游夜盘价，
 // 盘中与休市显示常规价。对应时段没有数据时回退常规价，避免整块行情空掉。
 function activeSessionQuote(quote) {
   const sessions = quote?.sessions || {};
@@ -3735,7 +3735,7 @@ function activeSessionQuote(quote) {
   if (marketState === "POST" && sessions.post?.price != null) return sessions.post;
   if (marketState === "OVERNIGHT") {
     // 配置 Alpaca 后，夜盘价优先级高于分析面板的盘后价基准开关；未配置时保留旧口径。
-    if (sessions.overnight?.provider !== "alpaca-overnight"
+    if (!isOvernightQuote(quote)
       && state.levelBasisMode === "close" && sessions.post?.price != null) return sessions.post;
     return overnightCloseQuote(quote) || quote;
   }
@@ -3765,7 +3765,7 @@ function quoteReference(quote) {
     title = "昨收与趋势通道一致，按最近一个已完成交易日的收盘价显示";
   } else if (marketState === "POST" || (marketState === "OVERNIGHT"
     && state.levelBasisMode === "close"
-    && sessions.overnight?.provider !== "alpaca-overnight")) {
+    && !isOvernightQuote(quote))) {
     label = "相对收盘";
     price = finitePrice(sessions.post?.reference_close);
     title = "盘后涨跌以最近一次正式盘中收盘为基准，不用昨收代替";
@@ -3947,13 +3947,13 @@ function resetChanAnalysis() {
   pendingChanQuoteRender = null;
   state.chanStale = false;
   state.chanMarketPayload = null;
-  state.chanViewports = { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } };
+  state.chanViewports = { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "1h": { visibleBars: 0, endOffset: 0 }, "2h": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } };
   state.chanRefreshPending = false;
   state.view.chan = OptionScopeChan.empty();
-  state.chanIntradayPayload = { "15m": null, "4h": null };
-  state.chanIntradayLoading = { "15m": false, "4h": false };
-  state.chanIntradayRetryTimers = { "15m": null, "4h": null };
-  state.chanIntradayRetryAttempts = { "15m": 0, "4h": 0 };
+  state.chanIntradayPayload = { "15m": null, "1h": null, "2h": null, "4h": null };
+  state.chanIntradayLoading = { "15m": false, "1h": false, "2h": false, "4h": false };
+  state.chanIntradayRetryTimers = { "15m": null, "1h": null, "2h": null, "4h": null };
+  state.chanIntradayRetryAttempts = { "15m": 0, "1h": 0, "2h": 0, "4h": 0 };
   state.chanIntradaySpot = null;
 }
 
@@ -4664,8 +4664,13 @@ function marketStateLabel(value, fallback = "快照") {
 function quoteMarketLabel(quote) {
   if (quote?.market_state === "PRE" && finitePrice(quote?.sessions?.pre?.price) == null) return "盘前无报价";
   if (quote?.market_state !== "OVERNIGHT") return marketStateLabel(quote?.market_state);
-  if (quote?.sessions?.overnight?.provider === "alpaca-overnight") return "夜盘";
+  if (isOvernightQuote(quote)) return "夜盘";
   return state.levelBasisMode === "close" ? "盘后" : "收盘";
+}
+
+function isOvernightQuote(quote) {
+  const provider = quote?.sessions?.overnight?.provider || quote?.provider;
+  return provider === "alpaca-overnight" || provider === "yahoo-overnight";
 }
 
 // 期权链表格里的 Gamma 与 IV 同样优先展示价格反解出的模型值，避免展示数据源里的占位 IV。
@@ -6623,8 +6628,8 @@ const optionScopeApp = new Vue({
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
         const payload = this.chanIntradayPayload[this.chanPeriod];
         return payload
-          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, 30, this.chanViewports[this.chanPeriod], this.chanChartLayers, this.chanSubcharts)
-          : OptionScopeChan.emptyFrame(({ "15m": "15分钟", "4h": "4小时" })[this.chanPeriod]);
+          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, 30, this.chanViewports[this.chanPeriod], this.chanChartLayers, this.chanSubcharts, { marketHistory: this.chanPayload?.market_history })
+          : OptionScopeChan.emptyFrame(({ "15m": "15分钟", "1h": "1小时", "2h": "2小时", "4h": "4小时" })[this.chanPeriod]);
       }
       return this.view.chan[this.chanPeriod] || this.view.chan.daily;
     },

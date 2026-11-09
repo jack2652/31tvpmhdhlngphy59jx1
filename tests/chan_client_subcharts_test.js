@@ -21,7 +21,7 @@ function frame(period = "1d") {
   });
   return {
     period,
-    label: period === "15m" ? "15分钟" : period === "4h" ? "4小时" : period === "1w" ? "周线" : "日线",
+    label: period === "15m" ? "15分钟" : period === "1h" ? "1小时" : period === "2h" ? "2小时" : period === "4h" ? "4小时" : period === "1w" ? "周线" : "日线",
     as_of: candles[candles.length - 1].date,
     bar_count: candles.length,
     last_close: candles[candles.length - 1].close,
@@ -141,7 +141,7 @@ assert.match(template, /<details class="chan-period-menu"[^>]*@keydown\.esc\.sto
 assert.match(template, /<summary aria-label="周期设置">周期<\/summary>/, "周期菜单显示统一的按钮标题");
 assert.match(template, /<summary>递归买卖点/, "递归买卖点使用明确折叠标题");
 assert.match(template, /<summary>笔级转折预警/, "笔级转折预警使用明确折叠标题");
-assert.match(template, /<div class="chan-layer-menu-panel chan-period-menu-panel">[\s\S]*aria-label="K 线周期"/, "点击周期按钮后显示四个周期选项");
+assert.match(template, /<div class="chan-layer-menu-panel chan-period-menu-panel">[\s\S]*aria-label="K 线周期"[\s\S]*>1小时<\/button>[\s\S]*>2小时<\/button>/, "点击周期按钮后显示 1 小时和 2 小时选项");
 assert.doesNotMatch(template, /chan-period-control-group/, "周期不再使用常驻分段控件");
 for (const [name, label] of [["volume", "成交量"], ["macd", "MACD"], ["dmi", "DMI"], ["mfi", "MFI"]]) {
   assert.ok(template.includes(`:aria-pressed="chanSubcharts.${name} ? 'true' : 'false'"`), `${label} 按钮提供 pressed 状态`);
@@ -157,6 +157,7 @@ assert.match(template, /<summary aria-label="技术指标设置">指标<\/summar
 assert.doesNotMatch(template, /<details class="chan-indicator-description"/, "指标名称不使用下拉式 disclosure");
 assert.doesNotMatch(app, /chanIndicatorHelp|toggleChanIndicatorHelp/, "不维护与图层状态重复的说明状态");
 assert.match(futuresApp, /\{ value: "afStochZ", label: "AF StochZ" \}[\s\S]*?\{ value: "turtle", label: "海龟交易法" \}[\s\S]*?\{ value: "granville", label: "葛兰碧法则" \}[\s\S]*?\{ value: "wyckoff", label: "威科夫阶段" \}[\s\S]*?\{ value: "supertrend", label: "超级趋势" \}[\s\S]*?\{ value: "macdSma200", label: "异同移动平均线 \+ 200期简单均线" \}/, "期货页指标按钮顺序与股票行情页保持一致");
+assert.match(futuresApp, /const periods = \[[\s\S]*\{ value: "15m", label: "15分钟" \}[\s\S]*\{ value: "1h", label: "1小时" \}[\s\S]*\{ value: "2h", label: "2小时" \}[\s\S]*\{ value: "4h", label: "4小时" \}/, "期货页周期菜单包含 1 小时和 2 小时");
 assert.match(futuresApp, /function signalTimestamp\(signal\)[\s\S]*?signal\?\.confirmed_at \|\| signal\?\.observed_at \|\| signal\?\.date/, "期货指标信号使用确认、观察、结构日期判断时间");
 assert.match(futuresApp, /signals\(\) \{[\s\S]*?\.sort\(\(left, right\) => signalTimestamp\(right\) - signalTimestamp\(left\)\)\.slice\(0, 8\)/, "期货指标信号按最近时间降序并限制显示数量");
 assert.match(template, /<div class="chan-indicator-options">[\s\S]*?aria-controls="chan-af-stochz-help" @click="toggleChanChartLayer\('afStochZ'\)">AF StochZ<\/button>[\s\S]*?aria-controls="chan-turtle-help" @click="toggleChanChartLayer\('turtle'\)">海龟交易法<\/button>[\s\S]*?aria-controls="chan-granville-help" @click="toggleChanChartLayer\('granville'\)">葛兰碧法则<\/button>[\s\S]*?aria-controls="chan-wyckoff-help" @click="toggleChanChartLayer\('wyckoff'\)">威科夫阶段<\/button>[\s\S]*?aria-controls="chan-supertrend-help" @click="toggleChanChartLayer\('supertrend'\)">超级趋势<\/button>[\s\S]*?aria-controls="chan-macd-sma200-help" @click="toggleChanChartLayer\('macdSma200'\)">异同移动平均线 \+ 200期简单均线<\/button>/, "价格指标按钮按当前菜单顺序渲染");
@@ -175,7 +176,7 @@ assert.ok(template.indexOf("/static/common/js/chan-turtle.js") < template.indexO
 assert.ok(template.indexOf("/static/common/js/chan-macd-sma.js") < template.indexOf("/static/common/js/chan-client.js"), "MACD + SMA200 计算脚本先于图表客户端加载");
 assert.ok(template.indexOf("/static/common/js/chan-mfi.js") < template.indexOf("/static/common/js/chan-client.js"), "MFI 计算脚本先于图表客户端加载");
 assert.match(styles, /\.chan-layer-menu>summary,\.chan-subchart-menu>summary,\.chan-period-menu>summary,\.chan-indicator-menu>summary\{min-height:44px\}/, "移动端菜单按钮统一为 44px 触控高度");
-assert.match(styles, /\.chan-period-menu-panel\{grid-template-areas:"display";grid-template-columns:minmax\(0,1fr\);width:min\(330px,calc\(100vw - 40px\)\)/, "周期面板按四个选项收窄");
+assert.match(styles, /\.chan-period-menu-panel\{grid-template-areas:"display";grid-template-columns:minmax\(0,1fr\);width:min\(360px,calc\(100vw - 40px\)\)/, "周期面板为周期按钮保留右侧留白");
 assert.match(styles, /\.chan-indicator-options\{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px\}/, "指标按钮紧凑排列且窄屏可换行");
 assert.match(styles, /\.chan-indicator-description-body\{flex:0 0 100%;/, "指标说明在按钮下方占满面板宽度");
 assert.match(styles, /\.chan-indicator-menu-panel\{grid-template-areas:"display";grid-template-columns:minmax\(0,1fr\)/, "窄屏指标面板与说明内容保持单列");

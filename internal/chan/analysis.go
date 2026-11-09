@@ -689,9 +689,12 @@ func chainAggregatedIntradayBars(bars, source []Bar, interval time.Duration, gro
 			} else if hasPrevious {
 				nextTrading := marketcalendar.NextTradingDayOrdinal(previousDays)
 				previousExpectedEnd := expectedAggregateSessionEndMinute(previousDays, groupSize, intervalMinutes)
-				currentExpectedEnd := expectedAggregateSessionEndMinute(days, groupSize, intervalMinutes)
 				previousComplete := previousExpectedEnd > previousMinute && previousEndMinute == previousExpectedEnd && completeIntradayGroups(sourceDays[previousDays], previousDays, groupSize)
-				currentComplete := days == nextTrading && minute == intradaySessionOpenMinute && endMinute == currentExpectedEnd && completeIntradayGroups(sourceDays[days], days, groupSize)
+				// 当前 K 线是新交易日的第一根聚合柱，不能用它的结束时间
+				// 判断整天是否完整；否则每个交易日都会被错误切成独立链。
+				// 只要新的一天从开盘开始且源数据覆盖了完整交易时段，就
+				// 允许结构跨日延续；尚未收盘的当天仍会自然开启新链。
+				currentComplete := days == nextTrading && minute == intradaySessionOpenMinute && completeIntradayGroups(sourceDays[days], days, groupSize)
 				split = !previousComplete || !currentComplete
 			} else {
 				split = true

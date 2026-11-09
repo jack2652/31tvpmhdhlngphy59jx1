@@ -98,6 +98,40 @@ func TestFourHourAggregationRetainsSeparateChainsAroundMissingSourceBars(t *test
 	}
 }
 
+func TestAggregatedIntradayChainsContinueAcrossCompleteSessions(t *testing.T) {
+	location, _ := time.LoadLocation("America/New_York")
+	cutoff := time.Date(2026, 10, 19, 17, 0, 0, 0, location)
+	input := []Bar{}
+	for _, day := range []string{"2026-10-16", "2026-10-19"} {
+		start, _ := time.ParseInLocation(time.DateOnly, day, location)
+		for index := 0; index < 26; index++ {
+			stamp := start.Add(9*time.Hour + 30*time.Minute + time.Duration(index)*15*time.Minute)
+			price := 100 + float64(len(input))/100
+			input = append(input, Bar{Date: stamp.Format("2006-01-02 15:04"), Open: price, High: price + 1, Low: price - 1, Close: price + .1, Volume: 10})
+		}
+	}
+	for _, testCase := range []struct {
+		name         string
+		interval     time.Duration
+		expectedBars int
+	}{
+		{name: "1h", interval: time.Hour, expectedBars: 12},
+		{name: "2h", interval: 2 * time.Hour, expectedBars: 6},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			aggregated, _, _ := aggregateIntradayBarsWithQuality(input, cutoff, testCase.interval)
+			if len(aggregated) != testCase.expectedBars {
+				t.Fatalf("aggregated bars=%d, want %d complete bars across two sessions", len(aggregated), testCase.expectedBars)
+			}
+			for index := 1; index < len(aggregated); index++ {
+				if aggregated[index].Chain != aggregated[0].Chain {
+					t.Fatalf("complete sessions were split at index %d: %+v", index, aggregated)
+				}
+			}
+		})
+	}
+}
+
 func TestAnalyzeIntradayExposesTimeframeLevelRawBasisAndFormingState(t *testing.T) {
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {

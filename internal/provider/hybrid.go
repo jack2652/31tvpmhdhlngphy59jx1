@@ -182,31 +182,58 @@ func (h *Hybrid) Quote(ctx context.Context, rawSymbol string) (model.Quote, erro
 	if err != nil {
 		return model.Quote{}, err
 	}
-	// During the overnight session Alpaca's overnight snapshot is the current
-	// price, so the Yahoo regular quote is not fetched. When Alpaca is not
-	// configured (or is in an authentication cooldown) Yahoo takes over.
+	// Yahoo 的夜盘字段优先作为股票夜盘价格；Yahoo 没有有效夜盘字段时，
+	// 再使用 Alpaca 作为回退。指数和期货仍始终使用 Yahoo 自身路径。
 	// 指数没有可交易的夜盘期权，始终使用 Yahoo 指数行情，避免向 Alpaca 请求无效标的。
-	if !IsIndexSymbol(symbol) && !IsFutureSymbol(symbol) && isNYSEOvernightSession(h.marketNow()) && h.Overnight != nil && h.Overnight.CanRequest() {
-		overnight, overnightErr := h.Overnight.Quote(ctx, symbol)
-		if err := ctx.Err(); err != nil {
-			return model.Quote{}, err
+	if !IsIndexSymbol(symbol) && !IsFutureSymbol(symbol) && isNYSEOvernightSession(h.marketNow()) {
+		type quoteAttempt struct {
+			quote model.Quote
+			err   error
 		}
-		if overnightErr == nil && overnight.Price != nil {
-			quote := overnightOnlyQuote(overnight)
+		attemptCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		baseCh := make(chan quoteAttempt, 1)
+		go func() {
+			base, baseErr := h.Regular.Quote(attemptCtx, symbol)
+			baseCh <- quoteAttempt{quote: base, err: baseErr}
+		}()
+		alpacaEnabled := h.Overnight != nil && h.Overnight.CanRequest()
+		alpacaCh := make(chan quoteAttempt, 1)
+		if alpacaEnabled {
+			go func() {
+				overnight, overnightErr := h.Overnight.Quote(attemptCtx, symbol)
+				alpacaCh <- quoteAttempt{quote: overnight, err: overnightErr}
+			}()
+		}
+		var baseAttempt, alpacaAttempt quoteAttempt
+		baseDone, alpacaDone := false, !alpacaEnabled
+		for !baseDone || !alpacaDone {
+			select {
+			case <-ctx.Done():
+				return model.Quote{}, ctx.Err()
+			case baseAttempt = <-baseCh:
+				baseDone = true
+				if baseAttempt.err == nil && baseAttempt.quote.Provider == "yahoo-overnight" {
+					h.attachPreviousPostSession(ctx, symbol, &baseAttempt.quote)
+					return baseAttempt.quote, nil
+				}
+			case alpacaAttempt = <-alpacaCh:
+				alpacaDone = true
+			}
+		}
+		if baseAttempt.err == nil {
+			h.attachPreviousPostSession(ctx, symbol, &baseAttempt.quote)
+			return baseAttempt.quote, nil
+		}
+		if alpacaAttempt.err == nil && alpacaAttempt.quote.Price != nil {
+			quote := overnightOnlyQuote(alpacaAttempt.quote)
 			h.attachPreviousPostSession(ctx, symbol, &quote)
 			return quote, nil
 		}
-		base, baseErr := h.Regular.Quote(ctx, symbol)
-		if baseErr != nil {
-			if overnightErr != nil {
-				return model.Quote{}, overnightErr
-			}
-			return model.Quote{}, baseErr
+		if alpacaAttempt.err != nil {
+			return model.Quote{}, alpacaAttempt.err
 		}
-		if shouldAttachPreviousPost(&base) {
-			h.attachPreviousPostSession(ctx, symbol, &base)
-		}
-		return base, nil
+		return model.Quote{}, baseAttempt.err
 	}
 	quote, err := h.Regular.Quote(ctx, symbol)
 	if err != nil {

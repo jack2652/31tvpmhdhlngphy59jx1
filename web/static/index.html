@@ -230,6 +230,8 @@
                   <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'daily' ? 'true' : 'false'" @click="chanPeriod = 'daily'">日线</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanPeriod === 'weekly' ? 'true' : 'false'" @click="chanPeriod = 'weekly'">周线</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '15m' ? 'true' : 'false'" @click="chanPeriod = '15m'">15分钟</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '1h' ? 'true' : 'false'" @click="chanPeriod = '1h'">1小时</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '2h' ? 'true' : 'false'" @click="chanPeriod = '2h'">2小时</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanPeriod === '4h' ? 'true' : 'false'" @click="chanPeriod = '4h'">4小时</button>
                 </div></section>
               </div>
@@ -445,6 +447,19 @@
           <div class="chan-compatibility-body">
             <details class="chan-more-fold"><summary>日线与周线背景</summary><div class="chan-compatibility-structure"><div class="chan-overview"><article v-for="item in [view.chan.daily, view.chan.weekly]" :key="item.label" class="chan-overview-item"><h3>{{ item.label }}背景</h3><strong>{{ item.position }}</strong><span>中枢 {{ item.center }}</span><p>{{ item.confirmed }} 根已确认笔 · 截至 {{ item.asOf }}</p></article></div>
               <dl class="chan-facts"><div><dt>最近笔级中枢</dt><dd>{{ chanFrame.boundary }}<small>{{ chanFrame.structure }}</small></dd></div><div><dt>最近一笔</dt><dd>{{ chanFrame.stroke }}<small>{{ chanFrame.observation }}</small></dd></div></dl></div></details>
+          <details class="chan-fold chan-turning-evidence" :open="chanFolds.evidence" @toggle="rememberChanFold('evidence', $event)">
+            <summary>抄底／逃顶候选与识别依据<span class="chan-fold-meta">{{ chanTurningStatus(0) }} / {{ chanTurningStatus(1) }}</span></summary>
+            <div class="chan-turning-grid">
+              <article v-for="setup in chanFrame.turning" :key="setup.side" :class="'chan-turning-' + setup.phase">
+                <header><span class="chan-section-label">{{ setup.label }}</span><h4>{{ setup.title }}</h4><span class="chan-turning-status">{{ setup.status }}</span></header>
+                <p>{{ setup.detail }}</p>
+                <dl v-if="setup.phase !== 'empty'" class="chan-turning-prices"><div><dt>{{ setup.side === 'buy' ? '原来的低点' : '原来的高点' }}</dt><dd>{{ setup.price }}</dd></div><div><dt>{{ setup.side === 'buy' ? '跌至此价失效' : '涨至此价失效' }}</dt><dd>{{ setup.boundary }}</dd></div><div><dt>MACD 推动力度比</dt><dd>{{ setup.ratio }}</dd></div></dl>
+                <dl class="chan-turning-steps"><div><dt>当前结构与确认条件</dt><dd>{{ setup.condition }}</dd></div><div><dt>接下来观察</dt><dd>{{ setup.nextStep }}</dd></div><div v-if="setup.phase !== 'empty'"><dt>价格条件</dt><dd>{{ setup.trigger }}</dd></div></dl>
+                <small v-if="setup.phase !== 'empty'">极值 {{ setup.date }} · 首次识别 {{ setup.observedAt }} · 阶段识别 {{ setup.phaseAt }}</small>
+              </article>
+            </div>
+            <p class="chan-guidance-note">底部／顶部观察采用当前周期的笔力度与回试形态，不等同于完整一类、二类买卖点。图上标记落在原始极值处，实际识别时间更晚。形成中的观察可变化；候选不保证反转，本项目尚无对应胜率统计。</p>
+          </details>
           <details class="chan-fold chan-plan-fold" :open="chanFolds.plan" @toggle="rememberChanFold('plan', $event)">
             <summary><h3 class="chan-fold-title" id="chan-turning-title">错过底部／顶部，现在怎么做<span class="chan-fold-meta">{{ chanFrame.label }} · 新仓与持仓分别判断</span></h3></summary>
             <div class="chan-plan-body">
@@ -460,19 +475,6 @@
               <p v-if="chanFrame.plan.context" class="chan-plan-context">{{ chanFrame.plan.context }}</p>
               <p class="chan-guidance-note">{{ chanFrame.plan.note }}这是当前结构下的条件式判断，未读取个人持仓、成本和风险预算。</p>
             </div>
-          </details>
-          <details class="chan-fold chan-turning-evidence" :open="chanFolds.evidence" @toggle="rememberChanFold('evidence', $event)">
-            <summary>抄底／逃顶候选与识别依据<span class="chan-fold-meta">{{ chanTurningStatus(0) }} / {{ chanTurningStatus(1) }}</span></summary>
-            <div class="chan-turning-grid">
-              <article v-for="setup in chanFrame.turning" :key="setup.side" :class="'chan-turning-' + setup.phase">
-                <header><span class="chan-section-label">{{ setup.label }}</span><h4>{{ setup.title }}</h4><span class="chan-turning-status">{{ setup.status }}</span></header>
-                <p>{{ setup.detail }}</p>
-                <dl v-if="setup.phase !== 'empty'" class="chan-turning-prices"><div><dt>{{ setup.side === 'buy' ? '原来的低点' : '原来的高点' }}</dt><dd>{{ setup.price }}</dd></div><div><dt>{{ setup.side === 'buy' ? '跌至此价失效' : '涨至此价失效' }}</dt><dd>{{ setup.boundary }}</dd></div><div><dt>MACD 推动力度比</dt><dd>{{ setup.ratio }}</dd></div></dl>
-                <dl class="chan-turning-steps"><div><dt>当前结构与确认条件</dt><dd>{{ setup.condition }}</dd></div><div><dt>接下来观察</dt><dd>{{ setup.nextStep }}</dd></div><div v-if="setup.phase !== 'empty'"><dt>价格条件</dt><dd>{{ setup.trigger }}</dd></div></dl>
-                <small v-if="setup.phase !== 'empty'">极值 {{ setup.date }} · 首次识别 {{ setup.observedAt }} · 阶段识别 {{ setup.phaseAt }}</small>
-              </article>
-            </div>
-            <p class="chan-guidance-note">底部／顶部观察采用当前周期的笔力度与回试形态，不等同于完整一类、二类买卖点。图上标记落在原始极值处，实际识别时间更晚。形成中的观察可变化；候选不保证反转，本项目尚无对应胜率统计。</p>
           </details>
           <details class="chan-fold chan-terms" :open="chanFolds.terms" @toggle="rememberChanFold('terms', $event)">
             <summary>术语怎么理解：反向笔、回踩、反抽、保护位</summary>

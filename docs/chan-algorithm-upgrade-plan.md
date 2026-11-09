@@ -20,7 +20,7 @@
 - 递归中枢的输入单元范围与中枢所属级别的走势索引分开记录，买卖点扫描使用所属走势索引；笔级三类历史观察单独返回为 `pen_signals`，避免和严格递归信号混用。页面的笔级观察区同时消费这两类兼容来源，顶底卡片优先展示当前有效候选，避免被更早的失效候选遮住。
 - `chan-recursive-v4-preview.9` 将分型日期锚定到包含合并组末根行情，同时保留极值来源索引；三类点只接受从中枢范围内穿越边界的首次离开，并以回试端点日期和价格绘制。图区空状态区分当前缩放窗口没有标记、候选尚无绘图坐标和全周期没有信号，避免将历史视窗外的信号误读为算法空白。
 - 力度按同方向、同递归级别的已确认走势段积分版本化 MACD；80% 是待历史验证的候选参数，不是已验证结论。背驰与一、二、三类买卖点都保留候选阶段、确认条件、失效边界和信号可见时间。
-- S&P 500 环境标签与明确的 `15m → 4h → 1d → 1wk` 递归映射已接入 preview。日线/周线历史使用复权坐标；当前 15 分钟和 4 小时接口仍声明未复权价格坐标，缺少兼容因子时不用于复权日线信号确认。
+- S&P 500 环境标签与明确的 `15m → 1h → 2h → 4h → 1d → 1wk` 递归映射已接入 preview。日线/周线历史使用复权坐标；当前 15 分钟、1 小时、2 小时和 4 小时接口仍声明未复权价格坐标，缺少兼容因子时不用于复权日线信号确认。
 - `/api/chan/:symbol/adjusted` 返回新旧算法并行结果、复权基准、质量、递归结构及规则证据；SQLite 分开保存复权行情和版本化结构快照。Canvas 在 [`web/static/common/js/chan-client.js`](../web/static/common/js/chan-client.js) 与 [`web/static/common/js/charts.js`](../web/static/common/js/charts.js) 绘制可切换的线段、中枢和信号层。
 - 逐 bar 增量 analyzer 已保留并更新包含处理、分型与 MACD 状态，但追加时仍会重建笔之后的线段、递归中枢和信号。逐前缀完整 JSON parity 已有基础覆盖；复杂递归结构/信号非空覆盖与全量对比性能、内存和缓存指标仍在验收。
 
@@ -103,9 +103,9 @@
 - [x] 实现同级别中枢连接/不连接以及相邻中枢关系描述。输出 overlap、touch、separate_up、separate_down 关系及前序中心索引，并排除跨 chain 连接。
 - [x] 支持笔级、线段级和递归走势级中枢并标出级别；不再用同一“中枢”标签混称。兼容旧笔中枢显式标记 `level=0, kind=pen, input_kind=stroke`；递归中枢标记 Chan level，level 0 输入类型为 `segment`，更高级别为 `recursive_trend`，均由定向测试校验。
 - [x] 各层级只使用已确认的下级结构作为递归输入；形成中对象单独表示。递归输入仅采用确认线段；level 0 对形成中笔/线段设置 `forming` 和 `waiting_for`，不足三个已确认下级走势段时高一级明确 `awaiting_lower_level`，并有隔离用例。
-- [x] 保留历史有效结构链；发生行情缺口或无法连续接续时开启新链并记录起点。日线、15m 和 4h 保留历史 bars 并分配 chain_id；quality.chains/structure_chains_v4 记录各链起止时间、起链原因和缺口预期日期；缺口、休市跨段、异常价格跳变和快速反向重启均有对应摘要/测试。
-- [x] 日线、周线、4 小时和 15 分钟采用统一结构数据 schema，并显式标记 timeframe 与递归 level。盘中 15m/4h 与日线、周线共用 Frame；响应显式返回 timeframe、level、quality.price_basis 和 quality 计数，4 小时缺块按聚合周期统计并标记 partial。
-- [x] 新增 K 线后只允许形成中对象变化；已确认对象变动时记录源数据修订或规则版本原因。日/周/15m/4h 按规则版本保存规范输入指纹、逐 bar 指纹和已确认分型/笔/线段/闭合中枢快照；追加新结构不计作修订，历史 OHLC 改动、结构变化或规则版本改变会写入 SQLite 修订记录并由对应 API 返回；滚动窗口裁剪不会误报已离开输入窗口的对象。存储定向测试验证同输入幂等、追加稳定、异常结构变化可追溯、行情修订和规则变更归因。
+- [x] 保留历史有效结构链；发生行情缺口或无法连续接续时开启新链并记录起点。日线、15m、1h、2h 和 4h 保留历史 bars 并分配 chain_id；quality.chains/structure_chains_v4 记录各链起止时间、起链原因和缺口预期日期；缺口、休市跨段、异常价格跳变和快速反向重启均有对应摘要/测试。
+- [x] 日线、周线、4 小时、2 小时、1 小时和 15 分钟采用统一结构数据 schema，并显式标记 timeframe 与递归 level。盘中 15m/1h/2h/4h 与日线、周线共用 Frame；响应显式返回 timeframe、level、quality.price_basis 和 quality 计数，各聚合周期缺块按自身周期统计并标记 partial。
+- [x] 新增 K 线后只允许形成中对象变化；已确认对象变动时记录源数据修订或规则版本原因。日/周/15m/1h/2h/4h 按规则版本保存规范输入指纹、逐 bar 指纹和已确认分型/笔/线段/闭合中枢快照；追加新结构不计作修订，历史 OHLC 改动、结构变化或规则版本改变会写入 SQLite 修订记录并由对应 API 返回；滚动窗口裁剪不会误报已离开输入窗口的对象。存储定向测试验证同输入幂等、追加稳定、异常结构变化可追溯、行情修订和规则变更归因。
 
 ### D. 力度、走势和背驰判断
 
@@ -134,7 +134,7 @@
 - [x] 防止使用确认日期之后的 bars 确认更早的信号；信号状态按时间前推计算。`ReplayAdjusted` 每次仅将截至当日收盘的前缀交给生产分析器，并拒绝 `observed_at` 超出前缀；回放测试对每个前缀比较信号、线段和中枢与同一前缀重算结果，且拒绝乱序/重复输入；定向 Go 测试通过。
 - [x] 加入 S&P 500 环境数据及版本化的牛/熊/震荡分类。`market_environment.go` 使用复权 `^GSPC` 日线及 `sp500-sma50-sma200-v1`，仅在至少 200 根有效样本后按 close/SMA50/SMA200 分类；adjusted endpoint 独立加载/刷新基准历史并按时间点附加分类。分类器未来数据隔离测试、benchmark endpoint 集成测试通过。
 - [x] 实现市场过滤结果与个股结构结果分开输出；过滤阻止或降级时说明具体原因。v4 规则将大盘视作独立环境标签，不删个股结构候选；Frame 和每条信号分别暴露 environment 与 `market_filter`，无数据时附未过滤原因。`TestAttachMissingSP500EnvironmentKeepsSignalUnfiltered` 验证候选保留及未过滤原因，分类 benchmark endpoint 验证按 signal observed_at 取值；定向 server 测试通过。
-- [x] 实现明确的跨级别映射和下级别确认，不以周期按钮并列代替递归关系。timeframe_mapping.go 固定 15m→4h→1d→1wk 直接映射，并只使用直接下级已确认 level-0 走势按时间前推确认；/adjusted 将有匹配复权因子的 15m 历史转为复权基准后构建 4h 结构供日线确认，15m→4h 与周线→日线也已接入；缺数据/价格基准不兼容时明确等待。映射、未来数据隔离、复权转换和 adjusted endpoint 定向测试通过。
+- [x] 实现明确的跨级别映射和下级别确认，不以周期按钮并列代替递归关系。timeframe_mapping.go 固定 15m→1h→2h→4h→1d→1wk 直接映射，并只使用直接下级已确认 level-0 走势按时间前推确认；/adjusted 将有匹配复权因子的 15m 历史按周期阶梯转换并构建 1h、2h、4h 结构供更高周期确认；缺数据/价格基准不兼容时明确等待。映射、未来数据隔离、复权转换和 adjusted endpoint 定向测试通过。
 - [x] 缺少市场或低级别数据时显示“未确认/未过滤”，不默认按通过处理。低级别缺失会输出 `awaiting_lower_level` 及 missing 条件；市场历史缺失或不足 200 根会输出 `unfiltered` 和原因。双向 signal fixture、missing-market endpoint fixture 及 `chan_client_canvas_layers_test.js` 验证前后端状态，定向测试通过。
 - [x] 保留候选、观察、已确认、已失效等状态；不把规则倾向分伪装为胜率。信号阶段保留 observing、divergence/reversal/class2/class3 confirmed、awaiting lower level 与 invalidated 状态历史；回测输出是方向性收益诊断且不足 30 样本不报胜率。生命周期定向夹具及 UI 契约检查通过。
 
@@ -142,7 +142,7 @@
 
 - [x] 扩展 Go 响应类型，加入 Segment、Level、递归 Center、数据质量和复权元数据。Go `Frame`、`Segment`、`RecursiveCenter`、`LevelAnalysis`、`DataQuality` 与 `Result` 类型提供线段/中枢/级别、输入状态及坐标元数据字段；`/adjusted` 与 `/intraday` 使用同一 Frame schema；API 序列化回归用例验证日/周字段。
 - [x] `/api/chan/:symbol` 返回新规则版本、规则参数、复权口径及日/周各层级结构。`/adjusted` 实际返回 `rule_version`、目标与旧版本、参数、price_coordinate、日/周 Frame；接口用例检验复权和版本。旧 `/api/chan/:symbol` 保持严格旧版契约。
-- [x] 盘中接口返回同一 schema、对应周期级别、复权/未复权基准和数据状态。15m/4h 返回同一 Frame、显式 timeframe/level/quality、preview 与旧算法版本、参数，并声明 `price_coordinate.basis=raw`、`status=unadjusted`；接口测试同时确认未复权盘中信号为空。
+- [x] 盘中接口返回同一 schema、对应周期级别、复权/未复权基准和数据状态。15m/1h/2h/4h 返回同一 Frame、显式 timeframe/level/quality、preview 与旧算法版本、参数，并声明 `price_coordinate.basis=raw`、`status=unadjusted`；接口测试同时确认未复权盘中信号为空。
 - [x] API 对每个结构对象返回起止时间、确认时间、组成范围和形成/确认状态。Segment、RecursiveCenter、Fractal 和 Stroke 暴露时间、确认、level 和输入对象/bar 索引；日/周真实 JSON 序列化测试检查线段和中枢证据字段。
 - [x] API 对每个信号返回规则条件、满足/未满足证据、失效条件和级别来源。`V4Signal` 暴露 symbol、level、rule version、结构引用、conditions、missing_conditions、invalidation price、observed/confirmed/phase times、market 与下级状态；真实 endpoint JSON 测试校验契约。
 - [x] 复权历史缓存按标的、周期、复权类型和数据源隔离；结构结果快照按算法版本隔离，规则版本变化时不复用旧结构结果。复权行情缓存键包含 `symbol + timeframe + adjustment_type + provider`；结构快照主键包含 `symbol + timeframe + rule_version`。启动迁移会保留旧规则快照，跨规则版本更新继续独立比较和修订；迁移、双版本并存、旧版本继续独立修订及容量清理保留各版本快照的测试通过，`go test -count=1 ./internal/store` 通过。
@@ -176,7 +176,7 @@
 - [x] 披露回测标的、时间区间、样本数、信号后窗口、基准和交易成本。阈值报告默认最多读取 1,300 根日线（约五年），可用 `-bars` 显式调整；这避免常规验证无意读取几十年历史。QQQ 近五年报告披露实际起止日期、信号可见日后的下一根收盘价起算的 5/10/20 根收盘到收盘窗口、70/30 时间切分、按目标实际交易日期逐日对齐的 `^GSPC` 同期基准，以及手续费/滑点/执行未建模。报告明确是方向性诊断而非策略回测，并校验基准覆盖目标区间；`go run ./cmd/chan-threshold-validation -database data/threshold-study.db -symbol QQQ` 实际输出 1,300 根、2021-08-13 至 2026-10-16，0.6/0.7/0.8/0.9 均为零信号和 `no_conclusion_no_observed_signals`；`go test ./cmd/chan-threshold-validation -count=1` 通过。
 - [x] 披露收益分布、最大回撤、胜率置信区间和样本外验证；样本不足时明确不下胜率结论。实际 QQQ 报告输出训练期与样本外期、每个阈值各 5/10/20 根 horizon 的样本和推断状态、均值/中位数/P10/P90、信号窗口路径最大回撤及足量样本时 Wilson 95% 胜率区间字段。该数据的四档阈值均为零信号，输出 `no_conclusion_no_observed_signals` 和 `no_outcomes`，没有报告胜率或虚构收益；报告同时明确逐信号窗口回撤不是策略组合回撤。契约测试覆盖实际 JSON 字段及零样本处理。
 - [x] 记录全量重算与增量更新的延迟、内存、数据量和缓存命中差异。修复纽约时区重复加载后，在 AMD Ryzen 7 3700X 执行 `go test ./internal/chan -run '^$' -bench '^BenchmarkIncrementalAppendVsFullRecompute/bars_(252|1255)/(full|append)$' -benchmem -benchtime=10x`：252 根历史（追加后 253）全量 4.49 ms、702,424 B/op、6,019 allocs；追加 1 根 3.29 ms、348,504 B/op、4,476 allocs。1,255 根历史（追加后 1,256）全量 22.71 ms、3,986,574 B/op、35,629 allocs；追加 1 根 16.77 ms、2,102,292 B/op、26,556 allocs。两种追加都复用包含/分型/MACD 状态 1 次，结果快照缓存命中均为 0 次；各自结果 JSON 为 281,882→286,155 bytes、1,411,428→1,412,476 bytes。状态切片容量估算分别 99,400 与 455,872 bytes，另列结果快照体积，不含 Go 堆开销。再单独运行 `BenchmarkIncrementalResultCacheHitVsFullRecompute`：无新增 bar 时 252/1,255 根缓存命中分别约 70/50 ns、0 B/op、0 allocs，命中数 1；对应全量重算约 4.26/22.85 ms、627,258/3,731,590 B/op、5,969/35,602 allocs，命中数 0。基准分别隔离运行 10 次；追加路径保留逐根 parity（上项完整 JSON 测试通过），结果缓存只在输入前缀不变时命中。
-- [x] 对 15 分钟、4 小时、日线和周线的计算及渲染验证资源使用可接受。`go test ./internal/chan -run '^$' -bench '^BenchmarkAnalysisByTimeframe$' -benchmem -benchtime=3x` 在 AMD Ryzen 7 3700X 上测得日/周（252 个日 bar，分析同时生成 252 日日线与 52 周线）10.46 ms、5.41 MB、16,773 allocs；15m（6,552 根 bar）42.07 ms、16.41 MB、70,159 allocs；4h（504 根 bar）77.55 ms、22.14 MB、130,966 allocs。对当前 QQQ API 真实输入，日/周分别为 501/104 bars、调整日周 JSON 737,454 bytes；15m 为 1,066 bars、JSON 800,318 bytes；4h 为 82 bars、JSON 73,844 bytes（4h 与 15m 共用同一已缓存盘中序列）。使用 Chromium headless 调用生产 `charts.js` 的 `renderChanCanvas`，以真实各周期 bar/结构数量构造图层并在桌面 960×340 DPR 1、手机 328×406 DPR 3 各预热 15 次、测量 50 次：桌面 p95 约 0.2/0.2/0.9/0.2 ms，手机约 0.2/0.2/1.1/0.2 ms（日/周/15m/4h）；Canvas backing store 均为 1.31 MB（桌面）或 4.79 MB（手机）。实际 API 和 renderer 结果均覆盖四周期；此检查为当前设备、当前 QQQ 数据规模基线，不构成对未来任意数据量或低端设备的保证。
+- [x] 对 15 分钟、4 小时、日线和周线的计算及渲染验证资源使用可接受。`go test ./internal/chan -run '^$' -bench '^BenchmarkAnalysisByTimeframe$' -benchmem -benchtime=3x` 在 AMD Ryzen 7 3700X 上测得日/周（252 个日 bar，分析同时生成 252 日日线与 52 周线）10.46 ms、5.41 MB、16,773 allocs；15m（6,552 根 bar）42.07 ms、16.41 MB、70,159 allocs；4h（504 根 bar）77.55 ms、22.14 MB、130,966 allocs。对当前 QQQ API 真实输入，日/周分别为 501/104 bars、调整日周 JSON 737,454 bytes；15m 为 1,066 bars、JSON 800,318 bytes；4h 为 82 bars、JSON 73,844 bytes（4h 与 15m 共用同一已缓存盘中序列）。使用 Chromium headless 调用生产 `charts.js` 的 `renderChanCanvas`，以真实各周期 bar/结构数量构造图层并在桌面 960×340 DPR 1、手机 328×406 DPR 3 各预热 15 次、测量 50 次：桌面 p95 约 0.2/0.2/0.9/0.2 ms，手机约 0.2/0.2/1.1/0.2 ms（日/周/15m/4h）；Canvas backing store 均为 1.31 MB（桌面）或 4.79 MB（手机）。这组基线直接覆盖原有四周期；1h/2h 复用 15m 聚合与同一渲染路径，尚未单独记录性能样本。此检查为当前设备、当前 QQQ 数据规模基线，不构成对未来任意数据量或低端设备的保证。
 
 ### I. 灰度与完成验收
 

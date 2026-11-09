@@ -483,6 +483,65 @@ func useLocalYahooOptionsAuth(t *testing.T, yahoo *Yahoo) {
 	})
 }
 
+func TestYahooQuoteUsesYahooOvernightPriceWhenTimestampIsCurrent(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.October, 7, 21, 0, 30, 0, location)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v7/finance/quote" || r.URL.Query().Get("symbols") != "QQQ" || r.URL.Query().Get("overnightPrice") != "true" {
+			t.Fatalf("Yahoo overnight request = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		_, _ = fmt.Fprintf(w, `{"quoteResponse":{"result":[{"symbol":"QQQ","overnightMarketPrice":101.25,"overnightMarketTime":%d,"overnightMarketChangePercent":1.25}],"error":null}}`, now.Add(-30*time.Second).Unix())
+	}))
+	defer server.Close()
+
+	yahoo := NewYahoo(time.Second, 1)
+	yahoo.client = server.Client()
+	yahoo.quoteURL = server.URL + "/v7/finance/quote"
+	yahoo.now = func() time.Time { return now }
+	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{quote: &ymodels.Quote{Symbol: "QQQ", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"}})
+	useLocalYahooOptionsAuth(t, yahoo)
+
+	quote, err := yahoo.Quote(context.Background(), "QQQ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.Provider != "yahoo-overnight" || quote.Price == nil || *quote.Price != 101.25 {
+		t.Fatalf("Yahoo overnight quote = %#v, want Yahoo overnight price", quote)
+	}
+	summary, ok := quote.Sessions["overnight"].(map[string]any)
+	if !ok || summary["provider"] != "yahoo-overnight" || summary["price"] != 101.25 {
+		t.Fatalf("overnight summary = %#v", quote.Sessions["overnight"])
+	}
+}
+
+func TestYahooQuoteRejectsFutureOvernightTimestamp(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.October, 7, 21, 0, 0, 0, location)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, `{"quoteResponse":{"result":[{"symbol":"QQQ","overnightMarketPrice":101.25,"overnightMarketTime":%d}],"error":null}}`, now.Add(3*time.Minute).Unix())
+	}))
+	defer server.Close()
+	yahoo := NewYahoo(time.Second, 1)
+	yahoo.client = server.Client()
+	yahoo.quoteURL = server.URL + "/v7/finance/quote"
+	yahoo.now = func() time.Time { return now }
+	setYahooSDKTestTicker(yahoo, &yahooSDKTestTicker{quote: &ymodels.Quote{Symbol: "QQQ", Currency: "USD", RegularMarketPrice: 100, RegularMarketPreviousClose: 99, MarketState: "REGULAR"}})
+	useLocalYahooOptionsAuth(t, yahoo)
+	quote, err := yahoo.Quote(context.Background(), "QQQ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quote.Provider == "yahoo-overnight" || quote.Price == nil || *quote.Price != 100 {
+		t.Fatalf("future Yahoo timestamp was accepted: %#v", quote)
+	}
+}
+
 func TestNormalizeSymbolMatchesPythonBoundaries(t *testing.T) {
 	for _, raw := range []string{"qqq", "BRK.B", "A-B", "A123456789", "ES=F", "NQ=F", "BTC-USD=F"} {
 		if got, err := NormalizeSymbol(raw); err != nil || got != strings.ToUpper(raw) {

@@ -32,6 +32,13 @@ const compared = window.OptionScopeMfi.calculate(bars(Array.from({ length: 30 },
 assert.equal(compared.benchmarkMfi.length, 30, "基准 MFI 应按个股日期对齐");
 assert.ok(compared.benchmarkMfi.at(-1) >= 0 && compared.benchmarkMfi.at(-1) <= 100, "基准 MFI 应在有效范围内");
 
+const cachedSource = bars(Array.from({ length: 30 }, (_, index) => 10 + index));
+const emptyBenchmark = bars(Array.from({ length: 30 }, (_, index) => 20 + index), 0);
+const cachedWithoutBenchmark = window.OptionScopeMfi.calculateWithLiveBar(cachedSource, cachedSource, emptyBenchmark, -1);
+assert.ok(cachedWithoutBenchmark.benchmarkMfi.every((value) => value === null), "首次没有基准成交量时不应绘制标普 MFI");
+const cachedWithBenchmark = window.OptionScopeMfi.calculateWithLiveBar(cachedSource, cachedSource, benchmark, -1);
+assert.ok(cachedWithBenchmark.benchmarkMfi.some((value) => Number.isFinite(value)), "基准数据补齐后应重新计算标普 MFI");
+
 const unavailableBenchmark = window.OptionScopeMfi.calculate(
   bars(Array.from({ length: 30 }, (_, index) => 10 + index)),
   bars(Array.from({ length: 30 }, (_, index) => 20 + index), 0),

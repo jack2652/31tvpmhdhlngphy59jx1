@@ -90,7 +90,7 @@
 .chan-layer-menu-panel>.chan-layer-menu-close{position:absolute;top:8px;right:8px;z-index:1;display:grid;width:28px;height:28px;place-items:center;padding:0;border:1px solid var(--line);border-radius:4px;background:var(--field);color:var(--muted);font:inherit;font-size:20px;line-height:1;cursor:pointer}
 .chan-subchart-menu-panel{grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(260px,calc(100vw - 40px));left:0;right:auto}
 .chan-subchart-menu-panel .chan-subchart-switches{width:max-content;max-width:100%}
-.chan-period-menu-panel{grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(330px,calc(100vw - 40px));left:0;right:auto}
+.chan-period-menu-panel{grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(360px,calc(100vw - 40px));left:0;right:auto}
 .chan-period-menu-panel .chan-period-switches{width:max-content;max-width:100%}
 .chan-indicator-menu-panel{grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(360px,calc(100vw - 40px));left:0;right:auto}
 .chan-indicator-options{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px}
@@ -562,7 +562,7 @@
   .chan-layer-menu-panel{position:fixed;top:auto;right:16px;left:16px;bottom:max(16px,env(safe-area-inset-bottom));grid-template-areas:"close" "signals" "display" "pens" "recursive";grid-template-columns:minmax(0,1fr);gap:12px;width:auto;max-height:min(72vh,620px);overflow:auto;padding:16px;box-shadow:0 16px 42px rgba(0,0,0,.24)}
 }
 @media(min-width:601px) and (max-width:1100px){
-  .chan-period-menu-panel{position:absolute;top:calc(100% + 8px);right:auto;left:0;width:min(330px,calc(100vw - 32px));max-height:none;overflow:visible;padding:16px}
+  .chan-period-menu-panel{position:absolute;top:calc(100% + 8px);right:auto;left:0;width:min(360px,calc(100vw - 32px));max-height:none;overflow:visible;padding:16px}
 }
 /* 窄屏下拉面板跟随按钮组展开，避免固定到底部时盖住同一行的其他按钮。 */
 @media(max-width:760px){
@@ -572,7 +572,7 @@
   .chan-control-options>details{position:static}
   .chan-layer-menu-panel{position:absolute;top:calc(100% + 8px);right:auto;left:50%;bottom:auto;transform:translateX(-50%);width:min(560px,calc(100vw - 24px));max-height:min(72vh,620px);overflow:auto}
   .chan-subchart-menu-panel{position:absolute;top:calc(100% + 8px);right:auto;left:50%;bottom:auto;transform:translateX(-50%);width:min(260px,calc(100vw - 24px));max-height:min(72vh,420px);overflow:auto}
-  .chan-period-menu-panel{position:absolute;top:calc(100% + 8px);right:auto;left:50%;bottom:auto;transform:translateX(-50%);width:min(330px,calc(100vw - 24px));max-height:min(72vh,420px);overflow:auto}
+  .chan-period-menu-panel{position:absolute;top:calc(100% + 8px);right:auto;left:50%;bottom:auto;transform:translateX(-50%);width:min(360px,calc(100vw - 24px));max-height:min(72vh,420px);overflow:auto}
   .chan-indicator-menu-panel{position:absolute;top:calc(100% + 8px);right:auto;left:0;bottom:auto;transform:none;grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(360px,100%);max-height:min(72vh,420px);overflow:auto}
 }
 /* The single layer menu groups independent toggles without the former long segmented strip. */

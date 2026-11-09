@@ -122,7 +122,7 @@ Gamma 敞口使用 Black-Scholes 根据标的价格、执行价、隐含波动�
 新算法的目标规则版本为 `chan-recursive-v4.0.0`，当前 API 标记为 `chan-recursive-v4-preview.11`。`preview` 表示实现仍在升级与验收，不能将其称为正式 v4。旧字段 `strokes` / `centers` 继续使用 `strict-old-bi-v3` 语义；递归结构使用 `segments`、`recursive_centers`、`recursive_levels`、`strengths_v4` 和 `signals_v4`。较宽松的笔级历史观察单独位于 `pen_signals`，不可当作递归买卖点或混入阈值统计。
 
 - `GET /api/chan/{symbol}/adjusted` 使用拆股与分红自动复权的日线历史计算日线、完整周线结构；图表结构与现价需使用响应中的同一复权坐标。历史复权数据缺失或现价换算因子无效时，响应会降级并停止不兼容的现价比较，不静默回退到未复权价格。
-- `GET /api/chan/{symbol}/intraday?period=15m|4h` 只处理已收盘的盘中 bars，并复用 v4 递归结构 schema；这些盘中输入仍在原始价格基准内计算，响应会标出该基准。盘中信号只用于同一原始价格坐标内的结构分析，不直接与复权日线价格比较。`/adjusted` 会按逐日有效复权因子转换 15 分钟历史，再生成 4 小时结构供日线信号进行直接下级确认；因子缺失时对应 bars 不参与确认。
+- `GET /api/chan/{symbol}/intraday?period=15m|1h|2h|4h` 只处理已收盘的盘中 bars，并复用 v4 递归结构 schema；这些盘中输入仍在原始价格基准内计算，响应会标出该基准。1 小时、2 小时和 4 小时均由已存储的 15 分钟历史按美东交易时段合成，不单独请求上游周期。盘中信号只用于同一原始价格坐标内的结构分析，不直接与复权日线价格比较。`/adjusted` 会按逐日有效复权因子转换 15 分钟历史，再按同样的周期阶梯生成盘中结构供日线信号进行直接下级确认；因子缺失时对应 bars 不参与确认。
 - 预览结构包括方向性包含处理、严格分型和旧笔、特征序列线段、同级递归中枢与相邻关系、MACD 力度，以及需要中枢背景、价格创新极值和力度减弱条件的候选观察。返回对象带有级别、来源范围、形成／确认状态和时间；数据缺口、异常跳变及结构修订会进入质量或修订信息。
 - `chan-recursive-v4-preview.9` 将分型日期锚定到包含合并组的末根 K 线，同时保留实际极值的原始行情索引；三类位置只从与中枢相交后离开的走势开始判断，标记落在回试端点。结构信号图层在当前窗口无标记时，会区分历史窗口外的信号、尚无绘图位置的候选和全周期无信号。
 - `chan-recursive-v4-preview.10` 将稳定复权因子下的大幅价格变动标记为信息事件，不再将其误报为行情数据降级；结构仍在该处开启新链。版本变化会令 SQLite 中旧算法结果缓存失效并重新计算。
@@ -303,7 +303,7 @@ RESOURCE_MODE=auto
 - `GET /api/levels/{symbol}?expiration=YYYY-MM-DD&spot=144.57&raw=true`（压力位/支撑位：斐波那契 + 筹码密集 + 承接位 + 所选到期日期权持仓综合，每行含「到达概率」；`spot` 为可选基准价，缺省用快照常规价。`raw=true` 只读 SQLite，并在历史与 `fast_levels` 可用时省略原始期权行）
 - `GET /api/chan/{symbol}?spot=144.57&light=true`（日线＋周线缠论结构：包含处理、严格旧笔、笔中枢、当前价相对最近中枢的位置、抄底／逃顶观察与候选、第三类位置候选和条件式走势推演；只读取已落库日线，`spot` 为可选页面现价。`light=true` 只返回趋势/价位卡片所需的市场分析，不返回日／周结构）
 - `GET /api/chan/{symbol}/adjusted?spot=144.57&compact=true`（独立复权历史上的递归算法预览；返回规则版本、价格坐标、日／周结构、质量和修订信息。`compact=true` 省略图表不使用的 fractals、MACD、strength 等字段）
-- `GET /api/chan/{symbol}/intraday?period=15m|4h&spot=144.57`（已收盘盘中 K 线的递归结构预览；信号使用原始价格坐标，不与复权日线直接比较）
+- `GET /api/chan/{symbol}/intraday?period=15m|1h|2h|4h&spot=144.57`（已收盘盘中 K 线的递归结构预览；1 小时、2 小时和 4 小时由 15 分钟历史合成，信号使用原始价格坐标，不与复权日线直接比较）
 - `POST /api/refresh/{symbol}?expiration=YYYY-MM-DD&max_age=60`（本地快照在 `max_age` 秒内直接返回 `skipped=true`，不再请求上游接口；`max_age=0` 表示强制刷新）
 - `GET /api/status/{symbol}`
 - `POST /api/cleanup`

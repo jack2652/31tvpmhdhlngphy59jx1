@@ -6,6 +6,16 @@
   const AVERAGE_PERIOD = 9;
   const completedCache = new WeakMap();
 
+  function cachedResult(sourceCandles, benchmarkCandles) {
+    const cached = completedCache.get(sourceCandles);
+    return cached && cached.benchmarkCandles === benchmarkCandles ? cached.result : null;
+  }
+
+  function storeCachedResult(sourceCandles, benchmarkCandles, result) {
+    completedCache.set(sourceCandles, { benchmarkCandles, result });
+    return result;
+  }
+
   function validBar(bar) {
     const high = Number(bar?.high), low = Number(bar?.low), close = Number(bar?.close);
     const volume = Number(bar?.volume);
@@ -138,15 +148,12 @@
   function calculateWithLiveBar(sourceCandles, displayCandles, benchmarkCandles = [], liveIndex = -1) {
     const source = Array.isArray(sourceCandles) ? sourceCandles : [];
     const display = Array.isArray(displayCandles) ? displayCandles : source;
-    const cached = completedCache.get(source);
+    const cached = cachedResult(source, benchmarkCandles);
     if (liveIndex < 0 || !display[liveIndex] || display[liveIndex].is_forming !== true) {
       if (cached && liveIndex < 0) return cached;
-      const result = calculate(display, benchmarkCandles);
-      completedCache.set(source, result);
-      return result;
+      return storeCachedResult(source, benchmarkCandles, calculate(display, benchmarkCandles));
     }
-    const completed = cached || calculate(source, benchmarkCandles);
-    completedCache.set(source, completed);
+    const completed = cached || storeCachedResult(source, benchmarkCandles, calculate(source, benchmarkCandles));
     const live = calculate(display, benchmarkCandles);
     return { ...completed, liveIndex, liveValues: {
       mfi: live.mfi[liveIndex] ?? null,

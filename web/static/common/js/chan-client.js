@@ -20,7 +20,19 @@
     return `${end.getUTCFullYear()}-${String(end.getUTCMonth() + 1).padStart(2, "0")}-${String(end.getUTCDate()).padStart(2, "0")} ${String(end.getUTCHours()).padStart(2, "0")}:${String(end.getUTCMinutes()).padStart(2, "0")}`;
   }
   const chartCache = new WeakMap();
+  const cacheObjectIds = new WeakMap();
+  let nextCacheObjectId = 1;
   const afStochZCache = new WeakMap();
+
+  function cacheObjectId(value) {
+    if (!value || typeof value !== "object") return "none";
+    let id = cacheObjectIds.get(value);
+    if (!id) {
+      id = String(nextCacheObjectId++);
+      cacheObjectIds.set(value, id);
+    }
+    return id;
+  }
   const quoteEasternDateFormatter = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
   });
@@ -638,6 +650,8 @@
     const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
     const mfiEnabled = layers?.mfi === true || subcharts?.mfi === true;
     const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("") + (mfiEnabled ? "1" : "0");
+    // 标普基准数据可能在盘中图首次渲染后异步补齐；换数组时必须让布局缓存失效。
+    const mfiBenchmarkCacheKey = mfiEnabled ? cacheObjectId(dataContext?.marketHistory?.daily) : "none";
     // Only reserve the scenario lane when there is a path to draw. Reserving
     // it unconditionally leaves a large blank gutter on mobile charts whose
     // current structure produced no projection.
@@ -649,7 +663,7 @@
       const reference = Number.isFinite(anchor) && anchor > 0 ? anchor : spotPrice;
       return levels.some((level) => !Number.isFinite(reference) || Math.abs(level - reference) > 0.000001);
     });
-    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${ruleVersion || ""}`;
+    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${ruleVersion || ""}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
@@ -1957,12 +1971,19 @@
 
   // Closed-bar intraday view. Each requested period is aggregated from stored
   // 15-minute history and uses the same renderer as daily/weekly.
-  function intradayView(payload, showScenarios = true, spotOverride = null, mobileChart = false, mobileBars = 30, viewport = null, layers = null, subcharts = null) {
+  function intradayView(payload, showScenarios = true, spotOverride = null, mobileChart = false, mobileBars = 30, viewport = null, layers = null, subcharts = null, context = null) {
     const label = ({ "15m": "15分钟", "1h": "1小时", "2h": "2小时", "4h": "4小时" })[payload?.period] || "盘中";
     if (!payload || !payload.frame) return emptyFrame(label);
     const spot = spotOverride != null && Number.isFinite(Number(spotOverride)) && Number(spotOverride) > 0
       ? Number(spotOverride) : payload.spot;
-    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars, viewport, layers, payload.rule_version, { priceCoordinate: payload.price_coordinate, parameters: payload.parameters }, subcharts);
+    // 盘中周期也要沿用完整数据上下文。尤其是 MFI 的标普对比线，不能
+    // 因为切换到 1 小时或 2 小时就丢失 market_history。
+    const dataContext = {
+      priceCoordinate: payload.price_coordinate,
+      parameters: payload.parameters,
+      marketHistory: context?.marketHistory || payload.market_history,
+    };
+    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars, viewport, layers, payload.rule_version, dataContext, subcharts);
   }
 
   // Refresh the current price position without rebuilding historical pens.

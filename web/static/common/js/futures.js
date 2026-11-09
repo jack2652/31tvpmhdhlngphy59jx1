@@ -8,7 +8,9 @@
     { symbol: "YM=F", label: "道指期货" }, { symbol: "CL=F", label: "原油期货" },
     { symbol: "GC=F", label: "黄金期货" },
   ];
-  const periods = [{ value: "daily", label: "日线" }, { value: "weekly", label: "周线" }, { value: "15m", label: "15分钟" }, { value: "4h", label: "4小时" }];
+  const periods = [{ value: "daily", label: "日线" }, { value: "weekly", label: "周线" }, { value: "15m", label: "15分钟" }, { value: "1h", label: "1小时" }, { value: "2h", label: "2小时" }, { value: "4h", label: "4小时" }];
+  const intradayPeriods = ["15m", "1h", "2h", "4h"];
+  const intradayRetryLimit = 12;
   const indicators = [
     { value: "base", label: "缠论结构" }, { value: "afStochZ", label: "AF StochZ" },
     { value: "turtle", label: "海龟交易法" }, { value: "granville", label: "葛兰碧法则" },
@@ -120,6 +122,10 @@
     return Array.isArray(bars) && bars.filter((bar) => Number(bar?.volume) > 0
       && [bar?.high, bar?.low, bar?.close].every((value) => Number.isFinite(Number(value)))).length >= 15;
   }
+  function intradayFrameReady(payload) {
+    return Number(payload?.frame?.bar_count) > 0 && Array.isArray(payload?.frame?.candles)
+      && payload.frame.candles.length > 0;
+  }
   function navigate(symbol) {
     const params = new URLSearchParams();
     if (accessKey) params.set("key", accessKey);
@@ -147,8 +153,8 @@
     data: {
       symbol, symbolInput: symbol, presets, periods, indicators, period: chartPreferences.period,
       chartLayers: chartPreferences.layers, subcharts: chartPreferences.subcharts,
-      quote: null, payload: null, intradayPayload: {}, loading: false, error: "", mfiBenchmarkRetryCount: 0, clock: "--:--:--", theme: document.documentElement.dataset.theme || "light", mobileChart: mobileChartViewport(), chanExpanded: readFoldState(foldStorageKeys.panel, true), chanStatsExpanded: readFoldState(foldStorageKeys.stats, false), chanMoreExpanded: readFoldState(foldStorageKeys.more, false), chanScenariosVisible: readScenarioVisibility(), chanHoveredScenario: null, chanScenarioCardX: 0,
-      viewport: { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } },
+      quote: null, payload: null, intradayPayload: {}, intradayLoading: { "15m": false, "1h": false, "2h": false, "4h": false }, intradayRetryTimers: { "15m": null, "1h": null, "2h": null, "4h": null }, intradayRetryAttempts: { "15m": 0, "1h": 0, "2h": 0, "4h": 0 }, loading: false, error: "", mfiBenchmarkRetryCount: 0, clock: "--:--:--", theme: document.documentElement.dataset.theme || "light", mobileChart: mobileChartViewport(), chanExpanded: readFoldState(foldStorageKeys.panel, true), chanStatsExpanded: readFoldState(foldStorageKeys.stats, false), chanMoreExpanded: readFoldState(foldStorageKeys.more, false), chanScenariosVisible: readScenarioVisibility(), chanHoveredScenario: null, chanScenarioCardX: 0,
+      viewport: { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "1h": { visibleBars: 0, endOffset: 0 }, "2h": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } },
     },
     computed: {
       displaySymbol() { return this.symbol.replace("=F", ""); },
@@ -167,9 +173,9 @@
       },
       frame() {
         const layers = this.chartLayers;
-        if (this.period === "15m" || this.period === "4h") {
+        if (intradayPeriods.includes(this.period)) {
           const payload = this.intradayPayload[this.period];
-          return payload ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.quote?.price, this.mobileChart, 50, this.viewport[this.period], layers, this.subcharts) : null;
+          return payload ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.quote?.price, this.mobileChart, 50, this.viewport[this.period], layers, this.subcharts, { marketHistory: this.payload?.market_history }) : null;
         }
         const payload = this.payload && this.quote?.symbol === this.symbol
           ? OptionScopeChan.withSpot(this.payload, this.quote.price, null, this.quote)
@@ -242,7 +248,7 @@
         if (!periods.some((item) => item.value === value)) return;
         this.period = value;
         rememberChartPreferences(this.period, this.chartLayers, this.subcharts);
-        if ((value === "15m" || value === "4h") && !this.intradayPayload[value]) this.loadIntraday(value);
+        if (intradayPeriods.includes(value)) this.loadIntraday(value);
       },
       setIndicator(value) {
         if (value === "base") {
@@ -316,7 +322,43 @@
         this.viewport = { ...this.viewport, [this.period]: { ...current, visibleBars: current.visibleBars || chart.visibleBars, endOffset } };
       },
       zoomViewport(factor, anchor, ratio, baseVisible) { const current = this.viewport[this.period] || {}; const visible = Math.max(20, Math.round(Number(baseVisible || current.visibleBars || 50) * Number(factor || 1))); this.viewport = { ...this.viewport, [this.period]: { ...current, visibleBars: visible } }; },
-      async loadIntraday(value) { const token = this.symbol; try { const spot = finite(this.quote?.price); const queryString = spot ? `?period=${value}&spot=${encodeURIComponent(spot)}` : `?period=${value}`; const payload = await request(`/api/chan/${encodeURIComponent(token)}/intraday${queryString}`, { timeout: 60000 }); if (this.symbol === token) this.$set(this.intradayPayload, value, payload); } catch (error) { if (this.symbol === token) this.error = error.message || "盘中历史加载失败"; } },
+      scheduleIntradayRetry(value) {
+        if (!intradayPeriods.includes(value) || this.intradayRetryTimers[value] || (this.intradayRetryAttempts[value] || 0) >= intradayRetryLimit) return;
+        const attempt = this.intradayRetryAttempts[value] || 0;
+        const delay = Math.min(15000, 1500 * (2 ** Math.min(attempt, 3)));
+        this.$set(this.intradayRetryAttempts, value, attempt + 1);
+        const timer = window.setTimeout(() => {
+          this.$set(this.intradayRetryTimers, value, null);
+          this.loadIntraday(value, true);
+        }, delay);
+        this.$set(this.intradayRetryTimers, value, timer);
+      },
+      async loadIntraday(value, refresh = false) {
+        if (!intradayPeriods.includes(value) || this.intradayLoading[value]) return;
+        const existing = this.intradayPayload[value];
+        if (!refresh && intradayFrameReady(existing) && !existing.refreshing) return;
+        if (!refresh && this.intradayRetryTimers[value]) return;
+        const token = this.symbol;
+        this.$set(this.intradayLoading, value, true);
+        try {
+          const spot = finite(this.quote?.price);
+          const queryString = spot ? `?period=${value}&spot=${encodeURIComponent(spot)}` : `?period=${value}`;
+          const payload = await request(`/api/chan/${encodeURIComponent(token)}/intraday${queryString}`, { timeout: 60000 });
+          if (this.symbol !== token) return;
+          if (intradayFrameReady(payload) || !intradayFrameReady(existing)) this.$set(this.intradayPayload, value, payload);
+          if (intradayFrameReady(payload) && !payload.refreshing) {
+            window.clearTimeout(this.intradayRetryTimers[value]);
+            this.$set(this.intradayRetryTimers, value, null);
+            this.$set(this.intradayRetryAttempts, value, 0);
+          } else {
+            this.scheduleIntradayRetry(value);
+          }
+        } catch (error) {
+          if (this.symbol === token) this.scheduleIntradayRetry(value);
+        } finally {
+          if (this.symbol === token) this.$set(this.intradayLoading, value, false);
+        }
+      },
       scheduleMfiBenchmarkRetry() {
         if (mfiBenchmarkRetryTimer || !this.payload || hasMfiBenchmarkHistory(this.payload) || this.mfiBenchmarkRetryCount >= 12) return;
         mfiBenchmarkRetryTimer = window.setTimeout(() => {
@@ -358,7 +400,7 @@
           this.payload = payload;
           if (this.subcharts.mfi) this.scheduleMfiBenchmarkRetry();
           if (payload?.ready === false || !payload?.daily?.bar_count) this.error = "历史结构正在后台准备，稍后会自动更新";
-          if ((this.period === "15m" || this.period === "4h") && !this.intradayPayload[this.period]) this.loadIntraday(this.period);
+          if (intradayPeriods.includes(this.period)) this.loadIntraday(this.period);
         } catch (error) { if (this.symbol === token) this.error = error.message || "期货行情加载失败"; }
         finally { if (this.symbol === token) this.loading = false; }
       },

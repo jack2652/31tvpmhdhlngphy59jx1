@@ -27,6 +27,7 @@ import (
 
 const (
 	optionsURL                     = "https://query1.finance.yahoo.com/v7/finance/options/%s"
+	quoteURL                       = "https://query1.finance.yahoo.com/v7/finance/quote"
 	futuresChartURL                = "https://query1.finance.yahoo.com/v8/finance/chart/%s"
 	lowMemoryQuoteTickerCacheLimit = 128
 	defaultQuoteTickerCacheLimit   = 512
@@ -39,6 +40,7 @@ type Yahoo struct {
 	authClient    *yahooauth.Client
 	optionsAuth   yahooCrumbGetter
 	optionsURL    string
+	quoteURL      string
 	chartURL      string
 	fundamentals  *FundamentalsClient
 	earnings      *YahooEarningsClient
@@ -109,7 +111,7 @@ func NewYahoo(timeout time.Duration, concurrency int) *Yahoo {
 	fundamentals.Gate, fundamentals.GateWait = semaphore, timeout
 	earnings := NewYahooEarningsClient(client)
 	earnings.Gate, earnings.GateWait = semaphore, timeout
-	return &Yahoo{client: client, optionsURL: optionsURL, chartURL: futuresChartURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTickerCacheEntry), quoteTickerInit: make(map[string]*yahooTickerInit), quoteTickerCacheMax: boundedQuoteTickerCacheEntries(false), interactiveGate: interactiveGate}
+	return &Yahoo{client: client, optionsURL: optionsURL, quoteURL: quoteURL, chartURL: futuresChartURL, fundamentals: fundamentals, earnings: earnings, timeout: timeout, gateWait: timeout, semaphore: semaphore, now: time.Now, quoteTickers: make(map[string]yahooTickerCacheEntry), quoteTickerInit: make(map[string]*yahooTickerInit), quoteTickerCacheMax: boundedQuoteTickerCacheEntries(false), interactiveGate: interactiveGate}
 }
 
 func NewYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress string) (*Yahoo, error) {
@@ -159,6 +161,7 @@ func newYahooWithProxy(timeout time.Duration, concurrency int, proxyAddress stri
 		authClient:          authClient,
 		optionsAuth:         optionsAuth,
 		optionsURL:          optionsURL,
+		quoteURL:            quoteURL,
 		chartURL:            futuresChartURL,
 		fundamentals:        fundamentals,
 		earnings:            earnings,
@@ -336,6 +339,20 @@ func NormalizeExpiration(raw string) (string, error) {
 
 type yahooHTTPStatusError struct {
 	status int
+}
+
+// yahooOvernightQuoteResponse 是 Yahoo quote 接口中夜盘字段的最小响应模型。
+// go-yfinance 当前的 Quote 模型没有这些字段，因此这里保留原始字段解析。
+type yahooOvernightQuoteResponse struct {
+	QuoteResponse struct {
+		Result []struct {
+			Symbol                   string   `json:"symbol"`
+			OvernightMarketPrice     float64  `json:"overnightMarketPrice"`
+			OvernightMarketTime      int64    `json:"overnightMarketTime"`
+			OvernightMarketChangePct *float64 `json:"overnightMarketChangePercent"`
+		} `json:"result"`
+		Error *yahooAPIError `json:"error"`
+	} `json:"quoteResponse"`
 }
 
 func (e *yahooHTTPStatusError) Error() string {
@@ -889,12 +906,24 @@ func (y *Yahoo) Quote(ctx context.Context, symbol string) (model.Quote, error) {
 		change = &value
 	}
 	fetched := now.UTC()
-	return model.Quote{
+	result := model.Quote{
 		Symbol: symbol, Price: optionalFloat(price), ChangePercent: change, TodayOpen: regularOpen, PreviousClose: optionalFloat(previous),
 		DailyBar: yahooRegularDailyBar(metaQuote, now, state),
 		Currency: stringOr(currency, "USD"), MarketState: strings.ToUpper(state), Provider: "yahoo-chart", Source: "upstream", FetchedAt: &fetched,
 		Sessions: sessions, FairValuePending: true,
-	}, nil
+	}
+	if state == "OVERNIGHT" && !IsIndexSymbol(symbol) && !IsFutureSymbol(symbol) {
+		if overnight, ok := y.yahooOvernightQuote(ctx, symbol, now, previous); ok {
+			priceValue := overnight["price"].(float64)
+			result.Price = &priceValue
+			if value, ok := overnight["change_percent"].(float64); ok && validPercent(value) {
+				result.ChangePercent = &value
+			}
+			result.Provider = "yahoo-overnight"
+			result.Sessions["overnight"] = overnight
+		}
+	}
+	return result, nil
 }
 
 func yahooRegularDailyBar(quote *yahooQuoteModel, now time.Time, state string) *model.DailyBar {
@@ -1258,10 +1287,14 @@ func (y *Yahoo) options(ctx context.Context, symbol, timestamp string) (yahooOpt
 }
 
 func (y *Yahoo) getOptionsWithCrumb(ctx context.Context, endpoint string, query url.Values, target any) error {
+	return y.getYahooJSONWithCrumb(ctx, y.semaphore, endpoint, query, target)
+}
+
+func (y *Yahoo) getYahooJSONWithCrumb(ctx context.Context, gate chan struct{}, endpoint string, query url.Values, target any) error {
 	if y.optionsAuth == nil {
 		return errors.New("go-yfinance Yahoo authentication client is unavailable")
 	}
-	release, err := acquireGateTimeout(ctx, y.semaphore, y.gateWait)
+	release, err := acquireGateTimeout(ctx, gate, y.gateWait)
 	if err != nil {
 		return err
 	}
@@ -1293,6 +1326,74 @@ func (y *Yahoo) getOptionsWithCrumb(ctx context.Context, endpoint string, query 
 		}
 		return nil
 	}
+}
+
+// yahooOvernightQuote 在股票夜盘期间读取 Yahoo 的夜盘报价。
+// Yahoo 偶尔会返回超前或跨交易日的时间戳，这类数据不能覆盖当前行情。
+func (y *Yahoo) yahooOvernightQuote(ctx context.Context, symbol string, now time.Time, reference float64) (map[string]any, bool) {
+	if y == nil || y.optionsAuth == nil || IsIndexSymbol(symbol) || IsFutureSymbol(symbol) {
+		return nil, false
+	}
+	query := url.Values{}
+	query.Set("symbols", symbol)
+	query.Set("overnightPrice", "true")
+	query.Set("fields", "symbol,overnightMarketPrice,overnightMarketTime,overnightMarketChangePercent")
+	var payload yahooOvernightQuoteResponse
+	endpoint := y.quoteURL
+	if endpoint == "" {
+		endpoint = quoteURL
+	}
+	if err := y.getYahooJSONWithCrumb(ctx, y.interactiveUpstreamGate(), endpoint, query, &payload); err != nil {
+		return nil, false
+	}
+	if len(payload.QuoteResponse.Result) == 0 {
+		return nil, false
+	}
+	result := payload.QuoteResponse.Result[0]
+	if result.Symbol != "" && !strings.EqualFold(result.Symbol, symbol) {
+		return nil, false
+	}
+	if !validYahooPrice(result.OvernightMarketPrice) || result.OvernightMarketTime <= 0 {
+		return nil, false
+	}
+	quotedAt := time.Unix(result.OvernightMarketTime, 0)
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		location = time.FixedZone("EST", -5*60*60)
+	}
+	quotedAt = quotedAt.In(location)
+	now = now.In(location)
+	// 夜盘单次报价最长覆盖 20:00 到次日 04:00；给接口延迟留出少量余量。
+	if quotedAt.After(now.Add(2*time.Minute)) || now.Sub(quotedAt) > 12*time.Hour ||
+		yahooTradingDay(quotedAt).Format(time.DateOnly) != yahooTradingDay(now).Format(time.DateOnly) {
+		return nil, false
+	}
+	change := float64(0)
+	hasChange := false
+	if result.OvernightMarketChangePct != nil && validPercent(*result.OvernightMarketChangePct) {
+		change = *result.OvernightMarketChangePct
+		hasChange = true
+	} else if validYahooPrice(reference) {
+		change = (result.OvernightMarketPrice - reference) / reference * 100
+		hasChange = validPercent(change)
+	}
+	summary := map[string]any{
+		"price":    result.OvernightMarketPrice,
+		"as_of":    quotedAt.Format(time.RFC3339),
+		"date":     quotedAt.Format(time.DateOnly),
+		"provider": "yahoo-overnight",
+	}
+	if validYahooPrice(reference) {
+		summary["reference_close"] = reference
+	}
+	if hasChange {
+		summary["change_percent"] = change
+	}
+	return summary, true
+}
+
+func validPercent(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func floatPtr(value float64) *float64 { return &value }
