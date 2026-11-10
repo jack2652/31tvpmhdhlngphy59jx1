@@ -5058,7 +5058,7 @@ function renderChainHeatmapModel() {
       updatedAt: formatEasternClock(entry?.fetchedAt),
       current: isSelected,
       selected: isSelected,
-      title: `${expiration} · ${isSelected ? "已选期限" : "缓存参考"} · ${valuationTitle} · ${snapshotTitle}`,
+      title: `${expiration}${isSelected ? " · 已选期限" : ""} · ${valuationTitle} · ${snapshotTitle}`,
     };
   });
   if (chainHeatmapViewCache.key === heatmapKey && chainHeatmapViewCache.rows) {
@@ -5172,7 +5172,7 @@ function renderChainHeatmapModel() {
         value: formatGex(value / 1000000, 2),
         className: `chain-heatmap-cell ${value > 0 ? "chain-heatmap-cell-positive" : value < 0 ? "chain-heatmap-cell-negative" : "chain-heatmap-cell-zero"}${percent >= 65 ? " chain-heatmap-cell-hot" : ""}${spotClass}`,
         style: `--heat:${percent}`,
-        title: `${column.expiration} · 行权价 ${formatMoney(strike)} · ${gexLabel} ${formatGex(value / 1000000, 2)} · ${column.selected ? (valuation.closeBased ? "已选期限，按正式收盘基准估算" : "已选期限，按最新行情估算") : "缓存参考"}`,
+        title: `${column.expiration} · 行权价 ${formatMoney(strike)} · ${gexLabel} ${formatGex(value / 1000000, 2)}${column.selected ? ` · ${valuation.closeBased ? "已选期限，按正式收盘基准估算" : "已选期限，按最新行情估算"}` : ""}`,
       });
     });
     const row = {
