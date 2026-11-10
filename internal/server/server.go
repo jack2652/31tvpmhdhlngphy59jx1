@@ -767,10 +767,11 @@ func (w *gzipResponseWriter) finish() {
 }
 
 func quoteAPIValue(quote model.Quote) any {
+	overnightAvailable := quote.Provider == "alpaca-overnight" || quote.Provider == "yahoo-overnight"
 	quote = expireFormingQuoteDailyBar(quote, time.Now())
 	encoded, err := json.Marshal(quote)
 	if err != nil {
-		return quote
+		return gin.H{"symbol": quote.Symbol, "source": publicQuoteSource(quote.Source), "overnight_available": overnightAvailable}
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(encoded, &payload); err != nil {
@@ -782,12 +783,23 @@ func quoteAPIValue(quote model.Quote) any {
 	if quote.FairValueSource == "" {
 		payload["fair_value_source"] = nil
 	}
-	if quote.Source == "sqlite" && quote.SnapshotID > 0 {
-		payload["id"] = quote.SnapshotID
-		payload["raw_json"] = quote.RawJSON
-		payload["fair_value_methods_json"] = quote.FairValueMethodsJSON
-		payload["fair_value_historical_valuation_percentiles_json"] = quote.FairValueHistoricalValuationJSON
+	delete(payload, "provider")
+	payload["overnight_available"] = overnightAvailable
+	payload["source"] = publicQuoteSource(quote.Source)
+	if sessions, ok := payload["sessions"].(map[string]any); ok {
+		for _, value := range sessions {
+			if session, ok := value.(map[string]any); ok {
+				delete(session, "provider")
+			}
+		}
 	}
+	if source, ok := payload["fair_value_forward_eps_source"].(string); ok {
+		payload["fair_value_forward_eps_source"] = publicValuationSource(source)
+	}
+	delete(payload, "raw_json")
+	delete(payload, "id")
+	delete(payload, "fair_value_methods_json")
+	delete(payload, "fair_value_historical_valuation_percentiles_json")
 	if !strings.EqualFold(strings.TrimSpace(quote.MarketState), "REGULAR") {
 		if price, valuationTime, closeBased := chainGammaValuation(quote); closeBased && price != nil {
 			payload["gex_valuation"] = map[string]any{
@@ -796,6 +808,35 @@ func quoteAPIValue(quote model.Quote) any {
 		}
 	}
 	return payload
+}
+
+func publicQuoteSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "sqlite":
+		return "cache"
+	case "memory":
+		return "cache"
+	case "pending":
+		return "pending"
+	case "none":
+		return "none"
+	case "not_applicable":
+		return "not_applicable"
+	case "", "upstream":
+		return "live"
+	default:
+		return "snapshot"
+	}
+}
+
+func publicValuationSource(source string) string {
+	lower := strings.ToLower(source)
+	for _, name := range []string{"yahoo", "alpaca", "cboe", "sqlite", "go-yfinance"} {
+		if strings.Contains(lower, name) {
+			return "分析师预期"
+		}
+	}
+	return source
 }
 
 func expireFormingQuoteDailyBar(quote model.Quote, now time.Time) model.Quote {
@@ -1322,7 +1363,7 @@ func strictExpiration(raw string) (string, error) {
 func pendingQuoteResponse(symbol string) map[string]any {
 	return map[string]any{
 		"symbol": symbol, "price": nil, "change_percent": nil, "currency": "USD",
-		"market_state": nil, "sessions": map[string]any{}, "provider": "upstream", "source": "pending",
+		"market_state": nil, "sessions": map[string]any{}, "source": "pending",
 		"fair_value": nil, "fair_value_low": nil, "fair_value_high": nil,
 		"fair_value_buy_low": nil, "fair_value_buy_high": nil, "fair_value_source": nil,
 		"fair_value_model": nil, "fair_value_forward_eps": nil, "fair_value_forward_eps_source": nil,

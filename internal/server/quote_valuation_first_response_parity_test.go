@@ -74,7 +74,7 @@ func TestFirstQuoteReturnsPendingWhileValuationRunsInBackground(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("first quote status=%d body=%#v", response.StatusCode, body)
 	}
-	if body["price"] != nil || body["source"] != "pending" || body["provider"] != "upstream" || body["fair_value_status"] != "pending" || body["fair_value_pending"] != true {
+	if body["price"] != nil || body["source"] != "pending" || body["provider"] != nil || body["fair_value_status"] != "pending" || body["fair_value_pending"] != true {
 		t.Fatalf("first quote response=%#v; want Python-compatible pending placeholder", body)
 	}
 	if warning, present := body["fair_value_warning"]; !present || warning != nil {

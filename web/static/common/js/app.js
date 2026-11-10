@@ -546,7 +546,7 @@ function restoreDisplayedClientSnapshot(snapshot, message = "API 暂不可用", 
   if (unavailable) {
     markApiUnavailable(message);
   } else {
-    state.view.lastStatus = `${message}，继续显示本地缓存`;
+    state.view.lastStatus = `${sanitizeDisplayText(message)}，继续显示本地缓存`;
     setError("");
   }
   syncPageQuery();
@@ -653,7 +653,7 @@ function markApiUnavailable(message) {
   if (!hasRenderableClientSnapshot()) {
     if (!restoreClientSnapshot(state.symbol, state.expiration, true)) return false;
   }
-  const detail = message || "API 暂不可用";
+  const detail = sanitizeDisplayText(message, "API 暂不可用");
   state.view.lastStatus = `${detail}，保留本地缓存，等待 API 恢复`;
   const source = String(state.view.dataSource || "本地缓存");
   state.view.dataSource = source.includes("API 暂不可用") ? source : `${source} · API 暂不可用`;
@@ -1016,7 +1016,17 @@ function syncPageQuery() {
   history.replaceState(null, "", next);
 }
 
-function setError(message) { state.view.error = message || ""; }
+// 用户界面不展示上游服务名称或延迟提示，避免把实现细节带到页面文案中。
+function sanitizeDisplayText(value, fallback = "") {
+  const text = String(value == null ? fallback : value)
+    .replace(/(?:https?:\/\/)?(?:query\d+\.)?finance\.yahoo\.com|(?:Yahoo(?:\s+Finance)?|Alpaca|Cboe|SQLite|go-yfinance)(?:[-_]\w+)?/gi, "行情服务")
+    .replace(/可能(?:存在|有)?延迟|(?:存在|有)延迟/g, "")
+    .replace(/\s*([·；，。,.;])\s*/g, "$1")
+    .trim();
+  return text || fallback;
+}
+
+function setError(message) { state.view.error = sanitizeDisplayText(message); }
 // 快照年龄按服务端时钟计算。本机钟走得快时，不能提前把还新鲜的快照当成过期。
 function syncedNow() {
   return window.OptionScopeRequest && typeof OptionScopeRequest.serverNow === "function"
@@ -1196,7 +1206,7 @@ function fetchQuoteForDisplay(symbol, loadId, allowStaleValuation = false) {
   request(`/api/quote/${encodeURIComponent(symbol)}`).then((quote) => {
     if (symbol !== state.symbol || loadId !== state.loadId) return;
     const usableQuote = latestRenderableQuote(symbol, quote, state.lastQuote);
-    if (usableQuote) renderQuote(usableQuote, allowStaleValuation, quoteIsUsableSQLiteSnapshot(usableQuote, symbol));
+    if (usableQuote) renderQuote(usableQuote, allowStaleValuation, quoteIsUsableCachedSnapshot(usableQuote, symbol));
     if (!(state.lastQuote?.symbol === symbol && quoteIsReady(state.lastQuote))) scheduleQuoteRetry(symbol, loadId);
   }).catch(() => {
     scheduleQuoteRetry(symbol, loadId);
@@ -1215,9 +1225,9 @@ function quoteCacheBadgeIsStale(quote) {
   return !snapshotTimestampIsFresh(quote?.fetched_at, maxAge);
 }
 
-function quoteIsUsableSQLiteSnapshot(quote, symbol = state.symbol) {
+function quoteIsUsableCachedSnapshot(quote, symbol = state.symbol) {
   const fetchedAt = quote?.fetched_at ? new Date(quote.fetched_at).getTime() : NaN;
-  return quote?.source === "sqlite"
+  return quote?.source === "cache"
     && quoteIsReady(quote)
     && (!quote.symbol || quote.symbol === symbol)
     && Number.isFinite(fetchedAt);
@@ -1231,13 +1241,13 @@ function latestFreshQuote(symbol, ...quotes) {
 
 function latestRenderableQuote(symbol, ...quotes) {
   return latestFreshQuote(symbol, ...quotes)
-    || quotes.filter((quote) => quoteIsUsableSQLiteSnapshot(quote, symbol))
+    || quotes.filter((quote) => quoteIsUsableCachedSnapshot(quote, symbol))
       .sort((left, right) => new Date(right.fetched_at).getTime() - new Date(left.fetched_at).getTime())[0]
     || null;
 }
 
 function quoteAndChainAreAligned(quote, fetchedAt, allowStaleSQLite = false) {
-  const cachedPair = allowStaleSQLite && quoteIsUsableSQLiteSnapshot(quote);
+  const cachedPair = allowStaleSQLite && quoteIsUsableCachedSnapshot(quote);
   if ((!cachedPair && !quoteIsFresh(quote)) || !fetchedAt) return false;
   if (!cachedPair && !snapshotTimestampIsFresh(fetchedAt)) return false;
   const quoteAt = new Date(quote.fetched_at).getTime();
@@ -3249,8 +3259,7 @@ function renderTrend(trend, extremes, spot, historyMeta, recommendation = null, 
   const meta = historyMeta || {};
   const parts = [
     meta.extremes_fetched_at ? `高低点快照 ${formatTime(meta.extremes_fetched_at)}` : null,
-    meta.extremes_source ? `来源 ${meta.extremes_source}` : null,
-    meta.extremes_warning ? `高低点降级：${meta.extremes_warning}` : null,
+    meta.extremes_warning ? `高低点降级：${sanitizeDisplayText(meta.extremes_warning)}` : null,
   ].filter(Boolean);
   state.view.trend = {
     available: true,
@@ -3532,7 +3541,7 @@ function renderBuyerStructures(payload, fetchedAt = null) {
     horizonLabel: payload.horizon_label || "未来 5 个交易日",
     target: targetText || "--",
     reason: "",
-    note: `${buyerMethod} · ${sourceLabel} · ${buyerQuoteMethod} · ${ivLabel} · ${fetchedAt ? `数据 ${formatTime(fetchedAt)}` : "数据时间未知"} · 预计盈利/亏损以当前买卖价中间价为成本基准；负数表示目标价虽达到，扣除时间价值后仍未覆盖成本。${payload.disclaimer || "综合评分不是历史胜率"}`,
+    note: sanitizeDisplayText(`${buyerMethod} · ${sourceLabel} · ${buyerQuoteMethod} · ${ivLabel} · ${fetchedAt ? `数据 ${formatTime(fetchedAt)}` : "数据时间未知"} · 预计盈利/亏损以当前买卖价中间价为成本基准；负数表示目标价虽达到，扣除时间价值后仍未覆盖成本。${payload.disclaimer || "综合评分不是历史胜率"}`),
     items: payload.items.map((item, index) => {
       const strikes = (item.strikes || []).map((strike) => formatMoney(strike)).join(" / ");
       const compactStrikes = (item.strikes || []).map((strike) => formatStructureStrike(strike)).join("/");
@@ -4217,7 +4226,7 @@ function refreshChanAnalysis(force = false) {
     if (state.symbol !== symbol || state.chanRequestId !== token || payload?.symbol !== symbol) return;
     if (payload?.ready === false) {
       state.chanLoading = false;
-      state.view.chan = Object.freeze({ ...state.view.chan, warnings: [...new Set([...(state.view.chan.warnings || []), ...(payload.warnings || [])])] });
+      state.view.chan = Object.freeze({ ...state.view.chan, warnings: [...new Set([...(state.view.chan.warnings || []), ...(payload.warnings || []).map((warning) => sanitizeDisplayText(warning))])] });
       // An analytics event means the history prefetch just finished; bypass the
       // market-analysis throttle so the 0-bar trend/support cards refresh now
       // instead of waiting up to a minute or for the next retry backoff.
@@ -4245,9 +4254,9 @@ function refreshChanAnalysis(force = false) {
     refreshChanMarketAnalysis(force);
     if (!state.view.chan.available) state.view.chan = OptionScopeChan.empty("缠论分析暂不可用，等待历史行情或下次刷新");
     const retrying = isTransientChanRequestError(error);
-    state.view.chan = Object.freeze({ ...state.view.chan, warnings: [...new Set([...(state.view.chan.warnings || []), retrying
+    state.view.chan = Object.freeze({ ...state.view.chan, warnings: [...new Set([...(state.view.chan.warnings || []).map((warning) => sanitizeDisplayText(warning)), sanitizeDisplayText(retrying
       ? `结构行情暂时获取失败（${error.message}），正在自动重试`
-      : `结构更新失败：${error.message}`])] });
+      : `结构更新失败：${error.message}`)])] });
     if (isTransientChanRequestError(error)) scheduleChanAnalysisRetry(symbol, token, error?.retryAfterMs || 0);
   }).finally(() => {
     if (state.chanRequestId !== token) return;
@@ -4304,7 +4313,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     // A saved SQLite quote is useful immediately on a cold page load even when
     // the provider refresh has not completed. It must never roll back a newer
     // quote already visible for the same symbol.
-    if (allowStaleSQLiteMarket && quoteIsUsableSQLiteSnapshot(quote)) {
+    if (allowStaleSQLiteMarket && quoteIsUsableCachedSnapshot(quote)) {
       // Continue through the normal render path below.
     } else {
       // Valuation events can carry the last market snapshot timestamp. Apply
@@ -4324,13 +4333,13 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   if (quoteIsFresh(quote) && (!Number.isFinite(previousAt) || incomingAt > previousAt)) {
     state.quoteRecoveryAttempts = 0;
   }
-  // The quote endpoint reads the persisted snapshot and marks it "sqlite",
-  // while its SSE event retains the original provider. Those are the same
+  // The quote endpoint labels a persisted snapshot as cached, while its SSE
+  // event marks it live. Those are the same
   // market data when their timestamps match, so do not flash the cache label
   // just because a later 3-second poll took the SQLite read path.
   if (previous?.symbol === state.symbol && Number.isFinite(incomingAt)
     && Number.isFinite(previousAt) && incomingAt === previousAt
-    && previous.source !== "sqlite" && quote.source === "sqlite"
+    && previous.source !== "cache" && quote.source === "cache"
     && !quoteCacheBadgeIsStale(quote)) {
     quote = { ...quote, source: previous.source };
   }
@@ -4402,7 +4411,7 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   const fairValueStatus = String(quote?.fair_value_status || "pending");
   const fairValueUnavailable = ["unavailable", "failed"].includes(fairValueStatus);
   const fairValueRetrying = fairValueStatus === "retry";
-  const fairValueWarning = quote?.fair_value_warning || "公开财务数据不足，暂不输出估值";
+  const fairValueWarning = sanitizeDisplayText(quote?.fair_value_warning, "公开财务数据不足，暂不输出估值");
   const defensiveModel = defensive?.model || "保守情景估值";
   const optimisticModel = optimistic?.model || "乐观情景估值";
   const hasRange = (item) => item && item.low != null && item.high != null
@@ -4439,25 +4448,25 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   const defensiveBuy = defensive ? formatRange({ low: defensive.buy_low, high: defensive.buy_high }) : "--";
   const optimisticBuy = optimistic ? formatRange({ low: optimistic.buy_low, high: optimistic.buy_high }) : "--";
   state.view.fairValueSource = !hasConservativeValue
-    ? (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : "暂无可靠估算"))
+    ? (fairValueRetrying ? (fairValueWarning || "估值数据暂不可用，正在重试") : (fairValueUnavailable ? fairValueWarning : "暂无可靠估算"))
     : `保守买入 ${defensiveBuy} · 乐观买入 ${optimisticBuy}`;
   state.view.fairValueTitle = hasConservativeValue
-    ? `模型 A：${defensiveModel}，防守区间 ${formatRange(defensive)}；模型 B：${optimisticModel}，进攻区间 ${formatRange(optimistic)}。远期 EPS 来源：${quote?.fair_value_forward_eps_source || "暂无"}。确定性：${quote?.fair_value_confidence_score != null ? `${quote.fair_value_confidence_score}%（${quote.fair_value_confidence || "中"}）` : (quote?.fair_value_confidence || "暂无")}。市场状态：${quote?.fair_value_regime || "NORMAL"}`
-     : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : "公开财务数据不足，暂不输出保守估值"));
+    ? `模型 A：${defensiveModel}，防守区间 ${formatRange(defensive)}；模型 B：${optimisticModel}，进攻区间 ${formatRange(optimistic)}。远期 EPS 来源：${String(quote?.fair_value_forward_eps_source || "暂无").replace(/Yahoo(?:\s+Finance)?/gi, "分析师预期")}。确定性：${quote?.fair_value_confidence_score != null ? `${quote.fair_value_confidence_score}%（${quote.fair_value_confidence || "中"}）` : (quote?.fair_value_confidence || "暂无")}。市场状态：${quote?.fair_value_regime || "NORMAL"}`
+     : (fairValueRetrying ? (fairValueWarning || "估值数据暂不可用，正在重试") : (fairValueUnavailable ? fairValueWarning : "公开财务数据不足，暂不输出保守估值"));
   state.view.fairDefensive = hasDefensiveScenario ? formatRange(defensive) : "--";
   state.view.fairDefensiveSource = hasDefensiveScenario
     ? `买入 ${defensiveBuy} · 安全边际 ${(Number(defensive.safety_margin || 0) * 100).toFixed(0)}%`
-     : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "模型 A 数据不足" : "等待估值计算")));
+     : (fairValueRetrying ? (fairValueWarning || "估值数据暂不可用，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "模型 A 数据不足" : "等待估值计算")));
   state.view.fairDefensiveTitle = hasDefensiveScenario
     ? `保守估值：${defensiveModel}。${scenarioInputs(defensive)}估值 ${state.view.fairDefensive}，${state.view.fairDefensiveSource}。确定性 ${quote?.fair_value_confidence_score != null ? `${quote.fair_value_confidence_score}%` : (quote?.fair_value_confidence || "暂无")}。${quote?.fair_value_regime === "WINTER" ? "AI 寒冬：禁止仅凭远期 EPS 抄底" : ""}`
-    : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "模型 A 数据不足" : "等待估值计算")));
+    : (fairValueRetrying ? (fairValueWarning || "估值数据暂不可用，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "模型 A 数据不足" : "等待估值计算")));
   state.view.fairOptimistic = optimistic ? formatRange(optimistic) : "--";
   state.view.fairOptimisticSource = optimistic
     ? `买入 ${optimisticBuy} · 安全边际 ${(Number(optimistic.safety_margin || 0) * 100).toFixed(0)}%`
-     : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "暂无可靠远期盈利依据" : "等待估值计算")));
+     : (fairValueRetrying ? (fairValueWarning || "估值数据暂不可用，正在重试") : (fairValueUnavailable ? fairValueWarning : (hasConservativeValue ? "暂无可靠远期盈利依据" : "等待估值计算")));
   state.view.fairOptimisticTitle = optimistic
     ? `乐观估值：${optimisticModel}。${scenarioInputs(optimistic)}${state.view.fairOptimisticSource}`
-    : (fairValueRetrying ? (fairValueWarning || "Yahoo 数据源暂时限流，正在重试") : "当前没有足够数据生成乐观情景估值");
+    : (fairValueRetrying ? (fairValueWarning || "估值数据暂不可用，正在重试") : "当前没有足够数据生成乐观情景估值");
   scheduleFairValuePoll(quote);
 }
 
@@ -4669,8 +4678,7 @@ function quoteMarketLabel(quote) {
 }
 
 function isOvernightQuote(quote) {
-  const provider = quote?.sessions?.overnight?.provider || quote?.provider;
-  return provider === "alpaca-overnight" || provider === "yahoo-overnight";
+  return quote?.overnight_available === true;
 }
 
 // 期权链表格里的 Gamma 与 IV 同样优先展示价格反解出的模型值，避免展示数据源里的占位 IV。
@@ -5303,7 +5311,7 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
     if (!isCurrentLoad()) return;
     state.view.chainHeatmapMeta = currentRows.length
       ? `${heatmapBasisDescription()} · 其他期限缓存暂不可用 · GEX 估算仅供参考`
-      : `热力图数据暂不可用：${error.message}`;
+      : `热力图数据暂不可用：${sanitizeDisplayText(error.message)}`;
     const hasExpectedDates = heatmapExpiryDates(state.expirationOptions)
       .some((expiration) => expiration !== state.expiration);
     scheduleChainHeatmapDiscovery(symbol, loadId, token, hasExpectedDates);
@@ -5445,8 +5453,8 @@ function renderChain(payload, quote, analysisPayload) {
   // 上游在盘前/收盘后可能整链返回 0 未平仓量，读取层会用该合约最近一次有效值兜底，这里如实标注。
   const oiFallback = payload.oi_fallback || {};
   const snapshotSource = isIndexMarketSymbol(state.symbol)
-    ? "指数期权延迟快照"
-    : snapshotAge != null && snapshotAge >= 0 && snapshotAge < SNAPSHOT_FRESH_SECONDS ? "上游新快照" : "本地缓存";
+    ? "指数期权快照"
+    : snapshotAge != null && snapshotAge >= 0 && snapshotAge < SNAPSHOT_FRESH_SECONDS ? "最新快照" : "本地缓存";
   state.view.dataSource = snapshotSource + (oiFallback.restored ? ` · 未平仓量回溯 ${formatDay(oiFallback.as_of)}` : "");
   state.view.totalCount = formatNumber(rows.length);
   let callVolume = 0, putVolume = 0, callInterest = 0, putInterest = 0;
@@ -5517,7 +5525,7 @@ async function renderCachedHistoryOnly(loadId, quote = null) {
   ]);
   if (!isCurrentLoad(loadId)) return;
   const usableQuote = latestRenderableQuote(symbol, quotePayload, state.lastQuote);
-  if (usableQuote) renderQuote(usableQuote, false, quoteIsUsableSQLiteSnapshot(usableQuote));
+  if (usableQuote) renderQuote(usableQuote, false, quoteIsUsableCachedSnapshot(usableQuote));
   if (cachedLevels?.raw && cachedLevels?.fast_levels) {
     const levelsPayload = { ...cachedLevels, ...cachedLevels.fast_levels, raw: true };
     renderFactorLevels(levelsPayload);
@@ -5706,7 +5714,7 @@ function applyCachedQuote(quote) {
     if (quoteIsETF(null)) applyETFValuationDefaults();
     return;
   }
-  renderQuote(quote, false, quoteIsUsableSQLiteSnapshot(quote));
+  renderQuote(quote, false, quoteIsUsableCachedSnapshot(quote));
 }
 
 async function renderSnapshot(loadId, fallbackQuote = null) {
@@ -5750,7 +5758,7 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
     return null;
   }).then((result) => {
     if (!isCurrentLoad(loadId, expiration)) return null;
-    const incomingQuote = (quoteIsFresh(result) || quoteIsUsableSQLiteSnapshot(result, symbol)) ? result : null;
+    const incomingQuote = (quoteIsFresh(result) || quoteIsUsableCachedSnapshot(result, symbol)) ? result : null;
     quote = latestRenderableQuote(symbol, incomingQuote, state.lastQuote, usableFallback);
     if (!quote && result?.warning) quoteError = new Error(result.warning);
     const resolvedQuote = latestRenderableQuote(symbol, quote, state.lastQuote, usableFallback);
@@ -5777,7 +5785,7 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
       const cachedChain = result.source === "sqlite";
       if (!cachedChain && !snapshotTimestampIsFresh(result.fetched_at)) return result;
       const resolvedQuote = latestRenderableQuote(symbol, quote, state.lastQuote, usableFallback);
-      if (!quoteAndChainAreAligned(resolvedQuote, result.fetched_at, cachedChain && resolvedQuote?.source === "sqlite")) return result;
+      if (!quoteAndChainAreAligned(resolvedQuote, result.fetched_at, cachedChain && resolvedQuote?.source === "cache")) return result;
       state.analysisReady = gammaProfileReady(analysis) || state.analysisReady;
       renderChain(payload, resolvedQuote, analysis);
       state.view.lastStatus = payload.source === "sqlite"
@@ -5798,7 +5806,7 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
   [quote, payload] = await Promise.all([quoteRead, chainRead]);
   if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null, discarded: true };
   const resolvedQuote = latestRenderableQuote(symbol, quote, state.lastQuote, usableFallback);
-  const cachedPair = payload?.source === "sqlite" && resolvedQuote?.source === "sqlite";
+  const cachedPair = payload?.source === "sqlite" && resolvedQuote?.source === "cache";
   if (payload?.data?.length && !quoteAndChainAreAligned(resolvedQuote, payload.fetched_at, cachedPair)) {
     if (quoteError && markApiUnavailable(quoteError.message)) {
       return { shown: true, source: "client-cache", fetchedAt: state.chainFetchedAt, quote: state.lastQuote, payload: {
@@ -6014,7 +6022,7 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
         if (payload?.expiration && state.expiration && payload.expiration !== state.expiration) return;
         // Gamma 窗口刷新失败时仍补做一次价位请求，避免快照已更新却继续显示旧的价位结果。
         renderChain(payload, quote, state.lastAnalysis?.analysisPayload || null);
-        if (state.view.lastStatus === pendingText) state.view.lastStatus = `Gamma 窗口刷新失败，仍显示本地缓存（${error.message}）`;
+        if (state.view.lastStatus === pendingText) state.view.lastStatus = sanitizeDisplayText(`Gamma 窗口刷新失败，仍显示本地缓存（${error.message}）`);
       } finally {
         continuePolling = false;
         releaseAnalysisRefresh(symbol);
@@ -6177,7 +6185,7 @@ async function refreshInBackground(loadId) {
     } catch (error) {
       state.analysisRefreshSymbol = null;
       state.analysisBlockUntil = 0;
-      state.view.lastStatus = `Gamma 窗口刷新失败，仍显示本地缓存（${error.message}）`;
+      state.view.lastStatus = sanitizeDisplayText(`Gamma 窗口刷新失败，仍显示本地缓存（${error.message}）`);
     }
   } catch (error) {
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
@@ -6187,7 +6195,7 @@ async function refreshInBackground(loadId) {
       await recoverExpiredExpiration(loadId);
       return;
     }
-    state.view.lastStatus = `后台刷新失败，仍显示本地缓存（${error.message}）`;
+    state.view.lastStatus = sanitizeDisplayText(`后台刷新失败，仍显示本地缓存（${error.message}）`);
     if (!state.view.chainRows.length) setError(error.message);
     // 失败后不追加读请求：超时的服务端线程可能仍在抓取期权链，恢复读取
     // quote/chain 只会再占一轮连接。保留当前画面，等待 SSE 服务端调度下一轮重试。
@@ -6462,7 +6470,7 @@ async function loadSymbol() {
   if (state.chanExpanded) refreshChanAnalysis();
   else refreshChanMarketAnalysis(true);
   if (isIndexMarketSymbol(symbol) && supportsIndexOptions(symbol)) {
-    resetOptionFlow("指数期权延迟快照无法确认主动成交方向");
+    resetOptionFlow("指数期权快照无法确认主动成交方向");
   }
   if (isIndexMarketSymbol(symbol) && !supportsIndexOptions(symbol)) {
     state.expiration = null;
@@ -6535,7 +6543,7 @@ async function recoverExpiredExpiration(loadId = state.loadId) {
   try {
     await recovery;
   } catch (error) {
-    if (isCurrentLoad(loadId)) state.view.lastStatus = `到期日已结束，正在重新获取有效期限（${error.message}）`;
+    if (isCurrentLoad(loadId)) state.view.lastStatus = sanitizeDisplayText(`到期日已结束，正在重新获取有效期限（${error.message}）`);
   } finally {
     if (expirationRecoveryPromise === recovery) expirationRecoveryPromise = null;
   }

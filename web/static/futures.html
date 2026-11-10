@@ -38,7 +38,7 @@
         <div v-if="error" class="error-box" role="alert">{{ error }}</div>
 
         <section class="headline-grid futures-headline-grid futures-quote-overview">
-          <article class="quote futures-quote-card futures-quote-primary"><div class="futures-symbol-line"><span class="eyebrow">{{ symbol }} · FUTURES</span><span class="futures-quote-state">{{ marketState }}</span></div><div class="quote-line"><span>{{ displaySymbol }}</span><span :class="changeClass">{{ priceLabel }}</span></div><div class="quote-sub"><span :class="changeClass">{{ changeLabel }}</span><span>Yahoo 行情 · 可能延迟</span></div></article>
+          <article class="quote futures-quote-card futures-quote-primary"><div class="futures-symbol-line"><span class="eyebrow">{{ symbol }} · FUTURES</span><span class="futures-quote-state">{{ marketState }}</span></div><div class="quote-line"><span>{{ displaySymbol }}</span><span :class="changeClass">{{ priceLabel }}</span></div><div class="quote-sub"><span :class="changeClass">{{ changeLabel }}</span><span>行情快照</span></div></article>
           <article class="metric futures-stat futures-stat-close"><span class="eyebrow">最新收盘</span><strong>{{ closeLabel }}</strong><span>完成 K 线参考</span></article>
           <article class="metric futures-stat futures-stat-position"><span class="eyebrow">缠论位置</span><strong class="metric-text">{{ positionLabel }}</strong><span>{{ chartAsOf }}</span></article>
           <article class="metric futures-stat futures-stat-structure"><span class="eyebrow">结构状态</span><strong class="metric-text">{{ structureLabel }}</strong><span>{{ barCountLabel }}</span></article>
@@ -152,7 +152,7 @@
             </article>
           </template>
         </div>
-        <div v-else class="levels-empty">{{ loading ? '正在读取 Yahoo 历史行情…' : '暂无可用历史行情' }}</div>
+        <div v-else class="levels-empty">{{ loading ? '正在读取历史行情…' : '暂无可用历史行情' }}</div>
         <div v-if="frame && frame.chart" class="chan-chart-navigation" role="group" aria-label="K 线图缩放与移动">
           <span class="chan-chart-navigation-spacer"></span>
           <button type="button" aria-label="放大 K 线图" title="放大" :disabled="!frame.chart.canZoomIn" @click="changeViewport('zoom-in')">＋</button>
@@ -175,7 +175,7 @@
         </details>
       </section>
     </main>
-    <footer class="futures-footer"><span>期货数据来自 Yahoo Finance，可能存在延迟；图表结构仅供研究参考。</span><a href="/">返回股票行情分析</a></footer>
+    <footer class="futures-footer"><span>期货行情仅供研究参考。</span><a href="/">返回股票行情分析</a></footer>
   </div>
   <script src="/static/jquery@3.7.1/jquery.min.js"></script>
   <script src="/static/vue@2.7.16/vue.min.js"></script>

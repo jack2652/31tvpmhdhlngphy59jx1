@@ -61,8 +61,8 @@ func TestSNDKValuationDiagnosticsSurviveCacheToQuoteJSON(t *testing.T) {
 			t.Errorf("%s=%v, want %v; JSON=%s", key, got[key], want, encoded)
 		}
 	}
-	if got["fair_value_forward_eps_source"] != "Yahoo远期EPS" {
-		t.Errorf("forward EPS source=%v, want Yahoo远期EPS", got["fair_value_forward_eps_source"])
+	if got["fair_value_forward_eps_source"] != "分析师预期" {
+		t.Errorf("forward EPS source=%v, want generic analyst label", got["fair_value_forward_eps_source"])
 	}
 	tree, ok := got["fair_value_decision_tree"].(map[string]any)
 	if !ok || tree["industry_filter"] != "普通行业" || tree["lifecycle"] != "AI存储/硬件周期" ||

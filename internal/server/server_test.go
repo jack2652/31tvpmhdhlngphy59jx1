@@ -344,10 +344,10 @@ func TestQuoteRefreshWithoutUpstreamPriceUsesPythonFallback(t *testing.T) {
 				t.Fatalf("response status=%d decode=%v body=%#v", response.StatusCode, err, body)
 			}
 			if withCachedQuote {
-				if body["price"] != 101.0 || body["source"] != "sqlite" {
+				if body["price"] != 101.0 || body["source"] != "cache" {
 					t.Fatalf("response=%#v; want cached quote fallback", body)
 				}
-			} else if body["price"] != nil || body["source"] != "pending" || body["provider"] != "upstream" {
+			} else if body["price"] != nil || body["source"] != "pending" {
 				t.Fatalf("response=%#v; want pending quote", body)
 			}
 		})
@@ -597,8 +597,8 @@ VALUES ('QQQ', '2030-01-18T15:00:00Z', 100, 'USD', 'REGULAR', 'python',
 				t.Fatalf("status quote=%#v, want object", body["quote"])
 			}
 		}
-		if quote["id"] != float64(1) || quote["raw_json"] != `{"provider":"python","opaque":[1,2]}` || quote["fair_value_methods_json"] != `{ "owner_earnings" : 120 }` || quote["fair_value_historical_valuation_percentiles_json"] != `{"percentiles":[10,50,90]}` {
-			t.Errorf("%s dropped or changed Python SQLite columns: %#v", path, quote)
+		if quote["id"] != nil || quote["raw_json"] != nil || quote["source"] != "cache" || quote["provider"] != nil || quote["fair_value_methods_json"] != nil || quote["fair_value_historical_valuation_percentiles_json"] != nil {
+			t.Errorf("%s exposed internal quote storage metadata: %#v", path, quote)
 		}
 	}
 }
@@ -930,7 +930,7 @@ func TestQuoteIgnoresCachedSnapshotWithoutPrice(t *testing.T) {
 	if decodeErr != nil || response.StatusCode != http.StatusOK {
 		t.Fatalf("quote without refresh status=%d decode=%v body=%#v", response.StatusCode, decodeErr, pending)
 	}
-	if pending["source"] != "pending" || pending["provider"] != "upstream" || pending["price"] != nil {
+	if pending["source"] != "pending" || pending["provider"] != nil || pending["price"] != nil {
 		t.Fatalf("NULL-price snapshot should produce Python pending response: %#v", pending)
 	}
 
@@ -2781,7 +2781,7 @@ func TestStatusReportsActiveQuoteRefresh(t *testing.T) {
 		t.Fatalf("refresh run missing persisted id: %#v", refresh)
 	}
 	quote, ok := completed["quote"].(map[string]any)
-	if !ok || quote["price"] != float64(100) || quote["source"] != "sqlite" {
+	if !ok || quote["price"] != float64(100) || quote["source"] != "cache" {
 		t.Fatalf("status quote payload not compatible: %#v", completed["quote"])
 	}
 }
@@ -3185,7 +3185,7 @@ func TestStatusDecoratesPersistedQuoteWithoutUpstreamAfterRestart(t *testing.T) 
 	if !ok {
 		t.Fatalf("status quote=%#v, want object", statusBody["quote"])
 	}
-	if statusQuote["price"] != float64(110) || statusQuote["source"] != "sqlite" {
+	if statusQuote["price"] != float64(110) || statusQuote["source"] != "cache" {
 		t.Fatalf("status quote core fields=%#v", statusQuote)
 	}
 	if statusQuote["previous_close"] != float64(105) || statusQuote["change_percent"] != (float64(110-105)/105*100) {
@@ -3264,11 +3264,9 @@ func TestQuoteHTTPContractIncludesPersistedValuationFields(t *testing.T) {
 	}
 	assertFields := func(body map[string]any) {
 		t.Helper()
-		if body["source"] == "upstream" {
-			for _, field := range []string{"id", "raw_json", "fair_value_methods_json", "fair_value_historical_valuation_percentiles_json"} {
-				if _, present := body[field]; present {
-					t.Errorf("upstream quote unexpectedly includes SQLite column %q: %#v", field, body)
-				}
+		for _, field := range []string{"id", "provider", "raw_json", "fair_value_methods_json", "fair_value_historical_valuation_percentiles_json"} {
+			if _, present := body[field]; present {
+				t.Errorf("quote unexpectedly includes internal source metadata %q: %#v", field, body)
 			}
 		}
 		for field, want := range map[string]any{
@@ -3303,8 +3301,8 @@ func TestQuoteHTTPContractIncludesPersistedValuationFields(t *testing.T) {
 	service.mu.Unlock()
 	persistedResponse := requestQuote(false)
 	assertFields(persistedResponse)
-	if persistedResponse["source"] != "sqlite" {
-		t.Fatalf("persisted quote source=%v, want sqlite", persistedResponse["source"])
+	if persistedResponse["source"] != "cache" {
+		t.Fatalf("persisted quote source=%v, want cache", persistedResponse["source"])
 	}
 }
 
@@ -3942,7 +3940,7 @@ func TestChanAdjustedEndpointReturnsPointInTimeSP500Environment(t *testing.T) {
 	if environment["status"] != "classified" || environment["regime"] != "bull" || environment["benchmark"] != "^GSPC" {
 		t.Fatalf("market environment=%#v", environment)
 	}
-	if payload["market_history"].(map[string]any)["source"] != "sqlite" {
+	if payload["market_history"].(map[string]any)["source"] != "cache" {
 		t.Fatalf("market history metadata=%#v", payload["market_history"])
 	}
 	daily := payload["daily"].(map[string]any)

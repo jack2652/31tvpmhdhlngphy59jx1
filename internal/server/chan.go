@@ -71,7 +71,7 @@ func (s *Service) intradayChanAnalysis(c *gin.Context) {
 		"rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion,
 		"legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters,
 		"price_coordinate": gin.H{"basis": "raw", "adjustment_type": "none", "status": "unadjusted"},
-		"warnings":         warnings, "source": source, "fetched_at": frame.fetchedAt, "refreshing": refreshing,
+		"warnings":         warnings, "source": publicQuoteSource(source), "fetched_at": frame.fetchedAt, "refreshing": refreshing,
 	})
 }
 
@@ -471,7 +471,7 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 		result.Warnings = append(result.Warnings, marketWarning)
 	}
 	c.Header("X-Chan-Analysis-Cache", analysisCache)
-	response := gin.H{"symbol": symbol, "ready": true, "analysis_cache": analysisCache, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": mfiSymbol, "source": mfiSource, "fetched_at": mfiFetchedAt, "refreshing": mfiRefreshing, "daily": compactMfiHistoryBars(mfiHistory.bars)}, "price_coordinate": priceCoordinate, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": source, "provider": "go-yfinance", "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}}
+	response := gin.H{"symbol": symbol, "ready": true, "analysis_cache": analysisCache, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": mfiSymbol, "source": publicQuoteSource(mfiSource), "fetched_at": mfiFetchedAt, "refreshing": mfiRefreshing, "daily": compactMfiHistoryBars(mfiHistory.bars)}, "price_coordinate": priceCoordinate, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": publicQuoteSource(source), "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}}
 	if compact {
 		response["daily"] = compactChanFrame{Frame: result.Daily}
 		response["weekly"] = compactChanFrame{Frame: result.Weekly}
@@ -1438,12 +1438,12 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 		"generated_at": result.GeneratedAt, "warnings": warnings,
 		"trend": trend, "trend_market": trendMarketData, "extremes": extremes["extremes"],
 		"beta": beta["beta"], "trend_stop_loss": stopLoss, "market_analysis": marketAnalysis,
-		"history": gin.H{"source": cacheSource(history["bars"], history["fetched_at"]), "fetched_at": history["fetched_at"], "refreshing": refreshing, "bars": len(rawBars)},
+		"history": gin.H{"source": publicQuoteSource(cacheSource(history["bars"], history["fetched_at"])), "fetched_at": history["fetched_at"], "refreshing": refreshing, "bars": len(rawBars)},
 	}
 	if includeMfiMarketHistory {
 		indexHistory, marketSource, marketWarning, marketRefreshing := s.chanMarketHistory()
 		mfiHistory, mfiSource, mfiFetchedAt, mfiSymbol, mfiRefreshing, marketWarning := s.chanMfiHistory(indexHistory, marketSource, marketWarning, marketRefreshing)
-		response["market_history"] = gin.H{"symbol": mfiSymbol, "source": mfiSource, "fetched_at": mfiFetchedAt, "refreshing": mfiRefreshing, "daily": compactMfiHistoryBars(mfiHistory.bars)}
+		response["market_history"] = gin.H{"symbol": mfiSymbol, "source": publicQuoteSource(mfiSource), "fetched_at": mfiFetchedAt, "refreshing": mfiRefreshing, "daily": compactMfiHistoryBars(mfiHistory.bars)}
 		if marketWarning != "" {
 			response["warnings"] = append(warnings, marketWarning)
 		}

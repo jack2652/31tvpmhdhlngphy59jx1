@@ -116,6 +116,14 @@
     try { localStorage.setItem(chartPreferencesKey, JSON.stringify({ version: chartPreferencesVersion, period, layers, subcharts })); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
   }
   function marketStateLabel(value) { return ({ REGULAR: "正常交易", PRE: "盘前", POST: "盘后", OVERNIGHT: "夜盘", CLOSED: "休市" })[String(value || "").toUpperCase()] || "行情状态未知"; }
+  function sanitizeDisplayText(value, fallback) {
+    const text = String(value == null ? (fallback || "") : value)
+      .replace(/(?:https?:\/\/)?(?:query\d+\.)?finance\.yahoo\.com|(?:Yahoo(?:\s+Finance)?|Alpaca|Cboe|SQLite|go-yfinance)(?:[-_]\w+)?/gi, "行情服务")
+      .replace(/可能(?:存在|有)?延迟|(?:存在|有)延迟/g, "")
+      .replace(/\s*([·；，。,.;])\s*/g, "$1")
+      .trim();
+    return text || (fallback || "");
+  }
   function mobileChartViewport() { return window.matchMedia ? window.matchMedia("(max-width: 600px)").matches : window.innerWidth <= 600; }
   function hasMfiBenchmarkHistory(payload) {
     const bars = payload?.market_history?.daily;
@@ -383,7 +391,7 @@
       },
       async loadSymbol() {
         const entered = String(this.symbolInput || "").trim().toUpperCase();
-        if (!FUTURE_PATTERN.test(entered)) { this.error = "请输入 Yahoo 期货代码，例如 ES=F"; return; }
+        if (!FUTURE_PATTERN.test(entered)) { this.error = "请输入期货代码，例如 ES=F"; return; }
         if (entered !== this.symbol) { navigate(entered); return; }
         this.loading = true; this.error = ""; this.mfiBenchmarkRetryCount = 0; const token = this.symbol;
         try {
@@ -401,7 +409,7 @@
           if (this.subcharts.mfi) this.scheduleMfiBenchmarkRetry();
           if (payload?.ready === false || !payload?.daily?.bar_count) this.error = "历史结构正在后台准备，稍后会自动更新";
           if (intradayPeriods.includes(this.period)) this.loadIntraday(this.period);
-        } catch (error) { if (this.symbol === token) this.error = error.message || "期货行情加载失败"; }
+        } catch (error) { if (this.symbol === token) this.error = sanitizeDisplayText(error.message, "期货行情加载失败"); }
         finally { if (this.symbol === token) this.loading = false; }
       },
       connectQuoteStream() {
