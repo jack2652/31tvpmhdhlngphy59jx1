@@ -36,6 +36,15 @@
   let mfiBenchmarkRetryTimer = null;
   let quoteStream = null;
   let quoteStreamRetryTimer = null;
+  let chanRetryTimer = null;
+  let chanRetryAttempts = 0;
+  const chanRetryLimit = 60;
+  let chanPayloadLoading = false;
+  let chanPayloadRefreshPending = false;
+  let intradayRefreshTimer = null;
+  const intradayRefreshDelay = 3 * 60 * 1000 + 5000;
+  let historyCheckTimer = null;
+  const historyCheckDelay = 5 * 60 * 1000;
 
   function readStoredKey() {
     try { return localStorage.getItem("option-scope-access-key") || sessionStorage.getItem("option-scope-access-key") || ""; } catch (error) { return ""; }
@@ -255,8 +264,13 @@
       selectPeriod(value) {
         if (!periods.some((item) => item.value === value)) return;
         this.period = value;
+        if (intradayRefreshTimer) window.clearTimeout(intradayRefreshTimer);
+        intradayRefreshTimer = null;
+        if (historyCheckTimer) window.clearTimeout(historyCheckTimer);
+        historyCheckTimer = null;
         rememberChartPreferences(this.period, this.chartLayers, this.subcharts);
         if (intradayPeriods.includes(value)) this.loadIntraday(value);
+        else this.scheduleHistoryCheck();
       },
       setIndicator(value) {
         if (value === "base") {
@@ -330,6 +344,95 @@
         this.viewport = { ...this.viewport, [this.period]: { ...current, visibleBars: current.visibleBars || chart.visibleBars, endOffset } };
       },
       zoomViewport(factor, anchor, ratio, baseVisible) { const current = this.viewport[this.period] || {}; const visible = Math.max(20, Math.round(Number(baseVisible || current.visibleBars || 50) * Number(factor || 1))); this.viewport = { ...this.viewport, [this.period]: { ...current, visibleBars: visible } }; },
+      /* 历史刷新完成前安排重试，指数退避最长 60 秒。*/
+      scheduleChanRetry() {
+        if (chanRetryTimer || chanRetryAttempts >= chanRetryLimit) return;
+        const delay = Math.min(60000, 3000 * (2 ** Math.min(chanRetryAttempts, 5)));
+        chanRetryAttempts = Math.min(chanRetryLimit, chanRetryAttempts + 1);
+        chanRetryTimer = window.setTimeout(() => {
+          chanRetryTimer = null;
+          this.refreshChanPayload();
+        }, delay);
+      },
+      /* 只重新拉取 chan payload，不重复请求行情 quote，用于后台历史刷新完成后的更新。*/
+      async refreshChanPayload() {
+        if (chanPayloadLoading) {
+          chanPayloadRefreshPending = true;
+          return;
+        }
+        const token = this.symbol;
+        chanPayloadLoading = true;
+        try {
+          const spot = finite(this.quote?.price);
+          const params = new URLSearchParams();
+          if (this.subcharts.mfi) params.set("include_mfi_market_history", "true");
+          if (spot) params.set("spot", spot);
+          const payload = await request(`/api/chan/${encodeURIComponent(token)}?${params.toString()}`, { timeout: 60000 });
+          if (this.symbol !== token) return;
+          const hasBars = Number(payload?.daily?.bar_count) > 0;
+          if (hasBars || !this.payload) {
+            this.payload = payload;
+          }
+          if (hasBars) {
+            this.error = "";
+            if (this.subcharts.mfi) this.scheduleMfiBenchmarkRetry();
+            if (intradayPeriods.includes(this.period)) this.loadIntraday(this.period);
+          }
+          if (payload?.history?.refreshing || payload?.ready === false || !hasBars) {
+            this.scheduleChanRetry();
+          } else {
+            chanRetryAttempts = 0;
+            if (chanRetryTimer) window.clearTimeout(chanRetryTimer);
+            chanRetryTimer = null;
+          }
+        } catch (error) {
+          if (this.symbol === token) this.scheduleChanRetry();
+        } finally {
+          chanPayloadLoading = false;
+          if (chanPayloadRefreshPending) {
+            chanPayloadRefreshPending = false;
+            window.setTimeout(() => this.refreshChanPayload(), 100);
+          }
+        }
+      },
+      scheduleIntradayRefresh(value) {
+        if (intradayRefreshTimer) window.clearTimeout(intradayRefreshTimer);
+        intradayRefreshTimer = null;
+        if (this.period !== value || document.hidden) return;
+        intradayRefreshTimer = window.setTimeout(() => {
+          intradayRefreshTimer = null;
+          if (this.period === value) this.loadIntraday(value, true);
+        }, intradayRefreshDelay);
+      },
+      scheduleHistoryCheck() {
+        if (historyCheckTimer) window.clearTimeout(historyCheckTimer);
+        historyCheckTimer = null;
+        if (intradayPeriods.includes(this.period) || document.hidden) return;
+        historyCheckTimer = window.setTimeout(() => {
+          historyCheckTimer = null;
+          this.checkHistoricalFrame();
+        }, historyCheckDelay);
+      },
+      async checkHistoricalFrame() {
+        const token = this.symbol;
+        const params = new URLSearchParams({ light: "true" });
+        const spot = finite(this.quote?.price);
+        if (spot) params.set("spot", spot);
+        try {
+          const status = await request(`/api/chan/${encodeURIComponent(token)}?${params.toString()}`, { timeout: 60000 });
+          if (this.symbol !== token) return;
+          const currentFetchedAt = String(this.payload?.history?.fetched_at || "");
+          const latestFetchedAt = String(status?.history?.fetched_at || "");
+          if (status?.history?.refreshing) this.scheduleChanRetry();
+          if (!Number(this.payload?.daily?.bar_count) || latestFetchedAt && latestFetchedAt !== currentFetchedAt) {
+            await this.refreshChanPayload();
+          }
+        } catch (error) {
+          /* 下次周期检查会再次读取，避免短暂网络失败使自动刷新永久停止。 */
+        } finally {
+          if (this.symbol === token) this.scheduleHistoryCheck();
+        }
+      },
       scheduleIntradayRetry(value) {
         if (!intradayPeriods.includes(value) || this.intradayRetryTimers[value] || (this.intradayRetryAttempts[value] || 0) >= intradayRetryLimit) return;
         const attempt = this.intradayRetryAttempts[value] || 0;
@@ -358,6 +461,7 @@
             window.clearTimeout(this.intradayRetryTimers[value]);
             this.$set(this.intradayRetryTimers, value, null);
             this.$set(this.intradayRetryAttempts, value, 0);
+            this.scheduleIntradayRefresh(value);
           } else {
             this.scheduleIntradayRetry(value);
           }
@@ -408,6 +512,8 @@
           this.payload = payload;
           if (this.subcharts.mfi) this.scheduleMfiBenchmarkRetry();
           if (payload?.ready === false || !payload?.daily?.bar_count) this.error = "历史结构正在后台准备，稍后会自动更新";
+          if (payload?.history?.refreshing || payload?.ready === false || !payload?.daily?.bar_count) this.scheduleChanRetry();
+          this.scheduleHistoryCheck();
           if (intradayPeriods.includes(this.period)) this.loadIntraday(this.period);
         } catch (error) { if (this.symbol === token) this.error = sanitizeDisplayText(error.message, "期货行情加载失败"); }
         finally { if (this.symbol === token) this.loading = false; }
@@ -421,10 +527,19 @@
           if (quoteStream !== source || this.symbol !== symbol) return;
           let message;
           try { message = JSON.parse(event.data || "{}"); } catch (error) { return; }
-          if (message.symbol !== this.symbol || message.kind !== "quote") return;
-          const incoming = message.payload?.quote;
-          if (!incoming || incoming.symbol !== this.symbol || finite(incoming.price) == null) return;
-          if (quoteIsNewer(incoming, this.quote)) this.quote = incoming;
+          if (message.symbol !== this.symbol) return;
+          if (message.kind === "quote") {
+            const incoming = message.payload?.quote;
+            if (!incoming || incoming.symbol !== this.symbol || finite(incoming.price) == null) return;
+            if (quoteIsNewer(incoming, this.quote)) this.quote = incoming;
+            return;
+          }
+          /* 后端历史刷新完成后推送 analytics 事件，立即重新拉取 chan payload。*/
+          if (message.kind === "analytics") {
+            if (chanRetryTimer) { window.clearTimeout(chanRetryTimer); chanRetryTimer = null; }
+            chanRetryAttempts = 0;
+            this.refreshChanPayload();
+          }
         });
         source.addEventListener("open", () => {
           if (quoteStreamRetryTimer) window.clearTimeout(quoteStreamRetryTimer);
@@ -443,10 +558,31 @@
     mounted() {
       this.updateMobileChart = () => { this.mobileChart = mobileChartViewport(); };
       window.addEventListener("resize", this.updateMobileChart, { passive: true });
+      this.updateChartOnVisibility = () => {
+        if (document.hidden) {
+          if (intradayRefreshTimer) window.clearTimeout(intradayRefreshTimer);
+          intradayRefreshTimer = null;
+          if (historyCheckTimer) window.clearTimeout(historyCheckTimer);
+          historyCheckTimer = null;
+          return;
+        }
+        if (intradayPeriods.includes(this.period)) this.loadIntraday(this.period, true);
+        else this.checkHistoricalFrame();
+      };
+      document.addEventListener("visibilitychange", this.updateChartOnVisibility);
       clockTimer = window.setInterval(() => { this.clock = new Date().toLocaleTimeString("zh-CN", { hour12: false }); }, 1000);
       this.connectQuoteStream();
       this.loadSymbol();
     },
-    beforeDestroy() { closeQuoteStream(); if (clockTimer) window.clearInterval(clockTimer); if (mfiBenchmarkRetryTimer) window.clearTimeout(mfiBenchmarkRetryTimer); if (this.updateMobileChart) window.removeEventListener("resize", this.updateMobileChart); },
+    beforeDestroy() {
+      closeQuoteStream();
+      if (clockTimer) window.clearInterval(clockTimer);
+      if (mfiBenchmarkRetryTimer) window.clearTimeout(mfiBenchmarkRetryTimer);
+      if (chanRetryTimer) window.clearTimeout(chanRetryTimer);
+      if (intradayRefreshTimer) window.clearTimeout(intradayRefreshTimer);
+      if (historyCheckTimer) window.clearTimeout(historyCheckTimer);
+      if (this.updateMobileChart) window.removeEventListener("resize", this.updateMobileChart);
+      if (this.updateChartOnVisibility) document.removeEventListener("visibilitychange", this.updateChartOnVisibility);
+    },
   });
 }(window));

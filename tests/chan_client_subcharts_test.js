@@ -67,6 +67,29 @@ const intraday = window.OptionScopeChan.intradayView({ period: "15m", frame: fra
 assert.ok(Number.isFinite(intraday.macdTop), "盘中图表使用相同的副图偏好");
 assert.ok(Number.isNaN(intraday.volumeTop) && Number.isNaN(intraday.dmiTop), "盘中图表隐藏未开启的副图");
 
+function futureFrame(period, label, futureDate) {
+  const candles = Array.from({ length: 8 }, (_, index) => {
+    const close = 20 + index;
+    return { date: `2026-11-10 ${String(9 + Math.floor((30 + index * 15) / 60)).padStart(2, "0")}:${String((30 + index * 15) % 60).padStart(2, "0")}`, open: close - 0.3, high: close + 0.5, low: close - 0.6, close, volume: 1000 };
+  });
+  return {
+    ...frame(period), period, label, as_of: candles[candles.length - 1].date, candles,
+    future_trading_dates: [futureDate],
+  };
+}
+for (const [period, label, futureDate] of [["15m", "15分钟", "2026-11-10 11:30"], ["1h", "1小时", "2026-11-10 12:30"], ["2h", "2小时", "2026-11-10 17:30"], ["4h", "4小时", "2026-11-11 09:30"]]) {
+  const source = futureFrame(period, label, futureDate);
+  const future = window.OptionScopeChan.intradayView({ period, frame: source, spot: 25 }, true, null, false, 30).chart;
+  assert.equal(future.pendingOpenDates.length, 1, `${period} must preserve server-provided future slots`);
+  assert.equal(future.pendingOpenDates[0], futureDate, `${period} future slot must keep its timestamp`);
+}
+const weeklyFuture = window.OptionScopeChan.view({
+  daily: frame(),
+  weekly: { ...frame("1w"), period: "1wk", label: "周线", future_trading_dates: ["2026-11-20"] },
+  spot: 13, summary: {},
+}).weekly.chart;
+assert.deepEqual(weeklyFuture.pendingOpenDates, ["2026-11-20"], "weekly charts must preserve future slots");
+
 const mfiChart = window.OptionScopeChan.view(payload, true, false, 30, null, null, { mfi: true }).daily.chart;
 assert.ok(Number.isFinite(mfiChart.mfiTop) && Number.isFinite(mfiChart.mfiBottom), "MFI 指标开启时显示专用副图");
 assert.equal(mfiChart.mfiValues.mfi.length, mfiChart.candles.length, "MFI 个股序列与视口 K 线长度一致");

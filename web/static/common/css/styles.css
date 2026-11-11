@@ -1060,6 +1060,7 @@ body{font-size:14px}
 .input-wrap .el-input{flex:1;min-width:0}
 .input-wrap .el-input__inner{width:100%;height:36px;padding:0 10px;border:0;background:transparent;color:var(--text);font:inherit;text-transform:uppercase}
 .input-wrap .el-input__inner:focus{border:0}
+.input-wrap .el-input__inner::placeholder{color:var(--muted)}
 .input-wrap .el-button{flex:none;height:36px;margin:0;border-radius:0;border:0;border-left:1px solid var(--field-line);padding-inline:16px;font-weight:700}
 .toolbar .el-select .el-input__inner{height:38px;border:1px solid var(--field-line);background:var(--field);color:var(--text);font:inherit}
 .toolbar .el-select .el-input__inner::placeholder{color:var(--muted)}

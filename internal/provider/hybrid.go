@@ -222,6 +222,15 @@ func (h *Hybrid) Quote(ctx context.Context, rawSymbol string) (model.Quote, erro
 			}
 		}
 		if baseAttempt.err == nil {
+			// Yahoo 有夜盘字段时已在上方提前返回（Provider=="yahoo-overnight"）；走到这里
+			// 说明 Yahoo 返回了普通收盘口径。若 Alpaca 同时拿到了夜盘价，优先 Alpaca，
+			// 否则每次 Yahoo 夜盘字段不稳定时 overnight_available 就会来回翻转，页面标签
+			// 会在"夜盘"/"收盘"之间反复抖动。
+			if alpacaAttempt.err == nil && alpacaAttempt.quote.Price != nil {
+				quote := overnightOnlyQuote(alpacaAttempt.quote)
+				h.attachPreviousPostSession(ctx, symbol, &quote)
+				return quote, nil
+			}
 			h.attachPreviousPostSession(ctx, symbol, &baseAttempt.quote)
 			return baseAttempt.quote, nil
 		}

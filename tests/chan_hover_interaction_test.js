@@ -169,6 +169,29 @@ assert.deepEqual(Array.from(tooltip.children.filter((child) => child.className.i
 assert.ok(!horizontal.attributes.visibility, "future price pane must show its horizontal guide");
 assert.ok(!tagY.attributes.visibility, "future price pane must show the left price tag");
 
+// 盘中周期也必须使用相同的待开盘槽位交互。
+directive.componentUpdated(target, { value: {
+  chart: {
+    ...model,
+    period: "1h",
+    periodLabel: "1小时",
+    candles: [{
+      date: "2026-11-10 15:00", displayDate: "2026-11-10 15:00", x: 150,
+      prices: { open: 100, high: 107, low: 99, close: 105 }, closeChangePercent: 5, volume: 1234500,
+    }],
+    historyRight: 450,
+    plotRight: 450,
+    visibleBars: 2,
+    endOffset: -1,
+    pendingOpenDates: ["2026-11-11 09:30"],
+    pendingSlotCount: 1,
+  },
+} });
+targetListeners.get("pointermove")({ clientX: 300, clientY: 110, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.equal(tooltip.children[0].textContent, "2026-11-11 09:30", "intraday future tooltip must show its pending timestamp");
+assert.equal(tooltip.children[1].textContent, "1小时 · 待开盘 K 线", "intraday future tooltip must identify its period");
+assert.ok(!horizontal.attributes.visibility, "intraday future price pane must show its horizontal guide");
+
 targetListeners.get("pointerleave")();
 assert.equal(layer.attributes.visibility, "hidden", "leaving the chart must hide crosshair guides");
 assert.equal(tooltip.hidden, true, "leaving the chart must hide the tooltip");

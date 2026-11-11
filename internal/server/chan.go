@@ -66,6 +66,8 @@ func (s *Service) intradayChanAnalysis(c *gin.Context) {
 	if warning != "" {
 		warnings = append(warnings, warning)
 	}
+	result.Daily.FutureTradingDates = futureTradingDates(result.Daily, provider.IsFutureSymbol(symbol))
+	result.Weekly.FutureTradingDates = futureTradingDates(result.Weekly, provider.IsFutureSymbol(symbol))
 	c.JSON(http.StatusOK, gin.H{
 		"symbol": symbol, "spot": result.Spot, "period": period, "frame": result.Daily,
 		"rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion,
@@ -467,6 +469,7 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 		result.Warnings = append(result.Warnings, "当前现价无效；未与复权结构比较")
 	}
 	result.Daily.FutureTradingDates = futureTradingDates(result.Daily, provider.IsFutureSymbol(symbol))
+	result.Weekly.FutureTradingDates = futureTradingDates(result.Weekly, provider.IsFutureSymbol(symbol))
 	if marketWarning != "" {
 		result.Warnings = append(result.Warnings, marketWarning)
 	}
@@ -515,34 +518,112 @@ func hasMfiVolume(rows []map[string]any) bool {
 }
 
 func futureTradingDates(frame chananalysis.Frame, isFuture bool) []string {
-	if frame.Period != "1d" || len(frame.Candles) == 0 {
+	if len(frame.Candles) == 0 {
 		return nil
 	}
-	lastDate := frame.Candles[len(frame.Candles)-1].Date
-	if len(lastDate) < len(time.DateOnly) {
+	// 覆盖图表可平移的未来空槽，并为右侧情景留白保留一格。
+	count := len(frame.Candles)*3/4 + 1
+	switch frame.Period {
+	case "1d":
+		return futureDailyDates(frame.Candles[len(frame.Candles)-1].Date, isFuture, count)
+	case "1wk":
+		return futureWeeklyDates(frame.Candles[len(frame.Candles)-1].Date, isFuture, count)
+	case "15m", "1h", "2h", "4h":
+		return futureIntradayDates(frame.Candles[len(frame.Candles)-1].Date, frame.Period, isFuture, count)
+	default:
+		return nil
+	}
+}
+
+func futureDailyDates(lastDate string, isFuture bool, count int) []string {
+	if len(lastDate) < len(time.DateOnly) || count <= 0 {
 		return nil
 	}
 	days, ok := marketcalendar.ParseDateOnly(lastDate[:len(time.DateOnly)])
 	if !ok {
 		return nil
 	}
-	// 覆盖图表可平移的未来空槽，并为右侧情景留白保留一格。
-	count := len(frame.Candles)*3/4 + 1
 	dates := make([]string, 0, count)
-	for index := 0; index < count; index++ {
-		for {
-			days++
-			weekday := marketcalendar.WeekdayOrdinal(days)
-			if weekday == 0 || weekday == 6 {
-				continue
-			}
-			if isFuture || marketcalendar.IsTradingDayOrdinal(days) {
-				break
-			}
+	for len(dates) < count {
+		days++
+		if !futureSessionDay(days, isFuture) {
+			continue
 		}
 		dates = append(dates, marketcalendar.FormatDateOnly(days))
 	}
 	return dates
+}
+
+func futureWeeklyDates(lastDate string, isFuture bool, count int) []string {
+	if len(lastDate) < len(time.DateOnly) || count <= 0 {
+		return nil
+	}
+	days, ok := marketcalendar.ParseDateOnly(lastDate[:len(time.DateOnly)])
+	if !ok {
+		return nil
+	}
+	// 周线 K 线的日期是该周最后一个交易日，和 weeklyBarsQualityDetailed 保持一致。
+	monday := days - (marketcalendar.WeekdayOrdinal(days)+6)%7
+	dates := make([]string, 0, count)
+	for len(dates) < count {
+		monday += 7
+		for candidate := monday + 4; candidate >= monday; candidate-- {
+			if futureSessionDay(candidate, isFuture) {
+				dates = append(dates, marketcalendar.FormatDateOnly(candidate))
+				break
+			}
+		}
+	}
+	return dates
+}
+
+func futureIntradayDates(lastDate, period string, isFuture bool, count int) []string {
+	if count <= 0 {
+		return nil
+	}
+	days, minute, ok := marketcalendar.ParseDateTime(lastDate)
+	if !ok {
+		return nil
+	}
+	periodMinutes := map[string]int{"15m": 15, "1h": 60, "2h": 120, "4h": 240}[period]
+	if periodMinutes == 0 {
+		return nil
+	}
+	const sessionOpenMinute = 9*60 + 30
+	dates := make([]string, 0, count)
+	for len(dates) < count {
+		candidate := minute + periodMinutes
+		closeMinute := futureSessionCloseMinute(days, isFuture)
+		if futureSessionDay(days, isFuture) && candidate+periodMinutes <= closeMinute {
+			minute = candidate
+			dates = append(dates, marketcalendar.FormatDateTime(days, minute))
+			continue
+		}
+		for {
+			days++
+			if futureSessionDay(days, isFuture) && sessionOpenMinute+periodMinutes <= futureSessionCloseMinute(days, isFuture) {
+				minute = sessionOpenMinute
+				dates = append(dates, marketcalendar.FormatDateTime(days, minute))
+				break
+			}
+		}
+	}
+	return dates
+}
+
+func futureSessionDay(days int, isFuture bool) bool {
+	weekday := marketcalendar.WeekdayOrdinal(days)
+	if weekday == 0 || weekday == 6 {
+		return false
+	}
+	return isFuture || marketcalendar.IsTradingDayOrdinal(days)
+}
+
+func futureSessionCloseMinute(days int, isFuture bool) int {
+	if isFuture {
+		return 16 * 60
+	}
+	return marketcalendar.RegularCloseMinuteOrdinal(days)
 }
 
 // compactChanFrame omits heavy fields the browser chart does not read. The
@@ -1410,6 +1491,7 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 	warnings = append(warnings, "历史沿用现有未复权日线；拆股和除息跳空可能改变笔与中枢，请结合公司行动核对")
 	if !light {
 		result.Daily.FutureTradingDates = futureTradingDates(result.Daily, provider.IsFutureSymbol(symbol))
+		result.Weekly.FutureTradingDates = futureTradingDates(result.Weekly, provider.IsFutureSymbol(symbol))
 	}
 	expected := chanExpectedHistoryDay(now)
 	asOf := result.Daily.AsOf

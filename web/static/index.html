@@ -336,7 +336,7 @@
                       </div>
                     </div>
                     <div id="chan-macd-sma200-help" class="chan-indicator-description-body" role="region" aria-label="MACD + SMA 200 策略说明" v-show="chanChartLayers.macdSma200">
-                      <small>按源码使用 SMA(12/26) 计算 MACD、SMA(9) 信号线和 SMA(200) 趋势线。柱体上穿/下穿零轴后，结合 MACD 方向、均线关系和 26 根前收盘价过滤；标记只表示收盘确认的多头/空头条件，不模拟 low/high 止损挂单成交。</small>
+                      <small>以 12 期与 26 期均线差值计算 MACD，以 9 期均线作为信号线，以 200 期均线判断大趋势方向。MACD 柱体越过零轴后，同时满足均线方向与 200 期均线过滤条件时标记买卖信号；标记仅表示当根 K 线收盘时条件成立，不代表实际挂单已成交。</small>
                       <div class="chan-macd-sma200-legend" role="list" aria-label="MACD + SMA 200 图例">
                         <span role="listitem"><i class="chan-macd-sma200-swatch chan-macd-sma200-fast" aria-hidden="true"></i>12 期 SMA</span>
                         <span role="listitem"><i class="chan-macd-sma200-swatch chan-macd-sma200-slow" aria-hidden="true"></i>26 期 SMA</span>
@@ -346,7 +346,7 @@
                       </div>
                     </div>
                     <div id="chan-supertrend-help" class="chan-indicator-description-body" role="region" aria-label="SuperTrend 说明" v-show="chanChartLayers.supertrend">
-                      <small>按源码默认参数计算：HL2、ATR(10) Wilder RMA、乘数 3.0。趋势线随当前价格更新，买入/卖出标记只在 K 线收盘确认趋势翻转；标记是指标条件，不代表策略订单已成交。</small>
+                      <small>以最高价与最低价的中点为基准，结合 10 期真实波幅（ATR）和 3 倍乘数计算上下轨。价格突破通道时趋势翻转，标记在当根 K 线收盘确认后才显示；标记代表指标条件，不代表实际挂单已成交。</small>
                       <div class="chan-supertrend-legend" role="list" aria-label="SuperTrend 图例">
                         <span role="listitem"><i class="chan-supertrend-swatch" aria-hidden="true"></i>上升趋势</span>
                         <span role="listitem"><i class="chan-supertrend-swatch chan-supertrend-down" aria-hidden="true"></i>下降趋势</span>
@@ -387,6 +387,7 @@
               <line class="chart-crosshair-h chart-crosshair-dmi"></line>
               <line class="chart-crosshair-h chart-crosshair-mfi"></line>
               <g class="chart-tag chart-tag-x"><rect rx="2" height="18"></rect><text></text></g>
+              <rect class="chan-spot-cover-rect" x="0" y="0" width="0" height="0" fill="var(--panel)" visibility="hidden"></rect>
               <g class="chart-tag chart-tag-y"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-volume"><rect rx="2" height="18"></rect><text></text></g>
               <g class="chart-tag chart-tag-macd"><rect rx="2" height="18"></rect><text></text></g>

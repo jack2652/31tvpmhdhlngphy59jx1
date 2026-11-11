@@ -4343,6 +4343,16 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
     && !quoteCacheBadgeIsStale(quote)) {
     quote = { ...quote, source: previous.source };
   }
+  // 夜盘会话期间，overnight_available 不能因上游偶发缺少夜盘字段而翻转为 false，
+  // 否则"夜盘"/"收盘"标签会来回抖动。只要市场状态仍为 OVERNIGHT 且前一份快照已
+  // 确认有夜盘数据，就继承该标志，直至 market_state 真正离开 OVERNIGHT。
+  if (previous?.symbol === state.symbol
+    && quote.market_state === "OVERNIGHT"
+    && quote.overnight_available !== true
+    && previous.market_state === "OVERNIGHT"
+    && previous.overnight_available === true) {
+    quote = { ...quote, overnight_available: true };
+  }
   const mergedQuote = mergeFairValueSnapshot(quote);
   if (!mergedQuote) return;
   quote = mergedQuote;
@@ -5628,7 +5638,7 @@ function showPending(message, preserveCache = false) {
     if (quoteIsETF(null)) applyETFValuationDefaults();
   }
   state.view.chainTitle = chainViewTitle(state.symbol, state.expiration);
-  state.view.dataSource = "后台刷新中";
+  state.view.dataSource = "正在获取数据…";
   state.view.fetchedAt = "快照时间 --";
   state.view.fetchedAtTitle = "等待行情与期权链快照";
   state.view.totalCount = "--";
@@ -5696,11 +5706,11 @@ function applyCachedQuote(quote) {
     state.lastQuote = null;
     state.view.quoteSymbol = state.symbol;
     state.view.quotePrice = "--";
-    state.view.quoteChange = "正在更新";
+    state.view.quoteChange = "正在获取行情…";
     state.view.quoteChangeColor = "var(--muted)";
     state.view.quoteCurrency = "USD";
-    state.view.quoteMarket = "后台刷新";
-    state.view.marketState = "后台刷新中";
+    state.view.quoteMarket = "获取中";
+    state.view.marketState = "正在获取行情";
     const reference = quoteReference(null);
     state.view.quoteReference = reference.text;
     state.view.quoteReferenceTitle = reference.title;

@@ -623,9 +623,9 @@
     }
     const totalBars = candlesForDisplay.length;
     const displayLastDate = candlesForDisplay[candlesForDisplay.length - 1]?.date || "";
-    const pendingOpenDates = ["1d", "daily"].includes(frame.period)
-      ? (frame.future_trading_dates || []).filter((date) => date > displayLastDate)
-      : [];
+    // 所有周期都由服务端提供与 K 线周期匹配的未来槽位，悬停层统一复用
+    // charts.js 的 pending K 线绘制，不再只为日线保留日期。
+    const pendingOpenDates = (frame.future_trading_dates || []).filter((date) => date > displayLastDate);
     // Start daily and 15-minute charts at the same readable 32-bar window on
     // desktop and mobile; keep the rest of their history reachable by zooming.
     const defaultBars = ["1d", "15m"].includes(frame.period) ? Math.min(32, totalBars) : totalBars;

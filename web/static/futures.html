@@ -30,7 +30,7 @@
     <main class="shell futures-shell">
       <section class="futures-market-strip futures-market-overview" aria-label="期货市场工作区">
         <section class="toolbar futures-toolbar futures-command-bar">
-          <div class="control symbol-control"><label for="future-symbol-input">标的</label><div class="input-wrap"><span>$</span><el-input id="future-symbol-input" v-model.trim="symbolInput" maxlength="12" autocomplete="off" @keyup.enter.native="loadSymbol"></el-input><el-button id="future-load-button" type="primary" size="small" @click="loadSymbol" :loading="loading" :disabled="loading">载入</el-button></div></div>
+          <div class="control symbol-control"><label for="future-symbol-input">标的</label><div class="input-wrap"><span>$</span><el-input id="future-symbol-input" v-model.trim="symbolInput" maxlength="12" autocomplete="off" placeholder="如 ES=F" @keyup.enter.native="loadSymbol"></el-input><el-button id="future-load-button" type="primary" size="small" @click="loadSymbol" :loading="loading" :disabled="loading">载入</el-button></div></div>
           <div class="control futures-presets"><span class="control-label">常用品种</span><div class="futures-preset-list"><button v-for="item in presets" :key="item.symbol" type="button" :class="{ 'is-active': item.symbol === symbol }" @click="selectPreset(item.symbol)">{{ item.label }} <small>{{ item.symbol }}</small></button></div></div>
           <div class="futures-market-status"><span class="live-dot"></span><span>{{ marketState }}</span><span class="futures-status-divider"></span><span>{{ fetchedLabel }}</span></div>
         </section>
@@ -179,6 +179,7 @@
   </div>
   <script src="/static/jquery@3.7.1/jquery.min.js"></script>
   <script src="/static/vue@2.7.16/vue.min.js"></script>
+  <script src="/static/element-ui@2.15.14/js/index.min.js"></script>
   <script src="/static/common/js/request.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/charts.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-plan.js?v=__ASSET_VERSION__"></script>

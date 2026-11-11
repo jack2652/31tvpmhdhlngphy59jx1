@@ -4120,6 +4120,14 @@ func TestChanEndpointIncludesFutureTradingDatesForFutures(t *testing.T) {
 	if firstFutureDate <= lastDate {
 		t.Fatalf("first future date=%s must be after last candle=%s", firstFutureDate, lastDate)
 	}
+	weekly, ok := payload["weekly"].(map[string]any)
+	if !ok {
+		t.Fatalf("weekly frame type=%T", payload["weekly"])
+	}
+	weeklyFutureDates, ok := weekly["future_trading_dates"].([]any)
+	if !ok || len(weeklyFutureDates) == 0 {
+		t.Fatalf("weekly future trading dates=%#v", weekly["future_trading_dates"])
+	}
 }
 
 func TestChanAdjustedEndpointFetchesSPYBenchmarkWithoutPersistedQuote(t *testing.T) {
@@ -4270,6 +4278,9 @@ func TestChanIntradayEndpointDeclaresPreviewVersionAndRawPriceBasis(t *testing.T
 	}
 	if signals, ok := frame["signals_v4"].([]any); !ok || len(signals) != 0 {
 		t.Fatalf("single-bar intraday input must not create a structural signal: %#v", frame["signals_v4"])
+	}
+	if futureDates, ok := frame["future_trading_dates"].([]any); !ok || len(futureDates) == 0 {
+		t.Fatalf("intraday future trading dates=%#v", frame["future_trading_dates"])
 	}
 }
 

@@ -178,6 +178,7 @@ function bindChanChartHover(target, initialBinding) {
   let onScenarioLeave = initial.onScenarioLeave;
   let hoveredScenario = null;
   let activeIndex = null;
+  const spotCoverRect = layer.querySelector(".chan-spot-cover-rect");
   let lastPointer = null;
   let shownCandle = null;
   let shownHeaderCandle = null;
@@ -327,10 +328,9 @@ function bindChanChartHover(target, initialBinding) {
     setTag(tagX, axisDate, Math.max(2, Math.min(model.width - dateWidth - 2, crosshairX - dateWidth / 2)), model.height - 22, dateWidth);
     const priceLabel = formatMoney(price), priceWidth = Math.min(model.plotLeft - 4, Math.max(42, priceLabel.length * 6 + 10));
     // Preserve the current-price badge when the cursor reaches the same price.
-    const overlapsSpot = inPricePane && model.spot && Math.abs(cursorY - model.spot.y) < model.spot.height / 2 + 10;
     const priceX = Math.max(2, model.plotLeft - priceWidth - 4);
     setTag(tagY, priceLabel, priceX, cursorY - 9, priceWidth);
-    if (!inPricePane || overlapsSpot) tagY.setAttribute("visibility", "hidden");
+    if (!inPricePane) tagY.setAttribute("visibility", "hidden");
     else tagY.removeAttribute("visibility");
     const setPaneTag = (tag, active, text, y) => {
       if (!tag) return;
@@ -415,6 +415,16 @@ function bindChanChartHover(target, initialBinding) {
       structureTitle.textContent = ""; structureBody.textContent = "";
     }
     layer.setAttribute("visibility", "visible");
+    // 十字线出现时用 SVG 矩形遮住左轴现价徽章，避免遮挡 K 线价格；
+    // cover rect 在 tagY 之前渲染，tagY 会叠在上方保持可见。
+    if (spotCoverRect && model.spot) {
+      const spotHeight = model.spot.height || 22;
+      spotCoverRect.setAttribute("x", 0);
+      spotCoverRect.setAttribute("y", model.spot.y - spotHeight / 2 - 2);
+      spotCoverRect.setAttribute("width", Math.max(0, model.plotLeft - 2));
+      spotCoverRect.setAttribute("height", spotHeight + 4);
+      spotCoverRect.removeAttribute("visibility");
+    }
     tooltip.hidden = false;
     const matrix = svg.getScreenCTM();
     if (!matrix) { hide(); return; }
