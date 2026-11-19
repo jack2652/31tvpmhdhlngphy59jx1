@@ -15,7 +15,7 @@ const details = window.OptionScopeCharts.chanStructureTooltipDetails({
   startPrice: 100, endPrice: 120, formedAt: "2026-10-12", confirmedAt: "2026-10-14",
   composition: "输入笔 3–7；输入 bar 20–80", ruleVersion: "chan-recursive-v4-preview.4",
 });
-assert.equal(details.title, "线段 · L2 · 已确认");
+assert.equal(details.title, "第3层线段 · 已确认");
 assert.match(details.body, /2026-10-01 100.00 → 2026-10-12 120.00/);
 assert.match(details.body, /形成 2026-10-12 · 确认 2026-10-14/);
 assert.match(details.body, /输入笔 3–7；输入 bar 20–80/);
@@ -25,7 +25,7 @@ const forming = window.OptionScopeCharts.chanStructureTooltipDetails({
   type: "笔", level: 0, confirmed: false, startPrice: 8, endPrice: 10,
   composition: "输入 bar 1–未知", ruleVersion: "strict-old-bi-v3",
 }, "recursive-fallback");
-assert.equal(forming.title, "笔 · L0 · 形成中");
+assert.equal(forming.title, "笔 · 形成中");
 assert.match(forming.body, /形成时间未知 · 尚未确认/);
 assert.match(forming.body, /规则 strict-old-bi-v3/);
 assert.equal(window.OptionScopeCharts.chanStructureTooltipDetails(null), null);

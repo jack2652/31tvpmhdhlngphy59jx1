@@ -332,6 +332,38 @@ func TestDailyQualityClassifiesDividendFactorAndReportsLargePriceMoves(t *testin
 	}
 }
 
+func TestAdjustedVerifiedLargeMarketMovePreservesStructureChain(t *testing.T) {
+	input := []Bar{
+		{Date: "2026-01-05", Open: 99, High: 101, Low: 98, Close: 100, RawOpen: 99, RawHigh: 101, RawLow: 98, RawClose: 100, AdjustmentFactor: 1},
+		{Date: "2026-01-06", Open: 130, High: 140, Low: 128, Close: 136, RawOpen: 130, RawHigh: 140, RawLow: 128, RawClose: 136, AdjustmentFactor: 1},
+	}
+	cutoff := time.Date(2026, 1, 7, 23, 0, 0, 0, time.UTC)
+	result := AnalyzeAdjustedStructure("TEST", input, cutoff)
+	quality := result.Daily.Quality
+	if len(quality.Chains) != 1 || quality.Chains[0].ID != 0 || quality.Chains[0].Start != "2026-01-05" || quality.Chains[0].End != "2026-01-06" {
+		t.Fatalf("verified market move chains=%+v, want one continuous chain", quality.Chains)
+	}
+	if len(quality.CorporateActionEvents) != 1 || quality.CorporateActionEvents[0].Kind != "large_price_move" || quality.CorporateActionEvents[0].Status != "observed" || !quality.CorporateActionEvents[0].FactorVerified {
+		t.Fatalf("verified market move event=%+v, want an informational large_price_move", quality.CorporateActionEvents)
+	}
+}
+
+func TestAdjustedExtremeUnexplainedMoveStartsNewStructureChain(t *testing.T) {
+	bars := []Bar{
+		{Date: "2026-01-05", Open: 99, High: 102, Low: 98, Close: 100, RawOpen: 99, RawHigh: 102, RawLow: 98, RawClose: 100, AdjustmentFactor: 1},
+		{Date: "2026-01-06", Open: 149, High: 152, Low: 148, Close: 150, RawOpen: 149, RawHigh: 152, RawLow: 148, RawClose: 150, AdjustmentFactor: 1},
+	}
+	for _, bar := range bars {
+		if !validAdjustedPair(bar) {
+			t.Fatalf("extreme-move fixture is invalid: %+v", bar)
+		}
+	}
+	chained, _ := chainDailyBars(bars)
+	if chained[0].Chain == chained[1].Chain {
+		t.Fatalf("unexplained 50%% market move crossed a structure chain: %+v", chained)
+	}
+}
+
 func TestCorporateActionClassifierDoesNotTreatNonTradingGapAsOneDayEvent(t *testing.T) {
 	bars := []Bar{
 		{Date: "2026-01-09", Close: 100, RawClose: 100, AdjustmentFactor: 1},

@@ -195,13 +195,14 @@ func calibrateDivergencePrefixes(bars []Bar, thresholds []float64, options Calib
 			return nil, fmt.Errorf("calibration replay at %s: %w", prefix[len(prefix)-1].Date, replayErr)
 		}
 		for thresholdIndex, threshold := range thresholds {
-			signals := buildV4SignalsWithDivergenceRatio(frame, frame.RecursiveLevels, frame.Strengths, threshold)
+			signalLevels := buildSignalScanLevels(frame, frame.RecursiveLevels)
+			signals := buildV4SignalsWithDivergenceRatio(frame, signalLevels, frame.Strengths, threshold)
 			strictIDs := make(map[string]bool, len(signals))
 			for _, signal := range signals {
 				if signal.Kind != "class1_buy" && signal.Kind != "class1_sell" || signal.SignalID == "" {
 					continue
 				}
-				identity := calibrationSignalIdentity(signal, frame.RecursiveLevels)
+				identity := calibrationSignalIdentity(signal, signalLevels)
 				if identity == "" {
 					identity = signal.SignalID
 				}
@@ -292,6 +293,7 @@ func exploratoryFormingAnalysis(frame Frame, bars []Bar, threshold float64) ([]V
 	if len(levels) == 0 {
 		return nil, nil
 	}
+	levels = buildSignalScanLevels(frame, levels)
 	signals := buildV4SignalsWithDivergenceRatio(frame, levels, buildStrengthsFromMACD(bars, levels, frame.MACD), threshold)
 	out := make([]V4Signal, 0, len(signals))
 	for _, signal := range signals {
@@ -340,7 +342,7 @@ func exploratoryLevels(frame Frame, asOf string) []LevelAnalysis {
 
 func calibrationSignalIdentity(signal V4Signal, levels []LevelAnalysis) string {
 	for _, level := range levels {
-		if level.Level != signal.Level || len(signal.StructureRefs) < 3 {
+		if level.Level != signal.Level || signalSourceKind(level) != signalSourceKind(LevelAnalysis{SourceKind: signal.SourceKind}) || len(signal.StructureRefs) < 3 {
 			continue
 		}
 		indices := signal.StructureRefs[len(signal.StructureRefs)-3:]
@@ -355,7 +357,7 @@ func calibrationSignalIdentity(signal V4Signal, levels []LevelAnalysis) string {
 			parts = append(parts, fmt.Sprintf("%d:%s:%s", segment.Chain, segment.Direction, segment.Start))
 		}
 		if valid {
-			return fmt.Sprintf("%s|L%d|%s|%s", RecursivePreviewVersion, signal.Level, signal.Kind, strings.Join(parts, "|"))
+			return fmt.Sprintf("%s|%s|L%d|%s|%s", RecursivePreviewVersion, signal.SourceKind, signal.Level, signal.Kind, strings.Join(parts, "|"))
 		}
 	}
 	return ""

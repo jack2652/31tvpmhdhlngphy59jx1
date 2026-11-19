@@ -2,12 +2,51 @@ package chananalysis
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
 
+func TestPriceComparisonUsesScaleAwareTolerance(t *testing.T) {
+	cases := []struct {
+		name      string
+		left      float64
+		right     float64
+		equal     bool
+		less      bool
+		greater   bool
+		lessEqual bool
+		greaterEq bool
+	}{
+		{name: "exact", left: 100, right: 100, equal: true, lessEqual: true, greaterEq: true},
+		{name: "within tolerance", left: 100, right: 100 + 5e-7, equal: true, lessEqual: true, greaterEq: true},
+		{name: "outside tolerance", left: 100, right: 100 + 2e-6, less: true, lessEqual: true},
+		{name: "small price absolute tolerance", left: 0.5, right: 0.5 + 5e-9, equal: true, lessEqual: true, greaterEq: true},
+		{name: "NaN is not equal", left: math.NaN(), right: 1},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := priceEqual(test.left, test.right); got != test.equal {
+				t.Fatalf("priceEqual(%v, %v)=%v, want %v", test.left, test.right, got, test.equal)
+			}
+			if got := priceLess(test.left, test.right); got != test.less {
+				t.Fatalf("priceLess(%v, %v)=%v, want %v", test.left, test.right, got, test.less)
+			}
+			if got := priceGreater(test.left, test.right); got != test.greater {
+				t.Fatalf("priceGreater(%v, %v)=%v, want %v", test.left, test.right, got, test.greater)
+			}
+			if got := priceLessOrEqual(test.left, test.right); got != test.lessEqual {
+				t.Fatalf("priceLessOrEqual(%v, %v)=%v, want %v", test.left, test.right, got, test.lessEqual)
+			}
+			if got := priceGreaterOrEqual(test.left, test.right); got != test.greaterEq {
+				t.Fatalf("priceGreaterOrEqual(%v, %v)=%v, want %v", test.left, test.right, got, test.greaterEq)
+			}
+		})
+	}
+}
+
 func TestAlgorithmComparisonExplainsLegacyAndRecursiveStructures(t *testing.T) {
-	legacy := Frame{Timeframe: "1d", Fractals: []Fractal{{Date: "2026-01-02", Kind: "top", Price: 12}}, Strokes: []Stroke{{Direction: "up", Start: Fractal{Date: "01", Kind: "bottom", Price: 10}, End: Fractal{Date: "02", Kind: "top", Price: 12}}}, Centers: []Center{{Level: 0, InputKind: "stroke", Start: "01", End: "02", Lower: 10, Upper: 12}}, Signals: []Signal{{Kind: "third_buy_candidate", Date: "02", Status: "candidate"}}}
+	legacy := Frame{Timeframe: "1d", Fractals: []Fractal{{Date: "2026-01-02", Kind: "top", Price: 12}}, Strokes: []Stroke{{Direction: "up", Start: Fractal{Date: "01", Kind: "bottom", Price: 10}, End: Fractal{Date: "02", Kind: "top", Price: 12}}}, Centers: []Center{{Level: 0, InputKind: "stroke", Start: "01", End: "02", Lower: 10, Upper: 12}}, Signals: []Signal{{Kind: "bottom_reversal_candidate", Date: "02", Status: "candidate"}}}
 	recursive := Frame{Timeframe: "1d", FractalsV4: []Fractal{{Date: "2026-01-03", Kind: "top", Price: 13}}, StrokesV4: []Stroke{{Level: 0, Direction: "up", Start: Fractal{Date: "01", Kind: "bottom", Price: 10}, End: Fractal{Date: "03", Kind: "top", Price: 13}}}, Segments: []Segment{{Level: 0, Direction: "up", Start: "01", End: "03", Confirmed: false}}, RecursiveCenters: []RecursiveCenter{{Level: 1, InputKind: "recursive_trend", Start: "01", End: "03", Lower: 10, Upper: 13, Forming: true}}, SignalsV4: []V4Signal{{Level: 1, Kind: "class1_buy", Date: "03", Status: "observing"}}}
 	comparison := compareAlgorithmFrames(legacy, recursive)
 	if comparison.Legacy.Strokes != 1 || comparison.Recursive.Strokes != 1 || comparison.Recursive.Segments != 1 || comparison.Recursive.Centers != 1 || comparison.Recursive.Signals != 1 {

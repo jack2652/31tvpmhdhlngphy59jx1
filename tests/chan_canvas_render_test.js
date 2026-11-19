@@ -7,7 +7,7 @@ const context = {
   dash: [], strokes: [], texts: [], rects: [], fills: 0,
   setTransform() {}, clearRect() {}, beginPath() { this.start = null; this.end = null; }, moveTo(x, y) { this.start = [x, y]; },
   lineTo(x, y) { this.end = [x, y]; }, stroke() { this.strokes.push({ start: this.start, end: this.end, dash: [...this.dash], width: this.lineWidth, color: this.strokeStyle }); },
-  setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font }); }, arc() {}, fill() { this.fills += 1; }, strokeText() {},
+  setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font, baseline: this.textBaseline }); }, measureText(text) { return { width: Array.from(String(text)).length * 8 }; }, arc() {}, fill() { this.fills += 1; }, strokeText() {},
   save() {}, restore() {}, translate() {}, rotate() {}, closePath() {}, rect() {}, clip() {},
 };
 const canvas = { width: 0, height: 0, style: {}, getContext: () => context };
@@ -36,6 +36,44 @@ function renderScenarios(visible) {
     scenariosVisible: visible,
   });
   return context.strokes.filter((stroke) => stroke.start && stroke.end && stroke.start[0] === 708 && stroke.start[1] === 120 && stroke.end[0] === 932 && stroke.end[1] === 40);
+}
+
+function renderStructureSupports(enabled) {
+  context.strokes = [];
+  context.texts = [];
+  window.OptionScopeCharts.renderChanCanvas(target, {
+    chart: { width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, priceBottom: 300, historyRight: 940, grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels: [], signals: [], dates: [], segments: [],
+      structureSupports: [
+        { key: "active", x1: 80, x2: 930, y: 120, pointX: 100, pointY: 120, labelX: 930, labelY: 120, label: "支撑 100.00", labelWidth: 80, status: "active" },
+        { key: "broken", x1: 80, x2: 930, y: 170, pointX: 110, pointY: 170, labelX: 930, labelY: 170, label: "失守 90.00", labelWidth: 80, status: "broken" },
+      ] },
+    layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, structureSupports: enabled },
+  });
+  return context;
+}
+
+function renderChanSignals(signals) {
+  context.strokes = [];
+  context.texts = [];
+  context.fills = 0;
+  window.OptionScopeCharts.renderChanCanvas(target, {
+    chart: { width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, historyRight: 940,
+      grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels: [], signals, dates: [], segments: [] },
+    layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: true },
+  });
+  return context;
+}
+
+function renderTurningWarnings() {
+  context.strokes = [];
+  context.texts = [];
+  window.OptionScopeCharts.renderChanCanvas(target, {
+    chart: { width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, priceBottom: 300, historyRight: 940,
+      grid: [], candles: [], strokes: [], points: [{ x: 180, y: 180, labelX: 180, labelY: 202, label: "109.21" }], centers: [], recursiveCenters: [], keyLevels: [], signals: [], dates: [], segments: [],
+      markers: [{ x: 180, y: 180, labelX: 180, labelY: 230, labelHeight: 15, label: "底观察", side: "buy", labelConnector: true }] },
+    layers: { pens: true, legacySignals: true, segments: false, recursiveCenters: {}, signals: false },
+  });
+  return context;
 }
 
 const indicatorChart = {
@@ -68,6 +106,30 @@ assert.equal(painted.length, 2, "enabled segment layer paints both confirmed and
 assert.deepEqual(painted[0].dash, [], "confirmed segment is a solid line");
 assert.deepEqual(painted[1].dash, [6, 4], "forming segment is a dashed line");
 assert.equal(painted[0].width, 2.6);
+
+const supportRender = renderStructureSupports(true);
+const activeSupportLine = supportRender.strokes.find((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 120 && stroke.end?.[0] === 930);
+const brokenSupportLine = supportRender.strokes.find((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 170 && stroke.end?.[0] === 930);
+assert.deepEqual(activeSupportLine.dash, [], "active structural supports use a solid horizontal line");
+assert.deepEqual(brokenSupportLine.dash, [5, 4], "closed breaks use a dashed horizontal line");
+assert.ok(supportRender.texts.some((item) => item.text === "支撑 100.00"), "active support exposes its price label");
+assert.ok(supportRender.texts.some((item) => item.text === "失守 90.00"), "broken support exposes a textual status");
+const hiddenSupportRender = renderStructureSupports(false);
+assert.ok(!hiddenSupportRender.strokes.some((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 120 && stroke.end?.[0] === 930), "hidden structure support layer paints no active support line");
+assert.ok(!hiddenSupportRender.strokes.some((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 170 && stroke.end?.[0] === 930), "hidden structure support layer paints no broken support line");
+assert.ok(!hiddenSupportRender.texts.some((item) => item.text === "支撑 100.00" || item.text === "失守 90.00"), "hidden structure support layer paints no support labels");
+
+const duplicateSignalRender = renderChanSignals([
+  { side: "buy", status: "candidate", x: 180, y: 180, markerY: 180, labelX: 180, labelY: 202, label: "一买", labelVisible: true },
+  { side: "buy", status: "candidate", x: 180, y: 190, markerY: 190, labelX: 180, labelY: 222, label: "一买", labelVisible: false },
+]);
+assert.equal(duplicateSignalRender.texts.filter((item) => item.text === "一买?").length, 1, "duplicate signal labels paint only once");
+assert.equal(duplicateSignalRender.fills, 2, "hiding a duplicate label keeps both signal markers visible");
+const turningWarningRender = renderTurningWarnings();
+assert.ok(turningWarningRender.texts.some((item) => item.text === "109.21"), "pivot price labels remain painted next to turning warnings");
+assert.ok(turningWarningRender.texts.some((item) => item.text === "底观察" && item.x === 180 && item.y === 230 && item.baseline === "middle"), "turning warnings use their collision-resolved center position");
+assert.ok(turningWarningRender.strokes.some((stroke) => stroke.start?.[0] === 180 && stroke.start?.[1] === 186
+  && stroke.end?.[0] === 180 && stroke.end?.[1] === 222.5), "relocated turning warnings draw a connector from the pivot");
 
 assert.equal(renderScenarios(false).length, 0, "hidden scenarios must not paint projection routes");
 const projections = renderScenarios(true);

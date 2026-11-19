@@ -62,6 +62,9 @@ toggleContext.toggleChanChartLayer.call(layerState, "macdSma200");
 assert.deepEqual(plain(layerState.chanChartLayers), { afStochZ: false, turtle: false, granville: false, macdSma200: true, supertrend: false, wyckoff: false, mfi: false }, "enabling MACD + SMA200 disables the previously selected exclusive indicator");
 toggleContext.toggleChanChartLayer.call(layerState, "macdSma200");
 assert.deepEqual(plain(layerState.chanChartLayers), { afStochZ: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false }, "the selected MACD + SMA200 indicator can be disabled");
+const supportLayerState = { chanChartLayers: { structureSupports: true } };
+toggleContext.toggleChanChartLayer.call(supportLayerState, "structureSupports");
+assert.equal(supportLayerState.chanChartLayers.structureSupports, false, "the automatic structure support layer can be disabled independently");
 
 const selectedMacdSma200 = { ...defaultPreferences.layers, macdSma200: true };
 defaults.api.rememberChanChartPreferences("daily", selectedMacdSma200, defaultPreferences.subcharts);
@@ -93,9 +96,9 @@ const versionFour = preferenceContext({
   subcharts: { volume: true, macd: false, dmi: true },
 });
 const upgradedVersionFour = versionFour.api.readChanChartPreferences();
-assert.deepEqual(plain(upgradedVersionFour.layers), previouslyCustomizedLayers, "version 4 custom layers that resemble older defaults remain unchanged");
+assert.deepEqual(plain(upgradedVersionFour.layers), { ...previouslyCustomizedLayers, structureSupports: true }, "version 4 custom layers remain unchanged and the new support layer uses its enabled default");
 assert.deepEqual(plain(upgradedVersionFour.subcharts), { volume: true, macd: false, dmi: true, mfi: false }, "version 4 subchart choices survive preference migration");
-assert.equal(versionFour.readStored().version, 13, "version 4 preferences are upgraded to the current format");
+assert.equal(versionFour.readStored().version, 14, "version 4 preferences are upgraded to the current format");
 
 const versionThree = preferenceContext({
   version: 3,

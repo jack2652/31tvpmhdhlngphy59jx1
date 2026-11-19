@@ -2,7 +2,7 @@ package chananalysis
 
 import "fmt"
 
-const timeframeMappingVersion = "chan-timeframe-map-v2"
+const TimeframeMappingVersion = "chan-timeframe-map-v5"
 
 type timeframeRelation struct {
 	higher string
@@ -32,10 +32,10 @@ func setTimeframeMapping(frame *Frame, lowerAvailable bool) {
 	}
 	relation, ok := timeframeRelationFor(frame.Timeframe)
 	if !ok {
-		frame.TimeframeMapping = TimeframeMapping{MappingVersion: timeframeMappingVersion, Role: "unmapped", LowerTimeframeStatus: "unavailable", Reason: fmt.Sprintf("周期 %q 未定义跨周期映射", frame.Timeframe)}
+		frame.TimeframeMapping = TimeframeMapping{MappingVersion: TimeframeMappingVersion, Role: "unmapped", LowerTimeframeStatus: "unavailable", Reason: fmt.Sprintf("周期 %q 未定义跨周期映射", frame.Timeframe)}
 		return
 	}
-	mapping := TimeframeMapping{MappingVersion: timeframeMappingVersion, HigherTimeframe: relation.higher, LowerTimeframe: relation.lower, Role: relation.role}
+	mapping := TimeframeMapping{MappingVersion: TimeframeMappingVersion, HigherTimeframe: relation.higher, LowerTimeframe: relation.lower, Role: relation.role}
 	switch {
 	case relation.lower == "":
 		mapping.LowerTimeframeStatus = "not_applicable"
@@ -84,6 +84,7 @@ func AttachMappedTimeframe(higher *Frame, lower Frame) {
 	for index := range higher.SignalsV4 {
 		higher.SignalsV4[index].TimeframeConfirmation = confirmOnMappedTimeframe(higher.SignalsV4[index], *higher, lower)
 	}
+	attachMappedClass2Signals(higher, lower)
 }
 
 func setWaitingTimeframeConfirmations(frame *Frame, lower, status, reason string) {
@@ -117,7 +118,7 @@ func confirmOnMappedTimeframe(signal V4Signal, higher, lower Frame) *TimeframeCo
 	}
 	for index := 0; index+1 < len(segments); index++ {
 		counter, recovery := segments[index], segments[index+1]
-		if !counter.Confirmed || !recovery.Confirmed || counter.Forming || recovery.Forming || counter.Chain != recovery.Chain || counter.Direction != counterDirection || recovery.Direction != direction || counter.End != recovery.Start {
+		if !confirmedSegmentWithinSnapshots(counter, higher.AsOf, lower.AsOf) || !confirmedSegmentWithinSnapshots(recovery, higher.AsOf, lower.AsOf) || counter.Direction != counterDirection || recovery.Direction != direction || !chanSegmentsAreContiguous(counter, recovery) {
 			continue
 		}
 		if compareStructureTime(counter.Start, signal.ObservedAt) <= 0 || compareStructureTime(recovery.ConfirmedAt, signal.ObservedAt) <= 0 {
@@ -134,7 +135,7 @@ func confirmOnMappedTimeframe(signal V4Signal, higher, lower Frame) *TimeframeCo
 			continue
 		}
 		confirmation.Status = "confirmed"
-		confirmation.StructureIDs = []string{chanSegmentID(0, counter), chanSegmentID(0, recovery)}
+		confirmation.StructureIDs = []string{chanSegmentID(0, counter, "recursive"), chanSegmentID(0, recovery, "recursive")}
 		confirmation.ConfirmedAt = confirmedAt
 		confirmation.Reason = fmt.Sprintf("%s 下级周期已先完成反向走势，再完成 %s 方向的已确认走势", relation.lower, signal.Side)
 		return confirmation
@@ -142,9 +143,23 @@ func confirmOnMappedTimeframe(signal V4Signal, higher, lower Frame) *TimeframeCo
 	return confirmation
 }
 
+// 已确认结构的完成时间必须不早于结构结束，且结构整体位于所有快照截止内。
+func confirmedSegmentWithinSnapshots(segment Segment, snapshots ...string) bool {
+	if !segment.Confirmed || segment.Forming || segment.Start == "" || segment.End == "" || segment.ConfirmedAt == "" ||
+		compareStructureTime(segment.Start, segment.End) > 0 || compareStructureTime(segment.End, segment.ConfirmedAt) > 0 {
+		return false
+	}
+	for _, asOf := range snapshots {
+		if asOf != "" && (compareStructureTime(segment.End, asOf) > 0 || compareStructureTime(segment.ConfirmedAt, asOf) > 0) {
+			return false
+		}
+	}
+	return true
+}
+
 func levelZeroSegments(frame Frame) []Segment {
 	for _, level := range frame.RecursiveLevels {
-		if level.Level == 0 {
+		if level.Level == 0 && len(level.Segments) > 0 {
 			return level.Segments
 		}
 	}
@@ -176,4 +191,18 @@ func normalizeStructureTime(value string) string {
 		return value + " 23:59"
 	}
 	return value
+}
+
+func structureDate(value string) string {
+	if len(value) >= len("2006-01-02") {
+		return value[:len("2006-01-02")]
+	}
+	return value
+}
+
+func higherStructureAfterLower(higherEvent, lowerEvent string) bool {
+	if len(higherEvent) == len("2006-01-02") && len(lowerEvent) > len("2006-01-02") {
+		return structureDate(higherEvent) > structureDate(lowerEvent)
+	}
+	return compareStructureTime(higherEvent, lowerEvent) > 0
 }

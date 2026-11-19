@@ -30,7 +30,6 @@ func main() {
 	}
 	full := chananalysis.AnalyzeAdjusted(os.Args[2], bars, nil, time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC))
 	fmt.Fprintf(os.Stderr, "bars=%d fullDailySignals=%d levels=%d segments=%d centers=%d\n", len(bars), len(full.Daily.SignalsV4), len(full.Daily.RecursiveLevels), len(full.Daily.Segments), len(full.Daily.RecursiveCenters))
-	return
 	cal, err := chananalysis.CalibrateDivergenceThresholds(os.Args[2], bars, []float64{0.6, 0.7, 0.8, 0.9})
 	if err != nil {
 		panic(err)

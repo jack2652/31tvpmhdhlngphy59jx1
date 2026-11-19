@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"time"
 )
 
 const (
@@ -89,7 +88,7 @@ func buildRecursiveLevels(baseStrokes []Stroke, baseSegments []Segment) []LevelA
 		switch {
 		case inputCount == 0:
 			levelStatus, waiting = "awaiting_lower_level", "等待下级产生连续的已确认走势单元"
-		case len(trends) == 0:
+		case len(centers) == 0:
 			levelStatus, waiting = "awaiting_lower_level", "等待三个连续下级走势单元形成重叠中枢"
 		case closedCenters == 0:
 			levelStatus, waiting = "developing", "高一级走势正在形成；中枢离开或后续中枢尚未确认"
@@ -125,15 +124,21 @@ func recursiveLevelUp(lower []Segment, level int) ([]RecursiveTrend, []Recursive
 	inputCount := 0
 	for chainStart := 0; chainStart < len(lower); {
 		chainEnd := chainStart
-		for chainEnd+1 < len(lower) && lower[chainEnd+1].Chain == lower[chainStart].Chain && lower[chainEnd].End == lower[chainEnd+1].Start {
+		for chainEnd+1 < len(lower) && lower[chainEnd+1].Chain == lower[chainStart].Chain && lower[chainEnd].End == lower[chainEnd+1].Start && priceEqual(lower[chainEnd].EndPrice, lower[chainEnd+1].StartPrice) {
 			chainEnd++
 		}
-		// Keep the visible forming tail in the recursive input. The reference
-		// level_up decomposes the current prefix, including its unfinished tail;
-		// dropping it hides higher-level structures until the next lower segment
-		// is already confirmed. Confirmation remains separate, so forming input
-		// can only produce forming structures and cannot validate signals.
+		// 只消费当前连续链的已确认前缀；形成中末段不能清空此前确认输入，
+		// 也不能跨过形成中对象拼接更晚的确认对象。
 		units := lower[chainStart : chainEnd+1]
+		confirmedCount := 0
+		for confirmedCount < len(units) && units[confirmedCount].Confirmed && units[confirmedCount].ConfirmedAt != "" {
+			confirmedCount++
+		}
+		units = units[:confirmedCount]
+		if len(units) == 0 {
+			chainStart = chainEnd + 1
+			continue
+		}
 		inputCount += len(units)
 		moves := decomposeRecursiveUnits(units, level)
 		for _, move := range moves {
@@ -170,13 +175,13 @@ func recursiveLevelUp(lower []Segment, level int) ([]RecursiveTrend, []Recursive
 						center.RelatedCenter = &previousIndex
 						center.PreviousCenterID = centers[previous].CenterID
 						switch {
-						case center.Lower < centers[previous].Upper && center.Upper > centers[previous].Lower:
+						case priceLess(center.Lower, centers[previous].Upper) && priceGreater(center.Upper, centers[previous].Lower):
 							center.RelationToPrevious, center.Relation, center.Kind = "overlap", "expands", "expansion"
-						case center.Lower == centers[previous].Upper || center.Upper == centers[previous].Lower:
+						case priceEqual(center.Lower, centers[previous].Upper) || priceEqual(center.Upper, centers[previous].Lower):
 							center.RelationToPrevious, center.Relation, center.Kind = "touch", "new_after", "newborn"
-						case center.Lower > centers[previous].Upper:
+						case priceGreater(center.Lower, centers[previous].Upper):
 							center.RelationToPrevious, center.Relation, center.Kind = "separate_up", "new_after", "newborn"
-						case center.Upper < centers[previous].Lower:
+						case priceLess(center.Upper, centers[previous].Lower):
 							center.RelationToPrevious, center.Relation, center.Kind = "separate_down", "new_after", "newborn"
 						default:
 							center.Relation, center.Kind = "new_after", "newborn"
@@ -204,7 +209,7 @@ func decomposeRecursiveUnits(units []Segment, level int) []recursiveMoveResult {
 		for index := position; index+2 < len(units); index++ {
 			zd := math.Max(units[index].Low, math.Max(units[index+1].Low, units[index+2].Low))
 			zg := math.Min(units[index].High, math.Min(units[index+1].High, units[index+2].High))
-			if zd <= zg {
+			if priceLess(zd, zg) {
 				centerStart = index
 				break
 			}
@@ -232,27 +237,36 @@ func decomposeRecursiveUnits(units []Segment, level int) []recursiveMoveResult {
 					k++
 					continue
 				}
-				closedAt := confirmedUnitTime(unit)
-				spans[len(spans)-1].closedAt = closedAt
+				closedAt := spans[len(spans)-1].closedAt
+				if closedAt == "" {
+					closedAt = confirmedUnitTime(unit)
+					spans[len(spans)-1].closedAt = closedAt
+				}
 				result = append(result, makeRecursiveMove(units, position, k-1, spans, level, kind, entryDirection, closedAt != "", closedAt))
 				position = k
 				break
 			}
 			if leaveStart < 0 {
 				leaveStart = k
+				// 中枢在首个已确认且不再重叠的下级走势单元处结束；
+				// 后续回到中枢或形成新中枢不能改写首次离开时间。
+				spans[len(spans)-1].closedAt = confirmedUnitTime(unit)
 			} else if k-2 >= leaveStart {
 				lower := math.Max(units[k-2].Low, math.Max(units[k-1].Low, units[k].Low))
 				upper := math.Min(units[k-2].High, math.Min(units[k-1].High, units[k].High))
-				if lower <= upper {
+				if priceLess(lower, upper) {
 					newDirection := ""
-					if lower > center.zg {
+					if priceGreater(lower, center.zg) {
 						newDirection = "up"
-					} else if upper < center.zd {
+					} else if priceLess(upper, center.zd) {
 						newDirection = "down"
 					}
 					if newDirection == "" || entryDirection != "" && entryDirection != newDirection {
-						closedAt := confirmedUnitTime(unit)
-						spans[len(spans)-1].closedAt = closedAt
+						closedAt := spans[len(spans)-1].closedAt
+						if closedAt == "" {
+							closedAt = confirmedUnitTime(unit)
+							spans[len(spans)-1].closedAt = closedAt
+						}
 						result = append(result, makeRecursiveMove(units, position, leaveStart-1, spans, level, kind, entryDirection, closedAt != "", closedAt))
 						position = leaveStart
 						break
@@ -261,7 +275,6 @@ func decomposeRecursiveUnits(units []Segment, level int) []recursiveMoveResult {
 						entryDirection = newDirection
 					}
 					kind = newDirection
-					spans[len(spans)-1].closedAt = confirmedUnitTime(units[k])
 					spans = append(spans, recursiveCenterSpan{start: k - 2, end: k, through: k, zd: lower, zg: upper})
 					leaveStart = -1
 				}
@@ -320,7 +333,7 @@ func recursiveUnitDirection(units []Segment, start, centerStart int) string {
 }
 
 func recursiveUnitOverlaps(unit Segment, lower, upper float64) bool {
-	return !(unit.High < lower || unit.Low > upper)
+	return priceLess(unit.Low, upper) && priceGreater(unit.High, lower)
 }
 
 func recursiveTrendSegments(trends []RecursiveTrend) []Segment {
@@ -380,11 +393,10 @@ func recursiveInputStrokes(segments []Segment, level int) []Stroke {
 	pivotAt := []int{}
 	for index := 0; index+2 < len(segments); index++ {
 		a, b, c := segments[index], segments[index+1], segments[index+2]
-		if a.Chain != b.Chain || b.Chain != c.Chain || !a.Confirmed || !b.Confirmed || !c.Confirmed || a.Direction != c.Direction || a.Direction == b.Direction || a.End != b.Start || b.End != c.Start {
+		if a.Chain != b.Chain || b.Chain != c.Chain || !a.Confirmed || !b.Confirmed || !c.Confirmed || a.Direction != c.Direction || a.Direction == b.Direction || a.End != b.Start || b.End != c.Start || !priceEqual(a.EndPrice, b.StartPrice) || !priceEqual(b.EndPrice, c.StartPrice) {
 			continue
 		}
-		pivotDate := a.End
-		pivotPrice := a.EndPrice
+		pivotDate, pivotPrice := a.End, a.EndPrice
 		if pivotDate == "" || !finitePositive(pivotPrice) {
 			continue
 		}
@@ -404,7 +416,7 @@ func recursiveInputStrokes(segments []Segment, level int) []Stroke {
 		}
 		previous := pivots[len(pivots)-1]
 		if previous.Kind == pivot.Kind {
-			moreExtreme := pivot.Kind == "top" && pivot.Price > previous.Price || pivot.Kind == "bottom" && pivot.Price < previous.Price
+			moreExtreme := pivot.Kind == "top" && priceGreater(pivot.Price, previous.Price) || pivot.Kind == "bottom" && priceLess(pivot.Price, previous.Price)
 			if moreExtreme {
 				pivots[len(pivots)-1], pivotAt[len(pivotAt)-1] = pivot, index+1
 			}
@@ -418,11 +430,11 @@ func recursiveInputStrokes(segments []Segment, level int) []Stroke {
 	result := []Stroke{}
 	for index := 1; index < len(pivots); index++ {
 		start, end := pivots[index-1], pivots[index]
-		if start.Chain != end.Chain || start.Kind == end.Kind || end.Price == start.Price {
+		if start.Chain != end.Chain || start.Kind == end.Kind || priceEqual(end.Price, start.Price) {
 			continue
 		}
 		direction := "up"
-		if end.Price < start.Price {
+		if priceLess(end.Price, start.Price) {
 			direction = "down"
 		}
 		first, last := pivotAt[index-1]-1, pivotAt[index]+1
@@ -496,7 +508,7 @@ func buildStrengthsFromMACD(bars []Bar, levels []LevelAnalysis, macd []MACDPoint
 				slope = 100 * (segment.EndPrice/base - 1) / float64(duration)
 				amplitude = 100 * (segment.High - segment.Low) / base
 			}
-			result = append(result, Strength{Direction: segment.Direction, Level: level.Level, Start: segment.Start, End: segment.End, ConfirmedAt: segment.ConfirmedAt, MACDArea: area, MACDVersion: macdVersion, WarmupBars: macdWarmupBars, WarmupComplete: start >= macdWarmupBars, SlopePercent: slope, DurationBars: duration, Amplitude: amplitude, StartIndex: start, EndIndex: end})
+			result = append(result, Strength{Direction: segment.Direction, Level: level.Level, SourceKind: signalSourceKind(level), Start: segment.Start, End: segment.End, ConfirmedAt: segment.ConfirmedAt, MACDArea: area, MACDVersion: macdVersion, WarmupBars: macdWarmupBars, WarmupComplete: start >= macdWarmupBars, SlopePercent: slope, DurationBars: duration, Amplitude: amplitude, StartIndex: start, EndIndex: end})
 		}
 	}
 	return result
@@ -568,9 +580,10 @@ func addRecursiveAnalysisWithComponents(frame Frame, bars []Bar, divergenceRatio
 	frame.Segments = buildSegments(frame.StrokesV4)
 	frame.RecursiveLevels = buildRecursiveLevels(frame.StrokesV4, frame.Segments)
 	frame.RecursiveCenters = recursiveCenterList(frame.RecursiveLevels)
-	frame.Strengths = buildStrengthsFromMACD(bars, frame.RecursiveLevels, macd)
+	signalLevels := buildSignalScanLevels(frame, frame.RecursiveLevels)
+	frame.Strengths = buildStrengthsFromMACD(bars, signalLevels, macd)
 	frame.MACD = macd
-	frame.SignalsV4 = buildV4SignalsWithDivergenceRatio(frame, frame.RecursiveLevels, frame.Strengths, divergenceRatio)
+	frame.SignalsV4 = buildV4SignalsWithDivergenceRatio(frame, signalLevels, frame.Strengths, divergenceRatio)
 	if len(frame.RecursiveLevels) > 0 {
 		frame.TrendState = frameTrendState(frame.RecursiveLevels[0])
 		frame.TrendContext = buildTrendContext(frame.RecursiveLevels[0], frame.TrendState)
@@ -609,7 +622,7 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 		// comparing index-1 with index would make divergence unreachable.
 		for index := 2; index < len(level.Segments); index++ {
 			current, retest, previous := level.Segments[index], level.Segments[index-1], level.Segments[index-2]
-			if !current.Confirmed || !retest.Confirmed || !previous.Confirmed || current.Direction != previous.Direction || retest.Direction == current.Direction || current.Chain != previous.Chain || retest.Chain != current.Chain {
+			if !current.Confirmed || !retest.Confirmed || !previous.Confirmed || current.Level != level.Level || retest.Level != level.Level || previous.Level != level.Level || current.Direction != previous.Direction || current.TrendKind != previous.TrendKind || retest.Direction == current.Direction || !chanSegmentRangeIsContiguous(level.Segments, index-2, index) {
 				continue
 			}
 			var center *RecursiveCenter
@@ -617,7 +630,8 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 				// The center must have been closed no later than the first push,
 				// and both compared pushes must occur after its final overlapping
 				// segment. The center-closing segment may itself be that first push.
-				if centers[i].Chain == current.Chain && centers[i].ConfirmedAt != "" && centers[i].ConfirmedAt <= previous.ConfirmedAt && centerOwnerMoveIndex(centers[i]) < index-2 {
+				ownerIndex := centerOwnerMoveIndex(centers[i])
+				if centers[i].Chain == current.Chain && centers[i].ConfirmedAt != "" && centers[i].ConfirmedAt <= previous.ConfirmedAt && ownerIndex <= index-2 && chanSegmentRangeIsContiguous(level.Segments, ownerIndex, index-2) {
 					center = &centers[i]
 				}
 			}
@@ -626,18 +640,18 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 			}
 			previousMove := segmentMovesAway(previous, center)
 			currentMove := segmentMovesAway(current, center)
-			// Require the intervening counter-swing to remain fully outside the
-			// center. A retest that enters the zone is not the frozen departure /
-			// non-return background for this comparison.
-			retestStayedOutside := current.Direction == "up" && retest.Low > center.Upper || current.Direction == "down" && retest.High < center.Lower
-			if !previousMove || !currentMove || !retestStayedOutside {
+			// 允许回试留在中枢外，或进入中枢后未穿越另一侧；穿越中枢的回试不属于这两类路径。
+			retestStayedOutside := current.Direction == "up" && priceGreater(retest.Low, center.Upper) || current.Direction == "down" && priceLess(retest.High, center.Lower)
+			retestEnteredWithoutCrossing := current.Direction == "up" && priceGreater(retest.High, center.Upper) && priceLess(retest.Low, center.Upper) && priceGreaterOrEqual(retest.Low, center.Lower) ||
+				current.Direction == "down" && priceLess(retest.Low, center.Lower) && priceGreater(retest.High, center.Lower) && priceLessOrEqual(retest.High, center.Upper)
+			if !previousMove || !currentMove || (!retestStayedOutside && !retestEnteredWithoutCrossing) {
 				continue
 			}
-			leftStrength, rightStrength := findSegmentStrength(byLevel[level.Level], previous), findSegmentStrength(byLevel[level.Level], current)
+			leftStrength, rightStrength := findSegmentStrength(byLevel[level.Level], previous, signalSourceKind(level)), findSegmentStrength(byLevel[level.Level], current, signalSourceKind(level))
 			if leftStrength == nil || rightStrength == nil || !leftStrength.WarmupComplete || !rightStrength.WarmupComplete || leftStrength.MACDArea <= 0 || rightStrength.MACDArea <= 0 {
 				continue
 			}
-			newExtreme := current.Direction == "up" && current.EndPrice > previous.EndPrice || current.Direction == "down" && current.EndPrice < previous.EndPrice
+			newExtreme := current.Direction == "up" && priceGreater(current.EndPrice, previous.EndPrice) || current.Direction == "down" && priceLess(current.EndPrice, previous.EndPrice)
 			ratio := rightStrength.MACDArea / leftStrength.MACDArea
 			if !newExtreme || ratio >= divergenceRatio {
 				continue
@@ -652,17 +666,23 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 			confirmedAt := ""
 			phaseAt := current.ConfirmedAt
 			phaseHistory := []SignalPhase{{Phase: "observation", At: current.ConfirmedAt}}
-			conditions := []string{"同级、同链、同方向的两段已确认推进，中间有已确认反向回试", "回试全段严格停留在中枢外，未回到中枢", "价格端点严格创新高/低", fmt.Sprintf("MACD 同向力度比低于版本参数 %.2f", divergenceRatio), "前一推进段已离开同级已确认中枢"}
+			conditions := []string{"同级、同链、同方向、同走势类别的两段已确认推进，中间有已确认反向回试", "价格端点严格创新高/低", fmt.Sprintf("MACD 同向力度比低于版本参数 %.2f", divergenceRatio), "前一推进段已离开同级已确认中枢"}
+			if retestStayedOutside {
+				conditions = append(conditions, "回试全段严格停留在中枢外，未回到中枢")
+			} else {
+				conditions = append(conditions, "首次反向回试进入中枢但未穿越另一侧")
+			}
 			missing := []string{"后续反向线段确认走势端点", "反向结构后续延续得到一条已确认同向线段"}
 			if index+1 < len(level.Segments) {
 				reversal := level.Segments[index+1]
-				if reversal.Confirmed && reversal.Direction != current.Direction && reversal.ConfirmedAt >= current.ConfirmedAt {
+				if reversal.Confirmed && reversal.Direction != current.Direction && reversal.ConfirmedAt > current.ConfirmedAt && chanSegmentsAreContiguous(current, reversal) {
 					status, phase, confirmedAt, phaseAt = "divergence_confirmed", "divergence_confirmed", reversal.ConfirmedAt, reversal.ConfirmedAt
 					phaseHistory = append(phaseHistory, SignalPhase{Phase: phase, At: reversal.ConfirmedAt})
 					missing = []string{"后续反向结构继续形成已确认走势段"}
-					if index+3 < len(level.Segments) {
+					if index+3 < len(level.Segments) && chanSegmentRangeIsContiguous(level.Segments, index+1, index+3) {
+						counterSwing := level.Segments[index+2]
 						followThrough := level.Segments[index+3]
-						if followThrough.Confirmed && followThrough.Direction == reversal.Direction && followThrough.Chain == current.Chain && followThrough.ConfirmedAt >= reversal.ConfirmedAt {
+						if counterSwing.Confirmed && counterSwing.Direction == current.Direction && followThrough.Confirmed && followThrough.Direction == reversal.Direction && followThrough.ConfirmedAt > reversal.ConfirmedAt {
 							status, phase, phaseAt = "reversal_confirmed", "reversal_confirmed", followThrough.ConfirmedAt
 							phaseHistory = append(phaseHistory, SignalPhase{Phase: phase, At: followThrough.ConfirmedAt})
 							missing = []string{}
@@ -689,8 +709,10 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 				phaseHistory = append(kept, SignalPhase{Phase: "invalidated", At: invalidatedAt})
 				status, phase, phaseAt = "invalidated", "invalidated", invalidatedAt
 				confirmedAt = ""
-				if len(phaseHistory) > 1 && phaseHistory[len(phaseHistory)-2].Phase == "divergence_confirmed" {
-					confirmedAt = phaseHistory[len(phaseHistory)-2].At
+				for _, event := range kept {
+					if event.Phase == "divergence_confirmed" {
+						confirmedAt = event.At
+					}
 				}
 				missing = []string{}
 			}
@@ -701,19 +723,21 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 					levelStatus = lower.Status
 				}
 			}
-			result = append(result, V4Signal{Symbol: "", Level: level.Level, Kind: kind, Side: side, Status: status, Phase: phase, PhaseAt: phaseAt, PhaseHistory: phaseHistory, RuleVersion: RecursivePreviewVersion, Date: current.End, ObservedAt: observedAt, ConfirmedAt: confirmedAt, StructureRefs: []int{index - 2, index - 1, index}, Conditions: conditions, Missing: missing, Invalidation: ptr(current.EndPrice), StrengthRatio: &ratioCopy, Price: &price, MarketFilter: "unfiltered", LowerLevelStatus: levelStatus, Detail: fmt.Sprintf("同级 %s 走势段价格创新极值而 MACD 力度减弱；失效边界 %.4f；大盘过滤状态未提供", current.Direction, current.EndPrice)})
+			sourceKind := signalSourceKind(level)
+			structureIDs := []string{center.CenterID, chanSegmentID(level.Level, previous, sourceKind), chanSegmentID(level.Level, retest, sourceKind), chanSegmentID(level.Level, current, sourceKind)}
+			result = append(result, V4Signal{Symbol: "", Level: level.Level, SourceKind: sourceKind, Kind: kind, Side: side, Status: status, Phase: phase, PhaseAt: phaseAt, PhaseHistory: phaseHistory, RuleVersion: RecursivePreviewVersion, Date: current.End, ObservedAt: observedAt, ConfirmedAt: confirmedAt, StructureRefs: []int{index - 2, index - 1, index}, StructureIDs: structureIDs, RelatedCenterID: center.CenterID, Conditions: conditions, Missing: missing, Invalidation: ptr(current.EndPrice), StrengthRatio: &ratioCopy, Price: &price, MarketFilter: "unfiltered", LowerLevelStatus: levelStatus, Detail: fmt.Sprintf("同级 %s 走势段价格创新极值而 MACD 力度减弱；失效边界 %.4f；大盘过滤状态未提供", current.Direction, current.EndPrice)})
 		}
 	}
 	// De-duplicate candidates by kind, level, and structural endpoint.
 	seen := make(map[string]bool)
 	filtered := result[:0]
 	for _, signal := range result {
-		key := fmt.Sprintf("%d|%s|%s", signal.Level, signal.Kind, signal.Date)
+		key := fmt.Sprintf("%s|%d|%s|%s", signal.SourceKind, signal.Level, signal.Kind, signal.Date)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		signal.SignalID = fmt.Sprintf("%s|L%d|%s|%s", RecursivePreviewVersion, signal.Level, signal.Kind, signal.Date)
+		signal.SignalID = fmt.Sprintf("%s|%s|L%d|%s|%s", RecursivePreviewVersion, signal.SourceKind, signal.Level, signal.Kind, signal.Date)
 		filtered = append(filtered, signal)
 	}
 	combined := append(filtered, buildClass23Signals(frame, filtered, levels)...)
@@ -737,7 +761,7 @@ func firstV4InvalidationAt(bars []Bar, observedAt, direction string, invalidatio
 		if bar.Date <= observedAt {
 			continue
 		}
-		if direction == "up" && bar.High >= invalidation || direction == "down" && bar.Low <= invalidation {
+		if direction == "up" && priceGreaterOrEqual(bar.High, invalidation) || direction == "down" && priceLessOrEqual(bar.Low, invalidation) {
 			return bar.Date
 		}
 	}
@@ -746,21 +770,28 @@ func firstV4InvalidationAt(bars []Bar, observedAt, direction string, invalidatio
 
 func segmentMovesAway(segment Segment, center *RecursiveCenter) bool {
 	if segment.Direction == "up" {
-		return segment.EndPrice > center.Upper
+		return priceGreater(segment.EndPrice, center.Upper)
 	}
 	if segment.Direction == "down" {
-		return segment.EndPrice < center.Lower
+		return priceLess(segment.EndPrice, center.Lower)
 	}
 	return false
 }
 
-func findSegmentStrength(strengths []Strength, segment Segment) *Strength {
+func findSegmentStrength(strengths []Strength, segment Segment, sourceKind string) *Strength {
 	for index := range strengths {
-		if strengths[index].Start == segment.Start && strengths[index].End == segment.End && strengths[index].Level == segment.Level {
+		if strengths[index].Start == segment.Start && strengths[index].End == segment.End && strengths[index].Level == segment.Level && strengthSourceKind(strengths[index]) == sourceKind {
 			return &strengths[index]
 		}
 	}
 	return nil
+}
+
+func strengthSourceKind(strength Strength) string {
+	if strength.SourceKind != "" {
+		return strength.SourceKind
+	}
+	return "recursive"
 }
 
 func centerOwnerMoveIndex(center RecursiveCenter) int {
@@ -789,16 +820,16 @@ func frameTrendState(level LevelAnalysis) string {
 		return "unknown"
 	}
 	departureDirection := ""
-	if departure.EndPrice > center.Upper && departure.Direction == "up" {
+	if priceGreater(departure.EndPrice, center.Upper) && departure.Direction == "up" {
 		departureDirection = "up"
-	} else if departure.EndPrice < center.Lower && departure.Direction == "down" {
+	} else if priceLess(departure.EndPrice, center.Lower) && departure.Direction == "down" {
 		departureDirection = "down"
 	}
 	if departureDirection == "" {
 		return "range"
 	}
 	if segment.Direction != departureDirection {
-		if segment.Low < center.Upper && segment.High > center.Lower {
+		if priceLess(segment.Low, center.Upper) && priceGreater(segment.High, center.Lower) {
 			return "returning"
 		}
 		return "returning"
@@ -811,7 +842,7 @@ func frameTrendState(level LevelAnalysis) string {
 	for index := departureIndex + 1; index < segmentIndex; index++ {
 		counter := level.Segments[index]
 		if counter.Confirmed && counter.Chain == center.Chain && counter.Direction != departureDirection {
-			if departureDirection == "up" && counter.Low > center.Upper || departureDirection == "down" && counter.High < center.Lower {
+			if departureDirection == "up" && priceGreater(counter.Low, center.Upper) || departureDirection == "down" && priceLess(counter.High, center.Lower) {
 				if departureDirection == "up" {
 					return "uptrend"
 				}
@@ -839,9 +870,9 @@ func buildTrendContext(level LevelAnalysis, status string) TrendContext {
 	context.CenterID = center.CenterID
 	context.CenterRelation = center.RelationToPrevious
 	switch {
-	case segment.EndPrice > center.Upper:
+	case priceGreater(segment.EndPrice, center.Upper):
 		context.CenterPosition = "above"
-	case segment.EndPrice < center.Lower:
+	case priceLess(segment.EndPrice, center.Lower):
 		context.CenterPosition = "below"
 	default:
 		context.CenterPosition = "inside"
@@ -866,9 +897,9 @@ func buildTrendContext(level LevelAnalysis, status string) TrendContext {
 		return context
 	}
 	departureDirection := ""
-	if departure.Direction == "up" && departure.EndPrice > center.Upper {
+	if departure.Direction == "up" && priceGreater(departure.EndPrice, center.Upper) {
 		departureDirection = "up"
-	} else if departure.Direction == "down" && departure.EndPrice < center.Lower {
+	} else if departure.Direction == "down" && priceLess(departure.EndPrice, center.Lower) {
 		departureDirection = "down"
 	}
 	if departureDirection == "" {
@@ -877,7 +908,7 @@ func buildTrendContext(level LevelAnalysis, status string) TrendContext {
 		return context
 	}
 	if segmentIndex > departureIndex && segment.Direction != departureDirection {
-		if context.CenterPosition == "inside" || segment.Low < center.Upper && segment.High > center.Lower {
+		if context.CenterPosition == "inside" || priceLess(segment.Low, center.Upper) && priceGreater(segment.High, center.Lower) {
 			context.Status, context.DepartureStatus = "returning", "returned_to_center"
 			context.Reason = "离开后反向回试重新进入中枢范围"
 		} else {
@@ -890,7 +921,7 @@ func buildTrendContext(level LevelAnalysis, status string) TrendContext {
 		for index := departureIndex + 1; index < segmentIndex; index++ {
 			counter := level.Segments[index]
 			if counter.Confirmed && counter.Direction != departureDirection {
-				if departureDirection == "up" && counter.Low > center.Upper || departureDirection == "down" && counter.High < center.Lower {
+				if departureDirection == "up" && priceGreater(counter.Low, center.Upper) || departureDirection == "down" && priceLess(counter.High, center.Lower) {
 					context.Status = departureDirection + "trend"
 					context.DepartureStatus = "trend_resumed_after_outside_retest"
 					context.Reason = "离开后反向回试保持在中枢外，随后同向走势再次确认"
@@ -925,25 +956,4 @@ func lastClosedRecursiveCenter(centers []RecursiveCenter) (*RecursiveCenter, int
 		}
 	}
 	return nil, -1
-}
-
-func parseTradingDate(value string) time.Time {
-	for _, layout := range []string{"2006-01-02 15:04", time.DateOnly} {
-		if date, err := time.Parse(layout, value); err == nil {
-			return date
-		}
-	}
-	return time.Time{}
-}
-
-func midpointDate(start, end string) (string, bool) {
-	startAt, endAt := parseTradingDate(start), parseTradingDate(end)
-	if startAt.IsZero() || endAt.IsZero() || endAt.Before(startAt) {
-		return "", false
-	}
-	midpoint := startAt.Add(endAt.Sub(startAt) / 2)
-	if len(start) > len(time.DateOnly) {
-		return midpoint.Format("2006-01-02 15:04"), true
-	}
-	return midpoint.Format(time.DateOnly), true
 }

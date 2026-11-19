@@ -10,6 +10,8 @@ import (
 	"option-scope-go/internal/marketcalendar"
 )
 
+const extremePriceMoveChainBreakRatio = 0.50
+
 type mergedBar struct {
 	high, low              float64
 	highIndex, lowIndex    int
@@ -20,41 +22,57 @@ type mergedBar struct {
 }
 
 func directionFromPair(previousHigh, previousLow, nextHigh, nextLow float64) int {
-	if nextHigh > previousHigh && nextLow > previousLow {
+	if priceGreater(nextHigh, previousHigh) && priceGreater(nextLow, previousLow) {
 		return 1
 	}
-	if nextHigh < previousHigh && nextLow < previousLow {
+	if priceLess(nextHigh, previousHigh) && priceLess(nextLow, previousLow) {
 		return -1
 	}
-	if nextHigh == previousHigh {
-		if nextLow > previousLow {
+	if priceEqual(nextHigh, previousHigh) {
+		if priceGreater(nextLow, previousLow) {
 			return 1
 		}
-		if nextLow < previousLow {
+		if priceLess(nextLow, previousLow) {
 			return -1
 		}
 	}
-	if nextLow == previousLow {
-		if nextHigh > previousHigh {
+	if priceEqual(nextLow, previousLow) {
+		if priceGreater(nextHigh, previousHigh) {
 			return 1
 		}
-		if nextHigh < previousHigh {
+		if priceLess(nextHigh, previousHigh) {
 			return -1
 		}
 	}
 	return 0
 }
 
-// Analyze uses completed regular-session daily bars only. The last pen remains
-// provisional until a valid opposite pen fixes its endpoint. A pen center is
-// formed only from confirmed pens; it is not a recursively defined Chan level.
+// 价格容差内的微小浮点差不应改变 K 线区间是否包含的判断。
+func priceRangeContains(outerHigh, outerLow, innerHigh, innerLow float64) bool {
+	return priceGreaterOrEqual(outerHigh, innerHigh) && priceLessOrEqual(outerLow, innerLow)
+}
+
+// Analyze uses completed regular-session daily bars and the shared recursive
+// signal engine. Legacy pen fields remain available as structural diagnostics.
 func Analyze(symbol string, input []Bar, spot *float64, cutoff time.Time) Result {
 	return analyzeWithComponents(symbol, input, spot, cutoff, nil)
 }
 
 func analyzeWithComponents(symbol string, input []Bar, spot *float64, cutoff time.Time, cached *incrementalComponents) Result {
 	bars, rejected, openBars, duplicates, reordered, exclusions := completedBarsDetailed(input, cutoff)
-	return analyzeValidatedWithComponents(symbol, input, bars, rejected, openBars, duplicates, reordered, exclusions, spot, cutoff, cached)
+	result := analyzeValidatedWithComponents(symbol, input, bars, rejected, openBars, duplicates, reordered, exclusions, spot, cutoff, cached)
+	result.LegacyRuleVersion = RuleVersion
+	result.RuleVersion = RecursivePreviewVersion
+	result.Parameters = RecursiveParameters()
+	result.Daily = addRecursiveAnalysisWithComponents(result.Daily, result.Daily.Candles, recursiveDivergenceRatio, cached)
+	result.Weekly = addRecursiveAnalysisWithDivergenceRatio(result.Weekly, result.Weekly.Candles, recursiveDivergenceRatio)
+	for index := range result.Daily.SignalsV4 {
+		result.Daily.SignalsV4[index].Symbol = symbol
+	}
+	for index := range result.Weekly.SignalsV4 {
+		result.Weekly.SignalsV4[index].Symbol = symbol
+	}
+	return result
 }
 
 // analyzeValidatedWithComponents runs the shared analysis pipeline when the
@@ -78,11 +96,9 @@ func analyzeValidatedWithSpotMode(symbol string, input, bars []Bar, rejected, op
 			"分型右侧 K 线结束合并后确认；末笔等待有效反向笔固定端点",
 			"历史交易日缺口仅分析最近连续行情；无法连续接续的笔链会分段保留历史笔与中枢，当前位置只按最新笔链判断",
 			"笔中枢：三根连续已确认笔的价格区间有严格重叠；延伸保留初始边界",
-			"本项目的笔级观察口径：围绕同一已形成笔中枢的相邻同向笔创新低或新高且越过中枢外沿，MACD(12,26,9) 同向柱面积低于前一同向笔 80% 时，输出底部或顶部力度衰减观察；80% 为筛选阈值",
-			"力度观察至少需要 60 根已收盘 K 线，前一比较笔起点避开前 35 根预热区；仅检查最近四根笔，各侧保留最近一条观察",
-			"末笔衰减仅为形成中观察；端点被反向笔固定后列为抄底或逃顶候选；首次回踩不破原低点或反抽不过原高点时，列出回试形态候选",
-			"候选失效边界为原始极值，触及后失效；笔力度衰减与首次回试不等同于完整递归级别的一类或二类买卖点，不输出未经回测的胜率",
-			"日线与周线表示图表周期；本版不输出递归级别、线段及一二类买卖点",
+			"普通笔顶底转折预警与递归一、二、三类买卖点分层展示；结构买卖点统一由 signals_v4 生成",
+			"递归买卖点按所属结构级别判断；缺少背驰、回试、确认或闭合中枢条件时保留明确等待状态",
+			"MACD 背驰比例是项目筛选参数，不是缠论理论常量；未完成样本外校准前不宣称收益最优",
 		}, Warnings: []string{},
 	}
 	if rejected > 0 {
@@ -184,9 +200,7 @@ func rebaseFrameSpot(frame Frame, spot *float64) Frame {
 	}
 	frame.Position = locate(currentCenters, spot)
 	frame.Signals = append([]Signal(nil), frame.Signals...)
-	frame.PenSignals = append([]Signal(nil), frame.PenSignals...)
 	invalidateSignals(frame.Signals, frame.Candles, spot)
-	invalidateSignals(frame.PenSignals, frame.Candles, spot)
 	frame.Scenarios = scenarios(frame.Position)
 	return frame
 }
@@ -343,7 +357,7 @@ func RecursiveParameters() map[string]any {
 	return map[string]any{
 		"rule_version": RecursivePreviewVersion, "target_rule_version": RecursiveRuleVersion, "implementation_status": "preview", "timeframes": []string{"15m", "1h", "2h", "4h", "1d", "1wk"},
 		"timeframe_mapping": map[string]any{
-			"version":   timeframeMappingVersion,
+			"version":   TimeframeMappingVersion,
 			"ladder":    []string{"15m->1h", "1h->2h", "2h->4h", "4h->1d", "1d->1wk"},
 			"semantics": "each chart timeframe computes its own recursive Chan levels; signal confirmation uses only confirmed level-0 structures from the direct lower timeframe",
 		},
@@ -1432,7 +1446,7 @@ func chainIntradayBars(bars []Bar, interval time.Duration) ([]Bar, []DataGap) {
 	return bars, gaps
 }
 
-// chainDailyBars 保留有效历史区间，并在交易日缺口或大幅价格波动处开启新结构链。
+// chainDailyBars 保留有效历史区间，并在交易日缺口或无法验证的价格跳变处开启新结构链。
 func chainDailyBars(bars []Bar) ([]Bar, []string) {
 	warnings := []string{}
 	if len(bars) == 0 {
@@ -1445,7 +1459,7 @@ func chainDailyBars(bars []Bar) ([]Bar, []string) {
 		days, currentOK := marketcalendar.ParseDateOnly(bars[i].Date)
 		expected := marketcalendar.NextTradingDayOrdinal(previousDays)
 		gap := !previousOK || !currentOK || expected != days
-		jump := bars[i-1].Close > 0 && math.Abs(bars[i].Close/bars[i-1].Close-1) > 0.20
+		jump := shouldSplitOnLargePriceMove(bars[i-1], bars[i])
 		if gap || jump {
 			chain++
 			missing = marketcalendar.FormatDateOnly(expected)
@@ -1456,9 +1470,23 @@ func chainDailyBars(bars []Bar) ([]Bar, []string) {
 		bars[i].Chain = chain
 	}
 	if chain > 0 {
-		warnings = append(warnings, fmt.Sprintf("历史存在 %d 处交易日缺口或超过 20%% 的大幅价格波动（最近结构断点为 %s）；保留历史结构并分链，当前位置仅按最新链判断", chain, missing))
+		warnings = append(warnings, fmt.Sprintf("历史存在 %d 处交易日缺口或极端价格跳变（最近结构断点为 %s）；保留历史结构并分链，当前位置仅按最新链判断", chain, missing))
 	}
 	return bars, warnings
+}
+
+func shouldSplitOnLargePriceMove(previous, current Bar) bool {
+	if previous.Close <= 0 || math.Abs(current.Close/previous.Close-1) <= 0.20 {
+		return false
+	}
+	if !validAdjustedPair(previous) || !validAdjustedPair(current) {
+		return true
+	}
+	event, suspected := classifyCorporateAction(previous, current)
+	if suspected {
+		return true
+	}
+	return event != nil && event.Kind == "large_price_move" && math.Abs(current.Close/previous.Close-1) >= extremePriceMoveChainBreakRatio
 }
 
 func weeklyBars(daily []Bar, cutoff time.Time) ([]Bar, bool) {
@@ -1599,6 +1627,7 @@ func weeklyGapsFromBars(weekly []Bar) []DataGap {
 
 func mergeBars(bars []Bar) []mergedBar {
 	merged := make([]mergedBar, 0, len(bars))
+	mergeDirection := 0
 	for i, bar := range bars {
 		sourceIndex := sourceIndexFor(bars, i)
 		next := mergedBar{high: bar.High, low: bar.Low, highIndex: i, lowIndex: i, start: i, end: i, sourceHigh: sourceIndex, sourceLow: sourceIndex, sourceStart: sourceIndex, sourceEnd: sourceIndex, chain: bar.Chain}
@@ -1608,27 +1637,36 @@ func mergeBars(bars []Bar) []mergedBar {
 		}
 		last := &merged[len(merged)-1]
 		if last.chain != next.chain {
+			// 新链不继承上一链的包含方向，否则缺口后的首个包含组
+			// 会按旧链方向收缩边界，造成批量与增量结果不一致。
+			mergeDirection = 0
 			merged = append(merged, next)
 			continue
 		}
-		contains := (last.high >= next.high && last.low <= next.low) || (next.high >= last.high && next.low <= last.low)
+		contains := priceRangeContains(last.high, last.low, next.high, next.low) || priceRangeContains(next.high, next.low, last.high, last.low)
 		if !contains {
+			if inferred := directionFromPair(last.high, last.low, next.high, next.low); inferred != 0 {
+				mergeDirection = inferred
+			}
 			merged = append(merged, next)
 			continue
 		}
-		// The reference processes inclusion sequentially and decides its
-		// direction from the immediately preceding merged pair at the moment
-		// the inclusion occurs. A persistent direction becomes stale after a
-		// reversal; the first pair uses the incoming candle as its reference.
-		directionUp := next.high >= last.high
-		if len(merged) >= 2 {
-			directionUp = last.high >= merged[len(merged)-2].high
-		}
-		if directionUp && next.high >= last.high || !directionUp && next.high <= last.high {
+		// 方向要等到出现非包含关系后才能确定；此前保留区间并集，
+		// 以便后续关系能够确定方向，同时不丢失原区间的任一边界。
+		if mergeDirection == 0 {
+			if priceGreater(next.high, last.high) {
+				last.high, last.highIndex = next.high, i
+				last.sourceHigh = sourceIndex
+			}
+			if priceLess(next.low, last.low) {
+				last.low, last.lowIndex = next.low, i
+				last.sourceLow = sourceIndex
+			}
+		} else if mergeDirection > 0 && priceGreaterOrEqual(next.high, last.high) || mergeDirection < 0 && priceLessOrEqual(next.high, last.high) {
 			last.high, last.highIndex = next.high, i
 			last.sourceHigh = sourceIndex
 		}
-		if directionUp && next.low >= last.low || !directionUp && next.low <= last.low {
+		if mergeDirection > 0 && priceGreaterOrEqual(next.low, last.low) || mergeDirection < 0 && priceLessOrEqual(next.low, last.low) {
 			last.low, last.lowIndex = next.low, i
 			last.sourceLow = sourceIndex
 		}
@@ -1650,9 +1688,9 @@ func findFractals(bars []Bar, merged []mergedBar) []Fractal {
 		}
 		var kind string
 		index, price := middle.highIndex, middle.high
-		if middle.high > left.high && middle.high > right.high && middle.low > left.low && middle.low > right.low {
+		if priceGreater(middle.high, left.high) && priceGreater(middle.high, right.high) && priceGreater(middle.low, left.low) && priceGreater(middle.low, right.low) {
 			kind = "top"
-		} else if middle.low < left.low && middle.low < right.low && middle.high < left.high && middle.high < right.high {
+		} else if priceLess(middle.low, left.low) && priceLess(middle.low, right.low) && priceLess(middle.high, left.high) && priceLess(middle.high, right.high) {
 			kind, index, price = "bottom", middle.lowIndex, middle.low
 		} else {
 			continue
@@ -1683,10 +1721,10 @@ func validPen(start, end Fractal, merged []mergedBar) bool {
 	// extra envelope condition is not part of the Python reference's 81-rule
 	// implementation and makes the recursive structure collapse on real data.
 	if start.Kind == "bottom" {
-		return end.Price > start.Price
+		return priceGreater(end.Price, start.Price)
 	}
 	if start.Kind == "top" {
-		return end.Price < start.Price
+		return priceLess(end.Price, start.Price)
 	}
 	return false
 }
@@ -1709,7 +1747,7 @@ func buildStrokesWithHistogram(fractals []Fractal, merged []mergedBar, histogram
 			}
 			start, end := points[i-1], points[i]
 			direction := "up"
-			if end.Price < start.Price {
+			if priceLess(end.Price, start.Price) {
 				direction = "down"
 			}
 			stroke := Stroke{Chain: chain, Start: start, End: end, Direction: direction, Level: 0,
@@ -1754,7 +1792,7 @@ func buildStrokesWithHistogram(fractals []Fractal, merged []mergedBar, histogram
 			continue
 		}
 		if last.Kind == fractal.Kind {
-			moreExtreme := fractal.Kind == "top" && fractal.Price > last.Price || fractal.Kind == "bottom" && fractal.Price < last.Price
+			moreExtreme := fractal.Kind == "top" && priceGreater(fractal.Price, last.Price) || fractal.Kind == "bottom" && priceLess(fractal.Price, last.Price)
 			if moreExtreme {
 				if len(points) == 1 || validPen(points[len(points)-2], fractal, merged) {
 					points[len(points)-1] = fractal
@@ -1766,7 +1804,7 @@ func buildStrokesWithHistogram(fractals []Fractal, merged []mergedBar, histogram
 		}
 		if !validPen(last, fractal, merged) {
 			for _, bar := range merged[last.MergedIndex : fractal.MergedIndex+1] {
-				if last.Kind == "top" && bar.high > last.Price || last.Kind == "bottom" && bar.low < last.Price {
+				if last.Kind == "top" && priceGreater(bar.high, last.Price) || last.Kind == "bottom" && priceLess(bar.low, last.Price) {
 					restart(fractal)
 					break
 				}
@@ -1808,16 +1846,19 @@ func buildCenters(strokes []Stroke) []Center {
 		}
 		lower := math.Max(a.Low, math.Max(b.Low, c.Low))
 		upper := math.Min(a.High, math.Min(b.High, c.High))
-		if lower >= upper {
+		if priceGreaterOrEqual(lower, upper) {
 			i++
 			continue
 		}
 		center := Center{Level: 0, Kind: "pen", InputKind: "stroke", Start: a.Start.Date, End: c.End.Date, Chain: a.Chain, Lower: lower, Upper: upper,
-			ConfirmedAt: c.ConfirmedAt, StartStroke: i, EndStroke: i + 2, StrokeCount: 3}
+			FormedAt: c.ConfirmedAt, ConfirmedAt: c.ConfirmedAt, StartStroke: i, EndStroke: i + 2, StrokeCount: 3}
 		j := i + 3
-		for j < len(strokes) && strokes[j].Chain == a.Chain && strokes[j].Confirmed && strokes[j].Low < upper && strokes[j].High > lower {
+		for j < len(strokes) && strokes[j].Chain == a.Chain && strokes[j].Confirmed && priceLess(strokes[j].Low, upper) && priceGreater(strokes[j].High, lower) {
 			center.End, center.EndStroke, center.StrokeCount = strokes[j].End.Date, j, center.StrokeCount+1
 			j++
+		}
+		if j < len(strokes) && strokes[j].Chain == a.Chain && strokes[j].Confirmed {
+			center.ClosedAt = strokes[j].ConfirmedAt
 		}
 		centers = append(centers, center)
 		// First pen wholly outside the center begins the search for the next
@@ -1836,7 +1877,7 @@ func analyzeFrame(bars []Bar, period, label string, spot *float64) Frame {
 func analyzeFrameWithComponents(bars []Bar, period, label string, spot *float64, merged []mergedBar, fractals []Fractal, histogram []float64) Frame {
 	frame := Frame{Period: period, Label: label, Status: "insufficient", BarCount: len(bars), Level: 0,
 		Direction: "unknown", Structure: "等待笔中枢形成", Candles: []Bar{}, Fractals: []Fractal{}, Strokes: []Stroke{},
-		Centers: []Center{}, Signals: []Signal{}, Scenarios: []Scenario{}, Warnings: []string{}}
+		Centers: []Center{}, Signals: []Signal{}, PenSignals: []Signal{}, Scenarios: []Scenario{}, Warnings: []string{}}
 	frame.Timeframe = period
 	if len(bars) > 0 {
 		frame.AsOf, frame.LastClose = bars[len(bars)-1].Date, ptr(bars[len(bars)-1].Close)
@@ -1874,18 +1915,13 @@ func analyzeFrameWithComponents(bars []Bar, period, label string, spot *float64,
 	}
 	if len(currentCenters) > 0 {
 		frame.Status = "ready"
-		frame.Signals = append(structuralSignals(frame.Strokes, currentCenters), turningSignals(frame.Strokes, currentCenters, bars)...)
+		frame.Signals = turningSignals(frame.Strokes, currentCenters, bars)
 		frame.Scenarios = scenarios(frame.Position)
 		frame.Structure = centerStructure(currentCenters)
 	} else {
 		frame.Warnings = append(frame.Warnings, "尚未形成由三根已确认笔重叠构成的中枢，暂不推演中枢突破与回试")
 	}
-	// Keep historical pen-level third-point observations in their own field;
-	// they are not recursive v4 buy/sell signals and must not be mixed into the
-	// structural signal contract.
-	frame.PenSignals = penThirdPointSignals(frame.Strokes, frame.Centers)
 	invalidateSignals(frame.Signals, bars, spot)
-	invalidateSignals(frame.PenSignals, bars, spot)
 	if len(bars) < 60 {
 		frame.Warnings = append(frame.Warnings, "历史长度不足 60 根，MACD 力度比较暂不输出")
 	}
@@ -1908,12 +1944,12 @@ func locate(centers []Center, spot *float64) Position {
 	position.Center = &center
 	position.Support, position.Resistance = ptr(center.Lower), ptr(center.Upper)
 	switch {
-	case *spot > center.Upper:
+	case priceGreater(*spot, center.Upper):
 		position.Code, position.Label = "above", "位于最近中枢上方"
 		position.Detail = "现价向上离开中枢；需观察回试是否守住中枢上沿"
 		position.Support = ptr(center.Upper)
 		position.Resistance = nil
-	case *spot < center.Lower:
+	case priceLess(*spot, center.Lower):
 		position.Code, position.Label = "below", "位于最近中枢下方"
 		position.Detail = "现价向下离开中枢；需观察反抽能否重新进入中枢"
 		position.Support = nil
@@ -1925,108 +1961,6 @@ func locate(centers []Center, spot *float64) Position {
 	return position
 }
 
-func structuralSignals(strokes []Stroke, centers []Center) []Signal {
-	signals := []Signal{}
-	if len(strokes) < 2 {
-		return signals
-	}
-	// Compare the newest fixed pen, never the mutable last pen. Signals are
-	// observations at their confirmation dates; invalidation is explicit.
-	index := len(strokes) - 2
-	current := strokes[index]
-	if index < 1 || !current.Confirmed || strokes[index-1].Chain != current.Chain {
-		return signals
-	}
-	var center *Center
-	for i := range centers {
-		if centers[i].EndStroke < index {
-			center = &centers[i]
-		}
-	}
-	if center != nil && center.Chain == current.Chain && index >= 1 && center.EndStroke == index-1 {
-		departure := strokes[index-1]
-		if current.Direction == "down" && departure.Direction == "up" && departure.End.Price > center.Upper && current.Low > center.Upper {
-			signals = append(signals, Signal{Kind: "third_buy_candidate", Label: "第三类买点候选（笔结构）", Status: "candidate",
-				Date: current.End.Date, ConfirmedAt: current.ConfirmedAt, Invalidation: ptr(center.Upper),
-				Detail: "向上离开中枢后的回试笔已固定，低点未进入中枢；仍需次级别走势确认"})
-		}
-		if current.Direction == "up" && departure.Direction == "down" && departure.End.Price < center.Lower && current.High < center.Lower {
-			signals = append(signals, Signal{Kind: "third_sell_candidate", Label: "第三类卖点候选（笔结构）", Status: "candidate",
-				Date: current.End.Date, ConfirmedAt: current.ConfirmedAt, Invalidation: ptr(center.Lower),
-				Detail: "向下离开中枢后的反抽笔已固定，高点未进入中枢；仍需次级别走势确认"})
-		}
-	}
-	return signals
-}
-
-// penThirdPointSignals keeps the reference implementation's historical
-// pen-level third-buy/third-sell observations visible. They are not recursive
-// Chan-level signals: the UI labels them as pen observations, and v4 signal
-// generation continues to use only RecursiveLevels.
-func penThirdPointSignals(strokes []Stroke, centers []Center) []Signal {
-	result := []Signal{}
-	seen := map[string]bool{}
-	for _, center := range centers {
-		if center.StartStroke < 0 || center.StartStroke >= len(strokes) {
-			continue
-		}
-		for _, buy := range []bool{true, false} {
-			leftCenter, departureIndex := false, -1
-			for index := center.StartStroke; index < len(strokes); index++ {
-				stroke := strokes[index]
-				if stroke.Chain != center.Chain {
-					break
-				}
-				if !stroke.Confirmed || stroke.Start.Date < center.Start {
-					continue
-				}
-				leaves := buy && stroke.Direction == "up" && stroke.End.Price > center.Upper ||
-					!buy && stroke.Direction == "down" && stroke.End.Price < center.Lower
-				if !leftCenter && leaves {
-					leftCenter, departureIndex = true, index
-					continue
-				}
-				if !leftCenter || buy && stroke.Direction != "down" || !buy && stroke.Direction != "up" {
-					continue
-				}
-				departure := strokes[departureIndex]
-				boundary, returned := center.Upper, stroke.End.Price >= center.Upper
-				kind, label, side := "third_buy_candidate", "第三类买点观察（笔级）", "buy"
-				leavePower := departure.End.Price/departure.Start.Price - 1
-				pullPower := math.Abs(stroke.End.Price/stroke.Start.Price - 1)
-				if !buy {
-					boundary, returned = center.Lower, stroke.End.Price <= center.Lower
-					kind, label, side = "third_sell_candidate", "第三类卖点观察（笔级）", "sell"
-					leavePower = math.Abs(departure.End.Price/departure.Start.Price - 1)
-					pullPower = stroke.End.Price/stroke.Start.Price - 1
-				}
-				if !returned {
-					leftCenter = false
-					departureIndex = -1
-					continue
-				}
-				if pullPower <= 0 {
-					break
-				}
-				ratio := leavePower / pullPower
-				identity := kind + "|" + stroke.End.Date
-				if ratio > 1 && !seen[identity] {
-					seen[identity] = true
-					result = append(result, Signal{Kind: kind, Label: label, Status: "candidate", Side: side,
-						Date: stroke.End.Date, OriginDate: stroke.End.Date, ObservedAt: stroke.ConfirmedAt,
-						ConfirmedAt: stroke.ConfirmedAt, PhaseAt: stroke.ConfirmedAt, Phase: "pen_observation",
-						Price: ptr(stroke.End.Price), Invalidation: ptr(boundary), StrengthRatio: ptr(ratio),
-						Detail: "同一已形成笔中枢外侧的离开与首次回试满足笔级三类位置条件；这是参考实现的笔级观察，不等同于递归级别买卖点"})
-				}
-				// The reference scans only the first opposite pen. A failed
-				// strength check is not retried with a later, weaker retest.
-				break
-			}
-		}
-	}
-	return result
-}
-
 func invalidateSignals(signals []Signal, bars []Bar, spot *float64) {
 	for i := range signals {
 		signal := &signals[i]
@@ -2034,8 +1968,8 @@ func invalidateSignals(signals []Signal, bars []Bar, spot *float64) {
 			continue
 		}
 		broken := func(low, high float64) bool {
-			return (signal.Kind == "third_buy_candidate" || signal.Kind == "bottom_reversal_candidate") && low <= *signal.Invalidation ||
-				(signal.Kind == "third_sell_candidate" || signal.Kind == "top_exit_candidate") && high >= *signal.Invalidation
+			return signal.Kind == "bottom_reversal_candidate" && low <= *signal.Invalidation ||
+				signal.Kind == "top_exit_candidate" && high >= *signal.Invalidation
 		}
 		invalid := spot != nil && broken(*spot, *spot)
 		since := signal.ConfirmedAt
@@ -2064,7 +1998,7 @@ func invalidateSignals(signals []Signal, bars []Bar, spot *float64) {
 
 func invalidatableSignal(kind string) bool {
 	switch kind {
-	case "third_buy_candidate", "third_sell_candidate", "bottom_reversal_candidate", "top_exit_candidate":
+	case "bottom_reversal_candidate", "top_exit_candidate":
 		return true
 	default:
 		return false
@@ -2076,10 +2010,10 @@ func centerStructure(centers []Center) string {
 		return "单个笔中枢，观察延伸与离开"
 	}
 	previous, latest := centers[len(centers)-2], centers[len(centers)-1]
-	if latest.Lower > previous.Upper {
+	if priceGreater(latest.Lower, previous.Upper) {
 		return "相邻笔中枢向上抬升且不重叠"
 	}
-	if latest.Upper < previous.Lower {
+	if priceLess(latest.Upper, previous.Lower) {
 		return "相邻笔中枢向下移动且不重叠"
 	}
 	return "相邻笔中枢区间仍有重叠或接触"

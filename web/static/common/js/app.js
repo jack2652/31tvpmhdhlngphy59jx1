@@ -66,9 +66,9 @@ const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 });
 let expirationCutoffCatalog = { symbol: "", values: null };
 let expirationCutoffTimer = null;
-const CHAN_CHART_PREFERENCES_VERSION = 13;
+const CHAN_CHART_PREFERENCES_VERSION = 14;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, structureSupports: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
 const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
 const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false, mfi: false };
 function readChainViewPreference() {
@@ -154,7 +154,7 @@ function readChanChartPreferences() {
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "mfi"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "structureSupports", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "mfi"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -7032,7 +7032,9 @@ const optionScopeApp = new Vue({
         this.toggleChanSubchart("mfi");
         return;
       }
-      if (EXCLUSIVE_CHAN_INDICATOR_LAYERS.includes(layer)) {
+      if (layer === "segments") {
+        this.chanChartLayers = OptionScopeChan.toggleAllSegmentLevels(this.chanChartLayers, this.chanSegmentLevels);
+      } else if (EXCLUSIVE_CHAN_INDICATOR_LAYERS.includes(layer)) {
         const enabled = !this.chanChartLayers[layer];
         this.chanChartLayers = {
           ...this.chanChartLayers,
@@ -7043,7 +7045,7 @@ const optionScopeApp = new Vue({
           supertrend: enabled && layer === "supertrend",
           wyckoff: enabled && layer === "wyckoff",
         };
-      } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "trendlines") {
+      } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "structureSupports" || layer === "trendlines") {
         this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };
       } else {
         const level = Number(layer);
@@ -7062,6 +7064,9 @@ const optionScopeApp = new Vue({
     },
     isChanSegmentLevelVisible(level) {
       return OptionScopeChan.isSegmentLevelVisible(this.chanChartLayers, level);
+    },
+    areAllChanSegmentLevelsVisible() {
+      return OptionScopeChan.allSegmentLevelsVisible(this.chanChartLayers, this.chanSegmentLevels);
     },
     isChanRecursiveCenterLevelVisible(level) {
       return OptionScopeChan.isRecursiveCenterLevelVisible(this.chanChartLayers, level);

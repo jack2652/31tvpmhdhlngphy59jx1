@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -16,12 +17,27 @@ type summary struct {
 	Symbol                                                                                                           string `json:"symbol"`
 	FetchError                                                                                                       string `json:"fetch_error,omitempty"`
 	AnalysisError                                                                                                    string `json:"analysis_error,omitempty"`
+	RuleVersion                                                                                                      string `json:"rule_version,omitempty"`
 	Bars, Accepted, Chains, Strokes, Segments, ConfirmedSegments, Centers, Signals                                   int
+	PlottableSignals                                                                                                 int `json:"plottable_signals"`
 	Start, End                                                                                                       string
 	Quality                                                                                                          string
 	SignalIDs                                                                                                        []string                            `json:"signal_ids,omitempty"`
+	SignalDetails                                                                                                    []signalDetail                      `json:"signal_details,omitempty"`
+	SignalCounts                                                                                                     map[string]int                      `json:"signal_counts,omitempty"`
 	Calibration                                                                                                      []chananalysis.ThresholdCalibration `json:"calibration,omitempty"`
 	WeeklyBars, WeeklyAccepted, WeeklyStrokes, WeeklySegments, WeeklyConfirmedSegments, WeeklyCenters, WeeklySignals int
+}
+
+type signalDetail struct {
+	Kind        string   `json:"kind"`
+	Status      string   `json:"status"`
+	Phase       string   `json:"phase"`
+	Date        string   `json:"date"`
+	ObservedAt  string   `json:"observed_at"`
+	ConfirmedAt string   `json:"confirmed_at"`
+	Price       *float64 `json:"price,omitempty"`
+	SourceKind  string   `json:"source_kind"`
 }
 
 func main() {
@@ -39,7 +55,7 @@ func main() {
 	if len(symbols) == 0 {
 		symbols = []string{"SPY", "DIA", "IWM", "AAPL", "MSFT", "NVDA", "XLF", "TLT", "GLD", "^GSPC"}
 	}
-	cutoff := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	cutoff := time.Now().UTC()
 	for _, symbol := range symbols {
 		s := summary{Symbol: symbol}
 		history, err := h.ChanAdjustedHistory(ctx, symbol, period)
@@ -65,6 +81,7 @@ func main() {
 		s.Segments = len(result.Daily.Segments)
 		s.Centers = len(result.Daily.RecursiveCenters)
 		s.Signals = len(result.Daily.SignalsV4)
+		s.RuleVersion = result.RuleVersion
 		s.Quality = result.Daily.Quality.Status
 		s.WeeklyBars = result.Weekly.Quality.InputBars
 		s.WeeklyAccepted = result.Weekly.Quality.AcceptedBars
@@ -86,6 +103,17 @@ func main() {
 		}
 		for _, sig := range result.Daily.SignalsV4 {
 			s.SignalIDs = append(s.SignalIDs, sig.SignalID)
+			if sig.Price != nil && finitePositive(*sig.Price) && sig.Date != "" {
+				s.PlottableSignals++
+			}
+			if s.SignalCounts == nil {
+				s.SignalCounts = make(map[string]int)
+			}
+			s.SignalCounts[sig.Kind+"|"+sig.Status+"|"+sig.SourceKind]++
+			s.SignalDetails = append(s.SignalDetails, signalDetail{
+				Kind: sig.Kind, Status: sig.Status, Phase: sig.Phase, Date: sig.Date,
+				ObservedAt: sig.ObservedAt, ConfirmedAt: sig.ConfirmedAt, Price: sig.Price, SourceKind: sig.SourceKind,
+			})
 		}
 		if os.Getenv("CHAN_SCAN_CALIBRATE") != "false" {
 			calibration, calibrationErr := chananalysis.CalibrateDivergenceThresholds(symbol, bars, []float64{0.6, 0.7, 0.8, 0.9})
@@ -101,6 +129,9 @@ func main() {
 
 func write(v summary)  { b, _ := json.Marshal(v); fmt.Println(string(b)) }
 func str(v any) string { s, _ := v.(string); return s }
+func finitePositive(value float64) bool {
+	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
 func num(v any) float64 {
 	switch x := v.(type) {
 	case float64:

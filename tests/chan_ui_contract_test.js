@@ -8,14 +8,15 @@ const readme = fs.readFileSync("README.md", "utf8");
 const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
 const styles = fs.readFileSync("web/static/common/css/styles.css", "utf8");
 
-assert.match(template, /class="chan-meta"[^>]*>[\s\S]*?chanFrame.dataSummary/, "Chan summary must be rendered in the quote metadata row");
-assert.match(template, /chanChartLayers\.recursiveCenters && chanChartLayers\.recursiveCenters\[level\] === true/, "recursive layer controls must tolerate missing persisted layer state");
+assert.match(template, /<div class="chan-summary">[\s\S]*?<h2>\{\{ chanFrame\.recursive\.heading \}\}<\/h2>[\s\S]*?<div class="chan-meta">[\s\S]*?chanStatusLine/, "Chan summary and status must be rendered in the dedicated structure summary");
+assert.match(template, /isChanRecursiveCenterLevelVisible\(level\)/, "recursive center controls must read the guarded visibility accessor");
 assert.match(template, /aria-label="显示或隐藏全部级别的线段"[^>]*@click="toggleChanChartLayer\('segments'\)"/, "the all-segments master switch must remain available and connected regardless of the currently available levels");
 assert.match(template, /v-for="level in chanSegmentLevels"[^>]*toggleChanSegmentLevel\(level\)/, "each available segment level must retain its independent visibility control");
 assert.match(template, /\{\{ chanTurningStatus\(0\) \}\} \/ \{\{ chanTurningStatus\(1\) \}\}/, "turning status summary must use its guarded accessor instead of indexing the frame array in the template");
 assert.doesNotMatch(template, /chanFrame\.turning\[[01]\]/, "template must not directly index turning data that can be absent during initial render");
 assert.match(app, /chanTurningStatus\(index\) \{[\s\S]*?Array\.isArray\(turning\) \? turning\[index\] : null[\s\S]*?item\?\.status \|\| "等待信号"/, "turning status accessor must tolerate an absent frame array and return a fallback");
-assert.match(app, /const recursiveCenters = this\.chanChartLayers\?\.recursiveCenters \|\| \{\};[\s\S]*?recursiveCenters\[level\] !== true/, "recursive center toggles must tolerate a missing layer map");
+assert.match(app, /const recursiveCenters = this\.chanChartLayers\?\.recursiveCenters \|\| \{\};[\s\S]*?recursiveCenters, \[level\]: !OptionScopeChan\.isRecursiveCenterLevelVisible\(this\.chanChartLayers, level\)/, "recursive center toggles must tolerate a missing layer map");
+assert.match(app, /layer === "segments"[\s\S]*?toggleAllSegmentLevels\(this\.chanChartLayers, this\.chanSegmentLevels\)/, "the all-segments control must toggle all visible levels as one action");
 assert.match(template, /class="chart-tooltip chan-chart-tooltip"/, "Canvas chart must retain a dedicated structure and OHLC tooltip");
 assert.match(template, /signal.evidenceLabel \|\| signal.detail/, "signal cards must show the structured rule evidence when available");
 assert.ok(client.includes("规则证据："), "signal evidence must list satisfied conditions");
@@ -36,7 +37,7 @@ assert.match(charts, /scenariosVisible && model\.projections\?\.length/, "scenar
 assert.match(app, /chanCanvasBinding\(\) \{ return \{ chart: this\.chanFrame\?\.chart, layers: this\.chanChartLayers, scenariosVisible: this\.chanScenariosVisible \}; \}/, "canvas rendering must follow the scenario visibility state");
 assert.match(template, /class="chan-scenario-toggle-canvas"/, "the scenario toggle must be an HTML button above the canvas");
 assert.doesNotMatch(template, /chan-scenario-toggle-svg/, "the scenario toggle must no longer be rendered as an SVG group");
-assert.match(charts, /fillText\("\\ue7b3"/, "the scenario toggle icon must be painted by the canvas");
+assert.match(charts, /fillText\("\\ue73d"/, "the scenario toggle icon must be painted by the canvas");
 assert.match(template, /class="chan-projection-backdrop"/, "touch scenario cards must offer a backdrop to dismiss the popup");
 assert.match(template, /class="chan-projection-close"/, "touch scenario cards must expose a close button");
 assert.match(styles, /\.chan-projection-float-card\{position:fixed;top:auto!important/, "touch scenario cards must dock to the bottom like the spot guide card");

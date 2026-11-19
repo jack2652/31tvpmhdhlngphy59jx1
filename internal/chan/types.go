@@ -6,7 +6,7 @@ import "time"
 
 const RuleVersion = "strict-old-bi-v3"
 const RecursiveRuleVersion = "chan-recursive-v4.0.0"
-const RecursivePreviewVersion = "chan-recursive-v4-preview.11"
+const RecursivePreviewVersion = "chan-recursive-v4-preview.23"
 
 type Bar struct {
 	// CapturedAt keeps a daily candle fetched before its session close from
@@ -161,6 +161,8 @@ type Center struct {
 	End         string  `json:"end"`
 	Lower       float64 `json:"lower"`
 	Upper       float64 `json:"upper"`
+	FormedAt    string  `json:"formed_at,omitempty"`
+	ClosedAt    string  `json:"closed_at,omitempty"`
 	ConfirmedAt string  `json:"confirmed_at"`
 	StartStroke int     `json:"start_stroke"`
 	EndStroke   int     `json:"end_stroke"`
@@ -234,6 +236,7 @@ type RecursiveCenter struct {
 
 type LevelAnalysis struct {
 	Level      int               `json:"level"`
+	SourceKind string            `json:"source_kind,omitempty"`
 	Status     string            `json:"status"`
 	InputCount int               `json:"input_count"`
 	Strokes    []Stroke          `json:"strokes"`
@@ -272,6 +275,7 @@ type RecursiveTrend struct {
 type Strength struct {
 	Direction      string  `json:"direction"`
 	Level          int     `json:"level"`
+	SourceKind     string  `json:"source_kind,omitempty"`
 	Start          string  `json:"start"`
 	End            string  `json:"end"`
 	ConfirmedAt    string  `json:"confirmed_at"`
@@ -321,6 +325,7 @@ type V4Signal struct {
 	SignalID              string                 `json:"signal_id,omitempty"`
 	Symbol                string                 `json:"symbol"`
 	Level                 int                    `json:"level"`
+	SourceKind            string                 `json:"source_kind,omitempty"`
 	Kind                  string                 `json:"kind"`
 	Side                  string                 `json:"side"`
 	Status                string                 `json:"status"`
@@ -416,7 +421,7 @@ type Frame struct {
 	Strokes            []Stroke            `json:"strokes"`
 	Centers            []Center            `json:"centers"`
 	Signals            []Signal            `json:"signals"`
-	PenSignals         []Signal            `json:"pen_signals"`
+	PenSignals         []Signal            `json:"pen_signals"` // 兼容字段；结构买卖点统一由 SignalsV4 提供。
 	Scenarios          []Scenario          `json:"scenarios"`
 	Warnings           []string            `json:"warnings"`
 	Quality            DataQuality         `json:"quality"`

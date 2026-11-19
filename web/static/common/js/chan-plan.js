@@ -95,10 +95,11 @@
     const higherHigh = priorHigh && olderHigh && priorHigh.price > olderHigh.price;
     const center = frame.position?.center;
     const active = (frame.signals || []).filter((signal) => signal.status === "candidate");
+    const activeClassSignals = (frame.signals_v4 || []).filter((signal) => signal.status !== "invalidated");
     const bottom = active.find((signal) => signal.kind === "bottom_reversal_candidate");
     const top = active.find((signal) => signal.kind === "top_exit_candidate");
-    const thirdBuy = active.find((signal) => signal.kind === "third_buy_candidate");
-    const thirdSell = active.find((signal) => signal.kind === "third_sell_candidate");
+    const thirdBuy = activeClassSignals.find((signal) => signal.kind === "class3_buy" && Number(signal.price) > 0);
+    const thirdSell = activeClassSignals.find((signal) => signal.kind === "class3_sell" && Number(signal.price) > 0);
     const topWatch = (frame.signals || []).find((signal) => signal.kind === "top_exit_candidate" && signal.status === "watch");
     const atr = atr14(frame.candles || []);
     const stop = low.price;

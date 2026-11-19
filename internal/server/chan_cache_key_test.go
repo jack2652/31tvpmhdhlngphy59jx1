@@ -31,7 +31,7 @@ func TestChanAnalysisCacheKeyPreservesJSONFingerprint(t *testing.T) {
 		Intraday []chananalysis.Bar `json:"intraday"`
 		Market   []chananalysis.Bar `json:"market"`
 	}{
-		Version:  chananalysis.RecursivePreviewVersion + "|" + chananalysis.MarketEnvironmentRuleVersion,
+		Version:  chananalysis.RecursivePreviewVersion + "|" + chananalysis.TimeframeMappingVersion + "|" + chananalysis.MarketEnvironmentRuleVersion,
 		Symbol:   "QQQ",
 		Bucket:   bucket,
 		Daily:    daily,

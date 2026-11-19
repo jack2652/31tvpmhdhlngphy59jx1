@@ -17,7 +17,7 @@
     { value: "wyckoff", label: "威科夫阶段" }, { value: "supertrend", label: "超级趋势" },
     { value: "macdSma200", label: "异同移动平均线 + 200期简单均线" },
   ];
-  const defaultLayers = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
+  const defaultLayers = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, structureSupports: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
   const defaultSubcharts = { volume: false, macd: false, dmi: false, mfi: false };
   const exclusiveIndicators = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
   const chartPreferencesKey = "option-scope-futures-chart-preferences";
@@ -306,7 +306,7 @@
         if (exclusiveIndicators.includes(layer)) {
           const enabled = !this.chartLayers[layer];
           this.chartLayers = { ...this.chartLayers, ...Object.fromEntries(exclusiveIndicators.map((key) => [key, enabled && key === layer])) };
-        } else if (["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "trendlines"].includes(layer)) {
+        } else if (["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "structureSupports", "trendlines"].includes(layer)) {
           this.chartLayers = { ...this.chartLayers, [layer]: !this.chartLayers[layer] };
         } else {
           const level = Number(layer);

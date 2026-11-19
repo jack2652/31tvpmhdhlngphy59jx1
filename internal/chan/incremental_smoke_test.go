@@ -45,6 +45,71 @@ func TestIncrementalAnalyzerMatchesEveryAdjustedPrefix(t *testing.T) {
 	}
 }
 
+func TestIncrementalAnalyzerUsesPriceToleranceForFractals(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bars := []Bar{
+		adjustedReplayBar("2026-01-05", 98),
+		adjustedReplayBar("2026-01-06", 99.5),
+		adjustedReplayBar("2026-01-07", 99),
+		adjustedReplayBar("2026-01-08", 98),
+	}
+	bars[0].High, bars[0].Low = 100, 95
+	bars[1].High, bars[1].Low = 100+5e-7, 99
+	bars[2].High, bars[2].Low = 100, 98
+	bars[3].High, bars[3].Low = 99, 97.5
+	for index := range bars {
+		bars[index].RawHigh, bars[index].RawLow = bars[index].High, bars[index].Low
+	}
+
+	state := NewIncrementalAnalyzer("PRICE-TOLERANCE")
+	var incremental Result
+	for _, bar := range bars {
+		incremental, err = state.Append(bar, dayForBarClose(bar.Date, location))
+		if err != nil {
+			t.Fatalf("append %s: %v", bar.Date, err)
+		}
+	}
+	full := AnalyzeAdjusted("PRICE-TOLERANCE", bars, nil, dayForBarClose(bars[len(bars)-1].Date, location))
+	if !sameRecursiveFrame(incremental.Daily, full.Daily) {
+		t.Fatal("incremental structure differs from full analysis for a sub-tolerance fractal edge")
+	}
+	for _, fractal := range incremental.Daily.FractalsV4 {
+		if fractal.Kind == "top" && fractal.Date == "2026-01-06" {
+			t.Fatalf("sub-tolerance high difference produced a top fractal: %+v", fractal)
+		}
+	}
+}
+
+func TestIncrementalAnalyzerPreservesVerifiedLargeMoveChain(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bars := []Bar{
+		adjustedReplayBar("2026-01-05", 100),
+		adjustedReplayBar("2026-01-06", 136),
+		adjustedReplayBar("2026-01-07", 132),
+	}
+	state := NewIncrementalAnalyzer("LARGE-MOVE")
+	var result Result
+	for index, bar := range bars {
+		result, err = state.Append(bar, dayForBarClose(bar.Date, location))
+		if err != nil {
+			t.Fatalf("append %s: %v", bar.Date, err)
+		}
+		full := AnalyzeAdjusted("LARGE-MOVE", bars[:index+1], nil, dayForBarClose(bar.Date, location))
+		if !sameRecursiveFrame(result.Daily, full.Daily) {
+			t.Fatalf("incremental structure diverged from full analysis after %s", bar.Date)
+		}
+	}
+	if len(result.Daily.Quality.Chains) != 1 || result.Daily.Quality.Chains[0].Start != "2026-01-05" || result.Daily.Quality.Chains[0].End != "2026-01-07" {
+		t.Fatalf("quality chains=%+v, want complete verified history in one chain", result.Daily.Quality.Chains)
+	}
+}
+
 func TestIncrementalAnalyzerRejectsNonAppendUpdatesWithoutMutation(t *testing.T) {
 	location, _ := time.LoadLocation("America/New_York")
 	bar := adjustedReplayBar("2026-01-02", 100)

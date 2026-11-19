@@ -37,9 +37,18 @@ func main() {
 		for _, row := range rows {
 			bars = append(bars, chananalysis.Bar{Date: str(row["date"]), Open: num(row["open"]), High: num(row["high"]), Low: num(row["low"]), Close: num(row["close"]), Volume: num(row["volume"]), RawOpen: num(row["raw_open"]), RawHigh: num(row["raw_high"]), RawLow: num(row["raw_low"]), RawClose: num(row["raw_close"]), AdjustmentFactor: num(row["adjustment_factor"])})
 		}
-		out := chananalysis.AnalyzeAdjusted(symbol, bars, nil, time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC))
+		out := chananalysis.AnalyzeAdjusted(symbol, bars, nil, time.Now())
 		f := out.Daily
 		fmt.Printf("%s bars=%d chains=%d strokes=%d segments=%d centers=%d signals=%d\n", symbol, f.Quality.AcceptedBars, len(f.Quality.Chains), len(f.StrokesV4), len(f.Segments), len(f.RecursiveCenters), len(f.SignalsV4))
+		for _, level := range f.RecursiveLevels {
+			fmt.Printf("level=%d status=%s segments=%d centers=%d waiting=%s\n", level.Level, level.Status, len(level.Segments), len(level.Centers), level.WaitingFor)
+			for _, center := range level.Centers {
+				fmt.Printf("center level=%d id=%s chain=%d range=%s..%s zone=%.4f..%.4f formed=%s closed=%s confirmed=%s forming=%t index=%d..%d owner=%d\n", center.Level, center.CenterID, center.Chain, center.Start, center.End, center.Lower, center.Upper, center.FormedAt, center.ClosedAt, center.ConfirmedAt, center.Forming, center.StartSegment, center.EndSegment, center.OwnerMoveIndex)
+			}
+		}
+		for _, signal := range f.SignalsV4 {
+			fmt.Printf("signal kind=%s status=%s date=%s observed=%s confirmed=%s center=%s\n", signal.Kind, signal.Status, signal.Date, signal.ObservedAt, signal.ConfirmedAt, signal.RelatedCenterID)
+		}
 		for _, fractal := range f.FractalsV4 {
 			if fractal.Date >= "2025-03-01" && fractal.Date <= "2025-09-01" {
 				fmt.Printf("fractal chain=%d kind=%s date=%s price=%.4f confirmed=%s merged=%d\n", fractal.Chain, fractal.Kind, fractal.Date, fractal.Price, fractal.ConfirmedAt, fractal.MergedIndex)

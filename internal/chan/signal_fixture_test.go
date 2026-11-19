@@ -38,6 +38,32 @@ func TestSignalFixturesCoverClassOneDirectionsWaitingMarketAndInvalidation(t *te
 	}
 }
 
+func TestAnalyzeExposesOneRecursiveClassSignalSource(t *testing.T) {
+	daily, _, cutoff := benchmarkBars()
+	result := Analyze("CANONICAL", daily, nil, cutoff)
+	if result.RuleVersion != RecursivePreviewVersion || result.LegacyRuleVersion != RuleVersion {
+		t.Fatalf("analysis versions=%q legacy=%q", result.RuleVersion, result.LegacyRuleVersion)
+	}
+	for _, frame := range []Frame{result.Daily, result.Weekly} {
+		if frame.SignalsV4 == nil || frame.PenSignals == nil {
+			t.Fatalf("frame %s did not initialize canonical/deprecated signal arrays", frame.Period)
+		}
+		if len(frame.PenSignals) != 0 {
+			t.Fatalf("frame %s still emits a second pen-level class-point source: %+v", frame.Period, frame.PenSignals)
+		}
+		for _, signal := range frame.Signals {
+			if signal.Kind != "bottom_reversal_candidate" && signal.Kind != "top_exit_candidate" {
+				t.Fatalf("legacy frame %s emitted structural class point %q; class points belong in signals_v4", frame.Period, signal.Kind)
+			}
+		}
+		for _, signal := range frame.SignalsV4 {
+			if signal.RuleVersion != RecursivePreviewVersion {
+				t.Fatalf("frame %s signal %q has version %q", frame.Period, signal.Kind, signal.RuleVersion)
+			}
+		}
+	}
+}
+
 func TestSignalFixturesCoverClassTwoAndThreeInBothDirections(t *testing.T) {
 	for _, side := range []string{"buy", "sell"} {
 		t.Run("class2_"+side, func(t *testing.T) {
@@ -113,8 +139,8 @@ func classTwoFixture() (V4Signal, LevelAnalysis, LevelAnalysis) {
 		{Chain: 3, Level: 1, Direction: "up", Start: "16", End: "17", Confirmed: true, ConfirmedAt: "17"},
 	}}
 	lower := LevelAnalysis{Level: 0, Status: "ready", Segments: []Segment{
-		{Chain: 3, Level: 0, Direction: "up", Start: "12", End: "14", Low: 90, High: 110, EndPrice: 110, Confirmed: true, ConfirmedAt: "14"},
-		{Chain: 3, Level: 0, Direction: "down", Start: "14", End: "16", Low: 96, High: 110, EndPrice: 96, Confirmed: true, ConfirmedAt: "16"},
+		{Chain: 3, Level: 0, Direction: "up", Start: "12", End: "14", StartPrice: 100, EndPrice: 110, Low: 90, High: 110, Confirmed: true, ConfirmedAt: "14"},
+		{Chain: 3, Level: 0, Direction: "down", Start: "14", End: "16", StartPrice: 110, EndPrice: 96, Low: 96, High: 110, Confirmed: true, ConfirmedAt: "16"},
 	}}
 	return parent, parentLevel, lower
 }
@@ -126,7 +152,7 @@ func classThreeFixture() LevelAnalysis {
 		{Level: 0, Chain: 0, Direction: "down", Start: "02", End: "03", Confirmed: true, ConfirmedAt: "03"},
 		{Level: 0, Chain: 0, Direction: "up", Start: "03", End: "04", Confirmed: true, ConfirmedAt: "04"},
 		{Level: 0, Chain: 0, Direction: "up", Start: "04", End: "05", EndPrice: 15, Low: 10, High: 15, Confirmed: true, ConfirmedAt: "05"},
-		{Level: 0, Chain: 0, Direction: "down", Start: "05", End: "06", EndPrice: 12, Low: 11, High: 15, Confirmed: true, ConfirmedAt: "06"},
+		{Level: 0, Chain: 0, Direction: "down", Start: "05", End: "06", StartPrice: 15, EndPrice: 12, Low: 11, High: 15, Confirmed: true, ConfirmedAt: "06"},
 	}
 	return LevelAnalysis{Level: 0, Status: "ready", Segments: segments, Centers: []RecursiveCenter{center}}
 }

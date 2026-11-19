@@ -23,6 +23,126 @@
   const cacheObjectIds = new WeakMap();
   let nextCacheObjectId = 1;
   const afStochZCache = new WeakMap();
+  const structureSupportCache = new WeakMap();
+  const STRUCTURE_SUPPORT_MERGE_RATIO = 0.003;
+  const MAX_STRUCTURE_SUPPORTS = 6;
+
+  // 支撑来自当前连续链的已确认结构，使用收盘行情判定失守，不随现价或可视窗口选点。
+  function structureSupportLevels(frame) {
+    const candles = frame.candles || [];
+    const completed = candles.filter((bar) => bar.is_forming !== true && (!frame.as_of || bar.date <= frame.as_of));
+    const latest = completed[completed.length - 1];
+    if (!latest || !Number.isFinite(Number(latest.close)) || Number(latest.close) <= 0) return [];
+    const recursive = Array.isArray(frame.strokes_v4);
+    const strokes = recursive ? frame.strokes_v4 : (frame.strokes || []);
+    const signature = [strokes, frame.segments, frame.centers, frame.recursive_centers, frame.recursive_levels, frame.structure_chains_v4]
+      .map(cacheObjectId).join(":") + ":" + (frame.as_of || latest.date);
+    const cached = structureSupportCache.get(candles);
+    if (cached?.signature === signature) return cached.levels;
+    const dataChain = Number(latest.chain_id) || 0;
+    const chainBars = completed.filter((bar) => (Number(bar.chain_id) || 0) === dataChain);
+    const structureChain = (frame.structure_chains_v4 || []).filter((chain) => (Number(chain.data_chain_id) || 0) === dataChain).slice(-1)[0];
+    const lastStroke = strokes[strokes.length - 1];
+    const activeChain = recursive ? Number(structureChain?.chain_id ?? lastStroke?.start?.chain_id ?? lastStroke?.chain ?? dataChain) : dataChain;
+    const chainStart = structureChain?.start || chainBars[0]?.date || latest.date;
+    const candidates = [];
+    const add = (priceValue, date, confirmedAt, source, chain, upperBoundary = false) => {
+      const price = Number(priceValue);
+      if (!date || date < chainStart || date > latest.date || !confirmedAt || confirmedAt > latest.date
+        || !Number.isFinite(price) || price <= 0 || Number(chain) !== activeChain) return;
+      let pointDate = date;
+      let start = chainBars.findIndex((bar) => bar.date >= confirmedAt && bar.date >= date);
+      if (start < 0) return;
+      // 中枢上沿先由收盘站上，才成为可观察的回踩支撑。
+      if (upperBoundary) {
+        while (start < chainBars.length && !(Number(chainBars[start].close) > price)) start += 1;
+        if (start >= chainBars.length) return;
+        confirmedAt = chainBars[start].date;
+        pointDate = confirmedAt;
+      }
+      const prior = candidates.find((item) => item.price === price && item.date === date && item.source === source);
+      if (prior && prior.confirmedAt <= confirmedAt) return;
+      if (prior) candidates.splice(candidates.indexOf(prior), 1);
+      const broken = chainBars.slice(start).find((bar) => Number(bar.close) < price * (1 - STRUCTURE_SUPPORT_MERGE_RATIO));
+      candidates.push({ price, date, pointDate, confirmedAt, source, brokenAt: broken?.date || "", status: broken ? "broken" : "active" });
+    };
+    for (const stroke of strokes) {
+      if (stroke.confirmed !== true) continue;
+      const confirmedAt = stroke.confirmed_at || stroke.end?.confirmed_at;
+      for (const point of [stroke.start, stroke.end]) {
+        if (point?.kind === "bottom") add(point.price, point.date, confirmedAt, "已确认笔低点", point.chain_id ?? stroke.chain ?? activeChain);
+      }
+    }
+    const segments = frame.recursive_levels?.length ? frame.recursive_levels.flatMap((level) => level.segments || []) : (frame.segments || []);
+    for (const segment of segments) {
+      if (segment.confirmed !== true || segment.forming === true) continue;
+      const source = (Number(segment.level) === 0 ? "已确认线段" : "第" + (Number(segment.level) + 1) + "层走势") + "低点";
+      if (segment.start_kind === "bottom") add(segment.start_price, segment.start, segment.confirmed_at, source, segment.chain_id ?? activeChain);
+      if (segment.end_kind === "bottom") add(segment.end_price, segment.end, segment.confirmed_at, source, segment.chain_id ?? activeChain);
+    }
+    const centers = recursive ? (frame.recursive_centers || []) : (frame.centers || []);
+    for (const center of centers) {
+      if (center.forming === true || !center.confirmed_at) continue;
+      const prefix = recursive ? "第" + (Number(center.level) + 1) + "层中枢" : "笔中枢";
+      const chain = center.chain_id ?? center.chain ?? activeChain;
+      add(center.zd ?? center.lower, center.start, center.confirmed_at, prefix + "下沿", chain);
+      add(center.zg ?? center.upper, center.start, center.confirmed_at, prefix + "上沿回踩", chain, true);
+    }
+    // 同状态价位合并；失守旧结构不拖累后来在同价位确认的新支撑。
+    const groups = [];
+    for (const candidate of candidates.sort((a, b) => a.price - b.price || a.date.localeCompare(b.date))) {
+      let group = groups.find((item) => item.status === candidate.status && (candidate.price - item.low) / item.low <= STRUCTURE_SUPPORT_MERGE_RATIO);
+      if (!group) {
+        group = { low: candidate.price, high: candidate.price, status: candidate.status, members: [] };
+        groups.push(group);
+      }
+      group.high = Math.max(group.high, candidate.price);
+      group.members.push(candidate);
+    }
+    const levels = groups.map((group) => {
+      const members = group.members.sort((a, b) => a.confirmedAt.localeCompare(b.confirmedAt));
+      const date = members.reduce((earliest, item) => item.date < earliest ? item.date : earliest, members[0].date);
+      const confirmedAt = members[0].confirmedAt;
+      const pointDate = members[0].pointDate;
+      const brokenAt = group.status === "broken" ? members.reduce((last, item) => item.brokenAt > last ? item.brokenAt : last, "") : "";
+      const price = group.low;
+      return { key: "support-" + date + "-" + price + "-" + group.status, price, zoneLow: group.low, zoneHigh: group.high,
+        date, pointDate, confirmedAt, brokenAt, status: group.status, sources: [...new Set(members.map((item) => item.source))].join("、"),
+        lastConfirmedAt: members[members.length - 1].confirmedAt, lastCloseDate: latest.date,
+        priceLabel: money(price), zoneLabel: group.low === group.high ? money(price) : money(group.low) + "–" + money(group.high),
+        statusLabel: group.status === "broken" ? "收盘已失守" : "结构支撑" };
+    });
+    const byDistance = (a, b) => Math.abs(a.price - latest.close) - Math.abs(b.price - latest.close) || b.lastConfirmedAt.localeCompare(a.lastConfirmedAt);
+    const active = levels.filter((level) => level.status === "active").sort(byDistance);
+    const broken = levels.filter((level) => level.status === "broken").sort((a, b) => b.brokenAt.localeCompare(a.brokenAt) || byDistance(a, b)).slice(0, 2);
+    const selected = [...active.slice(0, MAX_STRUCTURE_SUPPORTS - broken.length), ...broken].sort((a, b) => b.price - a.price);
+    structureSupportCache.set(candles, { signature, levels: selected });
+    return selected;
+  }
+
+  // 标签在价格窗内错开；支撑线价格坐标不因避让而改变。
+  function layoutStructureSupports(levels, bars, firstDate, lastDate, minimum, maximum, x, y, left, right, top, bottom, mobile) {
+    const rows = levels.filter((level) => level.confirmedAt <= lastDate && level.price > minimum && level.price < maximum).map((level) => {
+      const index = bars.findIndex((bar) => bar.date >= level.confirmedAt);
+      const pointIndex = bars.findIndex((bar) => bar.date === level.pointDate);
+      const broken = level.brokenAt && level.brokenAt <= lastDate;
+      return { ...level, status: broken ? "broken" : "active", statusLabel: broken ? "收盘已失守" : "结构支撑",
+        x1: level.confirmedAt < firstDate ? left : x(Math.max(0, index)), x2: right, y: y(level.price),
+        pointX: pointIndex < 0 ? null : x(pointIndex), pointY: y(level.price), labelX: right - 5,
+        label: (broken ? "失守 " : "支撑 ") + level.priceLabel };
+    }).sort((a, b) => a.y - b.y);
+    const gap = mobile ? 21 : 18;
+    let previousY = top;
+    for (const row of rows) {
+      row.labelY = Math.max(row.y - 5, previousY + gap);
+      previousY = row.labelY;
+    }
+    if (rows.length && rows[rows.length - 1].labelY > bottom - 5) {
+      rows[rows.length - 1].labelY = bottom - 5;
+      for (let index = rows.length - 2; index >= 0; index -= 1) rows[index].labelY = Math.min(rows[index].labelY, rows[index + 1].labelY - gap);
+    }
+    return rows;
+  }
 
   function cacheObjectId(value) {
     if (!value || typeof value !== "object") return "none";
@@ -37,7 +157,6 @@
     timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
   });
   const turningKinds = new Set(["bottom_reversal_candidate", "top_exit_candidate"]);
-  const penPointKinds = new Set(["third_buy_candidate", "third_sell_candidate"]);
   const v4ClassLabels = {
     class1_buy: "一买", class1_sell: "一卖",
     class2_buy: "二买", class2_sell: "二卖",
@@ -46,11 +165,11 @@
   const v4PhaseLabels = {
     observation: "观察中", divergence_confirmed: "背驰已确认", reversal_confirmed: "反向结构已确认",
     first_retest: "首次回试", awaiting_first_retest: "等待首次回试", class2_confirmed: "二类点已确认",
-    class3_confirmed: "三类点已确认", awaiting_lower_level: "等待下级别确认", invalidated: "已失效",
+    class3_confirmed: "三类点已确认", awaiting_lower_level: "等待下级别确认", awaiting_class1_confirmation: "等待一类点确认", invalidated: "已失效",
     awaiting_reversal: "等待反向确认", awaiting_retest: "等待回试",
   };
   const v4StatusLabels = {
-    awaiting_lower_level: "等待下级别确认", observing: "观察中", candidate: "候选",
+    awaiting_lower_level: "等待下级别确认", awaiting_class1_confirmation: "等待一类点确认", observing: "观察中", candidate: "候选",
     confirmed: "已确认", invalidated: "已失效", unfiltered: "未过滤", unconfirmed: "未确认",
     awaiting_reversal: "等待反向确认", awaiting_retest: "等待回试",
   };
@@ -70,6 +189,7 @@
   const v4LowerLevelLabels = {
     awaiting_lower_level: "等待下级别确认", unconfirmed: "尚未确认", confirmed: "已确认",
     ready: "下级别结构已具备", unavailable: "下级别数据不可用",
+    awaiting_class1_confirmation: "等待一类点确认",
     awaiting_lower_timeframe: "等待下级周期数据", awaiting_confirmation: "等待下级周期走势确认",
     incompatible_price_basis: "上下级价格基准不一致", not_applicable: "没有更低周期",
   };
@@ -87,21 +207,27 @@
     return `关联周期 ${path} · ${state}`;
   }
   function v4SignalLabel(kind) { return v4ClassLabels[kind] || kind || "递归买卖点"; }
-  function placeAFSignalLabels(signals, recursiveSignals, legacySignals, chart) {
+  function placeOverlaySignalLabels(signals, recursiveSignals, legacySignals, chart) {
     if (!signals?.length) return [];
     const gap = 4;
     const occupied = [];
     const reserveBox = (left, top, width, height, kind = "marker") => occupied.push({ left, top, right: left + width, bottom: top + height, kind });
     const reserveMarker = (x, y, radius = 7) => reserveBox(x - radius, y - radius, radius * 2, radius * 2, "marker");
     const fontSize = chart.mobileChart ? 12 : 9;
+    if (chart.layers?.pens === true) (chart.points || []).forEach((point) => {
+      const width = Array.from(point.label || "").length * fontSize * 0.55 + 8;
+      reserveBox(point.labelX - width / 2, point.labelY - fontSize - 2, width, fontSize + 6, "label");
+      reserveMarker(point.x, point.y, 3);
+    });
     (recursiveSignals || []).forEach((signal) => {
       const width = signal.hitLabelWidth || Array.from(signal.label || "").length * fontSize + 8;
-      reserveBox(signal.labelX - width / 2, signal.labelY - fontSize - 2, width, fontSize + 6, "label");
+      if (signal.labelVisible !== false) reserveBox(signal.labelX - width / 2, signal.labelY - fontSize - 2, width, fontSize + 6, "label");
       reserveMarker(signal.x, signal.markerY ?? signal.y, 7);
     });
     (legacySignals || []).forEach((signal) => {
-      const width = Array.from(signal.label || "").length * fontSize + 8;
-      reserveBox(signal.labelX - width / 2, signal.labelY - fontSize - 2, width, fontSize + 6, "label");
+      const width = signal.hitLabelWidth || Array.from(signal.label || "").length * fontSize + 8;
+      const height = signal.labelHeight || fontSize + 6;
+      reserveBox(signal.labelX - width / 2, signal.labelY - height / 2, width, height, "label");
       reserveMarker(signal.x, signal.y, 7);
     });
     signals.forEach((signal) => reserveMarker(signal.x, signal.markerY ?? signal.y, 8));
@@ -181,7 +307,8 @@
         left: finalX - halfWidth, right: finalX + halfWidth,
         top: finalY - halfHeight, bottom: finalY + halfHeight,
       });
-      const naturalY = signal.markerY + (signal.side === "buy" ? halfHeight + 13 : -halfHeight - 13);
+      const markerY = signal.markerY ?? signal.y;
+      const naturalY = markerY + (signal.side === "buy" ? halfHeight + 13 : -halfHeight - 13);
       const moved = Math.abs(finalX - signal.x) > 1 || Math.abs(finalY - naturalY) > 2;
       occupied.push({ left: finalX - halfWidth, right: finalX + halfWidth, top: finalY - halfHeight, bottom: finalY + halfHeight, kind: "label" });
       placed.set(signal, { ...signal, labelX: finalX, labelY: finalY, labelConnector: moved, labelBackground: !finalOverlaps.label && !finalOverlaps.marker && !finalOverlaps.candle });
@@ -242,8 +369,8 @@
         .map(structureReferenceLabel),
     };
   }
-  const buyKinds = new Set(["third_buy_candidate", "bottom_reversal_candidate"]);
-  const sellKinds = new Set(["third_sell_candidate", "top_exit_candidate"]);
+  const buyKinds = new Set(["class1_buy", "class2_buy", "class3_buy", "bottom_reversal_candidate"]);
+  const sellKinds = new Set(["class1_sell", "class2_sell", "class3_sell", "top_exit_candidate"]);
 
   // Keep the protection observed for this continuous pen chain through
   // quote recovery and a history refresh. A lower new low cannot move it down.
@@ -350,9 +477,9 @@
     const lastFixedStroke = [...(frame?.strokes || [])].reverse().find((stroke) => stroke.confirmed);
     if (lastFixedStroke?.direction === "up") bias += 0.25;
     else if (lastFixedStroke?.direction === "down") bias -= 0.25;
-    (frame?.signals || []).filter((signal) => signal.status === "candidate" && !turningKinds.has(signal.kind))
+    (frame?.signals_v4 || []).filter((signal) => signal.status !== "invalidated" && signal.price != null)
       .forEach((signal) => {
-        const side = signal.side || (signal.kind === "third_buy_candidate" ? "buy" : signal.kind === "third_sell_candidate" ? "sell" : "");
+        const side = signal.side;
         bias += side === "buy" ? 0.55 : side === "sell" ? -0.55 : 0;
       });
     (frame?.signals || []).filter((signal) => turningKinds.has(signal.kind) && signal.status !== "invalidated")
@@ -380,6 +507,82 @@
     return Object.freeze({ available: false, label: "等待日周结构", detail: reason, alignment: "insufficient",
       daily: emptyFrame("日线"), weekly: emptyFrame("周线"), warnings: [], rules: [],
       spot: "--", historyTime: "--", refreshing: false });
+  }
+
+  function placeChanSignalLabels(signals, legacySignals, chart) {
+    if (!signals?.length) return signals || [];
+    const gap = 4;
+    const fontSize = chart.mobileChart ? 12 : 9;
+    const labelHeight = fontSize + 6;
+    const occupied = [];
+    const reserveBox = (left, top, width, height, kind) => {
+      occupied.push({ left, top, right: left + width, bottom: top + height, kind });
+    };
+    const reserveMarker = (x, y, radius = 7) => reserveBox(x - radius, y - radius, radius * 2, radius * 2, "marker");
+
+    (chart.points || []).forEach((point) => {
+      const width = Array.from(point.label || "").length * fontSize * 0.55 + 8;
+      reserveBox(point.labelX - width / 2, point.labelY - fontSize - 2, width, fontSize + 6, "label");
+      reserveMarker(point.x, point.y, 3);
+    });
+    (chart.candles || []).forEach((candle) => {
+      const top = Math.min(candle.high, candle.body);
+      const bottom = Math.max(candle.low, candle.body + candle.bodyHeight);
+      const width = candle.bodyWidth + 4;
+      reserveBox(candle.x - width / 2, top, width, Math.max(1, bottom - top), "candle");
+    });
+    (legacySignals || []).forEach((signal) => {
+      const width = Array.from(signal.label || "").length * fontSize * 0.55 + 8;
+      reserveBox(signal.labelX - width / 2, signal.labelY - fontSize - 2, width, fontSize + 6, "label");
+      reserveMarker(signal.x, signal.y, 6);
+    });
+    signals.forEach((signal) => reserveMarker(signal.x, signal.markerY ?? signal.y, 7));
+
+    const countOverlaps = (rect) => occupied.reduce((count, other) => count + Number(
+      rect.left < other.right + gap && rect.right + gap > other.left
+      && rect.top < other.bottom + gap && rect.bottom + gap > other.top,
+    ), 0);
+    const ordered = signals.filter((signal) => signal.labelVisible !== false).sort((a, b) => a.x - b.x || a.labelY - b.labelY);
+    const placed = new Map();
+    ordered.forEach((signal) => {
+      const halfWidth = (signal.hitLabelWidth || Array.from(signal.label || "").length * fontSize + 8) / 2;
+      const halfHeight = labelHeight / 2;
+      const minX = chart.plotLeft + halfWidth, maxX = chart.historyRight - halfWidth;
+      const minY = chart.plotTop + labelHeight / 2 + 2, maxY = chart.priceBottom - labelHeight / 2 - 2;
+      const baseX = Math.max(minX, Math.min(maxX, signal.labelX));
+      const baseY = Math.max(minY, Math.min(maxY, signal.labelY));
+      const yStep = labelHeight + gap, xStep = halfWidth * 2 + gap;
+      const maxYSteps = Math.min(24, Math.ceil(Math.max(0, maxY - minY) / yStep));
+      const maxXSteps = Math.min(8, Math.ceil(Math.max(0, maxX - minX) / xStep));
+      const preferredDirection = signal.side === "buy" ? 1 : -1;
+      const candidates = [];
+      for (let yStepIndex = 0; yStepIndex <= maxYSteps; yStepIndex += 1) {
+        const yOffsets = yStepIndex === 0 ? [0] : [preferredDirection * yStepIndex * yStep, -preferredDirection * yStepIndex * yStep];
+        for (let xStepIndex = 0; xStepIndex <= maxXSteps; xStepIndex += 1) {
+          const xOffsets = xStepIndex === 0 ? [0] : [xStepIndex * xStep, -xStepIndex * xStep];
+          for (const dy of yOffsets) for (const dx of xOffsets) {
+            const labelX = Math.max(minX, Math.min(maxX, baseX + dx));
+            const labelY = baseY + dy;
+            if (labelY < minY || labelY > maxY) continue;
+            candidates.push({ labelX, labelY, cost: Math.abs(dy) + Math.abs(dx) * 1.4 + (dy * preferredDirection < 0 ? 3 : 0) });
+          }
+        }
+      }
+      candidates.sort((a, b) => a.cost - b.cost);
+      let selected = { labelX: baseX, labelY: baseY }, leastOverlap = Infinity;
+      for (const candidate of candidates) {
+        const rect = { left: candidate.labelX - halfWidth, right: candidate.labelX + halfWidth,
+          top: candidate.labelY - halfHeight, bottom: candidate.labelY + halfHeight };
+        const overlaps = countOverlaps(rect);
+        if (overlaps === 0) { selected = candidate; break; }
+        const score = overlaps * 1000000 + candidate.cost;
+        if (score < leastOverlap) { leastOverlap = score; selected = candidate; }
+      }
+      occupied.push({ left: selected.labelX - halfWidth, right: selected.labelX + halfWidth,
+        top: selected.labelY - halfHeight, bottom: selected.labelY + halfHeight, kind: "label" });
+      placed.set(signal, { ...signal, labelX: selected.labelX, labelY: selected.labelY });
+    });
+    return signals.map((signal) => placed.get(signal) || signal);
   }
 
   // Recompute the left-axis current-price marker on quote updates even when
@@ -663,7 +866,9 @@
       const reference = Number.isFinite(anchor) && anchor > 0 ? anchor : spotPrice;
       return levels.some((level) => !Number.isFinite(reference) || Math.abs(level - reference) > 0.000001);
     });
-    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${ruleVersion || ""}`;
+    const supportLevels = layers?.structureSupports === false ? [] : structureSupportLevels(frame);
+    const supportCacheKey = supportLevels.map((level) => [level.key, level.zoneHigh, level.confirmedAt, level.brokenAt, level.lastCloseDate, level.sources].join(":")).join("|");
+    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${ruleVersion || ""}-${layers?.structureSupports === false ? "off" : "on"}-${supportCacheKey}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
@@ -841,7 +1046,7 @@
     const wyckoffSnapshotIndex = Math.min(dataEndIndex - 1, sourceCandles.length - 1);
     const wyckoffWindowSnapshot = wyckoffResult?.snapshots?.[wyckoffSnapshotIndex] || null;
     const legacyRule = "strict-old-bi-v3";
-    const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.11";
+    const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.23";
     let minimum = Infinity, maximum = -Infinity;
     bars.forEach((bar) => { minimum = Math.min(minimum, bar.low); maximum = Math.max(maximum, bar.high); });
     selectedStrokes.forEach((stroke) => {
@@ -1218,6 +1423,7 @@
     const zones = (frame.centers || []).filter((center) => center.end >= firstDate && center.start <= lastDate);
     const latest = frame.centers?.[frame.centers.length - 1];
     const visibleCenterForLevels = latestRecursiveCenter || (layers?.penCenters === true ? latest : null);
+    const structureSupports = layoutStructureSupports(supportLevels, bars, firstDate, lastDate, minimum, maximum, x, y, left, historyRight, top, priceBottom, mobile);
     if (latest && latest.end < firstDate && latest.lower < maximum && latest.upper > minimum) zones.push(latest);
     // Adjacent pens share a turning point. Label the actual endpoint once;
     // clipped endpoints outside the visible candle range are not labelled.
@@ -1257,6 +1463,7 @@
         title: `${displayBarTime(point.date, frame.period)} · ${point.kind === "top" ? "高点" : "低点"} ${money(point.price)} · ${point.confirmed ? "已确认端点" : "形成中，端点可延伸"}`,
       };
     });
+    const seenSignalLabels = new Set();
     const signalLayouts = selectedV4Signals.filter((signal) => Number.isFinite(Number(signal.price)) && Number(signal.price) > 0).map((signal, index) => {
       const date = signal.date, price = Number(signal.price);
       const labelText = v4SignalLabel(signal.kind), invalidated = signal.status === "invalidated";
@@ -1269,6 +1476,9 @@
       const status = invalidated ? "" : signal.status === "confirmed" ? "✓" : "?";
       const label = invalidated ? labelText + " · 已失效" : labelText;
       const visibleLabel = label + status;
+      const labelKey = `${date}\u0000${visibleLabel}`;
+      const labelVisible = !seenSignalLabels.has(labelKey);
+      seenSignalLabels.add(labelKey);
       const labelFontSize = mobile ? 12 : 9;
       const labelHalfWidth = Array.from(visibleLabel).length * labelFontSize / 2 + 4;
       const labelLeft = left + labelHalfWidth;
@@ -1281,7 +1491,7 @@
       let labelY = yPosition + labelOffset;
       if (labelY < labelTop || labelY > labelBottom) labelY = yPosition - labelOffset;
       labelY = Math.max(labelTop, Math.min(labelBottom, labelY));
-      return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, side, status: signal.status, invalidated, label, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, start: date, end: date, startPrice: price, endPrice: price, confirmed: signal.status === "confirmed", formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || signal.phase_at, composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
+      return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, labelVisible, side, status: signal.status, invalidated, label, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, start: date, end: date, startPrice: price, endPrice: price, confirmed: signal.status === "confirmed", formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || signal.phase_at, composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
     });
     const afSignalLayouts = visibleAFSignals.map((signal, index) => {
       const price = Number(signal.price), markerPrice = Number(signal.markerPrice ?? signal.price);
@@ -1325,6 +1535,8 @@
       historyRight, scenarioBoundary, scenarioLaneLeft, lastClose: frame.last_close,
       title: `${frame.label} K 线与结构观察，${firstDisplayDate} 至 ${lastDisplayDate}`,
       ruleVersion: recursiveRule,
+      structureSupports,
+      structureSupportLevels: supportLevels,
       description: `实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔、递归买卖点和笔级转折预警均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。${indicatorDescription}按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。向左拖动可将 K 线移入右侧空白槽，查看未破位结构趋势线的延长；趋势线延长与右侧条件情景均为基于已知数据的示意，不代表未来行情或确定预测。现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；已开启的副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。`,
       points,
       chanCandles,
@@ -1350,7 +1562,7 @@
       ],
       // `segments` here is the Canvas paint gate: the mapped segment list is
       // already filtered by the global default and any per-level overrides.
-      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, mfi: mfiEnabled, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
+      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, mfi: mfiEnabled, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false, structureSupports: layers?.structureSupports !== false },
       // Keep per-level controls stable while users pan and zoom; their options
       // should describe the loaded structure, not only the current viewport.
       availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
@@ -1374,8 +1586,8 @@
         x1: x(dateIndex(segment.start)), y1: y(segment.start_price), x2: x(dateIndex(segment.end)), y2: y(segment.end_price),
         title: (Number(segment.level) === 0 ? "基础线段" : "第" + (Number(segment.level) + 1) + "层走势类型") + (segment.trend_kind ? " · " + segment.trend_kind : segment.direction ? (segment.direction === "up" ? "向上" : "向下") : "") + " · " + displayBarTime(segment.start, frame.period) + " " + money(segment.start_price) + " → " + displayBarTime(segment.end, frame.period) + " " + money(segment.end_price) + " · " + (segment.confirmed ? "确认于 " + displayBarTime(segment.confirmed_at, frame.period) : "形成中"),
       })),
-      signals: signalLayouts.map(({ signal: _signal, key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice }) => ({
-        key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice,
+      signals: signalLayouts.map(({ signal: _signal, key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, labelVisible, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice }) => ({
+        key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, labelVisible, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice,
       })),
       afSignals: afSignalLayouts,
       trendlines: trendlineLayouts,
@@ -1464,6 +1676,7 @@
       dates: [...new Set([0, Math.floor((bars.length - 1) / 2), bars.length - 1])]
         .map((index) => { const displayDate = displayBarTime(bars[index].date, frame.period); return { x: x(index), y: height - 12, label: mobile ? axisDateLabel(displayDate).slice(-5) : axisDateLabel(displayDate) }; }),
     };
+    if (layers?.structureSupports !== false) chart.description += "结构支撑自动取当前连续行情的已确认笔、线段低点及中枢边界；近价合并，蓝色实线表示支撑，灰色虚线表示收盘失守。盘中价格不改变确认状态；价位与来源可在图下结构支撑列表查看。";
     if (trendlineLayouts?.length) chart.description += "结构趋势线由已确认的笔与线段端点拟合，实线连接结构点，虚线延伸至当前窗口；收盘价有效穿越后不再显示。";
     if (layers?.turtle === true) {
       const eventDescription = turtleEventLayouts.length
@@ -1539,13 +1752,13 @@
     const lower = low && recent.filter((point) => point.kind === "bottom" && point.confirmed
       && point.price < Math.min(low.price, scenarioPrice)).sort((a, b) => b.price - a.price)[0];
     const higher = high && recent.find((point) => point.kind === "top" && point.confirmed && point.price > high.price);
-    const structural = [...(frame.signals || []).filter((signal) => !turningKinds.has(signal.kind)), ...(frame.pen_signals || [])];
+    const structural = frame.signals_v4 || [];
     const active = structural.filter((signal) => signal.status !== "invalidated");
     const invalidated = structural.filter((signal) => signal.status === "invalidated");
-    guide.signalReason = active.length ? "已识别 " + active.length + " 条笔级观察；这些观察不等同于递归级买卖点，详情见下方。"
-      : invalidated.length ? "已识别 " + invalidated.length + " 条历史笔级观察，目前均已失效；详情仍保留供回看。"
-      : !center ? "已确认笔还未形成中枢，暂无法识别第三类位置；可先用近期高低点观察价格变化。"
-      : "当前没有符合规则的已确认回试结构，未识别出第三类位置候选；近端高低点仍可作为观察边界。";
+    guide.signalReason = active.length ? `递归信号引擎有 ${active.length} 条结构信号，详情列出级别、确认阶段和缺少条件。`
+      : invalidated.length ? `递归信号引擎有 ${invalidated.length} 条历史信号已失效；详情保留其结构依据。`
+      : !center ? "当前笔结构尚未形成可用中枢；递归买卖点需要中枢及后续走势条件。"
+      : "当前递归级别没有满足六类买卖点条件的结构；近端笔高低点仍可作为价格观察位。";
     if (close != null) guide.evidence.push(`最近已收盘${frame.label}：${displayBarTime(frame.as_of, frame.period)} · ${money(close)}；现价 ${money(price)}。`);
     if (!high || !low || price == null) {
       guide.title = "笔结构尚不足，方向暂待确认";
@@ -1701,7 +1914,7 @@
     const centers = Array.isArray(frame.recursive_centers) ? frame.recursive_centers : [];
     const closedCenters = centers.filter((center) => !center.forming && (center.confirmed_at || center.closed_at));
     if (closedCenters.length) {
-      return `已形成 ${closedCenters.length} 个闭合中枢；目前没有同级、同链的两段推进与中间反向回试同时满足中枢外、创新高/低和 MACD 力度比条件。`;
+      return `已形成 ${closedCenters.length} 个闭合中枢；目前没有同级、同链的两段推进及合格的中间反向回试：回试需停留在中枢外，或进入中枢但未穿越另一侧；两段推进还需满足创新高/低与 MACD 力度比条件。`;
     }
     if (longestRun < 3) {
       const forming = segments.filter((segment) => !segment.confirmed).length;
@@ -1738,6 +1951,8 @@
     const activeSignals = allSignals.filter((signal) => signal.status !== "invalidated");
     const invalidatedSignals = allSignals.filter((signal) => signal.status === "invalidated");
     const readiness = recursiveReadinessReason(frame) || (levels.length ? "多级结构已计算。" : "当前周期还没有可用的结构。");
+    const plottableSignals = activeSignals.filter((signal) => Number.isFinite(Number(signal.price)) && Number(signal.price) > 0);
+    const emptySignalNotice = plottableSignals.length ? "" : readiness;
     const heading = activeSignals.length ? `有 ${activeSignals.length} 条递归买卖点`
       : invalidatedSignals.length ? `${invalidatedSignals.length} 条候选已失效`
       : closedCenters.length ? "中枢已闭合，等待信号条件"
@@ -1780,7 +1995,7 @@
       invalidation: signal.invalidation_price == null ? "失效边界未知" : `失效边界 ${money(signal.invalidation_price)}`,
     }));
     return {
-      heading, readiness, trend: recursiveTrendLabels[frame?.trend_state_v4] || "趋势待确认",
+      heading, readiness, emptySignalNotice, trend: recursiveTrendLabels[frame?.trend_state_v4] || "趋势待确认",
       quality: qualityStatus, qualityCode: quality.status || "unknown",
       qualityClass: quality.status === "ok" ? "good" : quality.status === "partial" ? "partial" : quality.status === "degraded" ? "degraded" : "unknown", priceBasis,
       acceptedBars: quality.accepted_bars ?? frame?.bar_count ?? 0,
@@ -1875,23 +2090,29 @@
       chart.layerLevels = chart.availableRecursiveLevels || [];
       chart.segmentLevels = chart.availableSegmentLevels || [];
     }
-    const penSignalsByIdentity = new Map();
-    [...(frame.pen_signals || []), ...(frame.signals || []).filter((signal) => penPointKinds.has(signal.kind))].forEach((signal) => {
-      penSignalsByIdentity.set([signal.kind, signal.origin_date || signal.date, signal.price].join("|"), signal);
-    });
-    const penSignals = [...penSignalsByIdentity.values()];
-    const observationSignals = [...(frame.signals || []).filter((signal) => !turningKinds.has(signal.kind) && !penPointKinds.has(signal.kind)), ...penSignals];
-    const markers = chart && layers?.legacySignals === true ? [...(frame.signals || []).filter((signal) => turningKinds.has(signal.kind)), ...penSignals].map((signal) => {
+    const turningSignals = (frame.signals || []).filter((signal) => turningKinds.has(signal.kind));
+    const markers = chart && layers?.legacySignals === true ? turningSignals.map((signal) => {
       const point = chart.points.find((item) => item.date === (signal.origin_date || signal.date) && item.price === signal.price);
       if (!point) return null;
       const buy = signal.side === "buy", watch = signal.status === "watch", invalidated = signal.status === "invalidated";
+      const label = `${buy ? "底" : "顶"}${invalidated ? "失效" : watch ? "观察" : "候选"}`;
+      const fontSize = chart.mobileChart ? 12 : 9;
       return { key: `${signal.kind}-${signal.origin_date || signal.date}`, x: point.x, y: point.y,
           labelX: Math.max(48, Math.min(chart.plotRight - 35, point.x)),
         labelY: buy ? Math.min(chart.plotBottom - 4, point.labelY + 13) : Math.max(10, point.labelY - 13),
-        label: `${penPointKinds.has(signal.kind) ? (buy ? "三买" : "三卖") : (buy ? "底" : "顶")}${invalidated ? "失效" : watch ? "观察" : "候选"}`, watch, invalidated,
+        label, side: buy ? "buy" : "sell", labelHeight: fontSize + 6, hitLabelWidth: Array.from(label).length * fontSize + 8, watch, invalidated,
         title: `${signal.label} · 极值 ${signal.origin_date || signal.date} ${money(signal.price)} · 首次识别 ${signal.observed_at || signal.confirmed_at} · 当前阶段 ${signal.phase_at || signal.confirmed_at}${invalidated ? " · 该观察已失效" : ""}` };
     }).filter(Boolean) : [];
-    const afSignals = chart ? placeAFSignalLabels(chart.afSignals, chart.signals, markers, chart) : [];
+    if (chart) {
+      chart.signals = placeChanSignalLabels(chart.signals, markers, chart);
+      const placedSignals = new Map(chart.signals.map((signal) => [signal.key, signal]));
+      chart.structures = chart.structures.map((structure) => {
+        const signal = placedSignals.get(structure.key);
+        return signal ? { ...structure, labelX: signal.labelX, labelY: signal.labelY } : structure;
+      });
+    }
+    const placedMarkers = chart ? placeOverlaySignalLabels(markers, chart.signals, [], chart) : markers;
+    const afSignals = chart ? placeOverlaySignalLabels(chart.afSignals, chart.signals, placedMarkers, chart) : [];
     const plan = window.OptionScopeChanPlan.view(frame, spot, weekly);
     if (plan.metrics.length) {
       guidance.title = plan.headline;
@@ -1911,7 +2132,7 @@
     const qualityEventSummary = quality.corporate_action_suspected ? " · 异常复权或价格跳变待核验" : largeMoveSummary;
     const dataSummary = `${basisLabel} · 基准日 ${basisDate} · 输入质量 ${quality.status || "未知"}（${quality.accepted_bars ?? frame.bar_count}/${quality.input_bars ?? frame.bar_count} 根） · 缺口 ${gapCount} 处 · ${timeframeMappingLabel(frame.timeframe_mapping)}${qualityEventSummary}`;
     const marketSummary = marketEnvironmentLabel(frame.market_environment);
-    const legacySignals = observationSignals.map((signal, index) => ({ ...signal, key: `legacy-${signal.kind}-${index}`,
+    const legacySignals = turningSignals.map((signal, index) => ({ ...signal, key: `legacy-${signal.kind}-${index}`,
       dateLabel: `结构位置 ${signal.date} · 识别于 ${signal.confirmed_at || signal.observed_at || "未知"}`,
       statusLabel: signal.status === "invalidated" ? "已失效" : signal.status === "candidate" ? "候选" : "观察中",
       invalidationLabel: signal.invalidation == null ? "" : `参考边界 ${money(signal.invalidation)}`,
@@ -1940,7 +2161,7 @@
       plan,
       spotGuide: liveSpotGuide(frame, spot, guidance),
       dataSummary, marketSummary, recursive: recursiveStructureSummary(frame, ruleVersion, dataContext), legacySignals, recursiveSignals, signals: [...legacySignals, ...recursiveSignals],
-      guidance, chart: chart ? { ...chart, afSignals, markers } : null,
+      guidance, chart: chart ? { ...chart, afSignals, markers: placedMarkers } : null,
     };
   }
 
@@ -2000,13 +2221,15 @@
         const preserveInvalidations = (key) => {
           const invalidated = (observed[period]?.[key] || []).filter((signal) => signal.status === "invalidated");
           return (frame[key] || []).map((signal) => {
+            const invalidation = key === "signals_v4" ? signal.invalidation_price : signal.invalidation;
             const previous = invalidated.find((old) => old.kind === signal.kind && old.date === signal.date
-              && (turningKinds.has(signal.kind) || old.confirmed_at === signal.confirmed_at) && old.invalidation === signal.invalidation);
+              && (turningKinds.has(signal.kind) || old.confirmed_at === signal.confirmed_at)
+              && (key === "signals_v4" ? old.invalidation_price : old.invalidation) === invalidation);
             return previous && signal.status !== "invalidated"
-              ? { ...signal, status: "invalidated", detail: previous.detail } : signal;
+              ? { ...signal, status: "invalidated", phase: "invalidated", detail: previous.detail } : signal;
           });
         };
-        payload[period] = { ...frame, signals: preserveInvalidations("signals"), pen_signals: preserveInvalidations("pen_signals") };
+        payload[period] = { ...frame, signals: preserveInvalidations("signals"), signals_v4: preserveInvalidations("signals_v4") };
       });
     }
     let livePrice = spot != null && Number.isFinite(Number(spot)) && Number(spot) > 0 ? Number(spot) : null;
@@ -2041,15 +2264,17 @@
         detail = "现价向下离开中枢；需观察反抽能否重新进入中枢";
         support = null; resistance = center.lower;
       }
-      const invalidate = (items) => (items || []).map((signal) => {
-        const invalidated = signal.invalidation != null && (
-          buyKinds.has(signal.kind) && spot <= signal.invalidation
-          || sellKinds.has(signal.kind) && spot >= signal.invalidation
+      const invalidate = (items, boundaryField) => (items || []).map((signal) => {
+        const boundary = signal[boundaryField];
+        const invalidated = boundary != null && (
+          buyKinds.has(signal.kind) && spot <= boundary
+          || sellKinds.has(signal.kind) && spot >= boundary
         );
         return invalidated && signal.status !== "invalidated"
           ? { ...signal, status: "invalidated", detail: (signal.detail || "") + "；现价已触及失效边界" } : signal;
       });
-      return { ...frame, signals: invalidate(frame.signals), pen_signals: invalidate(frame.pen_signals), position: { ...frame.position, code, label, detail, support, resistance } };
+      return { ...frame, signals: invalidate(frame.signals, "invalidation"),
+        signals_v4: invalidate(frame.signals_v4, "invalidation_price"), position: { ...frame.position, code, label, detail, support, resistance } };
     };
     const daily = locate(payload.daily), weekly = locate(payload.weekly);
     let summary = payload.summary;

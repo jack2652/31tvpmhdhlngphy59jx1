@@ -124,7 +124,7 @@ func TestBuildStrengthsIntegratesSameLevelDirectionalAreasAndExposesWindow(t *te
 	}
 }
 
-func TestRecursiveInputsUseConsistentPriceAndMidpointDates(t *testing.T) {
+func TestRecursiveInputsUseSharedConfirmedEndpoints(t *testing.T) {
 	segments := withConfirmedSegmentEndpoints([]Segment{
 		{Direction: "up", Chain: 0, Start: "2026-01-05", End: "2026-01-09", StartPrice: 10, EndPrice: 20, Low: 10, High: 20, Confirmed: true, ConfirmedAt: "2026-01-12"},
 		{Direction: "down", Chain: 0, Start: "2026-01-09", End: "2026-01-15", StartPrice: 20, EndPrice: 12, Low: 11, High: 20, Confirmed: true, ConfirmedAt: "2026-01-16"},
@@ -137,11 +137,23 @@ func TestRecursiveInputsUseConsistentPriceAndMidpointDates(t *testing.T) {
 	if len(inputs) != 3 {
 		t.Fatalf("recursive inputs=%+v, want continuous higher-level strokes", inputs)
 	}
-	if inputs[0].Start.Date != "2026-01-12" || inputs[0].Start.Price != 16 || inputs[0].End.Date != "2026-01-19" || inputs[0].End.Price != 17 {
-		t.Fatalf("first recursive input endpoints=%+v, want midpoint date/price", inputs[0])
+	if inputs[0].Start.Date != "2026-01-09" || inputs[0].Start.Price != 20 || inputs[0].End.Date != "2026-01-15" || inputs[0].End.Price != 12 {
+		t.Fatalf("first recursive input endpoints=%+v, want the shared observed endpoints", inputs[0])
 	}
 	if inputs[0].ConfirmedAt != "2026-01-28" || !inputs[0].Confirmed || inputs[1].Start.Date != inputs[0].End.Date || inputs[1].Start.Price != inputs[0].End.Price {
 		t.Fatalf("recursive confirmation/continuity=%+v, want confirmed continuous pivots", inputs[:2])
+	}
+}
+
+func TestRecursiveInputsAcceptSubToleranceEndpointNoise(t *testing.T) {
+	segments := withConfirmedSegmentEndpoints([]Segment{
+		{Direction: "up", Chain: 0, Start: "2026-01-05", End: "2026-01-09", StartPrice: 10, EndPrice: 20, Low: 10, High: 20, Confirmed: true, ConfirmedAt: "2026-01-12"},
+		{Direction: "down", Chain: 0, Start: "2026-01-09", End: "2026-01-15", StartPrice: 20 + 1e-8, EndPrice: 12, Low: 11, High: 21, Confirmed: true, ConfirmedAt: "2026-01-16"},
+		{Direction: "up", Chain: 0, Start: "2026-01-15", End: "2026-01-23", StartPrice: 12 + 1e-8, EndPrice: 22, Low: 12, High: 22, Confirmed: true, ConfirmedAt: "2026-01-26"},
+		{Direction: "down", Chain: 0, Start: "2026-01-23", End: "2026-01-27", StartPrice: 22 + 1e-8, EndPrice: 14, Low: 13, High: 22, Confirmed: true, ConfirmedAt: "2026-01-28"},
+	})
+	if got := recursiveInputStrokes(segments, 1); len(got) != 1 {
+		t.Fatalf("recursive inputs=%+v, sub-tolerance endpoint noise must not break a confirmed recursive turn", got)
 	}
 }
 
@@ -154,19 +166,112 @@ func TestRecursiveInputsRejectDisconnectedSegments(t *testing.T) {
 	if got := recursiveInputStrokes(segments, 1); len(got) != 0 {
 		t.Fatalf("recursive inputs=%+v, want disconnected triple rejected", got)
 	}
+	segments = withConfirmedSegmentEndpoints([]Segment{
+		{Direction: "up", Chain: 0, Start: "01", End: "02", StartPrice: 10, EndPrice: 20, Confirmed: true, ConfirmedAt: "03"},
+		{Direction: "down", Chain: 0, Start: "02", End: "03", StartPrice: 19, EndPrice: 12, Confirmed: true, ConfirmedAt: "04"},
+		{Direction: "up", Chain: 0, Start: "03", End: "04", StartPrice: 12, EndPrice: 22, Confirmed: true, ConfirmedAt: "05"},
+	})
+	if got := recursiveInputStrokes(segments, 1); len(got) != 0 {
+		t.Fatalf("recursive inputs=%+v, want a triple with mismatched shared endpoint prices rejected", got)
+	}
 }
 
-func TestBuildRecursiveLevelsDoesNotPromoteFormingLowerObjects(t *testing.T) {
+func TestBuildRecursiveLevelsUsesOnlyConfirmedPrefixBeforeFormingLowerObjects(t *testing.T) {
 	baseStrokes := []Stroke{{Confirmed: true}, {Confirmed: false}}
 	baseSegments := []Segment{
-		{Chain: 0, Level: 0, Direction: "up", Start: "01", End: "02", StartKind: "bottom", EndKind: "top", Low: 1, High: 10, Confirmed: true},
+		{Chain: 0, Level: 0, Direction: "up", Start: "01", End: "02", StartKind: "bottom", EndKind: "top", Low: 1, High: 10, Confirmed: true, ConfirmedAt: "02"},
 		{Chain: 0, Level: 0, Direction: "down", Start: "02", End: "03", StartKind: "top", EndKind: "bottom", Low: 4, High: 12, Confirmed: false, Forming: true},
-		{Chain: 0, Level: 0, Direction: "up", Start: "03", End: "04", StartKind: "bottom", EndKind: "top", Low: 3, High: 11, Confirmed: true},
+		{Chain: 0, Level: 0, Direction: "up", Start: "03", End: "04", StartKind: "bottom", EndKind: "top", Low: 3, High: 11, Confirmed: true, ConfirmedAt: "04"},
 	}
 	levels := buildRecursiveLevels(baseStrokes, baseSegments)
-	if len(levels) < 2 || levels[0].Status != "forming" || levels[0].WaitingFor == "" || levels[1].Status != "awaiting_lower_level" || levels[1].InputCount != 0 {
-		t.Fatalf("levels=%+v, want forming level 0 and empty awaiting level 1", levels)
+	if len(levels) < 2 || levels[0].Status != "forming" || levels[0].WaitingFor == "" || levels[1].Status != "awaiting_lower_level" || levels[1].InputCount != 1 || len(levels[1].Centers) != 0 {
+		t.Fatalf("levels=%+v, want level 1 to consume the one confirmed prefix and wait for enough input", levels)
 	}
+	for _, segment := range levels[1].Segments {
+		if segment.Confirmed || !segment.Forming {
+			t.Fatalf("higher-level segment=%+v, forming lower input must not produce a confirmed structure", segment)
+		}
+	}
+}
+
+func TestDecomposeRecursiveUnitsRequiresStrictCenterOverlap(t *testing.T) {
+	unit := func(direction string, low, high float64) Segment {
+		return Segment{Chain: 0, Level: 0, Direction: direction, Low: low, High: high, Confirmed: true, ConfirmedAt: "confirmed"}
+	}
+	t.Run("initial boundary touch is not a center", func(t *testing.T) {
+		moves := decomposeRecursiveUnits([]Segment{
+			unit("up", 1, 5), unit("down", 3, 8), unit("up", 5, 9),
+		}, 1)
+		if len(moves) != 1 || len(moves[0].centers) != 0 {
+			t.Fatalf("moves=%+v, a zero-width three-unit intersection must not form a center", moves)
+		}
+	})
+
+	t.Run("extension touching boundary does not extend center", func(t *testing.T) {
+		moves := decomposeRecursiveUnits([]Segment{
+			unit("up", 1, 8), unit("down", 3, 10), unit("up", 4, 9), unit("down", 8, 11),
+		}, 1)
+		if len(moves) != 1 || len(moves[0].centers) != 1 || moves[0].centers[0].through != 2 {
+			t.Fatalf("moves=%+v, a segment that only touches ZG must leave the center extension span at input 2", moves)
+		}
+	})
+
+	t.Run("new zero-width center after departure is rejected", func(t *testing.T) {
+		moves := decomposeRecursiveUnits([]Segment{
+			unit("up", 1, 8), unit("down", 3, 10), unit("up", 4, 9),
+			unit("down", 9, 12), unit("up", 8.5, 14), unit("down", 8.5, 9),
+		}, 1)
+		if len(moves) != 1 || len(moves[0].centers) != 1 {
+			t.Fatalf("moves=%+v, a post-departure triple touching at one price must not create another center", moves)
+		}
+	})
+}
+
+func TestDecomposeRecursiveUnitsClosesCenterAtFirstConfirmedDeparture(t *testing.T) {
+	unit := func(direction, start, end string, low, high float64) Segment {
+		return Segment{Chain: 0, Level: 0, Direction: direction, Start: start, End: end, Low: low, High: high, Confirmed: true, ConfirmedAt: end}
+	}
+	moves := decomposeRecursiveUnits([]Segment{
+		unit("up", "01", "02", 1, 10),
+		unit("down", "02", "03", 4, 12),
+		unit("up", "03", "04", 3, 11),
+		unit("down", "04", "05", 0, 3),
+	}, 1)
+	if len(moves) != 1 || moves[0].trend.Confirmed {
+		t.Fatalf("moves=%+v, a center departure may close its center while the recursive trend remains forming", moves)
+	}
+	if len(moves[0].centers) != 1 || moves[0].centers[0].closedAt != "05" || moves[0].centers[0].through != 2 {
+		t.Fatalf("first move centers=%+v, want original overlap span closed at the first departure", moves[0].centers)
+	}
+
+	t.Run("later return does not move the close time", func(t *testing.T) {
+		units := []Segment{
+			unit("up", "01", "02", 1, 10),
+			unit("down", "02", "03", 4, 12),
+			unit("up", "03", "04", 3, 11),
+			unit("down", "04", "05", 0, 3),
+			unit("up", "05", "06", 4, 9),
+		}
+		moves := decomposeRecursiveUnits(units, 1)
+		if len(moves) < 1 || len(moves[0].centers) != 1 || moves[0].centers[0].closedAt != "05" {
+			t.Fatalf("moves=%+v, a later return must not replace the first confirmed departure time", moves)
+		}
+	})
+
+	t.Run("later outside center does not move the close time", func(t *testing.T) {
+		units := []Segment{
+			unit("up", "01", "02", 1, 10),
+			unit("down", "02", "03", 4, 12),
+			unit("up", "03", "04", 3, 11),
+			unit("down", "04", "05", 11, 15),
+			unit("up", "05", "06", 12, 16),
+			unit("down", "06", "07", 13, 17),
+		}
+		moves := decomposeRecursiveUnits(units, 1)
+		if len(moves) < 1 || len(moves[0].centers) < 2 || moves[0].centers[0].closedAt != "05" {
+			t.Fatalf("moves=%+v, a later outside center must not replace the original center's first-departure time", moves)
+		}
+	})
 }
 
 func withConfirmedSegmentEndpoints(segments []Segment) []Segment {
@@ -219,6 +324,13 @@ func TestBuildV4SignalsRequiresConfirmedDepartureRetestAndWeakeningExtreme(t *te
 	if len(signal.Missing) != 0 || len(signal.Conditions) < 5 {
 		t.Fatalf("signal evidence=%+v, want all required evidence and no missing conditions after reversal confirmation", *signal)
 	}
+	nearEqualPushes := append([]Segment(nil), segments...)
+	nearEqualPushes[6].EndPrice = nearEqualPushes[4].EndPrice + 1e-8
+	nearEqualPushes[6].High = nearEqualPushes[6].EndPrice
+	nearEqualSignals := buildV4Signals(Frame{}, []LevelAnalysis{{Level: 0, Segments: nearEqualPushes, Centers: []RecursiveCenter{center}}}, strengths)
+	if hasSignalKind(nearEqualSignals, "class1_sell") {
+		t.Fatalf("signals=%+v, a sub-tolerance price difference must not count as a strict new high", nearEqualSignals)
+	}
 	for _, state := range []struct {
 		segments []Segment
 		status   string
@@ -252,6 +364,219 @@ func TestBuildV4SignalsRequiresConfirmedDepartureRetestAndWeakeningExtreme(t *te
 	if invalidatedDivergence == nil || invalidatedDivergence.Status != "invalidated" || invalidatedDivergence.Phase != "invalidated" || invalidatedDivergence.PhaseAt != "09" || invalidatedDivergence.ConfirmedAt != "" || invalidatedDivergence.PhaseHistory[len(invalidatedDivergence.PhaseHistory)-1] != (SignalPhase{Phase: "invalidated", At: "09"}) {
 		t.Fatalf("invalidated lifecycle=%+v, want post-observation invalidation preserving chronological history", invalidated)
 	}
+	laterInvalidation := buildV4Signals(Frame{Candles: []Bar{{Date: "12", High: 16, Low: 12}}}, levels, strengths)
+	for _, candidate := range laterInvalidation {
+		if candidate.Kind != "class1_sell" {
+			continue
+		}
+		if candidate.Status != "invalidated" || candidate.ConfirmedAt != "09" || len(candidate.PhaseHistory) != 4 || candidate.PhaseHistory[1] != (SignalPhase{Phase: "divergence_confirmed", At: "09"}) || candidate.PhaseHistory[2] != (SignalPhase{Phase: "reversal_confirmed", At: "11"}) || candidate.PhaseHistory[3] != (SignalPhase{Phase: "invalidated", At: "12"}) {
+			t.Fatalf("late invalidation=%+v, want to retain the first-point confirmation before reversal and invalidation", candidate)
+		}
+		return
+	}
+	t.Fatalf("signals=%+v, want a class1_sell invalidated after its confirmed reversal", laterInvalidation)
+}
+
+func TestBuildV4SignalsDoNotCompareDifferentTrendKinds(t *testing.T) {
+	level, strengths := classOneFixture(1)
+	level.Segments[4].TrendKind = "up"
+	level.Segments[6].TrendKind = "consolidation"
+	signals := buildV4Signals(Frame{}, []LevelAnalysis{level}, strengths)
+	if signal := findV4Signal(signals, "class1_sell"); signal != nil {
+		t.Fatalf("signal=%+v, pushes from different recursive trend kinds must not be compared for divergence", signal)
+	}
+}
+
+func TestBuildV4SignalsDoesNotConfirmClass1AcrossStructureChains(t *testing.T) {
+	t.Run("reversal on next chain", func(t *testing.T) {
+		level, strengths := classOneFixture(1)
+		level.Segments[7].Chain = 1
+		assertClassOneObservation(t, level, strengths)
+	})
+	t.Run("reversal disconnected inside chain", func(t *testing.T) {
+		level, strengths := classOneFixture(1)
+		level.Segments[7].Start = "08-gap"
+		assertClassOneObservation(t, level, strengths)
+	})
+	t.Run("reversal confirmed on observation date", func(t *testing.T) {
+		level, strengths := classOneFixture(1)
+		level.Segments[7].ConfirmedAt = level.Segments[6].ConfirmedAt
+		assertClassOneObservation(t, level, strengths)
+	})
+	t.Run("first push and retest are disconnected", func(t *testing.T) {
+		level, strengths := classOneFixture(1)
+		level.Segments[5].Start = "06-gap"
+		if hasSignalKind(buildV4Signals(Frame{}, []LevelAnalysis{level}, strengths), "class1_sell") {
+			t.Fatal("disconnected first push and retest must not form a divergence candidate")
+		}
+	})
+	t.Run("retest and second push are disconnected", func(t *testing.T) {
+		level, strengths := classOneFixture(1)
+		level.Segments[6].StartPrice = 12.1
+		if hasSignalKind(buildV4Signals(Frame{}, []LevelAnalysis{level}, strengths), "class1_sell") {
+			t.Fatal("disconnected retest and second push must not form a divergence candidate")
+		}
+	})
+}
+
+func assertClassOneObservation(t *testing.T, level LevelAnalysis, strengths []Strength) {
+	t.Helper()
+	for _, signal := range buildV4Signals(Frame{}, []LevelAnalysis{level}, strengths) {
+		if signal.Kind != "class1_sell" {
+			continue
+		}
+		if signal.Status != "observing" || signal.ConfirmedAt != "" || len(signal.PhaseHistory) != 1 {
+			t.Fatalf("signal=%+v, this disconnected or unordered reversal must not confirm the divergence", signal)
+		}
+		return
+	}
+	t.Fatal("expected the underlying class-1 divergence candidate to remain observable")
+}
+
+func TestBuildV4SignalsDoesNotConfirmReversalAcrossGap(t *testing.T) {
+	level, strengths := classOneFixture(1)
+	level.Segments[8].Start = "09-gap"
+	signal := findV4Signal(buildV4Signals(Frame{}, []LevelAnalysis{level}, strengths), "class1_sell")
+	if signal == nil || signal.Status != "divergence_confirmed" || signal.Phase != "divergence_confirmed" {
+		t.Fatalf("signal=%+v, a disconnected continuation must not confirm the reversal", signal)
+	}
+}
+
+func TestBuildV4SignalsDoesNotConfirmReversalWithoutContinuousCounterSwing(t *testing.T) {
+	level, strengths := classOneFixture(1)
+	level.Segments[8].StartPrice = 12.1
+	signal := findV4Signal(buildV4Signals(Frame{}, []LevelAnalysis{level}, strengths), "class1_sell")
+	if signal == nil || signal.Status != "divergence_confirmed" || signal.Phase != "divergence_confirmed" {
+		t.Fatalf("signal=%+v, a disconnected counter-swing must not confirm the reversal", signal)
+	}
+}
+
+func TestBuildV4SignalsRejectsDivergenceSequenceAcrossGapFromCenter(t *testing.T) {
+	level, strengths := classOneFixture(1)
+	level.Segments[3].Start = "04-gap"
+	if hasSignalKind(buildV4Signals(Frame{}, []LevelAnalysis{level}, strengths), "class1_sell") {
+		t.Fatal("a divergence sequence disconnected from its center must not qualify")
+	}
+}
+
+func TestBuildV4SignalsAllowsCenterOwnerMoveAsFirstPush(t *testing.T) {
+	segments := []Segment{
+		{Direction: "up", Chain: 0, Level: 1, Start: "01", End: "02", StartPrice: 4, EndPrice: 11, Low: 4, High: 12, Confirmed: true, ConfirmedAt: "02"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "02", End: "03", StartPrice: 11, EndPrice: 7, Low: 5, High: 11, Confirmed: true, ConfirmedAt: "03"},
+		{Direction: "up", Chain: 0, Level: 1, Start: "03", End: "04", StartPrice: 7, EndPrice: 9, Low: 6, High: 10, Confirmed: true, ConfirmedAt: "04"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "04", End: "05", StartPrice: 9, EndPrice: 6, Low: 4, High: 9, Confirmed: true, ConfirmedAt: "05"},
+		{Direction: "up", Chain: 0, Level: 1, Start: "05", End: "06", StartPrice: 6, EndPrice: 14, Low: 6, High: 14, Confirmed: true, ConfirmedAt: "06"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "06", End: "07", StartPrice: 14, EndPrice: 12, Low: 11, High: 14, Confirmed: true, ConfirmedAt: "07"},
+		{Direction: "up", Chain: 0, Level: 1, Start: "07", End: "08", StartPrice: 12, EndPrice: 16, Low: 12, High: 16, Confirmed: true, ConfirmedAt: "08"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "08", End: "09", StartPrice: 16, EndPrice: 13, Low: 12, High: 16, Confirmed: true, ConfirmedAt: "09"},
+	}
+	center := RecursiveCenter{Level: 1, Chain: 0, Lower: 5, Upper: 10, Start: "01", End: "04", FormedAt: "04", ConfirmedAt: "05", OwnerMoveIndex: 4}
+	strengths := []Strength{
+		{Direction: "up", Level: 1, Start: "05", End: "06", MACDArea: 10, WarmupComplete: true},
+		{Direction: "up", Level: 1, Start: "07", End: "08", MACDArea: 7.9, WarmupComplete: true},
+	}
+	level := LevelAnalysis{Level: 1, Status: "ready", Segments: segments, Centers: []RecursiveCenter{center}}
+	for _, side := range []string{"sell", "buy"} {
+		t.Run(side, func(t *testing.T) {
+			candidateLevel, candidateStrengths := level, strengths
+			if side == "buy" {
+				candidateLevel, candidateStrengths = mirrorSignalFixture(candidateLevel, candidateStrengths)
+			}
+			if signals := buildV4Signals(Frame{}, []LevelAnalysis{candidateLevel}, candidateStrengths); !hasSignalKind(signals, "class1_"+side) {
+				t.Fatalf("signals=%+v, want class-1 %s when the center owner move is the first push", signals, side)
+			}
+		})
+	}
+}
+
+func TestBuildV4SignalsPreservesZeroRecursiveCenterOwnerIndex(t *testing.T) {
+	segments := []Segment{
+		{Direction: "up", Chain: 0, Level: 1, Start: "01", End: "02", StartPrice: 4, EndPrice: 12, Low: 4, High: 12, Confirmed: true, ConfirmedAt: "02"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "02", End: "03", StartPrice: 12, EndPrice: 11, Low: 11, High: 12, Confirmed: true, ConfirmedAt: "03"},
+		{Direction: "up", Chain: 0, Level: 1, Start: "03", End: "04", StartPrice: 11, EndPrice: 14, Low: 11, High: 14, Confirmed: true, ConfirmedAt: "04"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "04", End: "05", StartPrice: 14, EndPrice: 12, Low: 10, High: 14, Confirmed: true, ConfirmedAt: "05"},
+	}
+	center := RecursiveCenter{Level: 1, Chain: 0, Lower: 5, Upper: 10, Start: "00", End: "01", ConfirmedAt: "01", OwnerMoveIndex: 0, EndSegment: 2}
+	strengths := []Strength{
+		{Direction: "up", Level: 1, Start: "01", End: "02", MACDArea: 10, WarmupComplete: true},
+		{Direction: "up", Level: 1, Start: "03", End: "04", MACDArea: 7.9, WarmupComplete: true},
+	}
+	level := LevelAnalysis{Level: 1, Status: "ready", Segments: segments, Centers: []RecursiveCenter{center}}
+	if signals := buildV4Signals(Frame{}, []LevelAnalysis{level}, strengths); !hasSignalKind(signals, "class1_sell") {
+		t.Fatalf("signals=%+v, want first recursive owner at index zero to qualify the first divergence push", signals)
+	}
+}
+
+func TestBuildV4SignalsRecognizesConsolidationRetestTouchingOppositeBoundaryBothWays(t *testing.T) {
+	segments := []Segment{
+		{Direction: "up", Chain: 0, Level: 1, Start: "01", End: "02", StartPrice: 4, EndPrice: 11, Low: 4, High: 12, Confirmed: true, ConfirmedAt: "02"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "02", End: "03", StartPrice: 11, EndPrice: 7, Low: 5, High: 11, Confirmed: true, ConfirmedAt: "03"},
+		{Direction: "up", Chain: 0, Level: 1, Start: "03", End: "04", StartPrice: 7, EndPrice: 9, Low: 6, High: 10, Confirmed: true, ConfirmedAt: "04"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "04", End: "05", StartPrice: 9, EndPrice: 4, Low: 4, High: 9, Confirmed: true, ConfirmedAt: "05"},
+		{Direction: "up", Chain: 0, Level: 1, Start: "05", End: "06", StartPrice: 4, EndPrice: 10, Low: 4, High: 10, Confirmed: true, ConfirmedAt: "06"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "06", End: "07", StartPrice: 10, EndPrice: 3, Low: 3, High: 10, Confirmed: true, ConfirmedAt: "07"},
+	}
+	center := RecursiveCenter{Level: 1, Chain: 0, Lower: 5, Upper: 10, Start: "01", End: "04", FormedAt: "04", ConfirmedAt: "04", OwnerMoveIndex: 2, EndSegment: 2}
+	strengths := []Strength{
+		{Direction: "down", Level: 1, Start: "04", End: "05", MACDArea: 10, WarmupComplete: true},
+		{Direction: "down", Level: 1, Start: "06", End: "07", MACDArea: 7.9, WarmupComplete: true},
+	}
+	level := LevelAnalysis{Level: 1, Status: "ready", Segments: segments, Centers: []RecursiveCenter{center}}
+	for _, side := range []string{"buy", "sell"} {
+		t.Run(side, func(t *testing.T) {
+			candidateLevel, candidateStrengths := level, strengths
+			if side == "sell" {
+				candidateLevel, candidateStrengths = mirrorSignalFixture(candidateLevel, candidateStrengths)
+			}
+			retest := candidateLevel.Segments[len(candidateLevel.Segments)-2]
+			center := candidateLevel.Centers[0]
+			if side == "buy" && retest.High != center.Upper {
+				t.Fatalf("buy retest high=%v, want exact touch of opposite center boundary %v", retest.High, center.Upper)
+			}
+			if side == "sell" && retest.Low != center.Lower {
+				t.Fatalf("sell retest low=%v, want exact touch of opposite center boundary %v", retest.Low, center.Lower)
+			}
+			signals := buildV4Signals(Frame{}, []LevelAnalysis{candidateLevel}, candidateStrengths)
+			var signal *V4Signal
+			for index := range signals {
+				if signals[index].Kind == "class1_"+side {
+					signal = &signals[index]
+					break
+				}
+			}
+			if signal == nil || signal.StrengthRatio == nil || math.Abs(*signal.StrengthRatio-0.79) > 1e-12 {
+				t.Fatalf("signals=%+v, want a %s candidate from a center-return divergence", signals, side)
+			}
+			conditionFound := false
+			for _, condition := range signal.Conditions {
+				if condition == "首次反向回试进入中枢但未穿越另一侧" {
+					conditionFound = true
+				}
+			}
+			if !conditionFound {
+				t.Fatalf("conditions=%v, want explicit consolidation-divergence evidence", signal.Conditions)
+			}
+		})
+	}
+}
+
+func TestBuildV4SignalsRejectsConsolidationRetestThatCrossesCenter(t *testing.T) {
+	segments := []Segment{
+		{Direction: "up", Chain: 0, Level: 1, Start: "01", End: "02", Confirmed: true, ConfirmedAt: "02"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "02", End: "03", Confirmed: true, ConfirmedAt: "03"},
+		{Direction: "up", Chain: 0, Level: 1, Start: "03", End: "04", StartPrice: 7, EndPrice: 9, Low: 6, High: 10, Confirmed: true, ConfirmedAt: "04"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "04", End: "05", StartPrice: 9, EndPrice: 4, Low: 4, High: 9, Confirmed: true, ConfirmedAt: "05"},
+		{Direction: "up", Chain: 0, Level: 1, Start: "05", End: "06", StartPrice: 4, EndPrice: 12, Low: 4, High: 12, Confirmed: true, ConfirmedAt: "06"},
+		{Direction: "down", Chain: 0, Level: 1, Start: "06", End: "07", StartPrice: 12, EndPrice: 3, Low: 3, High: 12, Confirmed: true, ConfirmedAt: "07"}, // 回试穿越中枢另一侧边界
+	}
+	center := RecursiveCenter{Level: 1, Chain: 0, Lower: 5, Upper: 10, Start: "01", End: "04", ConfirmedAt: "04", OwnerMoveIndex: 2, EndSegment: 2}
+	strengths := []Strength{
+		{Direction: "down", Level: 1, Start: "04", End: "05", MACDArea: 10, WarmupComplete: true},
+		{Direction: "down", Level: 1, Start: "06", End: "07", MACDArea: 7.9, WarmupComplete: true},
+	}
+	if got := buildV4Signals(Frame{}, []LevelAnalysis{{Level: 1, Segments: segments, Centers: []RecursiveCenter{center}}}, strengths); hasSignalKind(got, "class1_buy") {
+		t.Fatalf("signals=%+v, a retest crossing beyond the center must not count as consolidation divergence", got)
+	}
 }
 
 func TestV4SignalInvalidationStartsAfterObservationAndKeepsPhaseHistory(t *testing.T) {
@@ -272,7 +597,7 @@ func TestV4SignalInvalidationStartsAfterObservationAndKeepsPhaseHistory(t *testi
 }
 
 func TestBuildTrendContextReportsCenterRelationAndReturnState(t *testing.T) {
-	center := RecursiveCenter{Level: 1, Chain: 2, CenterID: "L1-C2-S0-E2", Lower: 10, Upper: 20, EndSegment: 1, ConfirmedAt: "04", RelationToPrevious: "separate_up"}
+	center := RecursiveCenter{Level: 1, Chain: 2, CenterID: "L1-C2-S0-E2", Lower: 10, Upper: 20, OwnerMoveIndex: 1, EndSegment: 1, ConfirmedAt: "04", RelationToPrevious: "separate_up"}
 	segments := []Segment{
 		{Direction: "up", Chain: 2, Level: 1, EndPrice: 14, Low: 10, High: 16, Confirmed: true, ConfirmedAt: "03"},
 		{Direction: "down", Chain: 2, Level: 1, EndPrice: 12, Low: 11, High: 14, Confirmed: true, ConfirmedAt: "04"},
@@ -298,15 +623,15 @@ func TestBuildTrendContextIgnoresFormingObjects(t *testing.T) {
 	}
 }
 
-func TestBuildV4SignalsRejectsDivergenceWithoutRequiredBackground(t *testing.T) {
+func TestBuildV4SignalsRejectsDivergenceAfterRetestCrossesCenter(t *testing.T) {
 	segments := []Segment{
-		{Direction: "up", Chain: 0, Level: 0, Start: "01", End: "02", EndPrice: 11, Confirmed: true, ConfirmedAt: "02"},
-		{Direction: "down", Chain: 0, Level: 0, Start: "02", End: "03", Low: 5, High: 11, Confirmed: true, ConfirmedAt: "03"},
-		{Direction: "up", Chain: 0, Level: 0, Start: "03", End: "04", EndPrice: 9, Confirmed: true, ConfirmedAt: "04"},
-		{Direction: "down", Chain: 0, Level: 0, Start: "04", End: "05", Low: 4, High: 9, Confirmed: true, ConfirmedAt: "05"},
-		{Direction: "up", Chain: 0, Level: 0, Start: "05", End: "06", EndPrice: 14, Low: 6, High: 14, Confirmed: true, ConfirmedAt: "06"},
-		{Direction: "down", Chain: 0, Level: 0, Start: "06", End: "07", Low: 9, High: 14, Confirmed: true, ConfirmedAt: "07"}, // enters center
-		{Direction: "up", Chain: 0, Level: 0, Start: "07", End: "08", EndPrice: 16, Low: 9, High: 16, Confirmed: true, ConfirmedAt: "08"},
+		{Direction: "up", Chain: 0, Level: 0, Start: "01", End: "02", StartPrice: 5, EndPrice: 11, Confirmed: true, ConfirmedAt: "02"},
+		{Direction: "down", Chain: 0, Level: 0, Start: "02", End: "03", StartPrice: 11, EndPrice: 7, Low: 5, High: 11, Confirmed: true, ConfirmedAt: "03"},
+		{Direction: "up", Chain: 0, Level: 0, Start: "03", End: "04", StartPrice: 7, EndPrice: 9, Confirmed: true, ConfirmedAt: "04"},
+		{Direction: "down", Chain: 0, Level: 0, Start: "04", End: "05", StartPrice: 9, EndPrice: 4, Low: 4, High: 9, Confirmed: true, ConfirmedAt: "05"},
+		{Direction: "up", Chain: 0, Level: 0, Start: "05", End: "06", StartPrice: 4, EndPrice: 14, Low: 4, High: 14, Confirmed: true, ConfirmedAt: "06"},
+		{Direction: "down", Chain: 0, Level: 0, Start: "06", End: "07", StartPrice: 14, EndPrice: 4, Low: 4, High: 14, Confirmed: true, ConfirmedAt: "07"}, // 回试穿越中枢另一侧边界
+		{Direction: "up", Chain: 0, Level: 0, Start: "07", End: "08", StartPrice: 4, EndPrice: 16, Low: 9, High: 16, Confirmed: true, ConfirmedAt: "08"},
 	}
 	center := RecursiveCenter{Level: 0, Chain: 0, Lower: 5, Upper: 10, FormedAt: "04", ConfirmedAt: "05", EndSegment: 2}
 	strengths := []Strength{{Direction: "up", Level: 0, Start: "05", End: "06", MACDArea: 10, WarmupComplete: true}, {Direction: "up", Level: 0, Start: "07", End: "08", MACDArea: 7, WarmupComplete: true}}
@@ -314,7 +639,7 @@ func TestBuildV4SignalsRejectsDivergenceWithoutRequiredBackground(t *testing.T) 
 	got := buildV4Signals(Frame{}, levels, strengths)
 	for _, signal := range got {
 		if signal.Kind == "class1_buy" || signal.Kind == "class1_sell" {
-			t.Fatalf("signals=%+v, want no divergence signal because intervening retest entered the center", got)
+			t.Fatalf("signals=%+v, want no divergence signal because the intervening retest crossed the center", got)
 		}
 	}
 	if signal := findV4Signal(got, "class3_sell"); signal == nil || signal.Status != "invalidated" {

@@ -41,6 +41,22 @@ func TestMergeBarsDoesNotJoinInclusionsAcrossChains(t *testing.T) {
 	}
 }
 
+func TestMergeBarsResetsDirectionAtChainBoundary(t *testing.T) {
+	bars := []Bar{
+		{Date: "01", High: 10, Low: 5, Chain: 0},
+		{Date: "02", High: 12, Low: 7, Chain: 0}, // 链 0 建立上行方向
+		{Date: "03", High: 10, Low: 5, Chain: 1},
+		{Date: "04", High: 9, Low: 6, Chain: 1}, // 未知方向必须保留并集 [5,10]
+	}
+	merged := mergeBars(bars)
+	if len(merged) != 3 {
+		t.Fatalf("merged count=%d, want three candles across two chains: %+v", len(merged), merged)
+	}
+	if merged[2].high != 10 || merged[2].low != 5 || merged[2].start != 2 || merged[2].end != 3 {
+		t.Fatalf("new-chain inclusion=%+v, want unknown-direction union [5,10] over raw bars 2..3", merged[2])
+	}
+}
+
 func TestDirectionInitializationKeepsUnknownInclusionUntilAnUnambiguousPair(t *testing.T) {
 	bars := []Bar{
 		{Date: "01", High: 10, Low: 5, Chain: 0},

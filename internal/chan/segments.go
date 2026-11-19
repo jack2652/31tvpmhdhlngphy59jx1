@@ -20,6 +20,11 @@ func buildSegments(strokes []Stroke) []Segment {
 			chainEnd++
 		}
 		if index+2 > chainEnd || !validSegmentStart(strokes[index]) || !overlappingStrokeTriple(strokes, index) {
+			if index+1 == chainEnd && index+1 < len(strokes) && strokes[index+1].Chain == chain && strokes[index+1].Direction != direction && validSegmentStart(strokes[index]) && len(segments) > 0 && segments[len(segments)-1].Confirmed && segments[len(segments)-1].Chain == chain {
+				segment := makeSegment(strokes, index, chainEnd, direction, chain, false)
+				segment.Feature = segmentFeatures(strokes, index, chainEnd, direction, chain)
+				segments = append(segments, segment)
+			}
 			index++
 			continue
 		}
@@ -30,7 +35,8 @@ func buildSegments(strokes []Stroke) []Segment {
 		candidate, evidence, _, complete := segmentEnd(strokes[:confirmedEnd+1], index)
 		end, next := -1, chainEnd+1
 		if complete {
-			end, next = candidate-1, candidate
+			end = segmentEndpoint(strokes, index, candidate-1, direction)
+			next = end + 1
 		} else {
 			end = formingSegmentEnd(strokes, index, chainEnd, direction)
 			if end < index+2 {
@@ -45,6 +51,8 @@ func buildSegments(strokes []Stroke) []Segment {
 			segment.BreakStroke, segment.ConfirmStroke = candidate, evidence
 			segment.ConfirmedAt = strokes[evidence].ConfirmedAt
 			segment.Forming = false
+		} else if candidate >= 0 {
+			segment.BreakStroke = candidate
 		}
 		segments = append(segments, segment)
 		if next <= index {
@@ -76,7 +84,7 @@ func overlappingStrokeTriple(strokes []Stroke, start int) bool {
 	if !first.Confirmed || !second.Confirmed || (!third.Confirmed && !lastInChain) || first.Chain != second.Chain || second.Chain != third.Chain || first.Direction != third.Direction || first.Direction == second.Direction {
 		return false
 	}
-	return math.Max(first.Low, math.Max(second.Low, third.Low)) <= math.Min(first.High, math.Min(second.High, third.High))
+	return priceLessOrEqual(math.Max(first.Low, math.Max(second.Low, third.Low)), math.Min(first.High, math.Min(second.High, third.High)))
 }
 
 func formingSegmentEnd(strokes []Stroke, start, end int, direction string) int {
@@ -85,12 +93,12 @@ func formingSegmentEnd(strokes []Stroke, start, end int, direction string) int {
 		if strokes[index].Chain != strokes[start].Chain || strokes[index].Direction != direction {
 			continue
 		}
-		if direction == "up" && strokes[index].End.Price > strokes[start].Start.Price {
-			if best < 0 || strokes[index].End.Price > strokes[best].End.Price {
+		if direction == "up" && priceGreater(strokes[index].End.Price, strokes[start].Start.Price) {
+			if best < 0 || priceGreater(strokes[index].End.Price, strokes[best].End.Price) {
 				best = index
 			}
-		} else if direction == "down" && strokes[index].End.Price < strokes[start].Start.Price {
-			if best < 0 || strokes[index].End.Price < strokes[best].End.Price {
+		} else if direction == "down" && priceLess(strokes[index].End.Price, strokes[start].Start.Price) {
+			if best < 0 || priceLess(strokes[index].End.Price, strokes[best].End.Price) {
 				best = index
 			}
 		}
@@ -107,58 +115,104 @@ func segmentEnd(strokes []Stroke, start int) (candidate, evidence, mode int, ok 
 	if !up {
 		counter = "up"
 	}
-	var featureStorage [3]featureRange
-	features := featureStorage[:0:len(featureStorage)]
+	features := []featureRange{}
 	featureDirection := segmentFeatureDirection(strokes[start].Direction)
 	bestCandidate, bestEvidence, bestMode := -1, -1, 0
+	consider := func(candidate, evidence, mode int) {
+		if bestEvidence < 0 || evidence < bestEvidence || evidence == bestEvidence && candidate < bestCandidate {
+			bestCandidate, bestEvidence, bestMode = candidate, evidence, mode
+		}
+	}
+scan:
 	for index := start + 1; index < len(strokes); index++ {
 		stroke := strokes[index]
-		if stroke.Chain != strokes[start].Chain || !stroke.Confirmed || stroke.Direction != counter {
+		if stroke.Chain != strokes[start].Chain {
+			break
+		}
+		if !stroke.Confirmed {
+			break
+		}
+		if stroke.Direction != counter {
 			continue
 		}
-		continuation := stroke.Start.Price > strokes[start].Start.Price
-		if !up {
-			continuation = stroke.Start.Price < strokes[start].Start.Price
-		}
-		if index >= start+3 && len(features) > 0 && continuation {
-			if candidate, evidence, mode, found := candidateSegmentEnd(strokes, start, index, features[len(features)-1]); found {
-				if bestEvidence < 0 || evidence < bestEvidence || evidence == bestEvidence && candidate < bestCandidate {
-					bestCandidate, bestEvidence, bestMode = candidate, evidence, mode
+		if index >= start+3 && len(features) > 0 {
+			left := features[len(features)-1]
+			continuation := up && priceGreater(stroke.Start.Price, strokes[start].Start.Price) || !up && priceLess(stroke.Start.Price, strokes[start].Start.Price)
+			if continuation {
+				if candidate, confirmation, candidateMode, found := candidateSegmentEnd(strokes, start, index, left); found {
+					consider(candidate, confirmation, candidateMode)
 				}
-			}
-			rawIndex := index - 2
-			if rawIndex > start {
-				raw := featureRange{StartStroke: rawIndex, EndStroke: rawIndex, Low: strokes[rawIndex].Low, High: strokes[rawIndex].High, Start: strokes[rawIndex].Start.Date, End: strokes[rawIndex].End.Date}
-				if candidate, evidence, mode, found := candidateSegmentEnd(strokes, start, index, raw); found {
-					confirmation := strokes[evidence].End.Price < strokes[start].Start.Price
-					if !up {
-						confirmation = strokes[evidence].End.Price > strokes[start].Start.Price
-					}
-					low, high := math.MaxFloat64, -math.MaxFloat64
-					for reverseIndex := index; reverseIndex <= evidence; reverseIndex++ {
-						low = math.Min(low, strokes[reverseIndex].Low)
-						high = math.Max(high, strokes[reverseIndex].High)
-					}
-					overlap := false
-					if evidence-index+1 >= 3 {
-						overlapLow := math.Max(strokes[index].Low, math.Max(strokes[index+1].Low, strokes[index+2].Low))
-						overlapHigh := math.Min(strokes[index].High, math.Min(strokes[index+1].High, strokes[index+2].High))
-						overlap = overlapLow <= overlapHigh
-					}
-					if confirmation && overlap && low <= high {
-						if bestEvidence < 0 || evidence < bestEvidence || evidence == bestEvidence && candidate < bestCandidate {
-							bestCandidate, bestEvidence, bestMode = candidate, evidence, mode
+				rawIndex := index - 2
+				if rawIndex > start {
+					raw := featureRange{StartStroke: rawIndex, EndStroke: rawIndex, Low: strokes[rawIndex].Low, High: strokes[rawIndex].High, Start: strokes[rawIndex].Start.Date, End: strokes[rawIndex].End.Date}
+					if candidate, confirmation, candidateMode, found := candidateSegmentEnd(strokes, start, index, raw); found {
+						validConfirmation := up && priceLess(strokes[confirmation].End.Price, strokes[start].Start.Price) || !up && priceGreater(strokes[confirmation].End.Price, strokes[start].Start.Price)
+						low, high := math.MaxFloat64, -math.MaxFloat64
+						for reverseIndex := index; reverseIndex <= confirmation; reverseIndex++ {
+							low = math.Min(low, strokes[reverseIndex].Low)
+							high = math.Max(high, strokes[reverseIndex].High)
+						}
+						overlap := false
+						if confirmation-index+1 >= 3 {
+							overlapLow := math.Max(strokes[index].Low, math.Max(strokes[index+1].Low, strokes[index+2].Low))
+							overlapHigh := math.Min(strokes[index].High, math.Min(strokes[index+1].High, strokes[index+2].High))
+							overlap = priceLessOrEqual(overlapLow, overlapHigh)
+						}
+						if validConfirmation && overlap && priceLessOrEqual(low, high) {
+							consider(candidate, confirmation, candidateMode)
 						}
 					}
 				}
 			}
 		}
-		features = appendFeatureWindow(features, &featureDirection, stroke, index, 2)
+		if len(features) >= 3 {
+			_, reclaim, broken := brokenFeatureExtreme(features, stroke, strokes[start].Direction)
+			if broken {
+				confirmedByFeatureBreak := false
+				for confirmationIndex := index + 1; confirmationIndex < len(strokes); confirmationIndex++ {
+					confirmationStroke := strokes[confirmationIndex]
+					if confirmationStroke.Chain != strokes[start].Chain {
+						break
+					}
+					if !confirmationStroke.Confirmed {
+						if bestEvidence >= 0 {
+							return bestCandidate, bestEvidence, bestMode, true
+						}
+						return index, -1, 0, false
+					}
+					if confirmationStroke.Direction != strokes[start].Direction {
+						continue
+					}
+					reclaimed := up && priceGreaterOrEqual(confirmationStroke.High, reclaim) || !up && priceLessOrEqual(confirmationStroke.Low, reclaim)
+					if reclaimed {
+						// 这次破坏被原方向走势收回，只撤销当前候选；后续笔仍可能形成新的有效破坏。
+						// 保留原特征基线，后续反向笔仍需重新突破同一极值才可确认。
+						if bestCandidate == index {
+							bestCandidate, bestEvidence, bestMode = -1, -1, 0
+						}
+						continue scan
+					}
+					confirmed := up && priceGreater(confirmationStroke.End.Price, strokes[start].Start.Price) || !up && priceLess(confirmationStroke.End.Price, strokes[start].Start.Price)
+					if confirmed {
+						consider(index, confirmationIndex, 1)
+						confirmedByFeatureBreak = true
+						break
+					}
+				}
+				if !confirmedByFeatureBreak {
+					if bestEvidence >= 0 {
+						return bestCandidate, bestEvidence, bestMode, true
+					}
+					return index, -1, 0, false
+				}
+			}
+		}
+		features = appendFeature(features, &featureDirection, stroke, index)
 	}
-	if bestEvidence < 0 {
-		return -1, -1, 0, false
+	if bestEvidence >= 0 {
+		return bestCandidate, bestEvidence, bestMode, true
 	}
-	return bestCandidate, bestEvidence, bestMode, true
+	return -1, -1, 0, false
 }
 
 func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRange) (int, int, int, bool) {
@@ -167,7 +221,7 @@ func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRan
 	if counter.Direction == strokes[start].Direction {
 		return -1, -1, 0, false
 	}
-	if up && counter.High <= left.High || !up && counter.Low >= left.Low {
+	if up && priceLessOrEqual(counter.High, left.High) || !up && priceGreaterOrEqual(counter.Low, left.Low) {
 		return -1, -1, 0, false
 	}
 	var rightStorage [3]featureRange
@@ -178,9 +232,9 @@ func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRan
 	second := secondStorage[:0:len(secondStorage)]
 	rightDirection, secondDirection := segmentFeatureDirection(strokes[start].Direction), segmentFeatureDirection(counter.Direction)
 	extreme := counter.Start.Price
-	gap := left.High < counter.Low
+	gap := priceLess(left.High, counter.Low)
 	if !up {
-		gap = left.Low > counter.High
+		gap = priceGreater(left.Low, counter.High)
 	}
 	pendingFirstKind := false
 	for index := candidate + 1; index < len(strokes); index++ {
@@ -206,9 +260,9 @@ func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRan
 					return candidate, index, 1, true
 				}
 			}
-			newExtreme := stroke.End.Price > extreme
+			newExtreme := priceGreater(stroke.End.Price, extreme)
 			if !up {
-				newExtreme = stroke.End.Price < extreme
+				newExtreme = priceLess(stroke.End.Price, extreme)
 			}
 			if newExtreme {
 				return -1, -1, 0, false
@@ -218,16 +272,16 @@ func candidateSegmentEnd(strokes []Stroke, start, candidate int, left featureRan
 			continue
 		}
 		a, b := right[0], right[1]
-		turned := b.High < a.High && b.Low < a.Low
+		turned := priceLess(b.High, a.High) && priceLess(b.Low, a.Low)
 		if !up {
-			turned = b.High > a.High && b.Low > a.Low
+			turned = priceGreater(b.High, a.High) && priceGreater(b.Low, a.Low)
 		}
 		if turned && !gap && stroke.Direction == counter.Direction {
-			selected := stroke.End.Price < counter.End.Price
-			crossedStart := stroke.End.Price < strokes[start].Start.Price
+			selected := priceLess(stroke.End.Price, counter.End.Price)
+			crossedStart := priceLess(stroke.End.Price, strokes[start].Start.Price)
 			if !up {
-				selected = stroke.End.Price > counter.End.Price
-				crossedStart = stroke.End.Price > strokes[start].Start.Price
+				selected = priceGreater(stroke.End.Price, counter.End.Price)
+				crossedStart = priceGreater(stroke.End.Price, strokes[start].Start.Price)
 			}
 			if selected || crossedStart {
 				return candidate, index, 1, true
@@ -254,15 +308,15 @@ func hasFeatureFractal(features []featureRange, kind string) bool {
 	}
 	a, b, c := features[len(features)-3], features[len(features)-2], features[len(features)-1]
 	if kind == "top" {
-		return b.High > a.High && b.High > c.High && b.Low > a.Low && b.Low > c.Low
+		return priceGreater(b.High, a.High) && priceGreater(b.High, c.High) && priceGreater(b.Low, a.Low) && priceGreater(b.Low, c.Low)
 	}
-	return b.Low < a.Low && b.Low < c.Low && b.High < a.High && b.High < c.High
+	return priceLess(b.Low, a.Low) && priceLess(b.Low, c.Low) && priceLess(b.High, a.High) && priceLess(b.High, c.High)
 }
 
 func segmentEndpoint(strokes []Stroke, start, end int, direction string) int {
 	endpoint := start
 	for index := start + 1; index <= end && index < len(strokes); index++ {
-		if direction == "up" && strokes[index].End.Price > strokes[endpoint].End.Price || direction == "down" && strokes[index].End.Price < strokes[endpoint].End.Price {
+		if direction == "up" && priceGreater(strokes[index].End.Price, strokes[endpoint].End.Price) || direction == "down" && priceLess(strokes[index].End.Price, strokes[endpoint].End.Price) {
 			endpoint = index
 		}
 	}
@@ -275,7 +329,7 @@ func appendFeature(features []featureRange, sequenceDirection *int, stroke Strok
 		return append(features, current)
 	}
 	last := &features[len(features)-1]
-	contains := current.High >= last.High && current.Low <= last.Low || last.High >= current.High && last.Low <= current.Low
+	contains := priceGreaterOrEqual(current.High, last.High) && priceLessOrEqual(current.Low, last.Low) || priceGreaterOrEqual(last.High, current.High) && priceLessOrEqual(last.Low, current.Low)
 	if !contains {
 		return append(features, current)
 	}
@@ -285,7 +339,7 @@ func appendFeature(features []featureRange, sequenceDirection *int, stroke Strok
 	if len(features) > 1 {
 		previous := features[len(features)-2]
 		*sequenceDirection = -1
-		if last.High > previous.High {
+		if priceGreater(last.High, previous.High) {
 			*sequenceDirection = 1
 		}
 	}
@@ -344,16 +398,16 @@ func brokenFeatureExtreme(features []featureRange, stroke Stroke, direction stri
 		left, middle, right := features[index-1], features[index], features[index+1]
 		var pivot bool
 		if direction == "up" {
-			pivot = middle.Low < left.Low && middle.High < left.High && middle.Low < right.Low && middle.High < right.High
-			if pivot && stroke.Low < middle.Low {
+			pivot = priceLess(middle.Low, left.Low) && priceLess(middle.High, left.High) && priceLess(middle.Low, right.Low) && priceLess(middle.High, right.High)
+			if pivot && priceLess(stroke.Low, middle.Low) {
 				// A rebound only cancels the break if it recovers through the
 				// other edge of the broken feature element. Comparing against
 				// middle.Low here makes every positive rebound look reclaimed.
 				return middle.Low, middle.High, true
 			}
 		} else {
-			pivot = middle.Low > left.Low && middle.High > left.High && middle.Low > right.Low && middle.High > right.High
-			if pivot && stroke.High > middle.High {
+			pivot = priceGreater(middle.Low, left.Low) && priceGreater(middle.High, left.High) && priceGreater(middle.Low, right.Low) && priceGreater(middle.High, right.High)
+			if pivot && priceGreater(stroke.High, middle.High) {
 				// Symmetric to an upward segment: after an upward break, a
 				// pullback must cross the lower edge to cancel the candidate.
 				return middle.High, middle.Low, true
@@ -373,7 +427,7 @@ func buildRecursiveCenters(segments []Segment) []RecursiveCenter {
 		}
 		zd := math.Max(a.Low, math.Max(b.Low, c.Low))
 		zg := math.Min(a.High, math.Min(b.High, c.High))
-		if zd >= zg {
+		if priceGreaterOrEqual(zd, zg) {
 			index++
 			continue
 		}
@@ -384,7 +438,7 @@ func buildRecursiveCenters(segments []Segment) []RecursiveCenter {
 		center := RecursiveCenter{Level: a.Level, Kind: "initial", InputKind: inputKind, Chain: a.Chain, Start: a.Start, End: c.End, Lower: zd, Upper: zg,
 			FormedAt: c.ConfirmedAt, ConfirmedAt: "", StartSegment: index, EndSegment: index + 2, ExtensionCount: 0, Forming: true}
 		end := index + 3
-		for end < len(segments) && eligibleCenterExtension(segments[end-1], segments[end], a.Level) && segments[end].Low < zg && segments[end].High > zd {
+		for end < len(segments) && eligibleCenterExtension(segments[end-1], segments[end], a.Level) && priceLess(segments[end].Low, zg) && priceGreater(segments[end].High, zd) {
 			center.End = segments[end].End
 			center.EndSegment = end
 			center.ExtensionCount++
@@ -410,13 +464,13 @@ func buildRecursiveCenters(segments []Segment) []RecursiveCenter {
 			center.RelatedCenter = &previousIndex
 			center.PreviousCenterID = previous.CenterID
 			switch {
-			case center.Lower < previous.Upper && center.Upper > previous.Lower:
+			case priceLess(center.Lower, previous.Upper) && priceGreater(center.Upper, previous.Lower):
 				center.RelationToPrevious, center.Relation, center.Kind = "overlap", "expands", "expansion"
-			case center.Lower == previous.Upper || center.Upper == previous.Lower:
+			case priceEqual(center.Lower, previous.Upper) || priceEqual(center.Upper, previous.Lower):
 				center.RelationToPrevious, center.Relation, center.Kind = "touch", "new_after", "newborn"
-			case center.Lower > previous.Upper:
+			case priceGreater(center.Lower, previous.Upper):
 				center.RelationToPrevious, center.Relation, center.Kind = "separate_up", "new_after", "newborn"
-			case center.Upper < previous.Lower:
+			case priceLess(center.Upper, previous.Lower):
 				center.RelationToPrevious, center.Relation, center.Kind = "separate_down", "new_after", "newborn"
 			default:
 				center.Relation, center.Kind = "new_after", "newborn"
@@ -424,8 +478,8 @@ func buildRecursiveCenters(segments []Segment) []RecursiveCenter {
 		}
 		center.CenterID = recursiveCenterID(center)
 		centers = append(centers, center)
-		// The first non-overlapping segment ends the old center. The next
-		// center's three-segment seed begins after that departure segment.
+		// 第一个不再重叠的走势段结束旧中枢；新中枢的三段初始区间
+		// 从该离开段之后开始。
 		index = end + 1
 	}
 	return centers
@@ -441,7 +495,8 @@ func eligibleCenterTriple(a, b, c Segment) bool {
 		a.Confirmed && b.Confirmed && c.Confirmed &&
 		a.Direction != b.Direction && b.Direction != c.Direction && a.Direction == c.Direction &&
 		a.EndKind != "" && a.EndKind == b.StartKind && b.EndKind == c.StartKind &&
-		a.End == b.Start && b.End == c.Start
+		a.End == b.Start && b.End == c.Start &&
+		priceEqual(a.EndPrice, b.StartPrice) && priceEqual(b.EndPrice, c.StartPrice)
 }
 
 func validSegmentStart(stroke Stroke) bool {
@@ -456,5 +511,6 @@ func validSegmentStart(stroke Stroke) bool {
 
 func eligibleCenterExtension(previous, next Segment, level int) bool {
 	return previous.Chain == next.Chain && previous.Level == level && next.Level == level &&
-		next.Confirmed && previous.Direction != next.Direction && previous.End == next.Start
+		next.Confirmed && previous.Direction != next.Direction && previous.End == next.Start &&
+		priceEqual(previous.EndPrice, next.StartPrice)
 }

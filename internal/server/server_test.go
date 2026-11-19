@@ -4336,15 +4336,15 @@ func TestChanLegacyEndpointKeepsStrictOldStrokeAndCenterSemantics(t *testing.T) 
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusOK || payload["rule_version"] != chananalysis.RuleVersion {
+	if response.StatusCode != http.StatusOK || payload["rule_version"] != chananalysis.RecursivePreviewVersion || payload["legacy_rule_version"] != chananalysis.RuleVersion {
 		t.Fatalf("legacy response status=%d rule_version=%v payload=%#v", response.StatusCode, payload["rule_version"], payload)
 	}
 	daily := payload["daily"].(map[string]any)
-	if value, exists := daily["strokes_v4"]; exists && value != nil {
-		t.Fatalf("legacy daily response unexpectedly populates v4 strokes: %#v", value)
+	if _, ok := daily["strokes_v4"].([]any); !ok {
+		t.Fatalf("legacy daily response does not expose recursive strokes: %T", daily["strokes_v4"])
 	}
-	if value, exists := daily["signals_v4"]; exists && value != nil {
-		t.Fatalf("legacy daily response unexpectedly populates v4 signals: %#v", value)
+	if _, ok := daily["signals_v4"].([]any); !ok {
+		t.Fatalf("legacy daily response does not expose the unified recursive signal list: %T", daily["signals_v4"])
 	}
 	if _, ok := daily["strokes"].([]any); !ok {
 		t.Fatalf("legacy strokes has type %T, want list", daily["strokes"])

@@ -23,6 +23,52 @@ func TestFeatureSequenceBuildsFormingAndConfirmedSegments(t *testing.T) {
 	}
 }
 
+func TestFirstKindFeatureSequenceConfirmsThroughOnePlusOne(t *testing.T) {
+	prices := [][2]float64{
+		{90.6201, 81.9843}, {81.9843, 97.1998}, {97.1998, 80.1524}, {80.1524, 83.9774},
+		{83.9774, 73.7053}, {73.7053, 78.5928}, {78.5928, 65.8817}, {65.8817, 79.2870},
+		{79.2870, 62.8339}, {62.8339, 70.4809}, {70.4809, 60.0463}, {60.0463, 68.5033},
+		{68.5033, 64.5433}, {64.5433, 73.9368},
+	}
+	strokes := make([]Stroke, len(prices))
+	for index, price := range prices {
+		direction, startKind, endKind := "down", "top", "bottom"
+		if index%2 == 1 {
+			direction, startKind, endKind = "up", "bottom", "top"
+		}
+		strokes[index] = Stroke{
+			Chain: 0, Direction: direction,
+			Start: Fractal{Kind: startKind, Date: fmt.Sprintf("%02d", index+1), Price: price[0]},
+			End:   Fractal{Kind: endKind, Date: fmt.Sprintf("%02d", index+2), Price: price[1]},
+			Low:   math.Min(price[0], price[1]), High: math.Max(price[0], price[1]),
+			Confirmed: true, ConfirmedAt: fmt.Sprintf("%02d", index+2),
+		}
+	}
+	for _, mirrored := range []bool{false, true} {
+		input := append([]Stroke(nil), strokes...)
+		if mirrored {
+			for index := range input {
+				stroke := &input[index]
+				stroke.Start.Price, stroke.End.Price = 200-stroke.Start.Price, 200-stroke.End.Price
+				stroke.Low, stroke.High = 200-stroke.High, 200-stroke.Low
+				if stroke.Direction == "up" {
+					stroke.Direction, stroke.Start.Kind, stroke.End.Kind = "down", "top", "bottom"
+				} else {
+					stroke.Direction, stroke.Start.Kind, stroke.End.Kind = "up", "bottom", "top"
+				}
+			}
+		}
+		candidate, evidence, mode, ok := segmentEnd(input, 0)
+		if !ok || candidate != 11 || evidence != 13 || mode != 1 {
+			t.Fatalf("mirrored=%v one-plus-one termination=(%d,%d,%d,%v), want break at stroke 11 confirmed at stroke 13", mirrored, candidate, evidence, mode, ok)
+		}
+		segments := buildSegments(input)
+		if len(segments) < 2 || !segments[0].Confirmed || segments[0].BreakStroke != 11 || segments[0].ConfirmStroke != 13 || segments[0].EndPointStroke != 10 {
+			t.Fatalf("mirrored=%v segments=%+v, want the first segment to close at its stroke-10 endpoint", mirrored, segments)
+		}
+	}
+}
+
 func TestRecursiveCenterExtensionKeepsInitialBoundaries(t *testing.T) {
 	segments := withAlternatingEndpointKinds([]Segment{
 		{Chain: 0, Level: 1, Direction: "up", Start: "01", End: "02", Low: 1, High: 10, Confirmed: true, ConfirmedAt: "02"},
@@ -109,6 +155,17 @@ func TestRecursiveCenterRequiresStrictOverlapAndAlternatingConfirmedInputs(t *te
 	}
 }
 
+func TestRecursiveCenterRejectsOverlapNarrowerThanPriceTolerance(t *testing.T) {
+	segments := withAlternatingEndpointKinds([]Segment{
+		{Chain: 0, Level: 1, Direction: "up", Start: "01", End: "02", Low: 1, High: 10 + 1e-9, Confirmed: true, ConfirmedAt: "02"},
+		{Chain: 0, Level: 1, Direction: "down", Start: "02", End: "03", Low: 10, High: 12, Confirmed: true, ConfirmedAt: "03"},
+		{Chain: 0, Level: 1, Direction: "up", Start: "03", End: "04", Low: 8, High: 14, Confirmed: true, ConfirmedAt: "04"},
+	})
+	if centers := buildRecursiveCenters(segments); len(centers) != 0 {
+		t.Fatalf("centers=%+v, an overlap narrower than source-price tolerance must normalize to a touch", centers)
+	}
+}
+
 func TestRecursiveCentersClassifyOverlapTouchAndSeparation(t *testing.T) {
 	targets := []struct {
 		name     string
@@ -164,7 +221,11 @@ func centerRelationFixture(lower, upper float64) []Segment {
 		}
 		segments = append(segments, Segment{Chain: 0, Level: 1, Direction: direction, Start: start, End: end, StartPrice: interval[1], EndPrice: interval[0], Low: interval[0], High: interval[1], Confirmed: true, ConfirmedAt: end})
 	}
-	return withAlternatingEndpointKinds(segments)
+	segments = withAlternatingEndpointKinds(segments)
+	for index := 1; index < len(segments); index++ {
+		segments[index].StartPrice = segments[index-1].EndPrice
+	}
+	return segments
 }
 
 func withAlternatingEndpointKinds(segments []Segment) []Segment {
@@ -245,6 +306,42 @@ func TestFeatureBreakReclaimedByOriginalDirectionRemainsForming(t *testing.T) {
 	}
 }
 
+func TestReclaimedFeatureBreakDoesNotHideLaterConfirmedBreak(t *testing.T) {
+	// 第一次破坏被反弹收回后，必须继续检查后续破坏，不能提前结束整条线段扫描。
+	strokes := featureBreakFixture(12)
+	for _, price := range [][2]float64{{12, 4}, {4, 8}} {
+		index := len(strokes)
+		direction, startKind, endKind := "down", "top", "bottom"
+		if price[1] > price[0] {
+			direction, startKind, endKind = "up", "bottom", "top"
+		}
+		strokes = append(strokes, Stroke{Chain: 0, Direction: direction,
+			Start: Fractal{Kind: startKind, Date: fmt.Sprintf("%02d", index+1), Price: price[0]},
+			End:   Fractal{Kind: endKind, Date: fmt.Sprintf("%02d", index+2), Price: price[1]},
+			Low:   math.Min(price[0], price[1]), High: math.Max(price[0], price[1]),
+			Confirmed: true, ConfirmedAt: fmt.Sprintf("%02d", index+2)})
+	}
+	for _, mirrored := range []bool{false, true} {
+		input := append([]Stroke(nil), strokes...)
+		if mirrored {
+			for index := range input {
+				stroke := &input[index]
+				stroke.Start.Price, stroke.End.Price = 30-stroke.Start.Price, 30-stroke.End.Price
+				stroke.Low, stroke.High = 30-stroke.High, 30-stroke.Low
+				if stroke.Direction == "up" {
+					stroke.Direction, stroke.Start.Kind, stroke.End.Kind = "down", "top", "bottom"
+				} else {
+					stroke.Direction, stroke.Start.Kind, stroke.End.Kind = "up", "bottom", "top"
+				}
+			}
+		}
+		segments := buildSegments(input)
+		if len(segments) == 0 || !segments[0].Confirmed || segments[0].BreakStroke != 9 || segments[0].ConfirmStroke != 10 || segments[0].EndPointStroke != 6 {
+			t.Fatalf("mirrored=%v segments=%+v, want the later break confirmed after the earlier candidate was reclaimed", mirrored, segments)
+		}
+	}
+}
+
 func TestFeatureBreakRequiresFollowingStrokeToConfirmAndBacktracksEndpoint(t *testing.T) {
 	// The rebound ends above the broken feature low (7) but below the
 	// feature element high (11), so it must not erase the break.
@@ -266,9 +363,7 @@ func TestFeatureBreakRequiresFollowingStrokeToConfirmAndBacktracksEndpoint(t *te
 
 func TestNextSegmentStartsAfterBacktrackedEndpointNotLateFeatureBreak(t *testing.T) {
 	strokes := featureBreakFixture(6.5)
-	// The strongest endpoint is at stroke 4, while feature break and
-	// confirmation occur later at strokes 7 and 8. The next move must begin
-	// at stroke 5 so the higher-level input remains continuous.
+	// 最强端点位于第 4 笔，第 5 笔候选由第 7 笔确认；后续线段应从第 5 笔开始。
 	strokes[4].End.Price, strokes[4].High = 17, 17
 	strokes[5].Start.Price, strokes[5].High = 17, 17
 	strokes[5].End.Price = 9
@@ -283,8 +378,8 @@ func TestNextSegmentStartsAfterBacktrackedEndpointNotLateFeatureBreak(t *testing
 		t.Fatalf("segments=%+v, want a following counter-direction segment", segments)
 	}
 	first, second := segments[0], segments[1]
-	if !first.Confirmed || first.BreakStroke != 7 || first.ConfirmStroke != 8 || first.EndPointStroke != 4 || first.End != strokes[4].End.Date {
-		t.Fatalf("first segment=%+v, want endpoint backtracked to stroke 4 and confirmed by stroke 8", first)
+	if !first.Confirmed || first.BreakStroke != 5 || first.ConfirmStroke != 7 || first.EndPointStroke != 4 || first.End != strokes[4].End.Date {
+		t.Fatalf("first segment=%+v, want the 1+1 candidate confirmed at stroke 7 with endpoint backtracked to stroke 4", first)
 	}
 	if second.StartStroke != first.EndPointStroke+1 || second.Direction != "down" || second.Start != first.End || strokes[second.StartStroke].Start.Date != first.End {
 		t.Fatalf("second segment=%+v first=%+v, want continuous counter move from backtracked endpoint", second, first)
@@ -331,6 +426,51 @@ func TestFeatureBreakWithoutConfirmedReversalRemainsForming(t *testing.T) {
 	if segment.Confirmed || !segment.Forming || segment.BreakStroke != 7 || segment.ConfirmStroke != -1 || segment.EndStroke != 6 || segment.EndPointStroke != 6 || segment.End != "08" || segment.EndPrice != 15 || segment.ConfirmedAt != "" {
 		t.Fatalf("unconfirmed reversal state=%+v, want forming segment with backtracked endpoint and no confirm time", segment)
 	}
+}
+
+func TestGappedFeatureSequenceTerminatesThroughSecondFeatureFractal(t *testing.T) {
+	for _, mirrored := range []bool{false, true} {
+		strokes := gappedFeatureBreakFixture()
+		if mirrored {
+			for index := range strokes {
+				stroke := &strokes[index]
+				stroke.Start.Price, stroke.End.Price = 30-stroke.Start.Price, 30-stroke.End.Price
+				stroke.Low, stroke.High = 30-stroke.High, 30-stroke.Low
+				if stroke.Direction == "up" {
+					stroke.Direction, stroke.Start.Kind, stroke.End.Kind = "down", "top", "bottom"
+				} else {
+					stroke.Direction, stroke.Start.Kind, stroke.End.Kind = "up", "bottom", "top"
+				}
+			}
+		}
+		candidate, evidence, mode, ok := segmentEnd(strokes, 0)
+		if !ok || candidate != 3 || evidence != 8 || mode != 2 {
+			t.Fatalf("mirrored=%v gapped feature termination=(%d,%d,%d,%v), want break at stroke 3 confirmed by second-sequence fractal at stroke 8", mirrored, candidate, evidence, mode, ok)
+		}
+		segments := buildSegments(strokes)
+		if len(segments) < 2 || !segments[0].Confirmed || segments[0].BreakStroke != 3 || segments[0].ConfirmStroke != 8 || segments[0].ConfirmedAt != "10" || segments[0].EndPointStroke != 2 {
+			t.Fatalf("mirrored=%v segments=%+v, want confirmed first segment at the gap break", mirrored, segments)
+		}
+	}
+}
+
+func gappedFeatureBreakFixture() []Stroke {
+	prices := [][2]float64{{10, 20}, {20, 15}, {15, 25}, {25, 21}, {21, 24}, {24, 18}, {18, 20}, {20, 19}, {19, 23}}
+	strokes := make([]Stroke, len(prices))
+	for index, price := range prices {
+		direction, startKind, endKind := "up", "bottom", "top"
+		if index%2 == 1 {
+			direction, startKind, endKind = "down", "top", "bottom"
+		}
+		strokes[index] = Stroke{
+			Chain: 0, Direction: direction,
+			Start: Fractal{Kind: startKind, Date: fmt.Sprintf("%02d", index+1), Price: price[0]},
+			End:   Fractal{Kind: endKind, Date: fmt.Sprintf("%02d", index+2), Price: price[1]},
+			Low:   math.Min(price[0], price[1]), High: math.Max(price[0], price[1]),
+			Confirmed: true, ConfirmedAt: fmt.Sprintf("%02d", index+2),
+		}
+	}
+	return strokes
 }
 
 func TestSegmentsDoNotCrossChainBoundaries(t *testing.T) {

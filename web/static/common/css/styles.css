@@ -8,6 +8,7 @@
 .chan-section-label{display:block;margin-bottom:8px;color:var(--muted);font-size:12px}
 .chan-summary h2{margin:0;font-size:20px;line-height:1.45;font-weight:600}
 .chan-summary-read>p{max-width:70ch;margin:10px 0 0;color:var(--text);font-size:13px;line-height:1.8}
+.chan-summary-read>.chan-summary-readiness{margin-top:6px;color:var(--muted);font-size:12px;line-height:1.65}
 .chan-meta{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:7px;color:var(--muted);font-size:11px;line-height:1.5;text-align:right;font-variant-numeric:tabular-nums}
 .chan-meta>span:first-child{color:var(--text)}
 .chan-meta>.chan-status-line{font-size:11px;}
@@ -330,6 +331,14 @@
 /* Separate adjacent enabled layers with a light divider when all toggles are on. */
 .chan-controls .chan-layer-control-group .chan-layer-switches .detail-seg[aria-pressed="true"]+.detail-seg[aria-pressed="true"]{border-left:1px solid color-mix(in srgb,var(--on-blue) 48%,var(--blue))}
 .chan-legend{display:flex;justify-content:center;flex-wrap:wrap;gap:12px 20px;margin:10px 0 20px;font-size:11px;color:var(--muted)}
+.chan-structure-support-details{margin:12px 0 20px;font-size:12px;line-height:1.6;color:var(--muted)}
+.chan-structure-support-details>summary{width:fit-content;cursor:pointer;color:var(--text);padding:6px 0}
+.chan-structure-support-details>summary:focus-visible{outline:2px solid var(--blue);outline-offset:3px}
+.chan-structure-support-details>p{margin:6px 0}
+.chan-structure-support-details>ul{list-style:none;padding:0;margin:8px 0;display:grid;gap:8px}
+.chan-structure-support-details li{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 12px}
+.chan-structure-support-details li strong{font-variant-numeric:tabular-nums;color:var(--text)}
+.chan-layer-menu-display .chan-layer-support-help{display:block;margin-top:8px;color:var(--muted);font-size:11px;line-height:1.45;white-space:normal}
 .chan-legend>span{display:inline-flex;align-items:center;gap:6px}
 .chan-legend-pen{width:20px;border-top:2px solid var(--blue)}
 .chan-legend-pending{border-top-style:dashed}

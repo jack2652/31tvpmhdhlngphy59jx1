@@ -81,7 +81,7 @@ func (a *IncrementalAnalyzer) Append(input Bar, cutoff time.Time) (Result, error
 	}
 	if len(a.bars) > 0 {
 		previous := a.bars[len(a.bars)-1]
-		if !adjacentTradingSessions(previous.Date, bar.Date) || previous.Close > 0 && (bar.Close/previous.Close-1 > 0.20 || bar.Close/previous.Close-1 < -0.20) {
+		if !adjacentTradingSessions(previous.Date, bar.Date) || shouldSplitOnLargePriceMove(previous, bar) {
 			bar.Chain = previous.Chain + 1
 		} else {
 			bar.Chain = previous.Chain
@@ -91,20 +91,20 @@ func (a *IncrementalAnalyzer) Append(input Bar, cutoff time.Time) (Result, error
 	mergedBarValue := mergedBar{high: bar.High, low: bar.Low, highIndex: len(a.bars) - 1, lowIndex: len(a.bars) - 1, start: len(a.bars) - 1, end: len(a.bars) - 1, sourceHigh: bar.SourceIndex, sourceLow: bar.SourceIndex, sourceStart: bar.SourceIndex, sourceEnd: bar.SourceIndex, chain: bar.Chain}
 	if len(a.merged) > 0 && a.merged[len(a.merged)-1].chain == bar.Chain {
 		last := &a.merged[len(a.merged)-1]
-		contains := (last.high >= mergedBarValue.high && last.low <= mergedBarValue.low) || (mergedBarValue.high >= last.high && mergedBarValue.low <= last.low)
+		contains := priceRangeContains(last.high, last.low, mergedBarValue.high, mergedBarValue.low) || priceRangeContains(mergedBarValue.high, mergedBarValue.low, last.high, last.low)
 		if contains {
 			if a.mergeDirection == 0 {
-				if mergedBarValue.high >= last.high {
+				if priceGreater(mergedBarValue.high, last.high) {
 					last.high, last.highIndex, last.sourceHigh = mergedBarValue.high, mergedBarValue.highIndex, mergedBarValue.sourceHigh
 				}
-				if mergedBarValue.low <= last.low {
+				if priceLess(mergedBarValue.low, last.low) {
 					last.low, last.lowIndex, last.sourceLow = mergedBarValue.low, mergedBarValue.lowIndex, mergedBarValue.sourceLow
 				}
 			} else {
-				if a.mergeDirection >= 0 && mergedBarValue.high >= last.high || a.mergeDirection < 0 && mergedBarValue.high <= last.high {
+				if a.mergeDirection >= 0 && priceGreaterOrEqual(mergedBarValue.high, last.high) || a.mergeDirection < 0 && priceLessOrEqual(mergedBarValue.high, last.high) {
 					last.high, last.highIndex, last.sourceHigh = mergedBarValue.high, mergedBarValue.highIndex, mergedBarValue.sourceHigh
 				}
-				if a.mergeDirection > 0 && mergedBarValue.low >= last.low || a.mergeDirection <= 0 && mergedBarValue.low <= last.low {
+				if a.mergeDirection > 0 && priceGreaterOrEqual(mergedBarValue.low, last.low) || a.mergeDirection <= 0 && priceLessOrEqual(mergedBarValue.low, last.low) {
 					last.low, last.lowIndex, last.sourceLow = mergedBarValue.low, mergedBarValue.lowIndex, mergedBarValue.sourceLow
 				}
 			}
@@ -135,15 +135,17 @@ func (a *IncrementalAnalyzer) Append(input Bar, cutoff time.Time) (Result, error
 			continue
 		}
 		kind, index, price := "", middle.highIndex, middle.high
-		if middle.high > left.high && middle.high > right.high && middle.low > left.low && middle.low > right.low {
+		if priceGreater(middle.high, left.high) && priceGreater(middle.high, right.high) && priceGreater(middle.low, left.low) && priceGreater(middle.low, right.low) {
 			kind = "top"
-		} else if middle.low < left.low && middle.low < right.low && middle.high < left.high && middle.high < right.high {
+		} else if priceLess(middle.low, left.low) && priceLess(middle.low, right.low) && priceLess(middle.high, left.high) && priceLess(middle.high, right.high) {
 			kind, index, price = "bottom", middle.lowIndex, middle.low
 		} else {
 			continue
 		}
 		confirmedAt := a.bars[final.start].Date
-		a.fractals = append(a.fractals, Fractal{Kind: kind, Date: a.bars[index].Date, Price: price, Level: 0, FirstObservedAt: confirmedAt, ConfirmedAt: confirmedAt, MergedIndex: i, RawIndex: index, RawStartIndex: middle.start, RawEndIndex: middle.end, SourceRawIndex: sourceIndexFor(a.bars, index), SourceRawStart: middle.sourceStart, SourceRawEnd: middle.sourceEnd, Chain: middle.chain})
+		// 分型日期锚定标准化 K 线吸收的最后一根原始 K 线；极值本身的
+		// 原始索引继续单独保留，避免增量路径与批量路径产生日期漂移。
+		a.fractals = append(a.fractals, Fractal{Kind: kind, Date: a.bars[middle.end].Date, Price: price, Level: 0, FirstObservedAt: confirmedAt, ConfirmedAt: confirmedAt, MergedIndex: i, RawIndex: index, RawStartIndex: middle.start, RawEndIndex: middle.end, SourceRawIndex: sourceIndexFor(a.bars, index), SourceRawStart: middle.sourceStart, SourceRawEnd: middle.sourceEnd, Chain: middle.chain})
 	}
 	a.updates++
 	return a.result(cutoff), nil

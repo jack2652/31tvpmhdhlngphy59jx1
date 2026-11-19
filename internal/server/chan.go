@@ -657,7 +657,7 @@ func chanAnalysisCacheKey(symbol string, daily, intraday, market []chananalysis.
 		Intraday []chananalysis.Bar `json:"intraday"`
 		Market   []chananalysis.Bar `json:"market"`
 	}{
-		Version:  chananalysis.RecursivePreviewVersion + "|" + chananalysis.MarketEnvironmentRuleVersion,
+		Version:  chananalysis.RecursivePreviewVersion + "|" + chananalysis.TimeframeMappingVersion + "|" + chananalysis.MarketEnvironmentRuleVersion,
 		Symbol:   symbol,
 		Bucket:   bucket,
 		Daily:    daily,
@@ -1533,7 +1533,7 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 	if light {
 		response["symbol"], response["spot"], response["generated_at"] = symbol, analysisSpot, now
 	} else {
-		response["rule_version"], response["rules"], response["summary"] = result.RuleVersion, result.Rules, result.Summary
+		response["rule_version"], response["legacy_rule_version"], response["rules"], response["summary"] = result.RuleVersion, result.LegacyRuleVersion, result.Rules, result.Summary
 		response["daily"], response["weekly"] = result.Daily, result.Weekly
 	}
 	c.JSON(http.StatusOK, response)

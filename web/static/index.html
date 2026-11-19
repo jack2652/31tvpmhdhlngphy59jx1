@@ -174,7 +174,7 @@
       </div>
       <div v-if="chanExpanded" class="detail-body chan-body" id="chan-body">
         <div class="chan-summary">
-          <div class="chan-summary-read"><span class="chan-section-label">缠论结构 · {{ chanFrame.label }}概况</span><h2>{{ chanFrame.recursive.heading }}</h2><p>{{ chanFrame.recursive.trend }}</p></div>
+          <div class="chan-summary-read"><span class="chan-section-label">缠论结构 · {{ chanFrame.label }}概况</span><h2>{{ chanFrame.recursive.heading }}</h2><p>{{ chanFrame.recursive.trend }}</p><p v-if="chanFrame.recursive.emptySignalNotice" class="chan-summary-readiness" role="status">{{ chanFrame.recursive.emptySignalNotice }}</p></div>
           <div class="chan-meta"><strong class="chan-summary-spot">现价 {{ view.chan.spot }}</strong><span class="chan-status-line" role="status">{{ chanStatusLine }}</span><span class="chan-summary-quality chan-quality" :class="'chan-quality-' + chanFrame.recursive.qualityClass">行情{{ chanFrame.recursive.quality }}</span></div>
         </div>
         <section class="chan-recursive" aria-labelledby="chan-recursive-title">
@@ -255,13 +255,16 @@
                 <section class="chan-layer-menu-display"><h4>价格图层</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="价格图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.supportResistance ? 'true' : 'false'" @click="toggleChanChartLayer('supportResistance')">支撑/压力线</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.structureSupports ? 'true' : 'false'" aria-describedby="chan-structure-support-help" @click="toggleChanChartLayer('structureSupports')">结构支撑</button>
                   <button class="detail-seg" type="button" title="按已确认的笔与线段高低点绘制支撑和压力趋势线；收盘破位后结束" :aria-pressed="chanChartLayers.trendlines ? 'true' : 'false'" @click="toggleChanChartLayer('trendlines')">结构趋势线</button>
                 </div>
+                <small class="chan-layer-support-help" id="chan-structure-support-help">蓝色实线为已确认结构支撑，灰色虚线为收盘已失守；盘中下穿不改变状态。</small>
                 </section>
                 <section class="chan-layer-menu-recursive" aria-label="结构层级"><div class="chan-recursive-layer-groups" :class="{ 'chan-recursive-layer-groups-single': !chanSegmentLevels.length || !chanLayerLevels.length }">
                   <div v-if="chanSegmentLevels.length" class="chan-recursive-layer-group">
                     <h5>线段与走势</h5>
                     <div class="detail-segmented chan-layer-switches chan-recursive-layer-switches" role="group" aria-label="各层线段和走势">
+                      <button class="detail-seg" type="button" :aria-pressed="areAllChanSegmentLevelsVisible() ? 'true' : 'false'" aria-label="显示或隐藏全部级别的线段" title="显示或隐藏全部级别的线段" @click="toggleChanChartLayer('segments')">全部级别</button>
                       <button v-for="level in chanSegmentLevels" :key="'segment-layer-' + level" class="detail-seg" type="button" :aria-pressed="isChanSegmentLevelVisible(level) ? 'true' : 'false'" :title="'仅显示或隐藏第 ' + (level + 1) + ' 层结构'" @click="toggleChanSegmentLevel(level)">{{ level === 0 ? '第1层线段' : '第' + (level + 1) + '层走势' }}</button>
                     </div>
                   </div>
@@ -410,6 +413,14 @@
           <p class="chan-chart-gesture-help">鼠标按住左右拖动；Ctrl 或 ⌘ + 滚轮缩放。手机单指左右拖动、双指捏合缩放。</p>
         </div>
         <div v-if="!chanFrame.chart" class="levels-empty">历史行情到达后展示 K 线与多级结构</div>
+        <details v-if="chanFrame.chart && chanChartLayers.structureSupports" class="chan-structure-support-details">
+          <summary>结构支撑 · {{ chanFrame.chart.structureSupportLevels.length }} 处</summary>
+          <p>相近价位合并；支撑来源、起点、确认日期和失守日期见下表。</p>
+          <ul v-if="chanFrame.chart.structureSupportLevels.length">
+            <li v-for="level in chanFrame.chart.structureSupportLevels" :key="level.key"><strong>{{ level.zoneLabel }}</strong><span>{{ level.statusLabel }}</span><span>{{ level.sources }} · 起点 {{ level.date }} · 确认 {{ level.confirmedAt }}{{ level.brokenAt ? ' · 失守 ' + level.brokenAt : '' }}</span></li>
+          </ul>
+          <p v-else>当前连续行情中暂无已确认结构支撑。</p>
+        </details>
         <button v-if="chanSpotGuideVisible && isChanTouchInput()" type="button" class="chan-spot-guide-backdrop" aria-label="关闭现价结构观察" @click.stop="dismissChanSpotGuide"></button>
         <button v-if="chanHoveredScenario && isChanTouchInput()" type="button" class="chan-projection-backdrop" aria-label="关闭条件情景" @click.stop="hideChanScenario($event)"></button>
         <article v-if="chanSpotGuideVisible && chanFrame.spotGuide" id="chan-spot-guide-card" class="chan-spot-float-card" :class="{ 'chan-spot-float-card-mobile': isChanTouchInput() }" role="region" aria-label="现价结构观察" @keydown.esc.stop.prevent="dismissChanSpotGuide" :style="{ left: chanSpotGuideX + 'px', top: chanSpotGuideY == null ? null : chanSpotGuideY + 'px' }">

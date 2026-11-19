@@ -95,8 +95,10 @@
                   <section class="chan-layer-menu-display"><h4>价格图层</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="价格图层">
                     <button class="detail-seg" type="button" :aria-pressed="chartLayers.chanCandles ? 'true' : 'false'" @click="toggleChartLayer('chanCandles')">缠论K线</button>
                     <button class="detail-seg" type="button" :aria-pressed="chartLayers.supportResistance ? 'true' : 'false'" @click="toggleChartLayer('supportResistance')">支撑/压力线</button>
+                    <button class="detail-seg" type="button" :aria-pressed="chartLayers.structureSupports ? 'true' : 'false'" aria-describedby="futures-structure-support-help" @click="toggleChartLayer('structureSupports')">结构支撑</button>
                     <button class="detail-seg" type="button" :aria-pressed="chartLayers.trendlines ? 'true' : 'false'" @click="toggleChartLayer('trendlines')">结构趋势线</button>
                   </div></section>
+                  <small class="chan-layer-support-help" id="futures-structure-support-help">蓝色实线为已确认结构支撑，灰色虚线为收盘已失守；盘中下穿不改变状态。</small>
                   <section class="chan-layer-menu-recursive" aria-label="结构层级"><div class="chan-recursive-layer-groups">
                     <div class="chan-recursive-layer-group"><h5>线段与走势</h5><div class="detail-segmented chan-layer-switches" role="group" aria-label="线段图层">
                       <button v-for="level in (frame?.chart?.segmentLevels || [])" :key="'segment-' + level" class="detail-seg" type="button" :aria-pressed="isSegmentLevelVisible(level) ? 'true' : 'false'" @click="toggleSegmentLevel(level)">{{ level === 0 ? '第1层线段' : '第' + (level + 1) + '层走势' }}</button>
@@ -153,6 +155,12 @@
           </template>
         </div>
         <div v-else class="levels-empty">{{ loading ? '正在读取历史行情…' : '暂无可用历史行情' }}</div>
+        <details v-if="frame?.chart && chartLayers.structureSupports" class="chan-structure-support-details">
+          <summary>结构支撑 · {{ frame.chart.structureSupportLevels.length }} 处</summary>
+          <p>相近价位合并；支撑来源、起点、确认日期和失守日期见下表。</p>
+          <ul v-if="frame.chart.structureSupportLevels.length"><li v-for="level in frame.chart.structureSupportLevels" :key="level.key"><strong>{{ level.zoneLabel }}</strong><span>{{ level.statusLabel }}</span><span>{{ level.sources }} · 起点 {{ level.date }} · 确认 {{ level.confirmedAt }}{{ level.brokenAt ? ' · 失守 ' + level.brokenAt : '' }}</span></li></ul>
+          <p v-else>当前连续行情中暂无已确认结构支撑。</p>
+        </details>
         <div v-if="frame && frame.chart" class="chan-chart-navigation" role="group" aria-label="K 线图缩放与移动">
           <span class="chan-chart-navigation-spacer"></span>
           <button type="button" aria-label="放大 K 线图" title="放大" :disabled="!frame.chart.canZoomIn" @click="changeViewport('zoom-in')">＋</button>

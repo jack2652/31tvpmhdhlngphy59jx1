@@ -37,16 +37,16 @@ func turningSignals(strokes []Stroke, centers []Center, bars []Bar) []Signal {
 			// Both pens must touch the same center, which must already have
 			// been known when this observation could first be made.
 			if center.StartStroke <= index-2 && center.ConfirmedAt <= observedAt &&
-				previous.High >= center.Lower && previous.Low <= center.Upper &&
-				current.High >= center.Lower && current.Low <= center.Upper {
+				priceGreaterOrEqual(previous.High, center.Lower) && priceLessOrEqual(previous.Low, center.Upper) &&
+				priceGreaterOrEqual(current.High, center.Lower) && priceLessOrEqual(current.Low, center.Upper) {
 				shared = center
 			}
 		}
 		if shared == nil {
 			continue
 		}
-		extended := side == "buy" && current.End.Price < previous.End.Price && current.End.Price < shared.Lower ||
-			side == "sell" && current.End.Price > previous.End.Price && current.End.Price > shared.Upper
+		extended := side == "buy" && priceLess(current.End.Price, previous.End.Price) && priceLess(current.End.Price, shared.Lower) ||
+			side == "sell" && priceGreater(current.End.Price, previous.End.Price) && priceGreater(current.End.Price, shared.Upper)
 		ratio := current.MACDArea / previous.MACDArea
 		if !extended || ratio >= 0.8 {
 			continue
@@ -91,7 +91,7 @@ func turningSignals(strokes []Stroke, centers []Center, bars []Bar) []Signal {
 			}
 			if reversal.Confirmed && index+2 < len(strokes) && strokes[index+2].Chain == current.Chain {
 				retest := strokes[index+2]
-				held := side == "buy" && retest.Low > current.End.Price || side == "sell" && retest.High < current.End.Price
+				held := side == "buy" && priceGreater(retest.Low, current.End.Price) || side == "sell" && priceLess(retest.High, current.End.Price)
 				if retest.Confirmed && retest.Direction == current.Direction && held {
 					signal.Phase, signal.PhaseAt = "retest", retest.ConfirmedAt
 					signal.RetestPrice = ptr(retest.End.Price)

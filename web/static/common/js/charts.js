@@ -106,6 +106,7 @@ function chanStructureTooltipDetails(structure) {
   const end = structure.end || "未知";
   const formed = structure.formedAt ? `形成 ${structure.formedAt}` : "形成时间未知";
   const confirmation = structure.confirmedAt ? ` · 确认 ${structure.confirmedAt}` : " · 尚未确认";
+  const ruleVersion = structure.ruleVersion ? ` · 规则 ${structure.ruleVersion}` : "";
   const level = structure.level == null ? "" : `第${Number(structure.level) + 1}层`;
   const signalTypes = ["一买", "一卖", "二买", "二卖", "三买", "三卖"];
   if (signalTypes.includes(structure.type)) {
@@ -114,7 +115,7 @@ function chanStructureTooltipDetails(structure) {
     const boundary = displayPrice(structure.invalidationPrice);
     return {
       title: `${structure.type} · ${status}${phase}`,
-      body: `${start} · 参考价 ${endPrice} · 失效边界 ${boundary}`,
+      body: `${start} · 参考价 ${endPrice} · 失效边界 ${boundary}${ruleVersion}`,
     };
   }
   const type = structure.type === "线段" ? `${level}线段`
@@ -122,7 +123,7 @@ function chanStructureTooltipDetails(structure) {
     : structure.type === "基础中枢" || /级中枢$/.test(structure.type) ? `${level}中枢` : structure.type;
   return {
     title: `${type}${["一买", "一卖", "二买", "二卖", "三买", "三卖"].includes(structure.type) ? ` · ${level}` : ""} · ${structure.confirmed ? "已确认" : "形成中"}`,
-    body: `${start} ${startPrice} → ${end} ${endPrice} · ${formed}${confirmation} · ${structure.composition || "组成范围未知"}`,
+    body: `${start} ${startPrice} → ${end} ${endPrice} · ${formed}${confirmation} · ${structure.composition || "组成范围未知"}${ruleVersion}`,
   };
 }
 
@@ -377,7 +378,7 @@ function bindChanChartHover(target, initialBinding) {
       const markerDistance = Math.hypot(localX - signal.x, localY - (Number.isFinite(signal.markerY) ? signal.markerY : signal.y));
       const halfLabel = (signal.hitLabelWidth || 48) / 2;
       const labelX = Number.isFinite(signal.labelX) ? signal.labelX : signal.x;
-      const labelDistance = localY >= signal.labelY - 12 && localY <= signal.labelY + 4 && Math.abs(localX - labelX) <= halfLabel ? 0 : Infinity;
+      const labelDistance = signal.labelVisible !== false && localY >= signal.labelY - 12 && localY <= signal.labelY + 4 && Math.abs(localX - labelX) <= halfLabel ? 0 : Infinity;
       return { signal, distance: Math.min(markerDistance, labelDistance) };
     }).filter(({ signal, distance }) => model.layers?.signals === true && distance <= 12)
       .sort((left, right) => left.distance - right.distance)[0]?.signal;
@@ -398,6 +399,12 @@ function bindChanChartHover(target, initialBinding) {
       structureBody.textContent = `${afSignalHit.date} · 确认于 ${afSignalHit.confirmedAt || "未知"} · Z ${formatIndicator(afSignalHit.z)}`;
       structureDetail.hidden = false;
     }
+    const supportHit = model.layers?.structureSupports === false ? null : (model.structureSupports || []).find((item) => {
+      const onLine = localX >= item.x1 && localX <= item.x2 && Math.abs(localY - item.y) <= 7;
+      const onLabel = localX >= item.labelX - (item.labelWidth || 100) && localX <= item.labelX
+        && Math.abs(localY - item.labelY) <= 9;
+      return onLine || onLabel;
+    });
     const structure = candle.pending ? null : (model.structures || []).map((item) => {
       const inArea = item.area && localX >= Math.min(item.x1, item.x2) && localX <= Math.max(item.x1, item.x2)
         && localY >= Math.min(item.y1, item.y2) && localY <= Math.max(item.y1, item.y2);
@@ -405,7 +412,11 @@ function bindChanChartHover(target, initialBinding) {
     })
       .filter(({ item, distance }) => distance <= (item.area ? 0 : 8))
       .sort((left, right) => left.distance - right.distance)[0]?.item;
-    if (!signalHit && !afSignalHit && structure) {
+    if (!signalHit && !afSignalHit && supportHit) {
+      structureTitle.textContent = `${supportHit.statusLabel} · ${supportHit.zoneLabel}`;
+      structureBody.textContent = `${supportHit.sources} · 起点 ${supportHit.date} · 确认 ${supportHit.confirmedAt}${supportHit.status === "broken" ? " · 失守 " + supportHit.brokenAt : " · 截至 " + supportHit.lastCloseDate + " 未被收盘跌破"}`;
+      structureDetail.hidden = false;
+    } else if (!signalHit && !afSignalHit && structure) {
       const detail = chanStructureTooltipDetails(structure);
       structureTitle.textContent = detail.title;
       structureBody.textContent = detail.body;
@@ -1324,7 +1335,16 @@ function drawChanCanvas(target, binding) {
     context.beginPath(); context.arc(marker.x, marker.y, 5, 0, Math.PI * 2);
     const markerColor = marker.invalidated ? colors.text : colors.blue;
     context.fillStyle = colors.panel; context.strokeStyle = markerColor; context.lineWidth = 1.5; context.setLineDash(marker.watch || marker.invalidated ? [2, 2] : []); context.fill(); context.stroke(); context.setLineDash([]);
-    context.font = model.mobileChart ? "550 12px Inter, ui-sans-serif, system-ui, sans-serif" : "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center";
+    const labelHeight = marker.labelHeight || (model.mobileChart ? 18 : 15);
+    if (marker.labelConnector) {
+      const labelBelowMarker = marker.labelY > marker.y;
+      const labelEdgeY = marker.labelY + (labelBelowMarker ? -labelHeight / 2 : labelHeight / 2);
+      context.beginPath();
+      context.moveTo(marker.x, marker.y + (labelBelowMarker ? 6 : -6));
+      context.lineTo(marker.labelX, labelEdgeY);
+      context.strokeStyle = markerColor; context.lineWidth = 1; context.globalAlpha = 0.62; context.stroke(); context.globalAlpha = 1;
+    }
+    context.font = model.mobileChart ? "550 12px Inter, ui-sans-serif, system-ui, sans-serif" : "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center"; context.textBaseline = "middle";
     context.lineWidth = 3; context.strokeStyle = colors.panel; context.strokeText(marker.label, marker.labelX, marker.labelY);
     context.fillStyle = markerColor; context.fillText(marker.label, marker.labelX, marker.labelY);
   }
@@ -1333,6 +1353,25 @@ function drawChanCanvas(target, binding) {
     if (model.layers?.supportResistance === false && ["support", "resistance"].includes(level.tone)) continue;
     const color = level.tone === "support" ? colors.up : level.tone === "resistance" ? colors.down : colors.blue;
     line(level.x1, level.y, level.x2, level.y, color, [3, 4], 1);
+  }
+  // 自动结构支撑与实时价无关；有效线为蓝色，收盘失守线同时用虚线和文字区分。
+  if (model.layers?.structureSupports !== false) for (const level of model.structureSupports || []) {
+    const color = level.status === "broken" ? colors.text : colors.blue;
+    line(level.x1, level.y, level.x2, level.y, color, level.status === "broken" ? [5, 4] : [], 1.6);
+    if (level.pointX != null) {
+      if (level.pointX < level.x1) line(level.pointX, level.y, level.x1, level.y, color, [2, 3], 1);
+      context.beginPath(); context.arc(level.pointX, level.pointY, 3.2, 0, Math.PI * 2);
+      context.fillStyle = colors.panel; context.fill(); context.strokeStyle = color; context.lineWidth = 1.6; context.stroke();
+    }
+    context.font = `550 ${model.mobileChart ? 12 : 11}px Inter, ui-sans-serif, system-ui, sans-serif`;
+    context.textAlign = "right"; context.textBaseline = "middle";
+    const measured = context.measureText?.(level.label).width ?? level.label.length * 8;
+    level.labelWidth = Math.min(measured + 8, model.historyRight - model.plotLeft - 8);
+    context.fillStyle = colors.panel;
+    context.fillRect(level.labelX - level.labelWidth - 2, level.labelY - 8, level.labelWidth + 4, 16);
+    if (Math.abs(level.labelY - level.y) > 10) line(level.labelX - level.labelWidth - 5, level.y, level.labelX - level.labelWidth - 5, level.labelY, color, [], 1);
+    context.fillStyle = color;
+    context.fillText(level.label, level.labelX, level.labelY);
   }
   if (model.layers?.signals === true) for (const signal of model.signals || []) {
     const color = signal.invalidated ? colors.text : signal.side === "buy" ? colors.up : colors.down;
@@ -1352,6 +1391,7 @@ function drawChanCanvas(target, binding) {
       context.moveTo(signal.x + 3, markerY - 3); context.lineTo(signal.x - 3, markerY + 3);
       context.strokeStyle = color; context.lineWidth = 1.2; context.stroke();
     }
+    if (signal.labelVisible === false) continue;
     const status = signal.invalidated ? "" : signal.status === "confirmed" ? "✓" : "?";
     const signalLabel = signal.label + status;
     const labelY = Number.isFinite(signal.labelY) ? signal.labelY : signal.y + (signal.side === "buy" ? 16 : -10);
