@@ -1457,6 +1457,71 @@ func testService(t *testing.T, accessKey string) (*Service, *httptest.Server) {
 	return service, ts
 }
 
+func TestChainHistoryRouteReturnsTimestampedSnapshots(t *testing.T) {
+	service, ts := testService(t, "")
+	const expiration = "2030-01-18"
+	asOf := time.Now().UTC().Truncate(time.Second)
+	for _, minutesAgo := range []int{1, 5, 10, 15, 30} {
+		fetchedAt := asOf.Add(-time.Duration(minutesAgo)*time.Minute - 20*time.Second)
+		quoteAt := fetchedAt.Add(-5 * time.Second)
+		price := 100 + float64(minutesAgo)
+		strike := 100.0
+		bid := 1.25
+		ask := 1.4
+		volume := int64(25)
+		openInterest := int64(200)
+		impliedVolatility := 0.3
+		_, err := service.store.SaveQuoteAndChainSnapshot(model.Quote{
+			Symbol: "QQQ", Provider: "test", Price: &price, FetchedAt: &quoteAt,
+		}, model.ChainResponse{
+			Symbol: "QQQ", Expiration: expiration, Source: "test", FetchedAt: &fetchedAt,
+			Data: []model.OptionRow{{
+				ContractSymbol: "QQQ300118C00100000", ContractType: "call", Strike: &strike,
+				Bid: &bid, Ask: &ask, Volume: &volume, OpenInterest: &openInterest,
+				ImpliedVolatility: &impliedVolatility,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	response, err := http.Get(ts.URL + "/api/chain/QQQ/history?expiration=" + expiration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("history status=%d body=%s", response.StatusCode, body)
+	}
+	var payload model.ChainHistoryResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Symbol != "QQQ" || payload.Expiration != expiration || len(payload.Points) != 5 {
+		t.Fatalf("history response=%#v", payload)
+	}
+	for index, minutesAgo := range []int{1, 5, 10, 15, 30} {
+		point := payload.Points[index]
+		if point.MinutesAgo != minutesAgo || point.FetchedAt == nil || point.QuoteFetchedAt == nil || point.Spot == nil || len(point.Data) != 1 {
+			t.Errorf("point[%d]=%#v, want a complete timestamped sample", index, point)
+		}
+		if len(point.Data) == 1 && point.Data[0].ModelGamma == nil {
+			t.Errorf("point[%d] model Gamma was not added", index)
+		}
+	}
+
+	invalid, err := http.Get(ts.URL + "/api/chain/QQQ/history?expiration=2030-02-30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer invalid.Body.Close()
+	if invalid.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid expiration status=%d, want %d", invalid.StatusCode, http.StatusUnprocessableEntity)
+	}
+}
+
 func TestNewSetsCboeCacheLimitForLowMemoryMode(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -5572,12 +5637,12 @@ func TestFastAPIDocumentRoutesExposeOpenAPISchemaAndUIs(t *testing.T) {
 		t.Fatalf("OpenAPI metadata = %#v, want FastAPI title/version and 3.1.0", document)
 	}
 	paths, ok := document["paths"].(map[string]any)
-	if !ok || len(paths) != 11 {
-		t.Fatalf("OpenAPI paths = %#v, want all 10 original API routes plus Chan structure", document["paths"])
+	if !ok || len(paths) != 12 {
+		t.Fatalf("OpenAPI paths = %#v, want the existing API routes plus Chan structure and chain history", document["paths"])
 	}
 	for _, path := range []string{
 		"/api/events/{stock_symbol}", "/api/quote/{stock_symbol}", "/api/expirations/{stock_symbol}",
-		"/api/chain/{stock_symbol}", "/api/flow/{stock_symbol}", "/api/gamma/{stock_symbol}",
+		"/api/chain/{stock_symbol}", "/api/chain/{stock_symbol}/history", "/api/flow/{stock_symbol}", "/api/gamma/{stock_symbol}",
 		"/api/refresh/{stock_symbol}", "/api/levels/{stock_symbol}", "/api/status/{stock_symbol}", "/api/cleanup",
 		"/api/chan/{stock_symbol}",
 	} {

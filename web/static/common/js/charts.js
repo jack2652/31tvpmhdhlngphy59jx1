@@ -2255,6 +2255,161 @@ function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emp
   chartSvg.addEventListener("focus", () => showTooltip(0, null));
   chartSvg.addEventListener("blur", hideTooltip);
 }
+function renderStrikeGexProfile(targetId, points, options = {}) {
+  const target = document.getElementById(targetId);
+  if (!target) return;
+  const currentPoints = points || [];
+  const history = options.history || [];
+  const hasGex = currentPoints.some((point) => point.callGex || point.putGex || point.callVolumeGex || point.putVolumeGex);
+  if (!currentPoints.length || !hasGex) {
+    target.innerHTML = "";
+    target.textContent = options.emptyMessage || "当前期权链缺少可用 Gamma";
+    target.dataset.chartWidth = "";
+    target.dataset.chartHeight = "";
+    target.dataset.profileScrollKey = "";
+    target.scrollTop = 0;
+    return;
+  }
+
+  const { width } = chartContentBox(target);
+  const rowHeight = 28;
+  const footerHeight = 42;
+  const currentByStrike = new Map(currentPoints.map((point) => [point.strike, point]));
+  const profileByStrike = new Map(currentPoints.map((point) => [point.strike, point]));
+  history.forEach((sample) => {
+    (sample.points || []).forEach((point) => {
+      if (!profileByStrike.has(point.strike)) profileByStrike.set(point.strike, null);
+    });
+  });
+  const allStrikes = [...profileByStrike.keys()].sort((left, right) => right - left);
+  const nearestStrikeIndex = (value, strikeList = allStrikes) => {
+    const targetStrike = Number(value);
+    if (!Number.isFinite(targetStrike) || !strikeList.length) return -1;
+    let nearest = 0;
+    for (let index = 1; index < strikeList.length; index += 1) {
+      if (Math.abs(strikeList[index] - targetStrike) < Math.abs(strikeList[nearest] - targetStrike)) nearest = index;
+    }
+    return nearest;
+  };
+  const anchorIndexes = [options.spot, options.zeroGamma, options.positiveStrike, options.negativeStrike]
+    .filter((value) => value != null && Number.isFinite(Number(value)))
+    .map((value) => nearestStrikeIndex(value))
+    .filter((index) => index >= 0);
+  const firstAnchorIndex = anchorIndexes.length ? Math.min(...anchorIndexes) : 0;
+  const lastAnchorIndex = anchorIndexes.length ? Math.max(...anchorIndexes) : allStrikes.length - 1;
+  const firstVisibleIndex = Math.max(0, firstAnchorIndex - 10);
+  const lastVisibleIndex = Math.min(allStrikes.length - 1, lastAnchorIndex + 10);
+  const strikes = allStrikes.slice(firstVisibleIndex, lastVisibleIndex + 1);
+  const visibleStrikes = new Set(strikes);
+  const maxDataValue = Math.max(
+    0.000001,
+    ...currentPoints.filter((point) => visibleStrikes.has(point.strike)).flatMap((point) => [point.callGex, point.putGex, point.callVolumeGex, point.putVolumeGex].map((value) => Math.abs(Number(value) || 0))),
+    ...history.flatMap((sample) => (sample.points || []).filter((point) => visibleStrikes.has(point.strike)).map((point) => Math.abs(Number(point.value) || 0))),
+  );
+  const rawMaximumBillions = maxDataValue / 1000;
+  const magnitude = 10 ** Math.floor(Math.log10(rawMaximumBillions));
+  const axisMaximumBillions = Math.max(magnitude * 3, Math.ceil(rawMaximumBillions / (magnitude * 3)) * magnitude * 3);
+  const axisMaximum = axisMaximumBillions * 1000;
+  const strikeLabelGutter = Math.min(80, Math.max(52, width * 0.075));
+  const plotLeft = strikeLabelGutter + 4;
+  const plotRight = width - 24;
+  const plotWidth = plotRight - plotLeft;
+  const halfBarWidth = Math.max(24, plotWidth / 2 - 4);
+  const zeroX = plotLeft + plotWidth / 2;
+  const strikeLabelX = plotLeft - 8;
+  const xOf = (value) => zeroX + (Number(value) || 0) / axisMaximum * halfBarWidth;
+  const barLength = (value) => Math.abs(xOf(value) - zeroX);
+  const referenceLines = [
+    { value: options.spot, className: "chain-profile-level-spot" },
+    { value: options.zeroGamma, className: "chain-profile-level-flip" },
+    { value: options.positiveStrike, className: "chain-profile-level-positive" },
+    { value: options.negativeStrike, className: "chain-profile-level-negative" },
+  ].map((line) => {
+    const value = Number(line.value);
+    if (line.value == null || !Number.isFinite(value) || value > strikes[0] || value < strikes[strikes.length - 1]) return "";
+    const index = nearestStrikeIndex(value, strikes);
+    if (index < 0) return "";
+    const y = index * rowHeight + rowHeight / 2;
+    return `<line class="${line.className}" x1="${plotLeft}" x2="${plotRight}" y1="${y}" y2="${y}"/>`;
+  }).join("");
+  const bars = strikes.map((strike, index) => {
+    const point = currentByStrike.get(strike);
+    if (!point) return "";
+    const y = index * rowHeight;
+    const callOpenInterest = Number(point.callGex) || 0;
+    const putOpenInterest = Number(point.putGex) || 0;
+    const callVolume = Number(point.callVolumeGex) || 0;
+    const putVolume = Number(point.putVolumeGex) || 0;
+    const title = `行权价 ${formatMoney(strike)} · 看涨持仓量 GEX ${formatChartValue(callOpenInterest, 2, "M")} · 看跌持仓量 GEX ${formatChartValue(putOpenInterest, 2, "M")} · 看涨成交量 GEX ${formatChartValue(callVolume, 2, "M")} · 看跌成交量 GEX ${formatChartValue(putVolume, 2, "M")}`;
+    const rect = (value, rowY, className, label) => {
+      const x = value < 0 ? xOf(value) : zeroX;
+      return `<rect class="${className}" x="${x}" y="${rowY}" width="${barLength(value)}" height="7" rx="1"><title>${label}</title></rect>`;
+    };
+    return `${rect(callOpenInterest, y + 3, "chain-profile-oi-positive", title)}${rect(putOpenInterest, y + 3, "chain-profile-oi-negative", title)}${rect(callVolume, y + 13, "chain-profile-volume-positive", title)}${rect(putVolume, y + 13, "chain-profile-volume-negative", title)}`;
+  }).join("");
+  const historyDots = history.map((sample, sampleIndex) => (sample.points || []).map((point) => {
+    const index = strikes.indexOf(point.strike);
+    const value = Number(point.value);
+    if (index < 0 || !Number.isFinite(value)) return "";
+    const title = `${sample.label} · 行权价 ${formatMoney(point.strike)} · 净持仓量 GEX ${formatChartValue(value, 2, "M")}`;
+    const markerClass = `chain-profile-history-${sampleIndex}`;
+    const markerX = xOf(value);
+    const markerY = index * rowHeight + rowHeight / 2 + (sampleIndex - (history.length - 1) / 2) * 5;
+    const markerTitle = `<title>${title}</title>`;
+    return `<circle class="${markerClass}" cx="${markerX}" cy="${markerY}" r="2.8">${markerTitle}</circle>`;
+  }).join("")).join("");
+  const gridLines = Array.from({ length: 7 }, (_, index) => {
+    const tick = (index - 3) / 3 * axisMaximum;
+    const x = xOf(tick);
+    const className = index === 3 ? "chain-profile-zero" : "chain-profile-grid";
+    return `<line class="${className}" x1="${x}" x2="${x}" y1="0" y2="${strikes.length * rowHeight}"/>`;
+  }).join("");
+  const rowLines = strikes.map((strike, index) => {
+    const y = index * rowHeight;
+    return `<line class="chain-profile-row" x1="0" x2="${width}" y1="${y + rowHeight - 1}" y2="${y + rowHeight - 1}"/><text class="chain-profile-strike" x="${strikeLabelX}" y="${y + 17}" text-anchor="end">${formatMoney(strike)}</text>`;
+  }).join("");
+  const plotDivider = `<line class="chain-profile-label-divider" x1="${plotLeft}" x2="${plotLeft}" y1="0" y2="${strikes.length * rowHeight}"/>`;
+  const currentLegend = [
+    { className: "chain-profile-oi-positive", label: "看涨持仓量 GEX" },
+    { className: "chain-profile-oi-negative", label: "看跌持仓量 GEX" },
+    { className: "chain-profile-volume-positive", label: "看涨成交量 GEX" },
+    { className: "chain-profile-volume-negative", label: "看跌成交量 GEX" },
+  ];
+  const levelLegend = [
+    { className: "chain-profile-spot-key", label: "现价" },
+    { className: "chain-profile-flip-key", label: "零伽马" },
+    { className: "chain-profile-positive-key", label: "主要正伽马" },
+    { className: "chain-profile-negative-key", label: "主要负伽马" },
+  ];
+  const legendGroup = (label, items) => `<section class="chain-profile-legend-group"><h3>${label}</h3><div class="chain-profile-legend-items">${items.map((item) => `<span class="chain-profile-legend-item"><i class="${item.className}${item.marker ? " chain-profile-legend-dot" : ""}"></i>${item.label}</span>`).join("")}</div></section>`;
+  const legendItems = [
+    legendGroup("历史快照", history.map((sample, index) => ({ className: `chain-profile-history-${index}`, label: sample.label, marker: true }))),
+    legendGroup("关键价位", levelLegend),
+    legendGroup("当前伽马敞口", currentLegend),
+  ].join("");
+  const axisPrecision = Math.min(6, Math.max(1, Math.ceil(-Math.log10(magnitude))));
+  const axisLabels = Array.from({ length: 7 }, (_, index) => {
+    const tick = (index - 3) / 3 * axisMaximumBillions;
+    const label = tick === 0 ? "0" : `${tick < 0 ? "-" : ""}${formatNumber(Math.abs(tick), axisPrecision)}`;
+    const x = xOf((index - 3) / 3 * axisMaximum);
+    const anchor = index === 0 ? "start" : index === 6 ? "end" : "middle";
+    return `<line class="chain-profile-axis-tick" x1="${x}" x2="${x}" y1="0" y2="5"/><text class="chain-profile-axis-label" x="${x}" y="17" text-anchor="${anchor}">${label}</text>`;
+  }).join("");
+  const axisFooter = `<svg class="chain-profile-axis-footer" viewBox="0 0 ${width} ${footerHeight}" width="100%" height="${footerHeight}" aria-hidden="true"><line class="chain-profile-axis-baseline" x1="${plotLeft}" x2="${plotRight}" y1="1" y2="1"/>${axisLabels}<text class="chain-profile-axis-title" x="${zeroX}" y="36" text-anchor="middle">伽马敞口（十亿美元）</text></svg>`;
+  const scrollKey = String(options.scrollKey || "");
+  target.dataset.chartWidth = String(width);
+  target.innerHTML = `<div class="chain-profile-axis-header"><h2 class="chain-profile-chart-title"></h2><div class="chain-profile-legend">${legendItems}</div></div><svg class="chain-profile-svg" viewBox="0 0 ${width} ${strikes.length * rowHeight}" width="100%" height="${strikes.length * rowHeight}" role="img" aria-label="按行权价显示的 GEX 分布图" tabindex="0">${gridLines}${referenceLines}${bars}${historyDots}${rowLines}${plotDivider}</svg>${axisFooter}`;
+  target.querySelector(".chain-profile-chart-title").textContent = options.title || "按行权价伽马敞口";
+  const headerHeight = target.querySelector(".chain-profile-axis-header")?.offsetHeight || 42;
+  target.dataset.chartHeight = String(headerHeight + strikes.length * rowHeight + footerHeight);
+  if (target.clientHeight > 0 && target.dataset.profileScrollKey !== scrollKey) {
+    const spotIndex = nearestStrikeIndex(options.spot);
+    const spotPosition = spotIndex < 0 ? 0 : headerHeight + spotIndex * rowHeight + rowHeight / 2;
+    target.scrollTop = Math.max(0, Math.round((spotPosition - target.clientHeight / 2) / rowHeight) * rowHeight);
+    target.dataset.profileScrollKey = scrollKey;
+  }
+}
+
 function renderDistributionSummary(target, rows, spot, key, totalLabel) {
   if (!target) return;
   const summary = summarizeDistribution(rows, spot, key);
@@ -2488,6 +2643,7 @@ window.OptionScopeCharts = {
   chanChartHover: chanChartHover,
   chanStructureTooltipDetails: chanStructureTooltipDetails,
   renderSignedChart: renderSignedChart,
+  renderStrikeGexProfile: renderStrikeGexProfile,
   renderLevelsChart: renderLevelsChart,
   renderDistributionSummary: renderDistributionSummary,
   renderChartSkeleton: renderChartSkeleton,

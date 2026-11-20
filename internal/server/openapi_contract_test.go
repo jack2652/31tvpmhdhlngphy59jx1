@@ -81,6 +81,11 @@ func TestFastAPIOpenAPIBusinessRouteContracts(t *testing.T) {
 			parameters:    []map[string]any{pathSymbol, query("expiration", true, requiredDateSchema("Expiration"))}, validation: true,
 		},
 		{
+			path: "/api/chain/{stock_symbol}/history", method: "get", operationID: "chain_history_api_chain__stock_symbol__history_get", summary: "Chain History",
+			description: "返回指定到期日期权链在 1、5、10、15、30 分钟目标点之前最近的实际快照及对应标的价格。快照过旧、缺少标的价格或没有合约时会返回 unavailable_reason。",
+			parameters:  []map[string]any{pathSymbol, query("expiration", true, requiredDateSchema("Expiration"))}, validation: true,
+		},
+		{
 			path: "/api/flow/{stock_symbol}", method: "get", operationID: "option_flow_api_flow__stock_symbol__get", summary: "Option Flow",
 			description:   "比较同一期限最近两次快照，返回估算的 Call/Put 买卖流向。",
 			responseTitle: "Response Option Flow Api Flow  Stock Symbol  Get",

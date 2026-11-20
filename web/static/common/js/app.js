@@ -74,11 +74,11 @@ const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false, mfi: fa
 function readChainViewPreference() {
   try {
     const stored = localStorage.getItem(CHAIN_VIEW_STORAGE_KEY);
-    return stored === "table" || stored === "heatmap" ? stored : "heatmap";
+    return stored === "table" || stored === "profile" || stored === "heatmap" ? stored : "heatmap";
   } catch (error) { return "heatmap"; }
 }
 function rememberChainViewPreference(view) {
-  if (view !== "table" && view !== "heatmap") return;
+  if (view !== "table" && view !== "profile" && view !== "heatmap") return;
   try { localStorage.setItem(CHAIN_VIEW_STORAGE_KEY, view); } catch (error) { /* 存储不可用时保留当前页面选择。 */ }
 }
 function readFavoriteSymbols(seedSymbol) {
@@ -313,6 +313,7 @@ const state = {
   chainHeatmapRefreshRunning: false,
   chainHeatmapRefreshProgress: "",
   chainHeatmapRefreshTarget: "",
+  chainBatchRefreshStatus: "",
   chainRows: [],
   chainSpot: null,
   levelBasisMode: "live",
@@ -400,6 +401,25 @@ const state = {
     chainHeatmap: { columns: [], rows: [] },
     chainHeatmapMeta: "GEX 估算仅供参考 · 等待读取缓存期限",
     chainHeatmapEmpty: "等待期权数据",
+    chainProfile: {
+      meta: "当前到期日 · 按行权价估算",
+      spot: "--",
+      zeroGamma: "--",
+      positiveLevel: "--",
+      negativeLevel: "--",
+      netOpenInterestGex: "--",
+      netVolumeGex: "--",
+      updatedAt: "--",
+      status: "选择到期日后读取历史快照",
+      history: [1, 5, 10, 15, 30].map((minutesAgo, index) => ({
+        key: String(minutesAgo),
+        label: `${minutesAgo} 分钟前`,
+        markerClass: `chain-profile-history-${index}`,
+        time: "等待快照",
+        maxChange: null,
+        status: "等待历史数据",
+      })),
+    },
     chart: {
       netGex: "净 Gamma 0 · 估算",
       gammaFlip: "零 Gamma 0.00 · 估算",
@@ -640,6 +660,10 @@ function restoreClientSnapshot(symbol, expiration = "", allowStale = false) {
       basis: activeBasis(quote),
       points: aggregateByStrike(payload.data, state.chainSpot),
     };
+  }
+  if (state.chainView === "profile") {
+    renderChainProfileView();
+    void loadChainProfileHistory();
   }
   // Force the first successful API response after recovery to repaint charts
   // and analysis rather than being skipped by a stale render signature.
@@ -1323,7 +1347,7 @@ function applyPushedSnapshotPayload(message) {
       applyExpirationCutoffs(state.symbol, catalog?.expiration_cutoffs);
       const dates = [...new Set([...(catalog?.expirations || []), ...(catalog?.cached_expirations || [])])].sort();
       if (dates.length) applyExpirations(dates, state.expiration);
-      if (state.chainView === "heatmap") void loadChainHeatmapBackground(catalog);
+      if (isGexChainView()) void loadChainHeatmapBackground(catalog);
     }).catch(() => {});
   }
   if (!state.analysisReady && chain.data?.length) {
@@ -1554,7 +1578,7 @@ function connectPushStream(symbol = state.symbol) {
       state.chainFetchedAt = null;
       state.chainFetchedSymbol = "";
       loadChain({ loadId: state.loadId, refresh: false, fallbackSnapshot: previousSnapshot });
-      if (state.chainView === "heatmap") void loadChainHeatmapBackground();
+      if (isGexChainView()) void loadChainHeatmapBackground();
     }
   };
   document.addEventListener("visibilitychange", state.pushVisibilityHandler);
@@ -1702,23 +1726,36 @@ function formatUsd(value) {
 function formatChartValue(value, digits, unit) { return unit === "M" ? formatGex(value, digits) : formatCount(value, digits); }
 function setBusy(busy) { state.loading = busy; }
 
-function aggregateByStrike(rows, spot) {
+function aggregateByStrike(rows, spot, valuationTime = Date.now()) {
   const grouped = new Map();
   const spotValue = Number(spot) || 0;
   const spotSquared = spotValue * spotValue;
   const spotKey = gammaSpotBucket(spotValue);
+  const valuationTimestamp = Number.isFinite(Number(valuationTime)) ? Number(valuationTime) : Date.now();
+  const timeBucket = Math.floor(valuationTimestamp / 30000);
   for (const row of rows) {
     const strike = Number(row.strike);
     if (!Number.isFinite(strike)) continue;
-    if (!grouped.has(strike)) grouped.set(strike, { strike, callVolume: 0, putVolume: 0, callOi: 0, putOi: 0, callGex: 0, putGex: 0 });
+    if (!grouped.has(strike)) grouped.set(strike, {
+      strike, callVolume: 0, putVolume: 0, callOi: 0, putOi: 0,
+      callGex: 0, putGex: 0, callVolumeGex: 0, putVolumeGex: 0,
+      contracts: 0, missingGamma: 0,
+    });
     const item = grouped.get(strike);
+    item.contracts += 1;
     const volume = Number(row.volume) || 0;
     const oi = Number(row.open_interest) || 0;
-    const recalculatedGamma = gammaAtSpot(spotValue, row, undefined, spotKey);
+    const recalculatedGamma = gammaAtSpot(spotValue, row, row.expiration || state.expiration, spotKey, timeBucket, valuationTimestamp);
+    const hasGamma = recalculatedGamma != null || (row.gamma != null && Number.isFinite(Number(row.gamma)));
+    if (!hasGamma) item.missingGamma += 1;
     const gamma = recalculatedGamma == null ? (Number(row.gamma) || 0) : recalculatedGamma;
     const gex = gamma * oi * 100 * spotSquared * 0.01 / 1000000;
-    if (row.contract_type === "call") { item.callVolume += volume; item.callOi += oi; item.callGex += gex; }
-    else { item.putVolume += volume; item.putOi += oi; item.putGex -= gex; }
+    const volumeGex = gamma * volume * 100 * spotSquared * 0.01 / 1000000;
+    if (row.contract_type === "call") {
+      item.callVolume += volume; item.callOi += oi; item.callGex += gex; item.callVolumeGex += volumeGex;
+    } else if (row.contract_type === "put") {
+      item.putVolume += volume; item.putOi += oi; item.putGex -= gex; item.putVolumeGex -= volumeGex;
+    }
   }
   return [...grouped.values()].sort((a, b) => a.strike - b.strike);
 }
@@ -4376,9 +4413,14 @@ function renderQuote(quote, allowStaleValuation = false, allowStaleSQLiteMarket 
   state.view.quoteMarket = quoteMarketLabel(quote);
   state.view.marketState = marketStateLabel(quote?.market_state, "快照数据");
   state.lastQuote = quote || null;
+  const profileSpot = finitePrice(price);
+  if (state.chainView === "profile" && profileSpot != null && state.chainRows.length) {
+    state.chainSpot = profileSpot;
+    renderChainProfileView();
+  }
   updateSnapshotStatus();
   void recoverExpiredExpiration();
-  if ((!isIndexMarketSymbol(state.symbol) || supportsIndexOptions(state.symbol)) && state.chainView === "heatmap") renderChainHeatmap();
+  if ((!isIndexMarketSymbol(state.symbol) || supportsIndexOptions(state.symbol)) && isGexChainView()) renderChainHeatmap();
   scheduleQuoteRecovery(state.lastQuote);
   // 行情可能晚于期权链到达。现价档位变化后重新触发一次价位计算，否则
   // 触达概率、强化色、最佳买卖点和止损会一直停在无 IV 的客户端回退结果，
@@ -4877,7 +4919,7 @@ function applyExpirationCutoffs(symbol, values) {
   expirationCutoffCatalog = { symbol, values };
   state.expirationOptions = activeExpirationDates(state.expirationOptions);
   if (state.expiration && !isActiveExpiration(state.expiration)) void recoverExpiredExpiration();
-  if (state.chainView === "heatmap") renderChainHeatmap();
+  if (isGexChainView()) renderChainHeatmap();
   scheduleExpirationCutoff();
 }
 
@@ -4897,7 +4939,7 @@ function scheduleExpirationCutoff() {
   expirationCutoffTimer = setTimeout(() => {
     expirationCutoffTimer = null;
     state.expirationOptions = activeExpirationDates(state.expirationOptions);
-    if (state.chainView === "heatmap") renderChainHeatmap();
+    if (isGexChainView()) renderChainHeatmap();
     void recoverExpiredExpiration();
     scheduleExpirationCutoff();
   }, Math.min(Math.max(nextCutoff - now + 50, 0), maxTimeout));
@@ -5222,9 +5264,13 @@ function cancelChainHeatmapDiscovery(resetDelay = true) {
   if (resetDelay) chainHeatmapDiscoveryDelayMs = CHAIN_HEATMAP_DISCOVERY_BASE_DELAY_MS;
 }
 
+function isGexChainView(view = state.chainView) {
+  return view === "heatmap" || view === "profile";
+}
+
 function scheduleChainHeatmapDiscovery(symbol, loadId, token, pending) {
   if (token !== chainHeatmapLoadToken || loadId !== state.loadId || symbol !== state.symbol
-    || state.chainView !== "heatmap") return;
+    || !isGexChainView()) return;
   if (!pending) {
     cancelChainHeatmapDiscovery();
     return;
@@ -5235,7 +5281,7 @@ function scheduleChainHeatmapDiscovery(symbol, loadId, token, pending) {
   chainHeatmapDiscoveryTimer = setTimeout(() => {
     chainHeatmapDiscoveryTimer = null;
     if (token !== chainHeatmapLoadToken || loadId !== state.loadId || symbol !== state.symbol
-      || state.chainView !== "heatmap") return;
+      || !isGexChainView()) return;
     void loadChainHeatmapBackground();
   }, delay);
 }
@@ -5257,7 +5303,7 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
   const token = ++chainHeatmapLoadToken;
   chainHeatmapLoadingSymbol = symbol;
   const isCurrentLoad = () => token === chainHeatmapLoadToken && loadId === state.loadId
-    && symbol === state.symbol && state.chainView === "heatmap";
+    && symbol === state.symbol && isGexChainView();
   const currentRows = state.chainRows?.length && state.chainFetchedSymbol === symbol
     && state.chainFetchedExpiration === state.expiration ? state.chainRows : [];
   if (currentRows.length) {
@@ -5330,7 +5376,7 @@ async function loadChainHeatmapBackground(catalogPayload = null) {
       chainHeatmapLoadingSymbol = "";
       const reloadRequested = chainHeatmapReloadRequested;
       chainHeatmapReloadRequested = false;
-      if (reloadRequested && symbol === state.symbol && state.chainView === "heatmap") {
+      if (reloadRequested && symbol === state.symbol && isGexChainView()) {
         void loadChainHeatmapBackground();
       }
     }
@@ -5380,8 +5426,167 @@ async function refreshHeatmapExpiration(symbol, expiration, previousFetchedAt) {
 }
 
 function chainViewTitle(symbol, expiration, view = state.chainView) {
-  const label = view === "heatmap" ? "GEX 热力图" : "期权链";
+  const labels = { heatmap: "GEX 热力图", profile: "按行权价 GEX", table: "期权链" };
+  const label = labels[view] || labels.heatmap;
   return `${label} · ${symbol}${expiration ? ` · ${expiration}` : ""}`;
+}
+
+let chainProfileRequestToken = 0;
+let chainProfileRequestKey = "";
+let chainProfileHistory = { key: "", loadedAt: 0, points: [] };
+
+function chainProfileRows(rows) {
+  if (state.chainFilter === "all") return rows || [];
+  return (rows || []).filter((row) => row.contract_type === state.chainFilter);
+}
+
+function summarizeChainProfile(points) {
+  const summary = (points || []).reduce((result, point) => {
+    const openInterest = point.callGex + point.putGex;
+    const volume = point.callVolumeGex + point.putVolumeGex;
+    result.netOpenInterest += openInterest;
+    result.netVolume += volume;
+    result.contracts += point.contracts || 0;
+    result.missingGamma += point.missingGamma || 0;
+    if (openInterest > (result.positive?.value || 0)) result.positive = { strike: point.strike, value: openInterest };
+    if (openInterest < (result.negative?.value || 0)) result.negative = { strike: point.strike, value: openInterest };
+    return result;
+  }, { netOpenInterest: 0, netVolume: 0, contracts: 0, missingGamma: 0, positive: null, negative: null });
+  return summary;
+}
+
+function chainProfileHistorySamples(key) {
+  const points = chainProfileHistory.key === key ? chainProfileHistory.points : [];
+  return [1, 5, 10, 15, 30].map((minutesAgo, index) => {
+    const point = points.find((sample) => sample.minutes_ago === minutesAgo);
+    const base = {
+      key: String(minutesAgo),
+      label: `${minutesAgo} 分钟前`,
+      markerClass: `chain-profile-history-${index}`,
+      time: point?.fetched_at ? formatEasternTime(point.fetched_at) : "暂无可用时间",
+      spot: point?.spot > 0 ? `标的 ${formatMoney(point.spot)}` : "标的 --",
+      status: point?.unavailable_reason || "历史快照不可用",
+      netValue: null,
+      profile: [],
+    };
+    if (point?.unavailable_reason || !point?.fetched_at || !(point.spot > 0) || !Array.isArray(point.data) || !point.data.length) {
+      return base;
+    }
+    const valuationTime = Date.parse(point.fetched_at);
+    if (!Number.isFinite(valuationTime)) return { ...base, status: "历史快照时间无效" };
+    const grouped = aggregateByStrike(chainProfileRows(point.data), point.spot, valuationTime);
+    const summary = summarizeChainProfile(grouped);
+    if (summary.contracts > 0 && summary.missingGamma >= summary.contracts) {
+      return { ...base, status: "所有合约缺少可用 Gamma" };
+    }
+    return {
+      ...base,
+      status: summary.missingGamma ? `${summary.missingGamma} 个合约缺少 Gamma` : "按历史标的价重新计算",
+      netValue: summary.netOpenInterest,
+      profile: grouped.map((item) => ({ strike: item.strike, value: item.callGex + item.putGex })),
+    };
+  });
+}
+
+function chainProfileMaxChange(currentPoints, historyPoints) {
+  const currentByStrike = new Map((currentPoints || []).map((point) => [point.strike, point.callGex + point.putGex]));
+  const historyByStrike = new Map((historyPoints || []).map((point) => [point.strike, point.value]));
+  const strikes = new Set([...currentByStrike.keys(), ...historyByStrike.keys()]);
+  let largest = null;
+  for (const strike of strikes) {
+    const current = currentByStrike.get(strike) || 0;
+    const historical = historyByStrike.get(strike) || 0;
+    const change = current - historical;
+    if (!largest || Math.abs(change) > Math.abs(largest.change)) largest = { strike, change };
+  }
+  return largest;
+}
+
+function renderChainProfileView() {
+  const key = `${state.symbol}|${state.expiration || ""}`;
+  const hasCurrentChain = state.displayedChainSymbol === state.symbol
+    && state.displayedChainExpiration === state.expiration;
+  const rows = chainProfileRows(hasCurrentChain ? state.chainRows : []);
+  const points = aggregateByStrike(rows, state.chainSpot);
+  const summary = summarizeChainProfile(points);
+  const hasGamma = summary.contracts > summary.missingGamma;
+  const analysis = state.lastAnalysis?.analysisPayload;
+  let zeroGamma = finitePrice(analysis?.zero_gamma?.price);
+  if (zeroGamma == null && state.analysisReady && gammaProfileReady(analysis)) {
+    zeroGamma = finitePrice(findGammaFlip(state.chainRows, state.chainSpot, state.expiration)?.strike);
+  }
+  const profileSamples = chainProfileHistorySamples(key);
+  const samples = profileSamples.map((sample) => {
+    const change = sample.profile.length ? chainProfileMaxChange(points, sample.profile) : null;
+    return {
+      key: sample.key,
+      label: sample.label,
+      markerClass: sample.markerClass,
+      time: sample.time,
+      spot: sample.spot,
+      status: sample.status,
+      maxChange: change ? {
+        strike: formatMoney(change.strike),
+        value: `${change.change > 0 ? "+" : ""}${formatNumber(change.change / 1000, 2)} 十亿美元`,
+      } : null,
+    };
+  });
+  const status = rows.length
+    ? `持仓量 GEX 为模型估算 · 成交量加权估算不代表真实方向性持仓${summary.missingGamma ? ` · ${summary.missingGamma} 个合约缺少 Gamma，显示可计算小计` : ""}`
+    : "当前到期日没有符合筛选条件的期权合约";
+  state.view.chainProfile = {
+    meta: `${state.symbol} · 当前到期日 ${state.expiration || "--"} · ${rows.length} 个合约`,
+    spot: state.chainSpot > 0 ? formatMoney(state.chainSpot) : "--",
+    zeroGamma: zeroGamma == null ? "--" : formatMoney(zeroGamma),
+    positiveLevel: hasGamma && summary.positive ? `${formatMoney(summary.positive.strike)} · ${formatGex(summary.positive.value)}` : "--",
+    negativeLevel: hasGamma && summary.negative ? `${formatMoney(summary.negative.strike)} · ${formatGex(summary.negative.value)}` : "--",
+    netOpenInterestGex: hasGamma ? formatGex(summary.netOpenInterest) : "--",
+    netVolumeGex: hasGamma ? formatGex(summary.netVolume) : "--",
+    updatedAt: state.displayedChainFetchedAt ? formatEasternTime(state.displayedChainFetchedAt) : "--",
+    status,
+    history: samples,
+  };
+  OptionScopeCharts.renderStrikeGexProfile("chain-profile-chart", points, {
+    title: `${state.symbol} 按行权价伽马敞口`,
+    spot: state.chainSpot,
+    zeroGamma,
+    positiveStrike: hasGamma ? summary.positive?.strike : null,
+    negativeStrike: hasGamma ? summary.negative?.strike : null,
+      history: profileSamples.map((sample) => ({
+      label: sample.label,
+      markerClass: sample.markerClass,
+      points: sample.profile,
+    })),
+    scrollKey: `${key}|${state.chainFilter}`,
+    emptyMessage: rows.length ? "当前快照缺少可用 Gamma，暂无法绘制 GEX" : "当前筛选下没有期权数据",
+  });
+}
+
+async function loadChainProfileHistory(force = false) {
+  const symbol = state.symbol;
+  const expiration = state.expiration;
+  if (!symbol || !expiration || state.chainView !== "profile") return;
+  const key = `${symbol}|${expiration}`;
+  if (chainProfileRequestKey === key) return;
+  if (!force && chainProfileHistory.key === key && Date.now() - chainProfileHistory.loadedAt < 30000) {
+    renderChainProfileView();
+    return;
+  }
+  const token = ++chainProfileRequestToken;
+  chainProfileRequestKey = key;
+  state.view.chainProfile.status = "正在读取历史快照";
+  try {
+    const payload = await request(`/api/chain/${encodeURIComponent(symbol)}/history?expiration=${encodeURIComponent(expiration)}`);
+    if (token !== chainProfileRequestToken || key !== `${state.symbol}|${state.expiration || ""}` || state.chainView !== "profile") return;
+    chainProfileHistory = { key, loadedAt: Date.now(), points: Array.isArray(payload?.points) ? payload.points : [] };
+    renderChainProfileView();
+  } catch (error) {
+    if (token !== chainProfileRequestToken || key !== `${state.symbol}|${state.expiration || ""}`) return;
+    state.view.chainProfile.status = `历史快照读取失败：${sanitizeDisplayText(error.message || "请求失败")}`;
+    renderChainProfileView();
+  } finally {
+    if (token === chainProfileRequestToken) chainProfileRequestKey = "";
+  }
 }
 
 function renderChain(payload, quote, analysisPayload) {
@@ -5449,7 +5654,8 @@ function renderChain(payload, quote, analysisPayload) {
     if (quote?.fetched_at && quote.fetched_at !== state.lastQuote?.fetched_at) {
       state.lastQuote = quote;
       updateSnapshotStatus();
-      if (state.chainView === "heatmap") renderChainHeatmap();
+      if (isGexChainView()) renderChainHeatmap();
+      if (state.chainView === "profile") renderChainProfileView();
     }
     if (state.pendingAnalyticsRefresh && state.lastAnalysis?.points?.length) schedulePushedAnalyticsRefresh();
     return;
@@ -5491,7 +5697,11 @@ function renderChain(payload, quote, analysisPayload) {
   if (state.pendingAnalyticsRefresh && state.lastAnalysis?.points?.length) schedulePushedAnalyticsRefresh();
   state.chainRows = Object.freeze(rows); state.chainSpot = quote?.price ?? null;
   renderChainTable();
-  if (state.chainView === "heatmap") renderChainHeatmap();
+  if (isGexChainView()) renderChainHeatmap();
+  if (state.chainView === "profile") {
+    renderChainProfileView();
+    void loadChainProfileHistory();
+  }
   chainRenderSignature = signature;
   rememberClientSnapshot();
 }
@@ -6007,7 +6217,7 @@ function pollGammaWindow(loadId, payload, quote, symbol, encodedSymbol, pendingT
         }
         const batchResult = status?.refresh?.result || {};
         // Gamma 每批可能把新的到期日写入 SQLite，完成后立即补读热力图目录。
-        if (status?.refresh && state.chainView === "heatmap") {
+        if (status?.refresh && isGexChainView()) {
           void loadChainHeatmapBackground();
         }
         if (batchResult.has_more) {
@@ -6300,7 +6510,7 @@ async function loadExpirations(loadId, fallbackSnapshot = null, refresh = false)
     applyExpirations(allDates, cachedExpiration, retryable ? "正在获取到期日…" : "该标的没有期权到期日");
     if (!retryable) clearSnapshotRetry();
     else scheduleSnapshotRetry(loadId, Math.max(10000, requestError?.retryAfterMs || 0));
-    if (state.chainView === "heatmap") void loadChainHeatmapBackground(payload);
+    if (isGexChainView()) void loadChainHeatmapBackground(payload);
     await loadChain({ loadId });
     return;
   }
@@ -6439,6 +6649,8 @@ async function loadSymbol() {
   state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
+  chainProfileRequestToken += 1;
+  chainProfileRequestKey = "";
   clearQuoteRecovery();
   clearSnapshotRetry();
   resetChanAnalysis();
@@ -6512,7 +6724,7 @@ async function loadSymbol() {
     }
   }
   state.loading = false;
-  if (state.chainView === "heatmap" && chainHeatmapCache.symbol !== state.symbol) void loadChainHeatmapBackground();
+  if (isGexChainView() && chainHeatmapCache.symbol !== state.symbol) void loadChainHeatmapBackground();
   // 首次进入新标的时行情/期权链可能先完成，估值仍在后端线程计算；
   // 在 loading 解除后启动独立轻量轮询，避免必须手动刷新整页才能看到估值。
   if (state.lastQuote) scheduleFairValuePoll(state.lastQuote);
@@ -6572,6 +6784,7 @@ async function switchExpiration(expiration) {
   const token = ++expirationSwitchToken;
   const previousSnapshot = displayedClientSnapshotRef();
   state.expiration = expiration;
+  if (state.chainView === "profile") renderChainProfileView();
   state.view.chainTitle = chainViewTitle(state.symbol, expiration);
   connectPushStream(state.symbol);
   resetOptionFlow("正在读取当前期限的相邻快照…");
@@ -7171,10 +7384,13 @@ const optionScopeApp = new Vue({
       const expirations = heatmapExpiryDates(catalogExpirations)
         .filter((expiration) => expiration !== selectedExpiration);
       if (!expirations.length) {
-        this.view.chainHeatmapMeta = "没有可批量刷新的其他到期日";
+        const status = "没有可批量刷新的其他到期日";
+        this.view.chainHeatmapMeta = status;
+        this.chainBatchRefreshStatus = status;
         return;
       }
 
+      this.chainBatchRefreshStatus = "";
       this.chainHeatmapRefreshRunning = true;
       this.chainHeatmapRefreshProgress = "0/" + expirations.length;
       this.chainHeatmapRefreshTarget = "";
@@ -7212,7 +7428,9 @@ const optionScopeApp = new Vue({
         }
         if (state.symbol === symbol) {
           const failureSummary = failed.length ? " · 失败 " + failed.join("、") : "";
-          this.view.chainHeatmapMeta = "批量刷新完成：成功 " + refreshed + "/" + expirations.length + failureSummary;
+          const status = "批量刷新完成：成功 " + refreshed + "/" + expirations.length + failureSummary;
+          this.view.chainHeatmapMeta = status;
+          this.chainBatchRefreshStatus = status;
         }
       } finally {
         this.chainHeatmapRefreshRunning = false;
@@ -7221,15 +7439,31 @@ const optionScopeApp = new Vue({
       }
     },
     filterChanged() {
-      return this.chainView === "heatmap" ? renderChainHeatmap() : renderChainTable();
+      if (this.chainView === "heatmap") return renderChainHeatmap();
+      if (this.chainView === "profile") return renderChainProfileView();
+      return renderChainTable();
     },
-    toggleChainView() {
-      if (isIndexMarketSymbol(state.symbol) && !supportsIndexOptions(state.symbol)) return;
-      this.chainView = this.chainView === "heatmap" ? "table" : "heatmap";
-      rememberChainViewPreference(this.chainView);
-      this.view.chainTitle = chainViewTitle(state.symbol, state.expiration, this.chainView);
-      if (this.chainView === "heatmap") loadChainHeatmapBackground();
-      else cancelChainHeatmapDiscovery();
+    changeChainView(view) {
+      if (!["heatmap", "profile", "table"].includes(view)) return;
+      this.chainView = view;
+      rememberChainViewPreference(view);
+      this.view.chainTitle = chainViewTitle(state.symbol, state.expiration, view);
+      if (view === "heatmap") {
+        chainProfileRequestToken += 1;
+        chainProfileRequestKey = "";
+        void loadChainHeatmapBackground();
+      } else if (view === "profile") {
+        this.$nextTick(() => {
+          if (state.chainView === "profile") renderChainProfileView();
+        });
+        if (chainHeatmapLoadingSymbol !== state.symbol) void loadChainHeatmapBackground();
+        void loadChainProfileHistory();
+      } else {
+        cancelChainHeatmapDiscovery();
+        chainProfileRequestToken += 1;
+        chainProfileRequestKey = "";
+        renderChainTable();
+      }
     },
     toggleTheme() {
       const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
@@ -7271,6 +7505,11 @@ function redrawChartsIfResized() {
   forceChartRedraw = true;
   renderAnalysis(rows, spot, analysisPayload, expirationRows || [], ivModel || {}, basis || null);
   forceChartRedraw = false;
+  if (state.chainView === "profile" && byId("chain-profile-chart")?.querySelector("svg")) {
+    const profileTarget = byId("chain-profile-chart");
+    const box = OptionScopeCharts.chartContentBox(profileTarget);
+    if (String(box.width) !== profileTarget.dataset.chartWidth) renderChainProfileView();
+  }
 }
 
 // 窗口尺寸变化后按新尺寸重绘图表；手机滚动时地址栏收起不会改变图表宽度，此时直接跳过重绘。

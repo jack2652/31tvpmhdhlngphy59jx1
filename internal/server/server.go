@@ -475,6 +475,7 @@ func (s *Service) Router() *gin.Engine {
 	api := router.Group("/api")
 	api.GET("/quote/:symbol", s.quote)
 	api.GET("/expirations/:symbol", s.expirations)
+	api.GET("/chain/:symbol/history", s.chainHistory)
 	api.GET("/chain/:symbol", s.chain)
 	api.POST("/refresh/:symbol", s.refresh)
 	api.GET("/events/:symbol", s.eventsStream)
@@ -1357,6 +1358,9 @@ func strictExpiration(raw string) (string, error) {
 	if !expirationPattern.MatchString(raw) {
 		return "", fmt.Errorf("expiration must use YYYY-MM-DD")
 	}
+	if _, err := time.Parse("2006-01-02", raw); err != nil {
+		return "", fmt.Errorf("expiration must be a valid calendar date")
+	}
 	return raw, nil
 }
 
@@ -1710,6 +1714,42 @@ func (s *Service) chain(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, model.ChainResponse{Symbol: symbol, Expiration: expiration, Data: []model.OptionRow{}, Source: "pending"})
+}
+
+func (s *Service) chainHistory(c *gin.Context) {
+	if !s.validateQuery(c, patternedStringQueryRule("expiration", true)) {
+		return
+	}
+	symbol, err := normalizeAPISymbol(c.Param("symbol"))
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	expirationRaw, _ := queryValue(c, "expiration")
+	expiration, err := strictExpiration(expirationRaw)
+	if err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	now := time.Now().UTC()
+	points := []model.ChainHistoryPoint{}
+	if !provider.IsFutureSymbol(symbol) {
+		points, err = s.store.ChainHistory(symbol, expiration, now)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": err.Error()})
+			return
+		}
+		for index := range points {
+			point := &points[index]
+			if point.FetchedAt == nil || point.Spot == nil || len(point.Data) == 0 {
+				continue
+			}
+			gamma.AnnotateAt(point.Data, point.Spot, *point.FetchedAt)
+		}
+	}
+	c.JSON(http.StatusOK, model.ChainHistoryResponse{
+		Symbol: symbol, Expiration: expiration, AsOf: now, Points: points,
+	})
 }
 
 func chainAPIOptions(rows []model.OptionRow) []map[string]any {

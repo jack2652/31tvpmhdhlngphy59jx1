@@ -12,6 +12,99 @@ import (
 
 func quoteTestPtr(value float64) *float64 { return &value }
 
+func TestChainHistoryReturnsRecentSnapshotsWithTheirPrices(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "chain-history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+
+	const expiration = "2030-01-18"
+	asOf := time.Now().UTC().Truncate(time.Second)
+	for _, minutesAgo := range chainHistoryOffsets {
+		fetchedAt := asOf.Add(-time.Duration(minutesAgo)*time.Minute - 20*time.Second)
+		quoteAt := fetchedAt.Add(-5 * time.Second)
+		price := 100 + float64(minutesAgo)
+		strike := 100.0
+		volume := int64(25 + minutesAgo)
+		openInterest := int64(200)
+		impliedVolatility := 0.3
+		if _, err := repository.SaveQuoteAndChainSnapshot(model.Quote{
+			Symbol: "QQQ", Provider: "test", Price: &price, FetchedAt: &quoteAt,
+		}, model.ChainResponse{
+			Symbol: "QQQ", Expiration: expiration, Source: "test", FetchedAt: &fetchedAt,
+			Data: []model.OptionRow{{
+				ContractSymbol: "QQQ300118C00100000", ContractType: "call", Strike: &strike,
+				Volume: &volume, OpenInterest: &openInterest, ImpliedVolatility: &impliedVolatility,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	points, err := repository.ChainHistory("QQQ", expiration, asOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != len(chainHistoryOffsets) {
+		t.Fatalf("history point count=%d, want %d", len(points), len(chainHistoryOffsets))
+	}
+	for index, minutesAgo := range chainHistoryOffsets {
+		point := points[index]
+		wantAt := asOf.Add(-time.Duration(minutesAgo)*time.Minute - 20*time.Second)
+		wantSpot := 100 + float64(minutesAgo)
+		if point.MinutesAgo != minutesAgo || point.FetchedAt == nil || !point.FetchedAt.Equal(wantAt) {
+			t.Errorf("point[%d] minutes/time=%d/%v, want %d/%v", index, point.MinutesAgo, point.FetchedAt, minutesAgo, wantAt)
+		}
+		if point.QuoteFetchedAt == nil || !point.QuoteFetchedAt.Equal(wantAt.Add(-5*time.Second)) {
+			t.Errorf("point[%d] quote time=%v, want %v", index, point.QuoteFetchedAt, wantAt.Add(-5*time.Second))
+		}
+		if point.Spot == nil || *point.Spot != wantSpot || len(point.Data) != 1 || point.Data[0].Expiration != expiration {
+			t.Errorf("point[%d] spot/data=%v/%#v, want %v and one %s row", index, point.Spot, point.Data, wantSpot, expiration)
+		}
+		if point.UnavailableReason != "" {
+			t.Errorf("point[%d] unexpectedly unavailable: %s", index, point.UnavailableReason)
+		}
+	}
+}
+
+func TestChainHistoryMarksStaleAndUnpricedSnapshotsUnavailable(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "chain-history-unavailable.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+
+	asOf := time.Now().UTC().Truncate(time.Second)
+	strike := 100.0
+	volume := int64(10)
+	staleAt := asOf.Add(-3*time.Minute - time.Second)
+	if err := repository.SaveChain(model.ChainResponse{
+		Symbol: "QQQ", Expiration: "2030-01-18", Source: "test", FetchedAt: &staleAt,
+		Data: []model.OptionRow{{ContractSymbol: "stale", ContractType: "call", Strike: &strike, Volume: &volume}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	chainAt := asOf.Add(-5*time.Minute - 20*time.Second)
+	if err := repository.SaveChain(model.ChainResponse{
+		Symbol: "QQQ", Expiration: "2030-01-18", Source: "test", FetchedAt: &chainAt,
+		Data: []model.OptionRow{{ContractSymbol: "unpriced", ContractType: "call", Strike: &strike, Volume: &volume}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	points, err := repository.ChainHistory("QQQ", "2030-01-18", asOf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if points[0].FetchedAt != nil || points[0].UnavailableReason != "目标时间附近没有可用的期权链快照" {
+		t.Errorf("stale point=%#v, want explicit missing-snapshot status", points[0])
+	}
+	if points[1].FetchedAt == nil || points[1].Spot != nil || points[1].UnavailableReason != "期权链快照附近没有可用的标的价格" {
+		t.Errorf("unpriced point=%#v, want actual chain time and missing-price status", points[1])
+	}
+}
+
 func TestQuoteValuationMetadataRoundTripsSQLite(t *testing.T) {
 	repository, err := Open(filepath.Join(t.TempDir(), "valuation-metadata.db"))
 	if err != nil {

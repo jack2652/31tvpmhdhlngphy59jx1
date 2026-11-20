@@ -11,7 +11,7 @@ import (
 // Generated with app.main.app.openapi() using FastAPI 0.142.2. DATABASE_PATH
 // pointed at a temporary file so importing the app could not touch production data.
 // JSON is decoded before comparison so map order and Go's numeric types do not matter.
-// The Chan endpoint is an intentional Go addition to that original contract.
+// The Chan and chain-history endpoints are intentional Go additions to that original contract.
 const fastAPIOpenAPIFrozenSchema = `
 {
   "openapi": "3.1.0",
@@ -203,7 +203,10 @@ func TestGoOpenAPIMatchesFrozenFastAPISchema(t *testing.T) {
 		t.Fatalf("decode Go OpenAPI document: %v", err)
 	}
 
-	if differences := openAPISchemaDifferences(got, want, "$", 20); len(differences) > 0 {
+	gotDocument := got.(map[string]any)
+	gotPaths := gotDocument["paths"].(map[string]any)
+	delete(gotPaths, "/api/chain/{stock_symbol}/history")
+	if differences := openAPISchemaDifferences(gotDocument, want, "$", 20); len(differences) > 0 {
 		t.Errorf("Go OpenAPI differs from the frozen FastAPI schema:\n%s", differences)
 	}
 }

@@ -126,6 +126,23 @@ type ChainResponse struct {
 	OIFallback map[string]any `json:"oi_fallback,omitempty"`
 }
 
+type ChainHistoryResponse struct {
+	Symbol     string              `json:"symbol"`
+	Expiration string              `json:"expiration"`
+	AsOf       time.Time           `json:"as_of"`
+	Points     []ChainHistoryPoint `json:"points"`
+}
+
+type ChainHistoryPoint struct {
+	MinutesAgo        int         `json:"minutes_ago"`
+	TargetAt          time.Time   `json:"target_at"`
+	FetchedAt         *time.Time  `json:"fetched_at,omitempty"`
+	QuoteFetchedAt    *time.Time  `json:"quote_fetched_at,omitempty"`
+	Spot              *float64    `json:"spot,omitempty"`
+	Data              []OptionRow `json:"data,omitempty"`
+	UnavailableReason string      `json:"unavailable_reason,omitempty"`
+}
+
 type RefreshResponse struct {
 	Skipped     bool           `json:"skipped"`
 	Coalesced   bool           `json:"coalesced,omitempty"`
