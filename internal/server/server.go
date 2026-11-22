@@ -933,15 +933,19 @@ func (s *Service) index(c *gin.Context) {
 	}
 	content := strings.ReplaceAll(string(page), "__DEFAULT_SYMBOL__", defaultSymbol)
 	content = strings.ReplaceAll(content, "__ACCESS_KEY_REQUIRED__", strconv.FormatBool(s.cfg.AccessKey != ""))
+	content = strings.ReplaceAll(content, "__ASSET_VERSION__", indexAssetVersion(assets))
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(content))
+}
+
+// 指标脚本使用不可变缓存，单独更新算法时也必须改变股票页资源版本。
+func indexAssetVersion(assets fs.FS) string {
 	versionHash := sha256.New()
-	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-trendlines.js", "common/js/chan-client.js", "common/js/app.js", "common/img/option-scope-mark.svg", "common/img/option-scope-favicon.svg"} {
+	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-trendlines.js", "common/js/chan-turtle.js", "common/js/chan-granville.js", "common/js/chan-wyckoff.js", "common/js/chan-client.js", "common/js/app.js", "common/img/option-scope-mark.svg", "common/img/option-scope-favicon.svg"} {
 		if contents, err := fs.ReadFile(assets, asset); err == nil {
 			_, _ = versionHash.Write(contents)
 		}
 	}
-	version := hex.EncodeToString(versionHash.Sum(nil))
-	content = strings.ReplaceAll(content, "__ASSET_VERSION__", version)
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(content))
+	return hex.EncodeToString(versionHash.Sum(nil))
 }
 
 func (s *Service) futuresIndex(c *gin.Context) {

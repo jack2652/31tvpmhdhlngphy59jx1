@@ -1176,6 +1176,18 @@ func cachedBuyerLiquidity(spread, activity float64) string {
 	return "偏弱"
 }
 
+func cachedBuyerExpectedReturn(targetExit, unchangedExit, mid, halfSpread, probability float64) float64 {
+	entryCost := mid + halfSpread
+	if mid <= 0 || halfSpread < 0 || entryCost <= 0 {
+		return math.NaN()
+	}
+	probability = math.Min(1, math.Max(0, probability))
+	roundTripCost := 2 * halfSpread
+	targetPnL := targetExit - mid - roundTripCost
+	unchangedPnL := unchangedExit - mid - roundTripCost
+	return (probability*targetPnL + (1-probability)*unchangedPnL) / entryCost
+}
+
 func cachedBuyerSingleQuality(contract *cachedBuyerContract, target, spot float64) float64 {
 	deltaQuality := math.Max(0, 1-math.Abs(math.Abs(contract.delta)-0.58)/0.58)
 	thetaRatio := math.Abs(contract.thetaPerDay) / math.Max(contract.mid, 0.01)
@@ -1195,15 +1207,11 @@ func cachedBuyerSingle(contract *cachedBuyerContract, direction string, target f
 	unchangedExit := cachedBuyerFutureMark(contract, spot, spot, horizonYears, isCall)
 	halfSpread := contract.mid * contract.spreadRatio / 2
 	scenarioReturn := (targetExit - contract.mid) / contract.mid
-	expected := (func() float64 {
-		probability := 0.5
-		if hasTouch {
-			probability = touch
-		}
-		targetReturn := (targetExit - contract.mid - halfSpread) / contract.mid
-		unchangedReturn := (unchangedExit - contract.mid - halfSpread) / contract.mid
-		return probability*targetReturn + (1-probability)*unchangedReturn
-	})()
+	probability := 0.5
+	if hasTouch {
+		probability = touch
+	}
+	expected := cachedBuyerExpectedReturn(targetExit, unchangedExit, contract.mid, halfSpread, probability)
 	if math.IsNaN(scenarioReturn) || math.IsInf(scenarioReturn, 0) || math.IsNaN(expected) || math.IsInf(expected, 0) {
 		return nil
 	}
@@ -1332,7 +1340,7 @@ func cachedBuyerVertical(long, short *cachedBuyerContract, direction string, tar
 	if hasTouch {
 		probability = touch
 	}
-	expected := probability*((targetExit-debit-halfSpread)/debit) + (1-probability)*((unchangedExit-debit-halfSpread)/debit)
+	expected := cachedBuyerExpectedReturn(targetExit, unchangedExit, debit, halfSpread, probability)
 	if math.IsNaN(scenarioReturn) || math.IsInf(scenarioReturn, 0) || math.IsNaN(expected) || math.IsInf(expected, 0) {
 		return nil
 	}
@@ -1825,7 +1833,7 @@ func cachedBuyerStructuresWithIVAt(rows []model.OptionRow, spot float64, recomme
 		"horizon_trading_days": horizon, "horizon_label": "未来 5 个交易日", "targets": targetMap,
 		"reference_iv": referenceIV, "items": built, "method": "布莱克-斯科尔斯模型估算", "quote_source": "server",
 		"iv_source": ivSource, "quote_method": "仅使用有效买卖价中间价，不使用最新成交价代替成本",
-		"disclaimer": "综合评分不是历史胜率。排序按触及概率加权，并扣掉半档价差；展示的预计盈亏仍以中间价计算，不扣价差。",
+		"disclaimer": "综合评分不是历史胜率。排序按触及概率加权，并按当前价差估算开仓和平仓成本（假设平仓价差与当前相同，不含佣金和额外滑点）；展示的预计盈亏仍以中间价计算，不扣价差。",
 	}
 }
 

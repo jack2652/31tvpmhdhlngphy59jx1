@@ -9,6 +9,17 @@ import (
 	"option-scope-go/internal/model"
 )
 
+func TestCachedBuyerExpectedReturnIncludesEstimatedRoundTripSpread(t *testing.T) {
+	got := cachedBuyerExpectedReturn(120, 80, 100, 2, 0.75)
+	want := 6.0 / 102.0
+	if math.Abs(got-want) > 1e-12 {
+		t.Fatalf("expected return=%v, want %v after entry and exit spread costs", got, want)
+	}
+	if got >= cachedBuyerExpectedReturn(120, 80, 100, 0, 0.75) {
+		t.Fatal("wider spreads should reduce the cost-adjusted expected return")
+	}
+}
+
 func TestCachedBuyerEligibilityUsesPythonTradingHorizonAndCalendarDTE(t *testing.T) {
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {

@@ -24,112 +24,352 @@
   let nextCacheObjectId = 1;
   const afStochZCache = new WeakMap();
   const structureSupportCache = new WeakMap();
-  const STRUCTURE_SUPPORT_MERGE_RATIO = 0.003;
-  const MAX_STRUCTURE_SUPPORTS = 6;
+  const REACTION_LOOKBACK = 252;
+  const MAX_REACTION_ZONES = 3;
+  const MAX_HISTORICAL_RESISTANCES = 2;
+  const MAX_HISTORICAL_SUPPORTS = 4;
+  const MAX_BROKEN_SUPPORTS = 2;
 
-  // 支撑来自当前连续链的已确认结构，使用收盘行情判定失守，不随现价或可视窗口选点。
-  function structureSupportLevels(frame) {
-    const candles = frame.candles || [];
-    const completed = candles.filter((bar) => bar.is_forming !== true && (!frame.as_of || bar.date <= frame.as_of));
-    const latest = completed[completed.length - 1];
-    if (!latest || !Number.isFinite(Number(latest.close)) || Number(latest.close) <= 0) return [];
+  // 支撑和压力使用同一份截止日完成行情及Wilder ATR，不跨越无效行情或数据链。
+  function reactionHistory(frame, cutoffDate) {
+    const cutoff = cutoffDate || frame.as_of || frame.candles?.[frame.candles.length - 1]?.date;
+    const endDate = frame.as_of && frame.as_of < cutoff ? frame.as_of : cutoff;
+    let bars = [], chain = null;
+    for (const bar of frame.candles || []) {
+      if (!bar.date || bar.date > endDate || bar.is_forming === true) continue;
+      const values = [bar.open, bar.high, bar.low, bar.close].map(Number);
+      const valid = values.every((value) => Number.isFinite(value) && value > 0)
+        && values[1] >= Math.max(values[0], values[3]) && values[2] <= Math.min(values[0], values[3]);
+      const nextChain = Number(bar.chain_id) || 0;
+      if (!valid) { bars = []; chain = null; continue; }
+      if (chain !== nextChain || (bars.length && bar.date <= bars[bars.length - 1].date)) bars = [];
+      chain = nextChain;
+      bars.push(bar);
+    }
+    const chainStart = bars[0]?.date;
+    const atr = [];
+    let previousClose = null, average = null, seed = 0;
+    for (let index = 0; index < bars.length; index += 1) {
+      const high = Number(bars[index].high), low = Number(bars[index].low);
+      const range = previousClose == null ? high - low : Math.max(high - low, Math.abs(high - previousClose), Math.abs(low - previousClose));
+      if (index < 14) { seed += range; if (index === 13) average = seed / 14; }
+      else average += (range - average) / 14;
+      atr[index] = average;
+      previousClose = Number(bars[index].close);
+    }
+    return { bars, atr, chainStart };
+  }
+
+  // 结构仅提供辅助证据；中枢上沿须先站上，再发生真实回踩反弹。
+  function supportStructureCandidates(frame, history) {
+    const { bars, atr } = history, latest = bars[bars.length - 1];
+    if (!latest) return [];
     const recursive = Array.isArray(frame.strokes_v4);
     const strokes = recursive ? frame.strokes_v4 : (frame.strokes || []);
-    const signature = [strokes, frame.segments, frame.centers, frame.recursive_centers, frame.recursive_levels, frame.structure_chains_v4]
-      .map(cacheObjectId).join(":") + ":" + (frame.as_of || latest.date);
-    const cached = structureSupportCache.get(candles);
-    if (cached?.signature === signature) return cached.levels;
     const dataChain = Number(latest.chain_id) || 0;
-    const chainBars = completed.filter((bar) => (Number(bar.chain_id) || 0) === dataChain);
-    const structureChain = (frame.structure_chains_v4 || []).filter((chain) => (Number(chain.data_chain_id) || 0) === dataChain).slice(-1)[0];
-    const lastStroke = strokes[strokes.length - 1];
+    const structureChain = (frame.structure_chains_v4 || []).filter((item) => (Number(item.data_chain_id) || 0) === dataChain && item.start <= latest.date).slice(-1)[0];
+    const lastStroke = strokes.filter((item) => item.confirmed === true && item.start?.date <= latest.date && item.end?.date <= latest.date && (item.confirmed_at || item.end?.confirmed_at) <= latest.date).slice(-1)[0];
     const activeChain = recursive ? Number(structureChain?.chain_id ?? lastStroke?.start?.chain_id ?? lastStroke?.chain ?? dataChain) : dataChain;
-    const chainStart = structureChain?.start || chainBars[0]?.date || latest.date;
+    const chainStart = [structureChain?.start, history.chainStart, bars[0].date].filter(Boolean).sort().slice(-1)[0];
     const candidates = [];
-    const add = (priceValue, date, confirmedAt, source, chain, upperBoundary = false) => {
-      const price = Number(priceValue);
-      if (!date || date < chainStart || date > latest.date || !confirmedAt || confirmedAt > latest.date
+    const add = (value, date, confirmedAt, source, chain, upperBoundary = false) => {
+      const price = Number(value);
+      if (!date || date < chainStart || date > latest.date || !confirmedAt || confirmedAt < date || confirmedAt > latest.date
         || !Number.isFinite(price) || price <= 0 || Number(chain) !== activeChain) return;
-      let pointDate = date;
-      let start = chainBars.findIndex((bar) => bar.date >= confirmedAt && bar.date >= date);
-      if (start < 0) return;
-      // 中枢上沿先由收盘站上，才成为可观察的回踩支撑。
+      let eligibleAfter = date;
       if (upperBoundary) {
-        while (start < chainBars.length && !(Number(chainBars[start].close) > price)) start += 1;
-        if (start >= chainBars.length) return;
-        confirmedAt = chainBars[start].date;
-        pointDate = confirmedAt;
+        const breakout = bars.findIndex((bar, index) => bar.date >= confirmedAt && Number(bar.close) > price + Math.max(price * 0.001, (atr[index] || 0) * 0.15));
+        if (breakout < 0 || breakout + 1 >= bars.length) return;
+        eligibleAfter = bars[breakout + 1].date;
       }
-      const prior = candidates.find((item) => item.price === price && item.date === date && item.source === source);
-      if (prior && prior.confirmedAt <= confirmedAt) return;
-      if (prior) candidates.splice(candidates.indexOf(prior), 1);
-      const broken = chainBars.slice(start).find((bar) => Number(bar.close) < price * (1 - STRUCTURE_SUPPORT_MERGE_RATIO));
-      candidates.push({ price, date, pointDate, confirmedAt, source, brokenAt: broken?.date || "", status: broken ? "broken" : "active" });
+      candidates.push({ price, date, confirmedAt, eligibleAfter, source, upperBoundary,
+        lifecycleStart: source.includes("中枢") ? confirmedAt : date });
     };
     for (const stroke of strokes) {
-      if (stroke.confirmed !== true) continue;
-      const confirmedAt = stroke.confirmed_at || stroke.end?.confirmed_at;
+      if (stroke.confirmed !== true || stroke.end?.date > latest.date || stroke.first_observed_at > latest.date) continue;
       for (const point of [stroke.start, stroke.end]) {
-        if (point?.kind === "bottom") add(point.price, point.date, confirmedAt, "已确认笔低点", point.chain_id ?? stroke.chain ?? activeChain);
+        if (point?.kind === "bottom" && !(point.first_observed_at > latest.date)) add(point.price, point.date, stroke.confirmed_at || stroke.end?.confirmed_at, "已确认笔低点", point.chain_id ?? stroke.chain ?? activeChain);
       }
     }
     const segments = frame.recursive_levels?.length ? frame.recursive_levels.flatMap((level) => level.segments || []) : (frame.segments || []);
     for (const segment of segments) {
-      if (segment.confirmed !== true || segment.forming === true) continue;
+      if (segment.confirmed !== true || segment.forming === true || segment.end > latest.date || segment.first_observed_at > latest.date) continue;
       const source = (Number(segment.level) === 0 ? "已确认线段" : "第" + (Number(segment.level) + 1) + "层走势") + "低点";
       if (segment.start_kind === "bottom") add(segment.start_price, segment.start, segment.confirmed_at, source, segment.chain_id ?? activeChain);
       if (segment.end_kind === "bottom") add(segment.end_price, segment.end, segment.confirmed_at, source, segment.chain_id ?? activeChain);
     }
-    const centers = recursive ? (frame.recursive_centers || []) : (frame.centers || []);
-    for (const center of centers) {
-      if (center.forming === true || !center.confirmed_at) continue;
+    for (const center of (recursive ? frame.recursive_centers : frame.centers) || []) {
+      if (center.forming === true || !center.confirmed_at || center.end > latest.date || center.first_observed_at > latest.date) continue;
       const prefix = recursive ? "第" + (Number(center.level) + 1) + "层中枢" : "笔中枢";
-      const chain = center.chain_id ?? center.chain ?? activeChain;
-      add(center.zd ?? center.lower, center.start, center.confirmed_at, prefix + "下沿", chain);
-      add(center.zg ?? center.upper, center.start, center.confirmed_at, prefix + "上沿回踩", chain, true);
+      add(center.zd ?? center.lower, center.start, center.confirmed_at, prefix + "下沿", center.chain_id ?? center.chain ?? activeChain);
+      add(center.zg ?? center.upper, center.start, center.confirmed_at, prefix + "上沿回踩", center.chain_id ?? center.chain ?? activeChain, true);
     }
-    // 同状态价位合并；失守旧结构不拖累后来在同价位确认的新支撑。
+    return candidates;
+  }
+
+  function reactionLevel(tests, history, support, lastBreak, evidence = []) {
+    const { bars, atr } = history, latest = bars[bars.length - 1];
+    const prices = tests.map((event) => event.price).sort((a, b) => a - b), middle = Math.floor(prices.length / 2);
+    const price = prices.length % 2 ? prices[middle] : (prices[middle - 1] + prices[middle]) / 2;
+    const last = tests[tests.length - 1], age = bars.length - 1 - last.confirmedIndex;
+    const meanDepth = tests.reduce((sum, event) => sum + Math.min(3, event.depthAtr), 0) / tests.length;
+    const sources = [...new Set(evidence.map((item) => item.source))];
+    const rawStrength = Math.min(tests.length, 6) * 2 + meanDepth + (support ? Math.min(sources.length, 3) * 0.5 : 0);
+    const score = rawStrength * (support ? Math.exp(-age / 126) : 1) + 2 * Math.exp(-age / 63)
+      - Math.min(10, Math.abs(price - Number(latest.close)) / atr[atr.length - 1]) * 0.15;
+    // 一次反弹须等结构确认后才能展示；结构确认不能刷新反弹发生的年龄。
+    const structureDate = tests.length === 1 ? evidence.map((item) => item.confirmedAt).sort()[0] : "";
+    const confirmedAt = structureDate > bars[last.confirmedIndex].date ? structureDate : bars[last.confirmedIndex].date;
+    const zoneLow = prices[0], zoneHigh = prices[prices.length - 1];
+    return { key: (support ? "support-zone-" : "resistance-zone-") + tests[0].date + "-" + money(price), price, priceLabel: money(price),
+      zoneLow, zoneHigh, zoneLabel: zoneLow === zoneHigh ? money(price) : money(zoneLow) + "–" + money(zoneHigh), tone: support ? "support" : "resistance",
+      label: support ? "回踩反弹支撑区" : "反复受阻压力区", date: tests[0].date, pointDate: last.date,
+      confirmedAt, lastConfirmedAt: confirmedAt, testCount: tests.length, lastTestDate: last.date,
+      lastCloseDate: latest.date, reestablished: lastBreak >= 0, score, ageBars: age,
+      reactionAtr: tests.reduce((sum, event) => sum + event.depthAtr, 0) / tests.length,
+      status: "active", kind: "reaction", statusLabel: support ? (tests.length >= 2 ? "回踩确认支撑" : "结构反弹确认") : "反复受阻压力",
+      sources: sources.length ? sources.join("、") : (support ? "已收盘反弹低点" : "已收盘反弹高点"),
+      tests: tests.map((event) => ({ date: event.date, price: event.price, confirmedAt: bars[event.confirmedIndex].date })) };
+  }
+
+  // 完整历史与近期窗口复用同一套局部极值和实际收盘反应验证。
+  function priceReactionCandidates(history, support, structures, lookback = REACTION_LOOKBACK) {
+    const { bars, atr } = history;
+    const extreme = (bar) => Number(support ? bar.low : bar.high);
+    const candidates = [];
+    for (let index = Math.max(14, bars.length - lookback); index < bars.length - 2; index += 1) {
+      const price = extreme(bars[index]), volatility = atr[index];
+      if (!(volatility > 0)) continue;
+      const left = bars.slice(index - 2, index), right = bars.slice(index + 1, index + 3);
+      if (!left.every((bar) => support ? extreme(bar) >= price : extreme(bar) <= price)
+        || !left.some((bar) => support ? extreme(bar) > price : extreme(bar) < price)
+        || !right.every((bar) => support ? extreme(bar) > price : extreme(bar) < price)) continue;
+      const minimumReaction = Math.max(volatility * 0.75, price * 0.005);
+      let reactedAt = -1, depth = 0;
+      for (let next = index + 1; next <= Math.min(bars.length - 1, index + 5); next += 1) {
+        const close = Number(bars[next].close), reaction = support ? close - price : price - close;
+        if (reactedAt < 0 && reaction < -Math.max(volatility * 0.15, price * 0.001)) break;
+        depth = Math.max(depth, reaction);
+        if (reactedAt < 0 && reaction >= minimumReaction) reactedAt = next;
+      }
+      if (reactedAt < 0) continue;
+      const tolerance = supportMergeTolerance(price, history);
+      candidates.push({ index, price, date: bars[index].date, atr: volatility, confirmedIndex: Math.max(index + 2, reactedAt), depthAtr: depth / volatility, tolerance,
+        structures: structures.filter((item) => Math.abs(item.price - price) <= tolerance && bars[index].date >= item.eligibleAfter) });
+    }
+    return candidates;
+  }
+
+  function supportMergeTolerance(price, history) {
+    return Math.max(price * 0.002, Math.min(price * 0.008, (history.atr[history.atr.length - 1] || 0) * 0.25));
+  }
+
+  function priceLevelBreakMargin(price, history, index) {
+    const volatility = history.atr[index] || (Number(history.bars[index].high) - Number(history.bars[index].low));
+    return Math.max(price * 0.001, volatility * 0.15);
+  }
+
+  // 双向区域共用局部极值、反应幅度、独立计数及两根收盘失效规则。
+  function priceReactionLevels(frame, cutoffDate, support, history = reactionHistory(frame, cutoffDate)) {
+    const { bars, atr } = history;
+    if (bars.length < 18) return [];
+    const structures = support ? supportStructureCandidates(frame, history) : [];
+    const candidates = priceReactionCandidates(history, support, structures);
+    // 限制整个区间直径，防止相邻价格串联成过宽区域。
     const groups = [];
-    for (const candidate of candidates.sort((a, b) => a.price - b.price || a.date.localeCompare(b.date))) {
-      let group = groups.find((item) => item.status === candidate.status && (candidate.price - item.low) / item.low <= STRUCTURE_SUPPORT_MERGE_RATIO);
-      if (!group) {
-        group = { low: candidate.price, high: candidate.price, status: candidate.status, members: [] };
+    for (const candidate of candidates.sort((a, b) => a.price - b.price || a.index - b.index)) {
+      let group = groups[groups.length - 1];
+      if (!group || candidate.price - group.low > 2 * Math.min(group.tolerance, candidate.tolerance)) {
+        group = { low: candidate.price, tolerance: candidate.tolerance, members: [] };
         groups.push(group);
       }
-      group.high = Math.max(group.high, candidate.price);
+      group.tolerance = Math.min(group.tolerance, candidate.tolerance);
       group.members.push(candidate);
     }
-    const levels = groups.map((group) => {
-      const members = group.members.sort((a, b) => a.confirmedAt.localeCompare(b.confirmedAt));
-      const date = members.reduce((earliest, item) => item.date < earliest ? item.date : earliest, members[0].date);
-      const confirmedAt = members[0].confirmedAt;
-      const pointDate = members[0].pointDate;
-      const brokenAt = group.status === "broken" ? members.reduce((last, item) => item.brokenAt > last ? item.brokenAt : last, "") : "";
-      const price = group.low;
-      return { key: "support-" + date + "-" + price + "-" + group.status, price, zoneLow: group.low, zoneHigh: group.high,
-        date, pointDate, confirmedAt, brokenAt, status: group.status, sources: [...new Set(members.map((item) => item.source))].join("、"),
-        lastConfirmedAt: members[members.length - 1].confirmedAt, lastCloseDate: latest.date,
-        priceLabel: money(price), zoneLabel: group.low === group.high ? money(price) : money(group.low) + "–" + money(group.high),
-        statusLabel: group.status === "broken" ? "收盘已失守" : "结构支撑" };
+    const latest = bars[bars.length - 1], levels = [];
+    for (const group of groups) {
+      const events = [...group.members].sort((a, b) => a.confirmedIndex - b.confirmedIndex || a.index - b.index);
+      let tests = [], historicalTests = [], historicalBreak = -1;
+      let cursor = 0, crossedCount = 0, lastBreak = -1, active = null, broken = null, activeSignature = "";
+      for (let index = events[0].confirmedIndex; index < bars.length; index += 1) {
+        if (tests.length) {
+          const boundary = support ? Math.min(...tests.map((event) => event.price)) : Math.max(...tests.map((event) => event.price));
+          const margin = priceLevelBreakMargin(boundary, history, index);
+          const crossed = support ? Number(bars[index].close) < boundary - margin : Number(bars[index].close) > boundary + margin;
+          crossedCount = crossed ? crossedCount + 1 : 0;
+          if (crossedCount >= 2) {
+            // 突破使本轮压力失效；旧的多次受阻只留作新回测的历史证据，不能混入本轮计数。
+            if (!support && tests.length >= 2) { historicalTests = tests.slice(); historicalBreak = index; }
+            if (active) broken = { ...active, status: "broken", statusLabel: "收盘已失守", brokenAt: bars[index].date };
+            tests = []; active = null; activeSignature = ""; lastBreak = index; crossedCount = 0;
+          }
+        }
+        while (cursor < events.length && events[cursor].confirmedIndex === index) {
+          const event = events[cursor++];
+          if (event.index <= lastBreak) continue;
+          const previous = tests[tests.length - 1];
+          const closes = previous ? bars.slice(previous.index + 1, event.index).map((bar) => Number(bar.close)) : [];
+          const independent = !previous || (event.index - previous.index >= 5 && (support
+            ? Math.max(...closes) >= Math.max(previous.price, event.price) + Math.max(previous.atr, event.atr) * 0.5
+            : Math.min(...closes) <= Math.min(previous.price, event.price) - Math.max(previous.atr, event.atr) * 0.5));
+          if (independent) tests.push(event);
+          else if (!support && event.price > previous.price) tests[tests.length - 1] = event;
+        }
+        if (support && tests.length) {
+          const evidence = tests.flatMap((event) => event.structures).filter((item) => item.confirmedAt <= bars[index].date);
+          const signature = tests.map((event) => event.index).join(":") + "|" + evidence.length;
+          // 只有新反弹或新结构证据才重建价位，避免逐根重复格式化同一区域。
+          if ((tests.length >= 2 || (lastBreak < 0 && evidence.length)) && signature !== activeSignature) {
+            active = reactionLevel(tests, history, true, lastBreak, evidence); activeSignature = signature;
+          }
+        }
+      }
+      if (!support && tests.length >= 2) active = reactionLevel(tests, history, false, lastBreak);
+      else if (!support && tests.length === 1 && historicalTests.length >= 2) {
+        active = { ...reactionLevel(tests, history, false, lastBreak), kind: "historical-retest",
+          label: "历史压力回测", statusLabel: "历史压力再次受阻",
+          sources: "历史多次受阻与突破后新回测", historicalTestCount: historicalTests.length,
+          historicalBrokenAt: bars[historicalBreak].date,
+          historicalTests: historicalTests.map((event) => ({ date: event.date, price: event.price, confirmedAt: bars[event.confirmedIndex].date })) };
+        active.score += Math.min(historicalTests.length, 6) * 0.5;
+      }
+      if (active) {
+        // 首次跌破或仍在区域容差内的支撑保留，由合并后的下沿统一展示待确认状态。
+        if (active.ageBars <= 126 && (support || active.price > Number(latest.close))) levels.push(active);
+      } else if (support && broken && broken.price > Number(latest.close)) {
+        const breakIndex = bars.findIndex((bar) => bar.date === broken.brokenAt);
+        if (bars.length - 1 - breakIndex <= 63) levels.push(broken);
+      }
+    }
+    const byScore = (a, b) => b.score - a.score || a.price - b.price;
+    const active = levels.filter((level) => level.status === "active" && level.kind !== "historical-retest").sort(byScore).slice(0, MAX_REACTION_ZONES);
+    const historical = levels.filter((level) => level.kind === "historical-retest").sort(byScore).slice(0, MAX_HISTORICAL_RESISTANCES);
+    const broken = levels.filter((level) => level.status === "broken").sort((a, b) => b.brokenAt.localeCompare(a.brokenAt) || byScore(a, b)).slice(0, MAX_BROKEN_SUPPORTS);
+    return support ? [...active, ...broken].sort((a, b) => b.price - a.price) : [...active, ...historical];
+  }
+
+  function resistanceZoneLevels(frame, cutoffDate, history) {
+    return priceReactionLevels(frame, cutoffDate, false, history);
+  }
+
+  // 已确认结构是长期参考；未近期回踩只影响强度，完整历史有效跌破才改变状态。
+  function historicalSupportLevels(frame, history) {
+    const { bars } = history, latest = bars[bars.length - 1];
+    if (!latest) return [];
+    const structures = supportStructureCandidates(frame, history);
+    const upper = structures.filter((item) => item.upperBoundary);
+    const retests = upper.length ? priceReactionCandidates(history, true, upper, bars.length) : [];
+    const indices = new Map(bars.map((bar, index) => [bar.date, index]));
+    const levels = [];
+    for (const item of structures) {
+      const retest = item.upperBoundary ? retests.find((event) => event.structures.includes(item)) : null;
+      if (item.upperBoundary && !retest) continue;
+      const pointDate = retest?.date || item.date;
+      const confirmedAt = retest && bars[retest.confirmedIndex].date > item.confirmedAt ? bars[retest.confirmedIndex].date : item.confirmedAt;
+      const start = indices.get(retest ? bars[retest.confirmedIndex].date : item.lifecycleStart);
+      const confirmedIndex = indices.get(confirmedAt);
+      if (start == null || confirmedIndex == null) continue;
+      let crossedCount = 0, brokenAt = "";
+      for (let index = start; index < bars.length; index += 1) {
+        const margin = priceLevelBreakMargin(item.price, history, index);
+        crossedCount = Number(bars[index].close) < item.price - margin ? crossedCount + 1 : 0;
+        if (crossedCount >= 2) { brokenAt = bars[index].date; break; }
+      }
+      const ageBars = bars.length - 1 - confirmedIndex;
+      const strength = item.source.includes("走势") ? 4 : item.source.includes("线段") ? 3 : item.source.includes("中枢") ? 2 : 1;
+      levels.push({ key: "historical-support-" + pointDate + "-" + money(item.price), price: item.price, priceLabel: money(item.price),
+        zoneLow: item.price, zoneHigh: item.price, zoneLabel: money(item.price), tone: "support", kind: "historical",
+        label: "历史结构支撑", status: brokenAt ? "broken" : "active", statusLabel: brokenAt ? "收盘已失守" : "历史结构支撑",
+        date: item.date, pointDate, evidenceAt: retest?.date || item.lifecycleStart, confirmedAt, lastConfirmedAt: confirmedAt,
+        lastCloseDate: latest.date, brokenAt, sources: item.source, historicalDate: confirmedAt, hasHistoricalStructure: true,
+        ageBars, structureStrength: strength, score: strength + Math.exp(-ageBars / 252),
+        testCount: retest ? 1 : 0, tests: retest ? [{ date: retest.date, price: retest.price, confirmedAt: bars[retest.confirmedIndex].date }] : [],
+        lastTestDate: retest?.date || "", reactionAtr: retest?.depthAtr ?? null });
+    }
+    return levels;
+  }
+
+  function structureSupportLevels(frame, cutoffDate, history = reactionHistory(frame, cutoffDate)) {
+    const latest = history.bars[history.bars.length - 1];
+    if (!latest) return [];
+    const signature = [frame.candles, frame.strokes_v4, frame.strokes, frame.segments, frame.centers, frame.recursive_centers, frame.recursive_levels, frame.structure_chains_v4]
+      .map(cacheObjectId).join(":") + ":" + latest.date + ":" + history.bars.length + ":" + [latest.open, latest.high, latest.low, latest.close].join(":");
+    const cached = structureSupportCache.get(frame);
+    if (cached?.signature === signature) return cached.levels;
+    const levels = [...priceReactionLevels(frame, cutoffDate, true, history), ...historicalSupportLevels(frame, history)];
+    const groups = [];
+    // 限制合并后的整体跨度，避免历史结构把几个独立近期区域串联成一条。
+    for (const level of levels.sort((a, b) => a.zoneLow - b.zoneLow || a.zoneHigh - b.zoneHigh)) {
+      const tolerance = supportMergeTolerance(level.price, history);
+      let group = groups[groups.length - 1];
+      if (!group || Math.max(group.high, level.zoneHigh) - group.low > 2 * Math.min(group.tolerance, tolerance)) {
+        group = { low: level.zoneLow, high: level.zoneHigh, tolerance, members: [] }; groups.push(group);
+      }
+      group.high = Math.max(group.high, level.zoneHigh); group.tolerance = Math.min(group.tolerance, tolerance);
+      group.members.push(level);
+    }
+    const merged = groups.map((group) => {
+      // 同区早已确认且尚未失守的下沿仍然有效，上方单个参考失守不能把整个区域一起标灰。
+      const broken = group.members.filter((level) => {
+        if (level.status !== "broken") return false;
+        const boundary = Math.min(level.zoneLow, ...group.members.filter((item) => item.status === "active" && item.confirmedAt <= level.brokenAt).map((item) => item.zoneLow));
+        const index = history.bars.findIndex((bar) => bar.date === level.brokenAt);
+        return index > 0 && [index - 1, index].every((at) => Number(history.bars[at].close) < boundary - priceLevelBreakMargin(boundary, history, at));
+      }).sort((a, b) => b.brokenAt.localeCompare(a.brokenAt)
+        || Number(b.kind === "reaction") - Number(a.kind === "reaction") || b.score - a.score)[0];
+      const valid = group.members.filter((level) => level.status === "active"
+        && (!broken || (level.evidenceAt || level.lastTestDate) > broken.brokenAt));
+      const members = valid.length ? valid : group.members.filter((level) => level.status === "broken");
+      const reaction = members.filter((level) => level.kind === "reaction" && (valid.length || level.brokenAt === broken.brokenAt)).sort((a, b) => b.score - a.score)[0];
+      const historical = members.filter((level) => level.hasHistoricalStructure);
+      const selected = valid.length ? (reaction || [...members].sort((a, b) => b.score - a.score)[0]) : broken;
+      const low = Math.min(...members.map((level) => level.zoneLow)), high = Math.max(...members.map((level) => level.zoneHigh));
+      const sources = [...new Set(members.flatMap((level) => level.sources.split("、")))];
+      const structureStrength = [...new Map(historical.map((level) => [level.sources, level.structureStrength])).values()].reduce((sum, strength) => sum + strength, 0);
+      const historicalDate = historical.map((level) => level.historicalDate).sort().slice(-1)[0];
+      return { ...selected, zoneLow: low, zoneHigh: high, zoneLabel: low === high ? money(low) : money(low) + "–" + money(high),
+        sources: sources.join("、"), hasHistoricalStructure: historical.length > 0, historicalDate,
+        score: reaction ? reaction.score : Math.min(structureStrength, 8) + Math.exp(-selected.ageBars / 252),
+        lineAlpha: selected.kind === "historical" ? 0.48 + 0.12 * Math.exp(-selected.ageBars / 252) : 0.68,
+        statusLabel: selected.status === "broken" ? "收盘已失守" : selected.kind === "historical" ? "历史结构支撑" : selected.statusLabel };
     });
-    const byDistance = (a, b) => Math.abs(a.price - latest.close) - Math.abs(b.price - latest.close) || b.lastConfirmedAt.localeCompare(a.lastConfirmedAt);
-    const active = levels.filter((level) => level.status === "active").sort(byDistance);
-    const broken = levels.filter((level) => level.status === "broken").sort((a, b) => b.brokenAt.localeCompare(a.brokenAt) || byDistance(a, b)).slice(0, 2);
-    const selected = [...active.slice(0, MAX_STRUCTURE_SUPPORTS - broken.length), ...broken].sort((a, b) => b.price - a.price);
-    structureSupportCache.set(candles, { signature, levels: selected });
+    const byScore = (a, b) => b.score - a.score || b.price - a.price;
+    const recent = merged.filter((level) => level.status === "active" && level.kind === "reaction").sort(byScore).slice(0, MAX_REACTION_ZONES);
+    // 历史参考优先展示距完成收盘最近的结构，避免久远极端低点挤掉当前价格下方的重要层级。
+    const historical = merged.filter((level) => level.status === "active" && level.kind === "historical")
+      .sort((a, b) => Math.abs(a.price - Number(latest.close)) - Math.abs(b.price - Number(latest.close)) || byScore(a, b)).slice(0, MAX_HISTORICAL_SUPPORTS);
+    const broken = merged.filter((level) => level.status === "broken" && latest.date >= level.brokenAt
+      && history.bars.length - 1 - history.bars.findIndex((bar) => bar.date === level.brokenAt) <= 63)
+      .sort((a, b) => b.brokenAt.localeCompare(a.brokenAt) || byScore(a, b)).slice(0, MAX_BROKEN_SUPPORTS);
+    const selected = [...recent, ...historical, ...broken].sort((a, b) => b.price - a.price).map((level) => {
+      if (level.status !== "active") return level;
+      // 待确认只看最新完成收盘和整区下沿；较高单一参考被破不代表整个支撑区被破。
+      const threshold = level.zoneLow - priceLevelBreakMargin(level.zoneLow, history, history.bars.length - 1);
+      return Number(latest.close) < threshold ? { ...level, status: "pending-break", statusLabel: "跌破待确认",
+        pendingBreakAt: latest.date, lastCloseLabel: money(latest.close), breakThresholdLabel: money(threshold) } : level;
+    });
+    structureSupportCache.set(frame, { signature, levels: selected });
     return selected;
   }
 
   // 标签在价格窗内错开；支撑线价格坐标不因避让而改变。
   function layoutStructureSupports(levels, bars, firstDate, lastDate, minimum, maximum, x, y, left, right, top, bottom, mobile) {
-    const rows = levels.filter((level) => level.confirmedAt <= lastDate && level.price > minimum && level.price < maximum).map((level) => {
+    // 同价位的旧失守结构与新支撑只画一条，以最近确认的结构展示状态。
+    const distinct = new Map();
+    for (const level of levels.filter((item) => item.confirmedAt <= lastDate && item.price > minimum && item.price < maximum)) {
+      const priceKey = money(level.price);
+      const previous = distinct.get(priceKey);
+      if (!previous || (level.lastConfirmedAt || level.confirmedAt) > (previous.lastConfirmedAt || previous.confirmedAt)) distinct.set(priceKey, level);
+    }
+    const rows = [...distinct.values()].map((level) => {
       const index = bars.findIndex((bar) => bar.date >= level.confirmedAt);
       const pointIndex = bars.findIndex((bar) => bar.date === level.pointDate);
       const broken = level.brokenAt && level.brokenAt <= lastDate;
-      return { ...level, status: broken ? "broken" : "active", statusLabel: broken ? "收盘已失守" : "结构支撑",
+      const pending = level.status === "pending-break" && level.pendingBreakAt <= lastDate;
+      return { ...level, status: broken ? "broken" : pending ? "pending-break" : "active", statusLabel: broken ? "收盘已失守" : level.statusLabel,
         x1: level.confirmedAt < firstDate ? left : x(Math.max(0, index)), x2: right, y: y(level.price),
         pointX: pointIndex < 0 ? null : x(pointIndex), pointY: y(level.price), labelX: right - 5,
-        label: (broken ? "失守 " : "支撑 ") + level.priceLabel };
+        label: (broken ? "失守 " : pending ? "跌破待确认 " : "支撑 ") + level.priceLabel };
     }).sort((a, b) => a.y - b.y);
     const gap = mobile ? 21 : 18;
     let previousY = top;
@@ -712,8 +952,9 @@
   }
   function dmiPoint(candles, index, state) {
     const candle = candles[index];
-    const high = Number(candle?.high), low = Number(candle?.low);
-    if (!Number.isFinite(high) || !Number.isFinite(low) || high < low) {
+    const high = Number(candle?.high), low = Number(candle?.low), open = Number(candle?.open), close = Number(candle?.close);
+    if (![open, high, low, close].every(Number.isFinite) || low <= 0
+      || high < Math.max(open, close) || low > Math.min(open, close) || candle?.is_forming === true) {
       resetDmiState(state);
       return null;
     }
@@ -721,8 +962,11 @@
     if (index > 0) {
       const previous = candles[index - 1];
       const previousHigh = Number(previous?.high), previousLow = Number(previous?.low);
-      const previousClose = Number(previous?.close);
-      if (Number.isFinite(previousHigh) && Number.isFinite(previousLow) && Number.isFinite(previousClose)) {
+      const previousClose = Number(previous?.close), previousOpen = Number(previous?.open);
+      if (Number.isFinite(previousHigh) && Number.isFinite(previousLow) && Number.isFinite(previousClose)
+        && Number.isFinite(previousOpen) && previousLow > 0
+        && previousHigh >= Math.max(previousOpen, previousClose) && previousLow <= Math.min(previousOpen, previousClose)
+        && previous?.is_forming !== true && (Number(previous?.chain_id) || 0) === (Number(candle?.chain_id) || 0)) {
         trueRange = Math.max(high - low, Math.abs(high - previousClose), Math.abs(previousClose - low));
         const highMove = high - previousHigh;
         const lowMove = previousLow - low;
@@ -774,6 +1018,8 @@
     // 保留一根前置 K 线，计算第一根真实波动幅度时才能使用前收盘价。
     const from = Math.max(0, liveIndex - DMI_TAIL_BARS);
     const tail = displayCandles.slice(from, liveIndex + 1);
+    // 实时副图允许预览当根DMI；该临时尾值不进入海龟已确认历史。
+    if (tail.length) tail[tail.length - 1] = { ...tail[tail.length - 1], is_forming: false };
     const tailValues = dmiSeries(tail);
     result[liveIndex - startIndex] = tailValues[tailValues.length - 1] ?? null;
     return result;
@@ -866,9 +1112,13 @@
       const reference = Number.isFinite(anchor) && anchor > 0 ? anchor : spotPrice;
       return levels.some((level) => !Number.isFinite(reference) || Math.abs(level - reference) > 0.000001);
     });
-    const supportLevels = layers?.structureSupports === false ? [] : structureSupportLevels(frame);
-    const supportCacheKey = supportLevels.map((level) => [level.key, level.zoneHigh, level.confirmedAt, level.brokenAt, level.lastCloseDate, level.sources].join(":")).join("|");
-    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${ruleVersion || ""}-${layers?.structureSupports === false ? "off" : "on"}-${supportCacheKey}`;
+    const priceLevelCutoff = frame.candles[dataEndIndex - 1]?.date || frame.as_of;
+    const priceLevelHistory = layers?.supportResistance === false ? null : reactionHistory(frame, priceLevelCutoff);
+    const supportLevels = layers?.supportResistance === false ? [] : structureSupportLevels(frame, priceLevelCutoff, priceLevelHistory);
+    const supportCacheKey = supportLevels.map((level) => [level.key, level.zoneLow, level.zoneHigh, level.kind, level.lineAlpha, level.confirmedAt, level.brokenAt, level.lastCloseDate, level.sources].join(":")).join("|");
+    const resistanceLevels = layers?.supportResistance === false ? [] : resistanceZoneLevels(frame, priceLevelCutoff, priceLevelHistory);
+    const resistanceCacheKey = resistanceLevels.map((level) => [level.key, level.zoneLow, level.zoneHigh, level.confirmedAt, level.testCount, level.kind, level.historicalTestCount, level.historicalBrokenAt].join(":")).join("|");
+    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${ruleVersion || ""}-${supportCacheKey}-${resistanceCacheKey}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
@@ -1147,7 +1397,7 @@
       const markerRadius = mobile ? 5 : 4;
       const markerGap = mobile ? 3 : 2;
       const fontSize = mobile ? 11 : 8;
-      const label = `${turtleEventLabels[event.kind] || "信号"}${event.forming ? "*" : ""}`;
+      const label = `${event.reentry ? (event.kind === "long-entry" ? "多再入" : "空再入") : event.reason === "risk-stop" ? (event.kind === "long-exit" ? "多止损" : "空止损") : turtleEventLabels[event.kind] || "信号"}${event.forming ? "*" : ""}`;
       const labelHalfWidth = Array.from(label).length * fontSize / 2 + 3;
       const labelGap = mobile ? 3 : 2;
       const lowerMarkerY = y(candle.low) + markerRadius + markerGap;
@@ -1174,6 +1424,7 @@
       const labelY = Math.max(labelMinY, Math.min(labelMaxY, labelCandidateY));
       return {
         key: `${event.date}-${event.kind}`, kind: event.kind, date: event.date, price: event.price,
+        reason: event.reason, stopPrice: event.stopPrice, riskN: event.riskN, reentry: event.reentry === true,
         x: Math.max(left + labelHalfWidth, Math.min(historyRight - labelHalfWidth, x(localIndex))),
         y: markerY, markerRadius, upMarker, forming: event.forming, label, labelY, fontSize,
       };
@@ -1537,6 +1788,8 @@
       ruleVersion: recursiveRule,
       structureSupports,
       structureSupportLevels: supportLevels,
+      supportStatus: supportLevels.some((level) => level.status !== "broken") ? "" : "当前连续行情中暂无未失守的历史结构或近期反弹支撑。",
+      resistanceLevels,
       description: `实体 K 线表示收盘后的行情，浅色影线显示缠论合并后的价格范围。多级线段、中枢、笔、递归买卖点和笔级转折预警均可从图层菜单单独控制。左侧显示价格刻度与现价；点击现价可查看结构观察。${indicatorDescription}按美股配色，绿色 PDI 表示多头方向强度，红色 MDI 表示空头方向强度；ADX 高于 25 为趋势强度参考。MACD 副图标题解读 DIF、DEA、柱体关系和零轴位置；DMI 副图标题解读 PDI/MDI 主导方向及 ADX 趋势强度。向左拖动可将 K 线移入右侧空白槽，查看未破位结构趋势线的延长；趋势线延长与右侧条件情景均为基于已知数据的示意，不代表未来行情或确定预测。现价已在近期低点下方且没有更低确认端点时，在下方观察列表中用灰色卡片说明，不绘制目标路径。移动鼠标或触摸图表可查看 K 线日期、OHLC 与成交量；已开启的副图标题会同步显示对应 K 线的指标值与解读。使用图表上方按钮缩放或左右移动，也可聚焦图表后用方向键查看 K 线。`,
       points,
       chanCandles,
@@ -1560,9 +1813,8 @@
         }),
         ...signalLayouts,
       ],
-      // `segments` here is the Canvas paint gate: the mapped segment list is
-      // already filtered by the global default and any per-level overrides.
-      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, mfi: mfiEnabled, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false, structureSupports: layers?.structureSupports !== false },
+      // Canvas绘制门由已选线段决定；每级已按总开关默认与单层覆盖筛选。
+      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, mfi: mfiEnabled, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
       // Keep per-level controls stable while users pan and zoom; their options
       // should describe the loaded structure, not only the current viewport.
       availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
@@ -1616,21 +1868,27 @@
         const sourceEndpoints = recursiveEndpointList.length ? recursiveEndpointList : endpointList;
         const ordered = [...sourceEndpoints].sort((a, b) => b.date.localeCompare(a.date));
         const lastHigh = ordered.find((point) => point.kind === "top");
-        const lastLow = ordered.find((point) => point.kind === "bottom");
         const centerLower = Number(visibleCenterForLevels?.zd ?? visibleCenterForLevels?.lower ?? visibleCenterForLevels?.lower_price);
         const centerUpper = Number(visibleCenterForLevels?.zg ?? visibleCenterForLevels?.upper ?? visibleCenterForLevels?.upper_price);
         const candidates = [
+          ...resistanceLevels.filter((level) => level.confirmedAt <= lastDate),
           lastHigh && { key: "recent-high", label: lastHigh.confirmed ? "近端高点" : "形成中高点", price: lastHigh.price, date: lastHigh.date, tone: "resistance" },
-          lastLow && { key: "recent-low", label: lastLow.confirmed ? "近端低点" : "形成中低点", price: lastLow.price, date: lastLow.date, tone: "support" },
           visibleCenterForLevels && Number.isFinite(centerUpper) && { key: "center-upper", label: "中枢上沿", price: centerUpper, date: visibleCenterForLevels.start, tone: "center" },
           visibleCenterForLevels && Number.isFinite(centerLower) && { key: "center-lower", label: "中枢下沿", price: centerLower, date: visibleCenterForLevels.start, tone: "center" },
-        ].filter((level) => level && level.price > minimum && level.price < maximum);
-        const seen = new Set();
+        ].filter((level) => level && level.price > minimum && level.price < maximum && (layers?.supportResistance !== false || level.tone === "center"));
+        // 与已绘制的结构支撑共享去重集合，保留结构确认信息；不同价格不按距离误删。
+        const seen = new Set(structureSupports.map((level) => money(level.price)));
+        const zones = [];
         const distinct = candidates.filter((level) => {
-          const duplicate = [...seen].some((value) => Math.abs(value - level.price) / Math.max(value, level.price) < 0.001);
-          seen.add(level.price);
+          const overlappingSupport = level.testCount && structureSupports.find((support) => support.price >= level.zoneLow && support.price <= level.zoneHigh);
+          if (overlappingSupport) { overlappingSupport.resistanceZone = level; zones.push(level); return false; }
+          if (!level.testCount && level.tone === "resistance" && zones.some((zone) => level.price >= zone.zoneLow && level.price <= zone.zoneHigh)) return false;
+          const priceKey = money(level.price);
+          const duplicate = seen.has(priceKey);
+          seen.add(priceKey);
+          if (!duplicate && level.testCount) zones.push(level);
           return !duplicate;
-        }).map((level) => ({ ...level, y: y(level.price), x1: x(dateIndex(level.date)), x2: historyRight,
+        }).map((level) => ({ ...level, y: y(level.price), x1: x(dateIndex(level.confirmedAt || level.date)), x2: historyRight, labelX: historyRight - 5,
           priceLabel: money(level.price),
           title: `${displayBarTime(level.date, frame.period)} · ${level.label} ${money(level.price)}` }));
         return distinct;
@@ -1676,19 +1934,19 @@
       dates: [...new Set([0, Math.floor((bars.length - 1) / 2), bars.length - 1])]
         .map((index) => { const displayDate = displayBarTime(bars[index].date, frame.period); return { x: x(index), y: height - 12, label: mobile ? axisDateLabel(displayDate).slice(-5) : axisDateLabel(displayDate) }; }),
     };
-    if (layers?.structureSupports !== false) chart.description += "结构支撑自动取当前连续行情的已确认笔、线段低点及中枢边界；近价合并，蓝色实线表示支撑，灰色虚线表示收盘失守。盘中价格不改变确认状态；价位与来源可在图下结构支撑列表查看。";
+    if (layers?.supportResistance !== false) chart.description += "支撑包含历史结构参考与近期反弹区域，相近价位按ATR(14)合并去重。已确认笔、线段低点和中枢下沿保留为历史结构支撑，近期性只影响排序及线条强度，不因长期未回踩而删除；中枢上沿仍须站上后真实回踩反弹。近期支撑按最近252根完成行情验证，需两次独立反弹，或结构与一次实际反弹，126根无新反弹时仅近期反应证据过期。历史结构使用完整连续行情检查两根收盘有效跌破，旧位不因价格回升自动复活；新结构源点或两次新反弹可重新确认。最多显示3个近期支撑（含跌破待确认）、4个历史结构参考（含跌破待确认）、2个近期失守、3个近期压力区域及2个历史压力回测。历史压力须曾有两次独立受阻，突破后出现新受阻才能重新显示，历史次数与本轮回测分开记录；无新受阻不恢复。重复区间只画一次。蓝色实线表示支撑，历史参考稍淡，金色虚线表示首次有效收盘跌破、待下一根确认，灰色虚线表示连续两根收盘确认失守，红色虚线表示压力。待确认按合并区域下沿及ATR容差判断；下一根不再有效跌破时恢复支撑展示，已确认失守不会因价格回升自动恢复。悬浮价位可查看来源、确认日期和实际反弹记录；历史结构参考不代表近期已回踩确认。盘中价格不改变确认状态，证据可在图下列表查看。";
     if (trendlineLayouts?.length) chart.description += "结构趋势线由已确认的笔与线段端点拟合，实线连接结构点，虚线延伸至当前窗口；收盘价有效穿越后不再显示。";
     if (layers?.turtle === true) {
       const eventDescription = turtleEventLayouts.length
         ? `当前窗口信号：${turtleEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
         : "当前窗口暂无海龟突破/退出信号。";
-      chart.description += `海龟通道按当前周期的前 20 根 K 线计算入场轨、前 10 根计算退出轨；入场需 PDI/MDI 与方向一致、ADX(14,6) 高于 25 且高于 3 根前、连续两根已收盘 K 线守住突破位，并且收盘价位于 55 周期 EMA 同侧、EMA 近 5 根方向一致；过滤条件不满足时不建立新仓，已有仓位仍按 K 线高低价触及退出，未收盘 K 线也可能触发退出；${eventDescription}`;
+      chart.description += `海龟使用前 20 根入场通道、前 10 根退出通道；连续两根收盘守住突破位，且 PDI/MDI 方向一致、ADX(14,6)>25、EMA55 同侧并持续同向后确认。首次入场与通道退出后的新入场还须 ADX 高于 3 根前；仅在 2N 止损后原趋势持续有效时，允许 ADX 保持强势但不加速，新突破仍须两根收盘确认，标记为多再入或空再入。趋势变弱或反向即清除再次入场许可。每次确认以前序 Wilder N(20) 重新设定固定 2N 止损参考，与反向通道选择先触及者；跳空退出按开盘价。盘中仅提示退出，收盘入场标记不代表已成交；无效行情或断链重新预热；${eventDescription}`;
     }
     if (layers?.granville === true) {
       const eventDescription = granvilleEventLayouts.length
         ? `当前窗口信号：${granvilleEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
         : "当前窗口暂无葛兰碧信号。";
-      chart.description += `葛兰碧规则使用当前周期 200 期 SMA，20 期斜率判断趋势；回踩阈值约 0.3 ATR(14)，乖离阈值约 2 ATR(14)。交叉、回踩与乖离回归信号是八条定性规则的量化近似，仅在 K 线收盘后确认；${eventDescription}`;
+      chart.description += `葛兰碧使用当前周期 SMA200、20/5 期斜率及前序 Wilder ATR(14)。买1/卖5要求均线转向；买2/卖6要求既有趋势中短暂穿越后在 10 根内恢复、越界深度不超过 1 ATR；买3/卖7要求未穿越均线的 0.3 ATR 内回踩/反抽，同轮只提示一次。买4/卖8先出现 2 ATR 乖离再收盘反向确认；信号仅在收盘后确认，断链重新预热；${eventDescription}`;
     }
     if (layers?.macdSma200 === true) {
       const eventDescription = macdSma200EventLayouts.length
@@ -1709,7 +1967,7 @@
       const eventDescription = wyckoffEventLayouts.length
         ? `当前窗口事件：${wyckoffEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
         : "当前窗口暂无已确认的 Wyckoff 事件。";
-      chart.description += `威科夫阶段按成交量、波幅、价格区间和收盘确认进行项目适配，识别 A–E 阶段及抛售高潮、买入高潮、自动反弹/回落、二次测试、弹簧探底、派发冲高、回测、强势/弱势信号、最后支撑/供给点。形成中的 K 线不产生确认事件；不包含可拖动示意图及源码的高周期覆盖；${phaseDescription}${eventDescription}`;
+      chart.description += `威科夫按前序成交量、波幅、区间与收盘确认估计 A–E 阶段；自动反弹/回落之后才确认缩量窄幅二次测试，成功回测要求较探底/冲高缩量且低点抬高/高点降低；突破须有量价证据，最后支撑/供给限制回踩深度。缺量不冒充缩量，突破失败回到区间、反向破坏或阶段过期后重新识别，断链重新预热。允许没有弹簧探底/派发冲高的路径；形成中的 K 线不产生确认事件；${phaseDescription}${eventDescription}`;
     }
     if (layers?.mfi === true) {
       const eventDescription = mfiResult?.events?.length
@@ -2377,11 +2635,11 @@
     return { date: source.date, open, high, low, close, volume, is_forming: forming };
   }
 
-  // Each recursive segment level has an independent visibility state.
+  // 单层显式选择优先；未单独设置时继承“全部级别”的显示状态。
   function isSegmentLevelVisible(layers, level) {
     const key = String(Number(level) || 0);
     return Object.prototype.hasOwnProperty.call(layers?.segmentLevels || {}, key)
-      ? layers.segmentLevels[key] === true : false;
+      ? layers.segmentLevels[key] === true : layers?.segments === true;
   }
 
   function isRecursiveCenterLevelVisible(layers, level) {

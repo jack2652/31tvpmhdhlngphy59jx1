@@ -234,3 +234,17 @@ assert.match(styles, /\.chan-layer-menu-signals \.chan-layer-empty\{display:bloc
 assert.match(styles, /@media\(max-width:760px\)\{[\s\S]*?\.chan-controls\{grid-template-columns:minmax\(0,1fr\);grid-template-rows:auto auto auto;grid-template-areas:"controls" "status" "levels";gap:10px\}[\s\S]*?\.chan-control-options\{position:relative;width:100%;align-items:center;flex-direction:row;flex-wrap:wrap;gap:8px\}[\s\S]*?\.chan-control-options>details\{position:static\}[\s\S]*?\.chan-layer-menu-panel\{position:absolute;top:calc\(100% \+ 8px\)/, "窄屏图表控制器保持单列，菜单跟随按钮组展开");
 
 console.log("Chan subchart layout and UI checks passed");
+
+const chainFrame = frame();
+chainFrame.candles = Array.from({ length: 80 }, (_, index) => {
+  const close = (index < 40 ? 100 : 1000) + index * 0.1;
+  return { date: new Date(Date.UTC(2025, 0, index + 1)).toISOString().slice(0, 10), open: close - 0.2, high: close + 1, low: close - 1, close, volume: 1000, chain_id: index < 40 ? 1 : 2 };
+});
+chainFrame.as_of = chainFrame.candles.at(-1).date;
+const dmiAfterChain = window.OptionScopeChan.view({ ...payload, daily: chainFrame }, true, false, 30, { daily: { visibleBars: 80 } }, {}, { dmi: true }).daily.chart.candles.map((bar) => bar.dmi);
+assert.ok(dmiAfterChain.slice(40, 53).every((point) => point === null), "DMI跨链跳变不当作方向动量，重新预热14根");
+assert.ok(Number.isFinite(dmiAfterChain[58].adx), "新链完整预热后DMI/ADX恢复");
+const badFrame = { ...chainFrame, candles: chainFrame.candles.map((bar, index) => index === 60 ? { ...bar, open: bar.high + 1 } : bar) };
+const dmiAfterBad = window.OptionScopeChan.view({ ...payload, daily: badFrame }, true, false, 30, { daily: { visibleBars: 80 } }, {}, { dmi: true }).daily.chart.candles.map((bar) => bar.dmi);
+assert.equal(dmiAfterBad[60], null, "DMI拒绝不合法OHLC");
+assert.ok(dmiAfterBad.slice(61, 74).every((point) => point === null), "无效行情后的DMI不沿用旧窗口");

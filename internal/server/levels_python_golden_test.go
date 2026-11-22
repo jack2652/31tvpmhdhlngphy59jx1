@@ -14,6 +14,58 @@ func pythonGoldenFloat(value float64) *float64 { return &value }
 
 func pythonGoldenInt(value int64) *int64 { return &value }
 
+type buyerRankingExpectation struct {
+	kind, direction string
+	strikes         []float64
+	primary         bool
+	expected, score float64
+}
+
+func assertBuyerReturnsRanked(t *testing.T, items []map[string]any, want []buyerRankingExpectation) {
+	t.Helper()
+	if len(items) != len(want) {
+		t.Fatalf("buyer item count=%d, want %d ranked structures", len(items), len(want))
+	}
+	previous := map[string]float64{"call": math.Inf(1), "put": math.Inf(1)}
+	kinds, directions := map[string]bool{}, map[string]bool{}
+	for index, expected := range want {
+		item := items[index]
+		value, ok := item["expected_return"].(float64)
+		if !ok || math.IsNaN(value) || math.IsInf(value, 0) {
+			t.Fatalf("buyer item[%d] has invalid expected return: %#v", index, item["expected_return"])
+		}
+		kind, _ := item["kind"].(string)
+		direction, _ := item["direction"].(string)
+		if kind != expected.kind || direction != expected.direction || item["is_primary"] != expected.primary {
+			t.Errorf("buyer item[%d] identity=%#v, want kind=%s direction=%s primary=%t", index, item, expected.kind, expected.direction, expected.primary)
+		}
+		strikes, ok := item["strikes"].([]float64)
+		if !ok || len(strikes) != len(expected.strikes) {
+			t.Errorf("buyer item[%d] strikes=%#v, want %v", index, item["strikes"], expected.strikes)
+		} else {
+			for strikeIndex, strike := range expected.strikes {
+				if strikes[strikeIndex] != strike {
+					t.Errorf("buyer item[%d] strike[%d]=%v, want %v", index, strikeIndex, strikes[strikeIndex], strike)
+				}
+			}
+		}
+		pythonGoldenNumber(t, item["expected_return"], expected.expected, .0000001, "buyer item["+strconv.Itoa(index)+"].expected_return")
+		pythonGoldenNumber(t, item["score"], expected.score, .0000001, "buyer item["+strconv.Itoa(index)+"].score")
+		if direction != "call" && direction != "put" {
+			continue
+		}
+		if value > previous[direction]+1e-12 {
+			t.Errorf("buyer item[%d] %s return=%v is above its preceding rank %v", index, direction, value, previous[direction])
+		}
+		previous[direction] = value
+		kinds[kind] = true
+		directions[direction] = true
+	}
+	if len(kinds) != 2 || len(directions) != 2 {
+		t.Errorf("ranked buyer items do not cover both structure types and directions: kinds=%v directions=%v", kinds, directions)
+	}
+}
+
 func pythonGoldenFixture() ([]map[string]any, []model.OptionRow) {
 	bars := make([]map[string]any, 180)
 	previous := 100.0
@@ -463,7 +515,7 @@ func TestBuildCachedLevelsMatchesPythonGolden(t *testing.T) {
 	pythonGoldenNumber(t, first["delta"], .2069068568, .0000001, "first buyer structure delta")
 	pythonGoldenNumber(t, first["target_price"], 103, .0001, "first buyer structure target")
 	pythonGoldenNumber(t, first["scenario_return"], .4043851121, .0000001, "first buyer structure scenario return")
-	pythonGoldenNumber(t, first["expected_return"], .2133700404, .0000001, "first buyer structure expected return")
+	pythonGoldenNumber(t, first["expected_return"], .0625570227, .0000001, "first buyer structure expected return")
 	pythonGoldenNumber(t, first["score"], .6664569653, .0000001, "first buyer structure score")
 	pythonGoldenNumber(t, first["touch_probability"], .7764, .0001, "first buyer structure touch probability")
 	pythonGoldenNumber(t, first["max_loss"], 224.4, .0001, "first buyer structure max loss")
@@ -471,7 +523,7 @@ func TestBuildCachedLevelsMatchesPythonGolden(t *testing.T) {
 	pythonGoldenNumber(t, first["breakeven"], 99.244, .0001, "first buyer structure breakeven")
 }
 
-func TestBuildCachedLevelsBuyRecommendationAndBuyerOrderMatchPythonGolden(t *testing.T) {
+func TestBuildCachedLevelsBuyRecommendationUsesRoundTripCostRanking(t *testing.T) {
 	bars, rows := pythonGoldenFixture()
 	now := time.Date(2026, time.October, 5, 16, 0, 0, 0, time.UTC)
 	spot, candidateSpot := 98.0, 100.0
@@ -505,47 +557,21 @@ func TestBuildCachedLevelsBuyRecommendationAndBuyerOrderMatchPythonGolden(t *tes
 	pythonGoldenNumber(t, putTarget["price"], 97.7778, .0001, "put target price")
 	pythonGoldenNumber(t, putTarget["touch_probability"], .9807, .0001, "put target touch probability")
 	items := pythonGoldenLevels(t, buyer["items"], "buy buyer items")
-	want := []struct {
-		kind, direction string
-		strikes         []float64
-		primary         bool
-		expected, score float64
-	}{
-		{"vertical", "call", []float64{97, 110}, true, .24949032, .65040668},
-		{"single", "call", []float64{100}, true, .11834872, .81886237},
-		{"vertical", "call", []float64{97, 106}, true, .10463306, .72927647},
-		{"single", "call", []float64{97}, true, .06405216, .79281971},
-		{"single", "call", []float64{103}, true, .05292407, .82826774},
-		{"vertical", "put", []float64{103, 90}, false, .09862232, .66833707},
-		{"vertical", "put", []float64{103, 94}, false, .00265836, .72527106},
-		{"vertical", "put", []float64{106, 94}, false, -.03179586, .73319606},
-		{"vertical", "put", []float64{106, 97}, false, -.06092764, .72946935},
-		{"single", "put", []float64{106}, false, -.07836846, .7711978},
-	}
-	if len(items) != len(want) {
-		t.Fatalf("buyer item count=%d, want Python's %d sorted structures", len(items), len(want))
-	}
-	for index, expected := range want {
-		item := items[index]
-		if item["kind"] != expected.kind || item["direction"] != expected.direction || item["is_primary"] != expected.primary {
-			t.Errorf("buyer item[%d] identity=%#v, want kind=%s direction=%s primary=%v", index, item, expected.kind, expected.direction, expected.primary)
-		}
-		strikes, ok := item["strikes"].([]float64)
-		if !ok || len(strikes) != len(expected.strikes) {
-			t.Errorf("buyer item[%d] strikes=%#v, want %v", index, item["strikes"], expected.strikes)
-			continue
-		}
-		for strikeIndex, strike := range expected.strikes {
-			if strikes[strikeIndex] != strike {
-				t.Errorf("buyer item[%d] strike[%d]=%v, want %v", index, strikeIndex, strikes[strikeIndex], strike)
-			}
-		}
-		pythonGoldenNumber(t, item["expected_return"], expected.expected, .0000001, "buyer item["+strconv.Itoa(index)+"].expected_return")
-		pythonGoldenNumber(t, item["score"], expected.score, .0000001, "buyer item["+strconv.Itoa(index)+"].score")
-	}
+	assertBuyerReturnsRanked(t, items, []buyerRankingExpectation{
+		{"single", "call", []float64{100}, true, .0964203171, .8188623675},
+		{"vertical", "call", []float64{97, 110}, true, .0941878166, .6504066817},
+		{"single", "call", []float64{97}, true, .0431861453, .7928197136},
+		{"single", "call", []float64{103}, true, .0322751719, .8282677359},
+		{"single", "call", []float64{94}, true, .0166646434, .7458307132},
+		{"vertical", "put", []float64{103, 90}, false, -.0379283913, .6683370660},
+		{"vertical", "put", []float64{106, 94}, false, -.0889491207, .7331960600},
+		{"single", "put", []float64{106}, false, -.0964425220, .7711978015},
+		{"vertical", "put", []float64{103, 94}, false, -.1014053458, .7252710556},
+		{"single", "put", []float64{103}, false, -.1031985597, .8240944089},
+	})
 }
 
-func TestBuildCachedLevelsSellRecommendationAndBuyerOrderMatchPythonGolden(t *testing.T) {
+func TestBuildCachedLevelsSellRecommendationUsesRoundTripCostRanking(t *testing.T) {
 	bars, rows := pythonGoldenFixture()
 	now := time.Date(2026, time.October, 5, 16, 0, 0, 0, time.UTC)
 	spot, candidateSpot := 105.0, 100.0
@@ -579,42 +605,16 @@ func TestBuildCachedLevelsSellRecommendationAndBuyerOrderMatchPythonGolden(t *te
 	pythonGoldenNumber(t, putTarget["price"], 97.7778, .0001, "put target price")
 	pythonGoldenNumber(t, putTarget["touch_probability"], .5086, .0001, "put target touch probability")
 	items := pythonGoldenLevels(t, buyer["items"], "sell buyer items")
-	want := []struct {
-		kind, direction string
-		strikes         []float64
-		primary         bool
-		expected, score float64
-	}{
-		{"vertical", "put", []float64{103, 90}, true, .25810395, .64912486},
-		{"vertical", "put", []float64{103, 94}, true, .09777658, .70668701},
-		{"single", "put", []float64{100}, true, .09192875, .78237905},
-		{"single", "put", []float64{103}, true, .04151752, .76401819},
-		{"single", "put", []float64{97}, true, .02624058, .76147656},
-		{"vertical", "call", []float64{97, 110}, false, .37374163, .77286738},
-		{"vertical", "call", []float64{97, 106}, false, .20181802, .83735988},
-		{"single", "call", []float64{100}, false, .0801882, .76730605},
-		{"vertical", "call", []float64{97, 103}, false, .073419, .75662517},
-		{"single", "call", []float64{97}, false, .03279145, .70711124},
-	}
-	if len(items) != len(want) {
-		t.Fatalf("buyer item count=%d, want Python's %d sorted structures", len(items), len(want))
-	}
-	for index, expected := range want {
-		item := items[index]
-		if item["kind"] != expected.kind || item["direction"] != expected.direction || item["is_primary"] != expected.primary {
-			t.Errorf("buyer item[%d] identity=%#v, want kind=%s direction=%s primary=%v", index, item, expected.kind, expected.direction, expected.primary)
-		}
-		strikes, ok := item["strikes"].([]float64)
-		if !ok || len(strikes) != len(expected.strikes) {
-			t.Errorf("buyer item[%d] strikes=%#v, want %v", index, item["strikes"], expected.strikes)
-			continue
-		}
-		for strikeIndex, strike := range expected.strikes {
-			if strikes[strikeIndex] != strike {
-				t.Errorf("buyer item[%d] strike[%d]=%v, want %v", index, strikeIndex, strikes[strikeIndex], strike)
-			}
-		}
-		pythonGoldenNumber(t, item["expected_return"], expected.expected, .0000001, "buyer item["+strconv.Itoa(index)+"].expected_return")
-		pythonGoldenNumber(t, item["score"], expected.score, .0000001, "buyer item["+strconv.Itoa(index)+"].score")
-	}
+	assertBuyerReturnsRanked(t, items, []buyerRankingExpectation{
+		{"vertical", "put", []float64{103, 90}, true, .1017308305, .6491248615},
+		{"single", "put", []float64{100}, true, .0705183825, .7823790472},
+		{"single", "put", []float64{103}, true, .0210934080, .7640181876},
+		{"single", "put", []float64{97}, true, .0061149731, .7614765609},
+		{"single", "put", []float64{106}, true, -.0031261869, .7381953652},
+		{"vertical", "call", []float64{97, 110}, false, .2029955955, .7728673839},
+		{"vertical", "call", []float64{97, 106}, false, .0770839719, .8373598765},
+		{"single", "call", []float64{100}, false, .0590080386, .7673060455},
+		{"single", "call", []float64{97}, false, .0125384512, .7071112438},
+		{"vertical", "call", []float64{97, 103}, false, -.0251689135, .7566251726},
+	})
 }

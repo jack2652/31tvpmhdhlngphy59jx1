@@ -4,15 +4,17 @@ const vm = require("node:vm");
 
 const window = { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} };
 const context = {
-  dash: [], strokes: [], texts: [], rects: [], fills: 0,
-  setTransform() {}, clearRect() {}, beginPath() { this.start = null; this.end = null; }, moveTo(x, y) { this.start = [x, y]; },
-  lineTo(x, y) { this.end = [x, y]; }, stroke() { this.strokes.push({ start: this.start, end: this.end, dash: [...this.dash], width: this.lineWidth, color: this.strokeStyle }); },
-  setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font, baseline: this.textBaseline }); }, measureText(text) { return { width: Array.from(String(text)).length * 8 }; }, arc() {}, fill() { this.fills += 1; }, strokeText() {},
-  save() {}, restore() {}, translate() {}, rotate() {}, closePath() {}, rect() {}, clip() {},
+  dash: [], strokes: [], texts: [], rects: [], fills: 0, transform: [1, 0, 0, 1, 0, 0], stack: [], globalAlpha: 1,
+  setTransform(...value) { this.transform = value; }, clearRect() {}, beginPath() { this.start = null; this.end = null; }, moveTo(x, y) { this.start = [x, y]; },
+  lineTo(x, y) { this.end = [x, y]; }, stroke() { this.strokes.push({ start: this.start, end: this.end, dash: [...this.dash], width: this.lineWidth, color: this.strokeStyle, alpha: this.globalAlpha, transform: [...this.transform] }); },
+  setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font, baseline: this.textBaseline, color: this.fillStyle, transform: [...this.transform] }); }, measureText(text) { return { width: Array.from(String(text)).length * 8 }; }, arc() {}, fill() { this.fills += 1; }, strokeText() {},
+  save() { this.stack.push({ transform: [...this.transform], globalAlpha: this.globalAlpha, font: this.font, fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, lineWidth: this.lineWidth, textAlign: this.textAlign, textBaseline: this.textBaseline }); },
+  restore() { Object.assign(this, this.stack.pop()); }, translate() {}, rotate() {}, closePath() {}, rect() {}, clip() {}, arcTo() {},
 };
 const canvas = { width: 0, height: 0, style: {}, getContext: () => context };
-const svg = { getBoundingClientRect: () => ({ width: 960, height: 340 }) };
-const target = { querySelector: (selector) => selector.startsWith("canvas") ? canvas : svg };
+let displayBounds = { width: 960, height: 340 };
+const svg = { getBoundingClientRect: () => displayBounds };
+const target = { querySelector: (selector) => selector.startsWith("canvas") ? canvas : selector.startsWith("svg") ? svg : null };
 const sandbox = { window, document: {}, getComputedStyle: () => ({ getPropertyValue: () => "" }), ResizeObserver: undefined, MutationObserver: undefined };
 vm.runInNewContext(fs.readFileSync("web/static/common/js/charts.js", "utf8"), sandbox);
 
@@ -38,16 +40,16 @@ function renderScenarios(visible) {
   return context.strokes.filter((stroke) => stroke.start && stroke.end && stroke.start[0] === 708 && stroke.start[1] === 120 && stroke.end[0] === 932 && stroke.end[1] === 40);
 }
 
-function renderStructureSupports(enabled) {
+function renderStructureSupports(enabled, positions = [120, 170], keyLevels = [], includeSupports = true, supportStates = ["active", "broken"]) {
   context.strokes = [];
   context.texts = [];
   window.OptionScopeCharts.renderChanCanvas(target, {
-    chart: { width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, priceBottom: 300, historyRight: 940, grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels: [], signals: [], dates: [], segments: [],
-      structureSupports: [
-        { key: "active", x1: 80, x2: 930, y: 120, pointX: 100, pointY: 120, labelX: 930, labelY: 120, label: "支撑 100.00", labelWidth: 80, status: "active" },
-        { key: "broken", x1: 80, x2: 930, y: 170, pointX: 110, pointY: 170, labelX: 930, labelY: 170, label: "失守 90.00", labelWidth: 80, status: "broken" },
-      ] },
-    layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, structureSupports: enabled },
+    chart: { width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, priceBottom: 300, historyRight: 940, grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels, signals: [], dates: [], segments: [],
+      structureSupports: includeSupports ? [
+        { key: "active", x1: 80, x2: 930, y: positions[0], pointX: 100, pointY: positions[0], labelX: 930, labelY: positions[0], label: "支撑 100.00", priceLabel: "100.00", labelWidth: 80, status: supportStates[0] },
+        { key: "broken", x1: 80, x2: 930, y: positions[1], pointX: 110, pointY: positions[1], labelX: 930, labelY: positions[1], label: "失守 90.00", priceLabel: "90.00", labelWidth: 80, status: supportStates[1] },
+      ] : [] },
+    layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, supportResistance: enabled },
   });
   return context;
 }
@@ -108,23 +110,163 @@ assert.deepEqual(painted[1].dash, [6, 4], "forming segment is a dashed line");
 assert.equal(painted[0].width, 2.6);
 
 const supportRender = renderStructureSupports(true);
-const activeSupportLine = supportRender.strokes.find((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 120 && stroke.end?.[0] === 930);
-const brokenSupportLine = supportRender.strokes.find((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 170 && stroke.end?.[0] === 930);
+const activeSupportLine = supportRender.strokes.find((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 120 && stroke.end?.[1] === 120);
+const brokenSupportLine = supportRender.strokes.find((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 170 && stroke.end?.[1] === 170);
 assert.deepEqual(activeSupportLine.dash, [], "active structural supports use a solid horizontal line");
-assert.deepEqual(brokenSupportLine.dash, [5, 4], "closed breaks use a dashed horizontal line");
-assert.ok(supportRender.texts.some((item) => item.text === "支撑 100.00"), "active support exposes its price label");
-assert.ok(supportRender.texts.some((item) => item.text === "失守 90.00"), "broken support exposes a textual status");
+assert.deepEqual(brokenSupportLine.dash, [4, 4], "closed breaks use an even dashed horizontal line");
+assert.equal(activeSupportLine.width, 1.25);
+assert.equal(brokenSupportLine.width, 1);
+assert.ok(supportRender.texts.some((item) => item.text === "支撑") && supportRender.texts.some((item) => item.text === "100.00"), "active support exposes its status and complete price");
+assert.ok(supportRender.texts.some((item) => item.text === "失守") && supportRender.texts.some((item) => item.text === "90.00"), "broken support exposes a textual status and complete price");
+const activeStatus = supportRender.texts.find((item) => item.text === "支撑");
+const activePrice = supportRender.texts.find((item) => item.text === "100.00");
+assert.ok(activeSupportLine.end[0] <= activeStatus.x - 8, "the support line ends before its label without a trailing fragment");
+assert.notEqual(activeStatus.color, activePrice.color, "status and price have distinct visual hierarchy");
 const hiddenSupportRender = renderStructureSupports(false);
-assert.ok(!hiddenSupportRender.strokes.some((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 120 && stroke.end?.[0] === 930), "hidden structure support layer paints no active support line");
-assert.ok(!hiddenSupportRender.strokes.some((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 170 && stroke.end?.[0] === 930), "hidden structure support layer paints no broken support line");
-assert.ok(!hiddenSupportRender.texts.some((item) => item.text === "支撑 100.00" || item.text === "失守 90.00"), "hidden structure support layer paints no support labels");
+assert.ok(!hiddenSupportRender.strokes.some((stroke) => stroke.start?.[0] === 80 && [120, 170].includes(stroke.start?.[1])), "hidden support layer paints no active or broken support line");
+assert.ok(!hiddenSupportRender.texts.some((item) => item.text === "支撑" || item.text === "失守"), "hidden support layer paints no support labels");
+
+// 宽屏、窄屏与高像素密度保持相同的视觉线宽、字号和虚线间隔。
+for (const [width, height, ratio] of [[1440, 510, 1], [390, 340, 1], [1440, 510, 2]]) {
+  displayBounds = { width, height };
+  window.devicePixelRatio = ratio;
+  const scaled = renderStructureSupports(true);
+  const solid = scaled.strokes.find((stroke) => stroke.start?.[0] === 80 * width / 960 && stroke.start?.[1] === 120 * height / 340 && stroke.end?.[1] === stroke.start[1]);
+  const dashed = scaled.strokes.find((stroke) => stroke.start?.[0] === 80 * width / 960 && stroke.dash.length === 2 && stroke.dash[0] === 4);
+  assert.equal(solid.width * solid.transform[3] / ratio, 1.25, "rendered horizontal line width stays 1.25 CSS pixels");
+  assert.equal(dashed.dash[0] * dashed.transform[0] / ratio, 4, "dash length stays 4 CSS pixels");
+  const price = scaled.texts.find((item) => item.text === "100.00");
+  assert.equal(Number(price.font.match(/(\d+)px/)[1]) * price.transform[3] / ratio, 12, "rendered label font stays 12 CSS pixels");
+  const crowded = renderStructureSupports(true, [280, 282]);
+  const labels = crowded.texts.filter((item) => item.text === "支撑" || item.text === "失守");
+  assert.ok(labels[1].y - labels[0].y >= 20, "nearby label prices retain at least 20 CSS pixels of separation");
+  assert.ok(labels.every((item) => item.y <= 300 * height / 340 - 38), "labels leave room for the bottom-right scenario toggle");
+}
+displayBounds = { width: 960, height: 340 };
+window.devicePixelRatio = 1;
+
+// 日期：2026-11-23；执行者：Codex。首次跌破显示金色待确认并保留价位及标签避让。
+for (const [width, height, ratio] of [[1440, 510, 1], [390, 340, 2]]) {
+  displayBounds = { width, height }; window.devicePixelRatio = ratio;
+  const pendingRender = renderStructureSupports(true, [120, 122], [], true, ["pending-break", "broken"]);
+  const pendingText = pendingRender.texts.find((item) => item.text === "跌破待确认");
+  const brokenText = pendingRender.texts.find((item) => item.text === "失守");
+  assert.ok(pendingText && pendingRender.texts.some((item) => item.text === "100.00"));
+  assert.equal(pendingText.color, "#e7b45c", "待确认复用主题金色，文本明确状态");
+  assert.ok(brokenText.y - pendingText.y >= 20, "较长待确认标签与相邻失守标签仍错开");
+  const pendingLine = pendingRender.strokes.filter((stroke) => stroke.start?.[0] === 80 * width / 960
+    && stroke.start?.[1] === 120 * height / 340 && stroke.end?.[1] === stroke.start[1]);
+  assert.equal(pendingLine.length, 1); assert.deepEqual(pendingLine[0].dash, [6, 3]);
+  assert.ok(pendingLine[0].end[0] <= pendingText.x - 8);
+  const off = renderStructureSupports(false, [120, 122], [], true, ["pending-break", "broken"]);
+  assert.ok(!off.texts.some((item) => item.text === "跌破待确认"));
+}
+displayBounds = { width: 960, height: 340 }; window.devicePixelRatio = 1;
+
+// 压力参考复用结构标签，只有压力线时也显示完整价格，不重复绘制红线。
+const pressureLevel = () => ({ tone: "resistance", x1: 400, x2: 930, y: 40, label: "形成中高点", price: 762.86, priceLabel: "762.86" });
+for (const [width, height, ratio] of [[960, 340, 1], [1440, 510, 2], [390, 340, 1]]) {
+  displayBounds = { width, height }; window.devicePixelRatio = ratio;
+  const pressureOnly = renderStructureSupports(true, undefined, [pressureLevel()], false);
+  const pressure = pressureOnly.texts.find((item) => item.text === "压力");
+  const price = pressureOnly.texts.find((item) => item.text === "762.86");
+  assert.ok(pressure && price, "pressure and its formatted price paint even without structural supports");
+  assert.equal(pressure.color, "#f04d68", "pressure status uses the existing red theme color");
+  assert.notEqual(price.color, pressure.color, "pressure price uses the same neutral hierarchy as support labels");
+  assert.equal(Number(price.font.match(/(\d+)px/)[1]) * price.transform[3] / ratio, 12);
+  const pressureLines = pressureOnly.strokes.filter((stroke) => stroke.start?.[0] === 400 * width / 960 && stroke.start?.[1] === 40 * height / 340 && stroke.end?.[1] === stroke.start[1]);
+  assert.equal(pressureLines.length, 1, "a pressure reference must paint only once");
+  assert.deepEqual(pressureLines[0].dash, [3, 4], "the pressure reference remains dashed");
+  assert.ok(pressureLines[0].end[0] <= pressure.x - 8, "pressure line stops before the price label");
+  const crowded = renderStructureSupports(true, [120, 170], [{ ...pressureLevel(), y: 118 }]);
+  const labels = crowded.texts.filter((item) => ["压力", "支撑", "失守"].includes(item.text));
+  assert.equal(labels.length, 3);
+  assert.ok(labels.slice(1).every((item, index) => item.y - labels[index].y >= 20), "pressure and support labels share collision avoidance");
+  const off = renderStructureSupports(false, undefined, [pressureLevel()]);
+  assert.ok(!off.texts.some((item) => item.text === "压力" || item.text === "762.86"), "the shared switch hides pressure labels");
+  assert.ok(!off.strokes.some((stroke) => stroke.color === "#f04d68"), "the shared switch hides pressure lines");
+}
+displayBounds = { width: 960, height: 340 }; window.devicePixelRatio = 1;
+
+// 使用真实反弹和结构证据进入Canvas，确认同区支撑实际只绘制一次。
+vm.runInNewContext(fs.readFileSync("web/static/common/js/chan-plan.js", "utf8"), sandbox);
+vm.runInNewContext(fs.readFileSync("web/static/common/js/chan-client.js", "utf8"), sandbox);
+const supportFrame = {
+  period: "1d", label: "日线", as_of: "2026-10-30", last_close: 110,
+  candles: Array.from({ length: 30 }, (_, index) => ({ date: `2026-10-${String(index + 1).padStart(2, "0")}`, open: 110, high: 111, low: 109, close: 110 })),
+  strokes: [{ confirmed: true, confirmed_at: "2026-10-22", start: { kind: "bottom", date: "2026-10-18", price: 100 }, end: { kind: "top", date: "2026-10-21", price: 120 }, low: 100, high: 120 }],
+  centers: [], segments: [], recursive_centers: [], recursive_levels: [], signals: [], position: {},
+};
+supportFrame.candles[17] = { ...supportFrame.candles[17], open: 103, close: 102, high: 104, low: 100 };
+supportFrame.candles[18] = { ...supportFrame.candles[18], open: 104, close: 105, high: 106, low: 103 };
+supportFrame.candles[20].high = 120;
+const supportPayload = { symbol: "TEST", spot: 110, daily: supportFrame, weekly: supportFrame, summary: {} };
+const supportLayers = { pens: false, penCenters: false, chanCandles: false, signals: false, legacySignals: false, supportResistance: true };
+const supportModel = window.OptionScopeChan.view(supportPayload, false, false, 30, null, supportLayers).daily.chart;
+context.strokes = [];
+context.texts = [];
+window.OptionScopeCharts.renderChanCanvas(target, { chart: supportModel, layers: supportLayers });
+assert.ok(context.texts.some((item) => item.text === "压力") && context.texts.some((item) => item.text === "120.00"), "real key-level model exposes its formatted resistance price");
+const supportY = supportModel.structureSupports[0].y;
+const mainLinesAtSupport = () => context.strokes.filter((stroke) => stroke.start?.[1] === supportY && stroke.end?.[1] === supportY
+  && stroke.start[0] === supportModel.structureSupports[0].x1 && stroke.end[0] === supportModel.structureSupports[0].lineEndX && stroke.dash.length === 0);
+assert.equal(mainLinesAtSupport().length, 1, "the same support price must paint exactly one horizontal reference line");
+const disabledSupportLayers = { ...supportLayers, supportResistance: false };
+const disabledSupportModel = window.OptionScopeChan.view(supportPayload, false, false, 30, null, disabledSupportLayers).daily.chart;
+context.strokes = [];
+context.texts = [];
+window.OptionScopeCharts.renderChanCanvas(target, { chart: disabledSupportModel, layers: disabledSupportLayers });
+assert.equal(mainLinesAtSupport().length, 0, "the shared switch must remove both duplicate sources from the canvas");
+assert.ok(!context.texts.some((item) => item.text === "压力"), "the shared off-state model removes resistance labels");
+
+// 长期结构和近期区域共用标签布局，线条强度有区分，合并来源仍只绘制一条。
+const historicalFrame = { ...supportFrame, candles: Array.from({ length: 300 }, (_, index) => ({
+  date: new Date(Date.UTC(2026, 9, index + 1)).toISOString().slice(0, 10), open: 110, high: 111, low: 109, close: 110
+})) };
+historicalFrame.as_of = historicalFrame.candles.at(-1).date;
+const historicalPayload = { ...supportPayload, daily: historicalFrame, weekly: historicalFrame };
+const historicalModel = window.OptionScopeChan.view(historicalPayload, false, false, 30, null, supportLayers).daily.chart;
+assert.equal(historicalModel.structureSupportLevels[0].kind, "historical");
+// 扩大价格范围只用于渲染夹具，使完整历史的100元参考在实际Canvas中可见。
+const visibleHistoricalModel = { ...historicalModel, structureSupports: [{ ...historicalModel.structureSupportLevels[0],
+  x1: 50, x2: 920, y: 160, pointY: 160, labelX: 910, labelY: 160, label: "支撑 100.00" }] };
+context.strokes = []; context.texts = [];
+window.OptionScopeCharts.renderChanCanvas(target, { chart: visibleHistoricalModel, layers: supportLayers });
+const historicalLine = context.strokes.filter((stroke) => stroke.start?.[0] === 50 && stroke.start?.[1] === 160 && stroke.end?.[1] === 160 && stroke.dash.length === 0);
+assert.equal(historicalLine.length, 1);
+assert.equal(historicalLine[0].alpha, historicalModel.structureSupportLevels[0].lineAlpha);
+assert.ok(historicalLine[0].alpha >= 0.48 && historicalLine[0].alpha < 0.68);
+assert.ok(context.texts.some((item) => item.text === "支撑") && context.texts.some((item) => item.text === "100.00"));
 
 const duplicateSignalRender = renderChanSignals([
   { side: "buy", status: "candidate", x: 180, y: 180, markerY: 180, labelX: 180, labelY: 202, label: "一买", labelVisible: true },
   { side: "buy", status: "candidate", x: 180, y: 190, markerY: 190, labelX: 180, labelY: 222, label: "一买", labelVisible: false },
 ]);
-assert.equal(duplicateSignalRender.texts.filter((item) => item.text === "一买?").length, 1, "duplicate signal labels paint only once");
-assert.equal(duplicateSignalRender.fills, 2, "hiding a duplicate label keeps both signal markers visible");
+assert.equal(duplicateSignalRender.texts.filter((item) => item.text === "一买").length, 1, "duplicate signal labels paint only once");
+assert.equal(duplicateSignalRender.texts.filter((item) => item.text === "待确认").length, 1);
+assert.ok(duplicateSignalRender.strokes.some((stroke) => stroke.start?.[0] === 180 && stroke.start?.[1] === 194.5), "hiding a duplicate label keeps its signal marker visible");
+for (const [width, height, ratio] of [[1326, 470, 1], [328, 406, 2]]) {
+  displayBounds = { width, height }; window.devicePixelRatio = ratio;
+  const signals = [
+    { type: "三买", label: "三买", side: "buy", status: "confirmed", x: 200, y: 200, markerY: 210, labelX: 200, labelY: 235 },
+    { type: "三卖", label: "三卖", side: "sell", status: "candidate", x: 500, y: 100, markerY: 90, labelX: 500, labelY: 65 },
+    { type: "三买", label: "三买 · 已失效", side: "buy", status: "invalidated", invalidated: true, x: 700, y: 200, markerY: 210, labelX: 700, labelY: 235 },
+  ];
+  const original = JSON.parse(JSON.stringify(signals));
+  const visual = renderChanSignals(signals);
+  assert.ok(["确认", "待确认", "失效"].every((status) => visual.texts.some((text) => text.text === status)), "all states have separate Chinese labels");
+  const labels = visual.texts.filter((text) => ["三买", "三卖"].includes(text.text));
+  assert.equal(labels.length, 3);
+  assert.ok(labels.every((text) => Math.abs(Number(text.font.match(/(\d+)px/)[1]) * text.transform[3] / ratio - 12) < 0.1), "signal title font stays at 12 CSS pixels across chart widths and DPR");
+  assert.equal(labels[0].color, "#19bd83"); assert.equal(labels[1].color, "#f04d68");
+  assert.notEqual(labels[2].color, labels[0].color, "invalidated signals use the existing muted theme color");
+  signals.forEach((signal, index) => {
+    assert.ok(Math.abs(signal.renderedLabel.height * height / 340 - 20) < 0.1);
+    const { renderedLabel, renderedMarker, ...unchanged } = signal;
+    assert.deepEqual(unchanged, original[index], "styling cannot change signal status, text or model coordinates");
+  });
+}
+displayBounds = { width: 960, height: 340 }; window.devicePixelRatio = 1;
 const turningWarningRender = renderTurningWarnings();
 assert.ok(turningWarningRender.texts.some((item) => item.text === "109.21"), "pivot price labels remain painted next to turning warnings");
 assert.ok(turningWarningRender.texts.some((item) => item.text === "底观察" && item.x === 180 && item.y === 230 && item.baseline === "middle"), "turning warnings use their collision-resolved center position");

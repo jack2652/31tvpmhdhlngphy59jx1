@@ -17,11 +17,11 @@
     { value: "wyckoff", label: "威科夫阶段" }, { value: "supertrend", label: "超级趋势" },
     { value: "macdSma200", label: "异同移动平均线 + 200期简单均线" },
   ];
-  const defaultLayers = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, structureSupports: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
+  const defaultLayers = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
   const defaultSubcharts = { volume: false, macd: false, dmi: false, mfi: false };
   const exclusiveIndicators = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
   const chartPreferencesKey = "option-scope-futures-chart-preferences";
-  const chartPreferencesVersion = 1;
+  const chartPreferencesVersion = 2;
   const scenarioVisibilityKey = "option-scope-chan-scenarios-visible";
   const foldStorageKeys = {
     panel: "option-scope-futures-chan-panel",
@@ -109,6 +109,10 @@
     try {
       const stored = JSON.parse(localStorage.getItem(chartPreferencesKey) || "null");
       const layers = copyLayers(stored?.layers);
+      // 与股票页一致，合并旧开关时保留已开启的任一价格图层。
+      if (Number(stored?.version) < 2 && typeof stored?.layers?.structureSupports === "boolean") {
+        layers.supportResistance = layers.supportResistance || stored.layers.structureSupports;
+      }
       const subcharts = copySubcharts(stored?.subcharts);
       if (typeof stored?.subcharts?.mfi !== "boolean" && typeof stored?.layers?.mfi === "boolean") subcharts.mfi = stored.layers.mfi;
       layers.mfi = subcharts.mfi;
@@ -306,7 +310,7 @@
         if (exclusiveIndicators.includes(layer)) {
           const enabled = !this.chartLayers[layer];
           this.chartLayers = { ...this.chartLayers, ...Object.fromEntries(exclusiveIndicators.map((key) => [key, enabled && key === layer])) };
-        } else if (["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "structureSupports", "trendlines"].includes(layer)) {
+        } else if (["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "trendlines"].includes(layer)) {
           this.chartLayers = { ...this.chartLayers, [layer]: !this.chartLayers[layer] };
         } else {
           const level = Number(layer);

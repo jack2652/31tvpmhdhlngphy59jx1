@@ -66,9 +66,9 @@ const NEW_YORK_INTRADAY_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", {
 });
 let expirationCutoffCatalog = { symbol: "", values: null };
 let expirationCutoffTimer = null;
-const CHAN_CHART_PREFERENCES_VERSION = 14;
+const CHAN_CHART_PREFERENCES_VERSION = 15;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, structureSupports: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
 const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
 const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false, mfi: false };
 function readChainViewPreference() {
@@ -154,7 +154,7 @@ function readChanChartPreferences() {
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "structureSupports", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "mfi"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "mfi"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -175,6 +175,10 @@ function readChanChartPreferences() {
     }
     layers.mfi = subcharts.mfi;
     const storedVersion = Number(stored.version) || 1;
+    // 两类价位统一开关，升级时保留任一旧图层已开启的选择。
+    if (storedVersion < 15 && typeof sourceLayers.structureSupports === "boolean") {
+      layers.supportResistance = layers.supportResistance || sourceLayers.structureSupports;
+    }
     // Earlier builds persisted their defaults immediately, so upgrade an untouched
     // old default set while keeping any explicitly customized layer choices.
     if (storedVersion < CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF && matchesPreviousDefaultChanChartLayers(sourceLayers)) {
@@ -204,6 +208,7 @@ const state = {
   expiration: null,
   expirationOptions: [],
   expirationPlaceholder: "先载入标的",
+  gammaViewMode: "gamma",
   analysisReady: false,
   loadId: 0,
   chanPeriod: initialChanChartPreferences.period,
@@ -350,47 +355,6 @@ const state = {
     putVolume: "--",
     callInterest: "未平仓 --",
     putInterest: "未平仓 --",
-    flow: {
-      available: false,
-      signalLabel: "等待相邻快照",
-      signalClass: "waiting",
-      signalDetail: "需要两份相邻期权链快照才能估算流向",
-      windowLabel: "快照窗口 --",
-      methodLabel: "成交量增量 · 买卖价方向估算 · 中性单列",
-      warning: "",
-      summary: {
-        totalVolume: "--",
-        buyVolume: "--",
-        sellVolume: "--",
-        neutralVolume: "--",
-      },
-      call: {
-        buyVolume: "--",
-        sellVolume: "--",
-        unknownVolume: "--",
-        buyPremium: "权利金 --",
-        sellPremium: "权利金 --",
-        netVolume: "--",
-        focusTitle: "集中执行价 --",
-        focusSummary: "等待相邻快照",
-        concentration: [],
-        rows: [{ key: "call-empty", label: "--", direction: "等待数据", className: "unknown", volume: "--", share: "--", premium: "权利金 --" }],
-        rowspan: 1,
-      },
-      put: {
-        buyVolume: "--",
-        sellVolume: "--",
-        unknownVolume: "--",
-        buyPremium: "权利金 --",
-        sellPremium: "权利金 --",
-        netVolume: "--",
-        focusTitle: "集中执行价 --",
-        focusSummary: "等待相邻快照",
-        concentration: [],
-        rows: [{ key: "put-empty", label: "--", direction: "等待数据", className: "unknown", volume: "--", share: "--", premium: "权利金 --" }],
-        rowspan: 1,
-      },
-    },
     chainTitle: "GEX 热力图 · 选择到期日查看",
     dataSource: "尚未加载",
     fetchedAt: "快照时间 --",
@@ -410,15 +374,7 @@ const state = {
       netOpenInterestGex: "--",
       netVolumeGex: "--",
       updatedAt: "--",
-      status: "选择到期日后读取历史快照",
-      history: [1, 5, 10, 15, 30].map((minutesAgo, index) => ({
-        key: String(minutesAgo),
-        label: `${minutesAgo} 分钟前`,
-        markerClass: `chain-profile-history-${index}`,
-        time: "等待快照",
-        maxChange: null,
-        status: "等待历史数据",
-      })),
+      status: "等待期权数据",
     },
     chart: {
       netGex: "净 Gamma 0 · 估算",
@@ -429,6 +385,11 @@ const state = {
       putWall: "看跌墙 0.00",
       gammaScopeDate: "柱状图 到期日 --",
       gammaScopeStats: "0 个合约",
+      maxPainStrike: "--",
+      maxPainPayout: "最低总赔付 --",
+      maxPainScopeDate: "到期日 --",
+      maxPainScopeStats: "0 个有效合约",
+      maxPainRange: "行权价 --",
       levelsBasis: "基准 0.00",
       volumeScope: "到期日 -- · 0 个合约",
       oiScope: "到期日 -- · 0 个合约",
@@ -661,10 +622,7 @@ function restoreClientSnapshot(symbol, expiration = "", allowStale = false) {
       points: aggregateByStrike(payload.data, state.chainSpot),
     };
   }
-  if (state.chainView === "profile") {
-    renderChainProfileView();
-    void loadChainProfileHistory();
-  }
+  if (state.chainView === "profile") renderChainProfileView();
   // Force the first successful API response after recovery to repaint charts
   // and analysis rather than being skipped by a stale render signature.
   chainRenderSignature = "";
@@ -901,48 +859,17 @@ function initChartGroup() {
   });
 }
 
-// 期权流向与买方结构共用一个默认折叠的分组，内部按钮只切换视图，不折叠外层面板。
-const OPTION_ANALYSIS_KEY = "option-scope-option-analysis-v2";
+// 买方结构继续沿用原期权分析分组的折叠状态。
+const BUYER_STRUCTURE_KEY = "option-scope-option-analysis-v2";
 
-function initOptionAnalysisGroup() {
+function initBuyerStructureGroup() {
   bindFoldGroup({
     headerId: "option-analysis-header",
     toggleId: "option-analysis-toggle",
     bodyId: "option-analysis-fold",
     actionId: "option-analysis-action",
-    storageKey: OPTION_ANALYSIS_KEY,
+    storageKey: BUYER_STRUCTURE_KEY,
     defaultExpanded: false,
-    // 面板折叠时隐藏视图切换按钮，避免折叠标题栏仍显示内部操作控件。
-    onChange: (expanded) => {
-      const tabs = byId("option-analysis-tabs");
-      if (tabs) tabs.hidden = !expanded;
-    },
-    shouldIgnore: (event) => {
-      const tab = closestElement(event.target, "[data-option-view]");
-      if (tab) {
-        setOptionAnalysisView(tab.dataset.optionView);
-        return true;
-      }
-      return Boolean(closestElement(event.target, "#option-analysis-tabs"));
-    },
-  });
-  document.querySelectorAll("[data-option-view]").forEach((tab) => {
-    tab.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      setOptionAnalysisView(tab.dataset.optionView);
-    });
-  });
-  setOptionAnalysisView("flow");
-}
-
-function setOptionAnalysisView(view) {
-  const next = view === "buyer" ? "buyer" : "flow";
-  document.querySelectorAll("[data-option-view-panel]").forEach((panel) => {
-    panel.hidden = panel.dataset.optionViewPanel !== next;
-  });
-  document.querySelectorAll("[data-option-view]").forEach((tab) => {
-    tab.setAttribute("aria-pressed", tab.dataset.optionView === next ? "true" : "false");
   });
 }
 
@@ -1357,14 +1284,6 @@ function applyPushedSnapshotPayload(message) {
   }
   state.view.lastStatus = `最近更新 ${formatTime(chain.fetched_at)}`;
   syncPageQuery();
-  // Flow requires two adjacent snapshots and is intentionally kept as the
-  // only small REST read on this push path.
-  if (state.expiration && !isIndexMarketSymbol(state.symbol)) {
-    request(`/api/flow/${encodeURIComponent(state.symbol)}?expiration=${encodeURIComponent(state.expiration)}`)
-      .then((flow) => {
-        if (loadId === state.loadId && state.symbol === message.symbol) renderOptionFlow(flow);
-      }).catch(() => {});
-  }
   return true;
 }
 
@@ -1671,18 +1590,6 @@ function updateSnapshotStatus() {
   state.view.fetchedAt = chainAt ? `期权链快照 ${formatEasternTime(chainAt)}` : "快照时间 --";
   state.view.fetchedAtTitle = chainAt ? `期权链快照：${formatEasternTime(chainAt)}` : "";
 }
-function formatFlowInterval(value) {
-  const seconds = Number(value);
-  if (!Number.isFinite(seconds) || seconds < 0) return "相邻快照";
-  if (seconds >= 3600) return `相隔 ${Math.floor(seconds / 3600)} 小时`;
-  if (seconds >= 60) return `相隔 ${Math.floor(seconds / 60)} 分钟`;
-  return `相隔 ${Math.max(1, Math.round(seconds))} 秒`;
-}
-function formatFlowStrike(value) {
-  const strike = Number(value);
-  if (!Number.isFinite(strike)) return "--";
-  return Number.isInteger(strike) ? String(strike) : strike.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
-}
 // 回溯的未平仓量只展示到日期，避免角标里塞入完整时间。
 function formatDay(value) { if (!value) return "--"; const date = new Date(value); return Number.isNaN(date.getTime()) ? "--" : date.toLocaleDateString("zh-CN"); }
 // GEX 以百万美元存储；按量级换算中文单位，digits 表示最多保留的小数位。
@@ -1708,16 +1615,6 @@ function formatCount(value, digits = 2) {
   if (absolute >= 10000) return `${sign}${formatNumber(absolute / 10000, digits)}万`;
   return `${sign}${formatNumber(absolute, 0)}`;
 }
-// 期权流向成交量带上方向：主动买入为正号，主动卖出为负号，中性成交不添加符号。
-// 这里仅改变展示值，后端的买入/卖出/中性原始数量与净量计算保持不变。
-function formatFlowVolume(value, direction) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "--";
-  const text = formatCount(Math.abs(number));
-  if (direction === "buy") return `+${text}`;
-  if (direction === "sell") return `-${text}`;
-  return text;
-}
 function formatUsd(value) {
   if (value == null || !Number.isFinite(Number(value))) return "--";
   return `$${Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -1726,12 +1623,12 @@ function formatUsd(value) {
 function formatChartValue(value, digits, unit) { return unit === "M" ? formatGex(value, digits) : formatCount(value, digits); }
 function setBusy(busy) { state.loading = busy; }
 
-function aggregateByStrike(rows, spot, valuationTime = Date.now()) {
+function aggregateByStrike(rows, spot) {
   const grouped = new Map();
   const spotValue = Number(spot) || 0;
   const spotSquared = spotValue * spotValue;
   const spotKey = gammaSpotBucket(spotValue);
-  const valuationTimestamp = Number.isFinite(Number(valuationTime)) ? Number(valuationTime) : Date.now();
+  const valuationTimestamp = Date.now();
   const timeBucket = Math.floor(valuationTimestamp / 30000);
   for (const row of rows) {
     const strike = Number(row.strike);
@@ -1758,6 +1655,59 @@ function aggregateByStrike(rows, spot, valuationTime = Date.now()) {
     }
   }
   return [...grouped.values()].sort((a, b) => a.strike - b.strike);
+}
+
+function calculateMaxPainByStrike(rows, contractMultiplier = 100) {
+  const multiplier = Number(contractMultiplier);
+  if (!Number.isFinite(multiplier) || multiplier <= 0) {
+    return { available: false, points: [], maxPain: null, contracts: 0 };
+  }
+  const grouped = new Map();
+  let contracts = 0;
+  for (const row of rows || []) {
+    const strike = Number(row?.strike);
+    const type = row?.contract_type;
+    if (!Number.isFinite(strike) || strike <= 0 || (type !== "call" && type !== "put")) continue;
+    if (!grouped.has(strike)) grouped.set(strike, { strike, callOi: 0, putOi: 0 });
+    if (row?.open_interest == null || row.open_interest === "") continue;
+    const openInterest = Number(row.open_interest);
+    if (!Number.isFinite(openInterest) || openInterest <= 0) continue;
+    grouped.get(strike)[type === "call" ? "callOi" : "putOi"] += openInterest;
+    contracts += 1;
+  }
+  if (!contracts) return { available: false, points: [], maxPain: null, contracts: 0 };
+
+  const strikes = [...grouped.values()].sort((left, right) => left.strike - right.strike);
+  const callOiPrefix = [0];
+  const callNotionalPrefix = [0];
+  const putOiSuffix = Array(strikes.length + 1).fill(0);
+  const putNotionalSuffix = Array(strikes.length + 1).fill(0);
+  strikes.forEach((item, index) => {
+    callOiPrefix[index + 1] = callOiPrefix[index] + item.callOi;
+    callNotionalPrefix[index + 1] = callNotionalPrefix[index] + item.strike * item.callOi;
+  });
+  for (let index = strikes.length - 1; index >= 0; index -= 1) {
+    putOiSuffix[index] = putOiSuffix[index + 1] + strikes[index].putOi;
+    putNotionalSuffix[index] = putNotionalSuffix[index + 1] + strikes[index].strike * strikes[index].putOi;
+  }
+
+  const points = strikes.map((item, index) => {
+    const callDollars = Math.max(0, item.strike * callOiPrefix[index] - callNotionalPrefix[index]) * multiplier;
+    const putDollars = Math.max(0, putNotionalSuffix[index + 1] - item.strike * putOiSuffix[index + 1]) * multiplier;
+    return {
+      strike: item.strike,
+      callPayoff: callDollars / 1000000,
+      putPayoff: putDollars / 1000000,
+      totalPayoff: (callDollars + putDollars) / 1000000,
+    };
+  });
+  const maxPainPoint = points.reduce((best, point) => (
+    !best || point.totalPayoff < best.totalPayoff
+      || (point.totalPayoff === best.totalPayoff && point.strike < best.strike)
+      ? point
+      : best
+  ), null);
+  return { available: true, points, maxPain: maxPainPoint, contracts };
 }
 
 // 到期日时间戳按到期日字符串缓存：零 Gamma 扫描会对同一批合约求值十几万次，
@@ -3635,9 +3585,10 @@ function renderBuyerStructures(payload, fetchedAt = null) {
 function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivModel = {}, basis = null) {
   // 期权链聚合结果：Gamma 敞口、分布图与压力位/支撑位共用；切换基准价开关时直接复用，不重新聚合。
   const points = aggregateByStrike(expirationRows, spot);
+  const maxPain = calculateMaxPainByStrike(expirationRows);
   // 记录本次分析输入，窗口尺寸变化（含手机横竖屏切换）与基准价切换后都按这些输入重绘。
   // 顶层冻结：这些数组只读，Vue 2 无需为每一行行情对象建立响应式观察器。
-  state.lastAnalysis = Object.freeze({ rows, spot, analysisPayload, expirationRows, ivModel, basis, points });
+  state.lastAnalysis = Object.freeze({ rows, spot, analysisPayload, expirationRows, ivModel, basis, points, maxPain });
   // 压力位/支撑位用「基准价」（默认实时价，可切盘后价），图表仍用常规价。
   const levelSpot = Number(basis?.price) > 0 ? Number(basis.price) : spot;
   state.levelBasisLabel = basis?.label || "常规";
@@ -3668,8 +3619,16 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
   state.view.chart.gammaFlipTitle = GAMMA_ESTIMATE_TITLE;
   state.view.chart.gammaScopeDate = `柱状图 到期日 ${state.expiration || "--"}`;
   state.view.chart.gammaScopeStats = `${expirationRows.length} 个合约${scopeSuffix}`;
+  state.view.chart.maxPainStrike = maxPain.maxPain ? formatMoney(maxPain.maxPain.strike) : "--";
+  state.view.chart.maxPainPayout = `最低总赔付 ${maxPain.maxPain ? formatGex(maxPain.maxPain.totalPayoff, 2) : "--"}`;
+  state.view.chart.maxPainScopeDate = `到期日 ${state.expiration || "--"}`;
+  state.view.chart.maxPainScopeStats = `${maxPain.contracts} 个有效合约`;
+  state.view.chart.maxPainRange = maxPain.points.length
+    ? `行权价 ${formatMoney(maxPain.points[0].strike)}–${formatMoney(maxPain.points[maxPain.points.length - 1].strike)}`
+    : "行权价 --";
   const analysisFallback = analysisPayload?.oi_fallback || {};
   if (analysisFallback.restored) state.view.chart.gammaScopeStats += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
+  if (analysisFallback.restored) state.view.chart.maxPainScopeStats += ` · 未平仓量回溯 ${formatDay(analysisFallback.as_of)}`;
   state.view.chart.callWall = `看涨墙 ${callWall?.callGex ? formatMoney(callWall.strike) : "--"}`;
   state.view.chart.putWall = `看跌墙 ${putWall?.putGex ? formatMoney(putWall.strike) : "--"}`;
   // 选中期限的综合价位与 Gamma 窗口并行请求，避免首次加载时趋势/支撑/压力面板长期空白。
@@ -3678,15 +3637,30 @@ function renderAnalysis(rows, spot, analysisPayload, expirationRows = [], ivMode
     renderClientBuyerFallback(expirationRows, levelSpot, state.view.levels.support, state.view.levels.resistance);
   }
   const chartChecksum = points.reduce((sum, point) => sum + point.callGex + point.putGex + point.callVolume + point.putVolume + point.callOi + point.putOi, 0);
-  const chartSignature = `${points.length}|${spot}|${gammaFlip ? gammaFlip.strike : ""}|${scopeText}|${chartChecksum}`;
+  const maxPainSignature = maxPain.points.map((point) => `${point.strike}:${point.callPayoff}:${point.putPayoff}`).join(",");
+  const chartSignature = `${points.length}|${spot}|${gammaFlip ? gammaFlip.strike : ""}|${scopeText}|${chartChecksum}|${state.gammaViewMode}|${maxPain.maxPain?.strike || ""}|${maxPainSignature}`;
   if (!forceChartRedraw && chartSignature === analysisChartSignatureValue) return;
   analysisChartSignatureValue = chartSignature;
   // 先让行情和期权链完成绘制，再在下一拍重建 SVG，避免和表格挤在同一次长任务里。
   scheduleScopeCharts(() => {
-    OptionScopeCharts.renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "当前期权链未提供 Gamma，暂无法估算 GEX", { spot, gammaFlip, crosshairTags: true, markers: [
-      { point: callWall, className: "chart-wall-call", label: "看涨墙", position: "top" },
-      { point: putWall, className: "chart-wall-put", label: "看跌墙", position: "bottom" },
-    ] });
+    if (state.gammaViewMode === "maxPain") {
+      OptionScopeCharts.renderSignedChart("gex-chart", maxPain.points, "callPayoff", "putPayoff", "M", "当前到期日缺少有效未平仓量，暂无法计算最大痛点", {
+        positiveBoth: true,
+        valueLabel: "赔付",
+        tooltipTitle: "结算价",
+        ariaLabel: "最大痛点赔付图",
+        spot,
+        priceMarkers: [
+          { value: spot, className: "chart-spot-price", label: "现价" },
+          { value: maxPain.maxPain?.strike, className: "chart-max-pain", label: "最大痛点" },
+        ],
+      });
+    } else {
+      OptionScopeCharts.renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "当前期权链未提供 Gamma，暂无法估算 GEX", { spot, gammaFlip, crosshairTags: true, markers: [
+        { point: callWall, className: "chart-wall-call", label: "看涨墙", position: "top" },
+        { point: putWall, className: "chart-wall-put", label: "看跌墙", position: "bottom" },
+      ] });
+    }
     OptionScopeCharts.renderSignedChart("volume-chart", points, "callVolume", "putVolume", "", "暂无成交量分布", { axis: "right", crosshairTags: true, valueLabel: "成交量", markers: [
       { point: volumeCallPeak, className: "chart-wall-call", label: "看涨", position: "top" },
       { point: volumePutPeak, className: "chart-wall-put", label: "看跌", position: "bottom" },
@@ -4572,149 +4546,6 @@ async function pollFairValue(key) {
   }
 }
 
-function emptyFlowSide(type) {
-  return {
-    buyVolume: "--",
-    sellVolume: "--",
-    unknownVolume: "--",
-    buyPremium: "权利金 --",
-    sellPremium: "权利金 --",
-    netVolume: "--",
-    focusTitle: "集中执行价 --",
-    focusSummary: "等待相邻快照",
-    concentration: [],
-    rows: [{ key: `${type}-empty`, label: "--", direction: "等待数据", className: "unknown", volume: "--", share: "--", premium: "权利金 --" }],
-    rowspan: 1,
-  };
-}
-
-function renderFlowSide(side, type) {
-  const source = side || {};
-  const netVolume = Number(source.net_volume);
-  const rawConcentration = Array.isArray(source.concentration) && source.concentration.length
-    ? source.concentration
-    : (Array.isArray(source.top_strikes) ? source.top_strikes : []).map((item) => ({
-      strike: item.strike,
-      volume: item.volume,
-      dominant_direction: item.direction,
-      buy_volume: item.direction === "buy" ? item.volume : 0,
-      sell_volume: item.direction === "sell" ? item.volume : 0,
-      unknown_volume: item.direction === "unknown" ? item.volume : 0,
-    }));
-  const directionLabel = (value) => value === "buy" ? "买入" : value === "sell" ? "卖出" : "中性";
-  const typeLabel = type === "call" ? "CALL" : "PUT";
-  const totalVolume = [source.buy_volume, source.sell_volume, source.unknown_volume].reduce((sum, value) => sum + (Number(value) || 0), 0);
-  const concentration = rawConcentration.slice(0, 5).map((item, index) => ({
-    key: `${type}-${item.strike}-${index}`,
-    label: `${formatFlowStrike(item.strike)} ${typeLabel}`,
-    detail: `${directionLabel(item.dominant_direction)} ${formatFlowVolume(item.volume, item.dominant_direction)}`,
-    className: item.dominant_direction === "buy" ? "buy" : item.dominant_direction === "sell" ? "sell" : "unknown",
-  }));
-  const rows = rawConcentration.slice(0, 5).map((item, index) => {
-    const volume = Number(item.volume) || 0;
-    const dominantDirection = item.dominant_direction;
-    return {
-      key: `${type}-row-${item.strike}-${index}`,
-      label: `${formatFlowStrike(item.strike)} ${typeLabel}`,
-      direction: directionLabel(dominantDirection),
-      className: dominantDirection === "buy" ? "buy" : dominantDirection === "sell" ? "sell" : "unknown",
-      volume: formatFlowVolume(item.volume, dominantDirection),
-      share: totalVolume > 0 ? `${Math.round(volume / totalVolume * 100)}%` : "--",
-      premium: `权利金 ${formatUsd(item.premium)}`,
-    };
-  });
-  if (!rows.length) rows.push({ key: `${type}-empty`, label: "--", direction: "等待数据", className: "unknown", volume: "--", share: "--", premium: "权利金 --" });
-  const top = rawConcentration[0] || null;
-  const focusPercent = top && totalVolume > 0 ? ` · 占 ${Math.round(Number(top.volume) / totalVolume * 100)}%` : "";
-  return {
-    buyVolume: formatFlowVolume(source.buy_volume, "buy"),
-    sellVolume: formatFlowVolume(source.sell_volume, "sell"),
-    unknownVolume: `中性 ${formatCount(source.unknown_volume)}`,
-    buyPremium: `权利金 ${formatUsd(source.buy_premium)}`,
-    sellPremium: `权利金 ${formatUsd(source.sell_premium)}`,
-    netVolume: Number.isFinite(netVolume) ? `${netVolume >= 0 ? "+" : ""}${formatCount(netVolume)}` : "--",
-    focusTitle: top ? `${formatFlowStrike(top.strike)} ${typeLabel}` : "集中执行价 --",
-    focusSummary: top ? `${directionLabel(top.dominant_direction)} ${formatFlowVolume(top.volume, top.dominant_direction)}${focusPercent}` : "等待相邻快照",
-    concentration,
-    rows,
-    rowspan: rows.length,
-  };
-}
-
-function resetOptionFlow(reason = "需要两份相邻期权链快照才能估算流向") {
-  state.view.flow = {
-    available: false,
-    signalLabel: "等待相邻快照",
-    signalClass: "waiting",
-    signalDetail: reason,
-    windowLabel: "快照窗口 --",
-    methodLabel: "成交量增量 · 买卖价方向估算 · 中性单列",
-    warning: "",
-    summary: {
-      totalVolume: "--",
-      buyVolume: "--",
-      sellVolume: "--",
-      neutralVolume: "--",
-    },
-    call: emptyFlowSide("call"),
-    put: emptyFlowSide("put"),
-  };
-}
-
-function hasOptionFlowData(payload) {
-  if (!payload?.available) return false;
-  return [payload.call, payload.put].some((side) => {
-    if (!side) return false;
-    const totals = [side.buy_volume, side.sell_volume, side.unknown_volume];
-    if (totals.some((value) => Number.isFinite(Number(value)) && Number(value) > 0)) return true;
-    return [side.concentration, side.top_strikes].some((rows) =>
-      Array.isArray(rows) && rows.some((row) => Number.isFinite(Number(row?.volume)) && Number(row.volume) > 0));
-  });
-}
-
-function renderOptionFlow(payload) {
-  // 无新增成交、接口暂不可用或迟到的旧期限响应都不覆盖当前有效流向；
-  // 换标的/期限时由相应加载流程显式 resetOptionFlow。
-  if (!payload || (payload.expiration && state.expiration && payload.expiration !== state.expiration)) return;
-  if (payload.available === false && payload.reason) {
-    state.view.flow = {
-      ...state.view.flow,
-      available: false,
-      signalLabel: "暂不可用",
-      signalClass: "waiting",
-      signalDetail: payload.reason,
-      windowLabel: "快照窗口 --",
-    };
-    return;
-  }
-  if (!hasOptionFlowData(payload)) return;
-  const signal = payload.signal || {};
-  const hasWindow = Boolean(payload.current_fetched_at && payload.previous_fetched_at);
-  const windowLabel = hasWindow
-    ? `${formatTime(payload.previous_fetched_at)} → ${formatTime(payload.current_fetched_at)} · ${formatFlowInterval(payload.interval_seconds)}`
-    : payload.current_fetched_at ? `当前快照 ${formatTime(payload.current_fetched_at)} · 等待下一份` : "快照窗口 --";
-  const call = payload.call || {};
-  const put = payload.put || {};
-  const sumVolume = (key) => (Number(call[key]) || 0) + (Number(put[key]) || 0);
-  state.view.flow = {
-    available: Boolean(payload.available),
-    signalLabel: payload.available ? (signal.label || "暂无新增流向") : "等待相邻快照",
-    signalClass: payload.available ? (signal.class_name || "neutral") : "waiting",
-    signalDetail: payload.available ? (signal.detail || payload.reason || "暂无方向判断") : (payload.reason || "需要两份相邻期权链快照才能估算流向"),
-    windowLabel,
-    methodLabel: "成交量增量 · 买卖价方向估算 · 中性单列",
-    warning: payload.warning || "",
-    summary: {
-      totalVolume: formatCount(sumVolume("buy_volume") + sumVolume("sell_volume") + sumVolume("unknown_volume")),
-      buyVolume: formatFlowVolume(sumVolume("buy_volume"), "buy"),
-      sellVolume: formatFlowVolume(sumVolume("sell_volume"), "sell"),
-      neutralVolume: formatCount(sumVolume("unknown_volume")),
-    },
-    call: renderFlowSide(payload.call, "call"),
-    put: renderFlowSide(payload.put, "put"),
-  };
-}
-
 // 时段标签：数据源若返回未知取值就原样展示，避免换口径时把信息吞掉。
 function marketStateLabel(value, fallback = "快照") {
   if (!value) return fallback;
@@ -5431,10 +5262,6 @@ function chainViewTitle(symbol, expiration, view = state.chainView) {
   return `${label} · ${symbol}${expiration ? ` · ${expiration}` : ""}`;
 }
 
-let chainProfileRequestToken = 0;
-let chainProfileRequestKey = "";
-let chainProfileHistory = { key: "", loadedAt: 0, points: [] };
-
 function chainProfileRows(rows) {
   if (state.chainFilter === "all") return rows || [];
   return (rows || []).filter((row) => row.contract_type === state.chainFilter);
@@ -5455,53 +5282,6 @@ function summarizeChainProfile(points) {
   return summary;
 }
 
-function chainProfileHistorySamples(key) {
-  const points = chainProfileHistory.key === key ? chainProfileHistory.points : [];
-  return [1, 5, 10, 15, 30].map((minutesAgo, index) => {
-    const point = points.find((sample) => sample.minutes_ago === minutesAgo);
-    const base = {
-      key: String(minutesAgo),
-      label: `${minutesAgo} 分钟前`,
-      markerClass: `chain-profile-history-${index}`,
-      time: point?.fetched_at ? formatEasternTime(point.fetched_at) : "暂无可用时间",
-      spot: point?.spot > 0 ? `标的 ${formatMoney(point.spot)}` : "标的 --",
-      status: point?.unavailable_reason || "历史快照不可用",
-      netValue: null,
-      profile: [],
-    };
-    if (point?.unavailable_reason || !point?.fetched_at || !(point.spot > 0) || !Array.isArray(point.data) || !point.data.length) {
-      return base;
-    }
-    const valuationTime = Date.parse(point.fetched_at);
-    if (!Number.isFinite(valuationTime)) return { ...base, status: "历史快照时间无效" };
-    const grouped = aggregateByStrike(chainProfileRows(point.data), point.spot, valuationTime);
-    const summary = summarizeChainProfile(grouped);
-    if (summary.contracts > 0 && summary.missingGamma >= summary.contracts) {
-      return { ...base, status: "所有合约缺少可用 Gamma" };
-    }
-    return {
-      ...base,
-      status: summary.missingGamma ? `${summary.missingGamma} 个合约缺少 Gamma` : "按历史标的价重新计算",
-      netValue: summary.netOpenInterest,
-      profile: grouped.map((item) => ({ strike: item.strike, value: item.callGex + item.putGex })),
-    };
-  });
-}
-
-function chainProfileMaxChange(currentPoints, historyPoints) {
-  const currentByStrike = new Map((currentPoints || []).map((point) => [point.strike, point.callGex + point.putGex]));
-  const historyByStrike = new Map((historyPoints || []).map((point) => [point.strike, point.value]));
-  const strikes = new Set([...currentByStrike.keys(), ...historyByStrike.keys()]);
-  let largest = null;
-  for (const strike of strikes) {
-    const current = currentByStrike.get(strike) || 0;
-    const historical = historyByStrike.get(strike) || 0;
-    const change = current - historical;
-    if (!largest || Math.abs(change) > Math.abs(largest.change)) largest = { strike, change };
-  }
-  return largest;
-}
-
 function renderChainProfileView() {
   const key = `${state.symbol}|${state.expiration || ""}`;
   const hasCurrentChain = state.displayedChainSymbol === state.symbol
@@ -5515,22 +5295,6 @@ function renderChainProfileView() {
   if (zeroGamma == null && state.analysisReady && gammaProfileReady(analysis)) {
     zeroGamma = finitePrice(findGammaFlip(state.chainRows, state.chainSpot, state.expiration)?.strike);
   }
-  const profileSamples = chainProfileHistorySamples(key);
-  const samples = profileSamples.map((sample) => {
-    const change = sample.profile.length ? chainProfileMaxChange(points, sample.profile) : null;
-    return {
-      key: sample.key,
-      label: sample.label,
-      markerClass: sample.markerClass,
-      time: sample.time,
-      spot: sample.spot,
-      status: sample.status,
-      maxChange: change ? {
-        strike: formatMoney(change.strike),
-        value: `${change.change > 0 ? "+" : ""}${formatNumber(change.change / 1000, 2)} 十亿美元`,
-      } : null,
-    };
-  });
   const status = rows.length
     ? `持仓量 GEX 为模型估算 · 成交量加权估算不代表真实方向性持仓${summary.missingGamma ? ` · ${summary.missingGamma} 个合约缺少 Gamma，显示可计算小计` : ""}`
     : "当前到期日没有符合筛选条件的期权合约";
@@ -5544,7 +5308,6 @@ function renderChainProfileView() {
     netVolumeGex: hasGamma ? formatGex(summary.netVolume) : "--",
     updatedAt: state.displayedChainFetchedAt ? formatEasternTime(state.displayedChainFetchedAt) : "--",
     status,
-    history: samples,
   };
   OptionScopeCharts.renderStrikeGexProfile("chain-profile-chart", points, {
     title: `${state.symbol} 按行权价伽马敞口`,
@@ -5552,41 +5315,9 @@ function renderChainProfileView() {
     zeroGamma,
     positiveStrike: hasGamma ? summary.positive?.strike : null,
     negativeStrike: hasGamma ? summary.negative?.strike : null,
-      history: profileSamples.map((sample) => ({
-      label: sample.label,
-      markerClass: sample.markerClass,
-      points: sample.profile,
-    })),
     scrollKey: `${key}|${state.chainFilter}`,
     emptyMessage: rows.length ? "当前快照缺少可用 Gamma，暂无法绘制 GEX" : "当前筛选下没有期权数据",
   });
-}
-
-async function loadChainProfileHistory(force = false) {
-  const symbol = state.symbol;
-  const expiration = state.expiration;
-  if (!symbol || !expiration || state.chainView !== "profile") return;
-  const key = `${symbol}|${expiration}`;
-  if (chainProfileRequestKey === key) return;
-  if (!force && chainProfileHistory.key === key && Date.now() - chainProfileHistory.loadedAt < 30000) {
-    renderChainProfileView();
-    return;
-  }
-  const token = ++chainProfileRequestToken;
-  chainProfileRequestKey = key;
-  state.view.chainProfile.status = "正在读取历史快照";
-  try {
-    const payload = await request(`/api/chain/${encodeURIComponent(symbol)}/history?expiration=${encodeURIComponent(expiration)}`);
-    if (token !== chainProfileRequestToken || key !== `${state.symbol}|${state.expiration || ""}` || state.chainView !== "profile") return;
-    chainProfileHistory = { key, loadedAt: Date.now(), points: Array.isArray(payload?.points) ? payload.points : [] };
-    renderChainProfileView();
-  } catch (error) {
-    if (token !== chainProfileRequestToken || key !== `${state.symbol}|${state.expiration || ""}`) return;
-    state.view.chainProfile.status = `历史快照读取失败：${sanitizeDisplayText(error.message || "请求失败")}`;
-    renderChainProfileView();
-  } finally {
-    if (token === chainProfileRequestToken) chainProfileRequestKey = "";
-  }
 }
 
 function renderChain(payload, quote, analysisPayload) {
@@ -5698,10 +5429,7 @@ function renderChain(payload, quote, analysisPayload) {
   state.chainRows = Object.freeze(rows); state.chainSpot = quote?.price ?? null;
   renderChainTable();
   if (isGexChainView()) renderChainHeatmap();
-  if (state.chainView === "profile") {
-    renderChainProfileView();
-    void loadChainProfileHistory();
-  }
+  if (state.chainView === "profile") renderChainProfileView();
   chainRenderSignature = signature;
   rememberClientSnapshot();
 }
@@ -5812,6 +5540,11 @@ function showChartSkeletons() {
   state.view.chart.putWall = "看跌墙 0.00";
   state.view.chart.gammaScopeDate = "柱状图 到期日 --";
   state.view.chart.gammaScopeStats = "0 个合约";
+  state.view.chart.maxPainStrike = "--";
+  state.view.chart.maxPainPayout = "最低总赔付 --";
+  state.view.chart.maxPainScopeDate = "到期日 --";
+  state.view.chart.maxPainScopeStats = "0 个有效合约";
+  state.view.chart.maxPainRange = "行权价 --";
   state.view.chart.levelsBasis = "基准 0.00";
   state.view.chart.volumeScope = "到期日 -- · 0 个合约";
   state.view.chart.oiScope = "到期日 -- · 0 个合约";
@@ -5836,7 +5569,6 @@ function showPending(message, preserveCache = false) {
     && state.lastQuote.symbol === state.symbol
     && hasFairValueSnapshot(state.lastQuote);
   clearFairValuePoll();
-  resetOptionFlow(message || "需要两份相邻期权链快照才能估算流向");
   if (!keepFairValue) {
     state.view.fairValue = "--";
     state.view.fairValueSource = "保守情景 -- · 乐观情景 --";
@@ -6015,13 +5747,6 @@ async function loadSnapshotForRender(loadId, symbol, expiration, fallbackQuote) 
       return payload;
     })
     : Promise.resolve(null);
-
-  // Flow 需要相邻快照计算，但不应阻塞报价和期权链首屏。
-  if (expiration) {
-    request(`/api/flow/${encodedSymbol}?expiration=${encodedExpiration}`).then((flow) => {
-      if (flow && isCurrentLoad(loadId, expiration) && state.symbol === symbol) renderOptionFlow(flow);
-    }).catch(() => {});
-  }
 
   [quote, payload] = await Promise.all([quoteRead, chainRead]);
   if (!isCurrentLoad(loadId, expiration)) return { shown: false, source: null, discarded: true };
@@ -6358,11 +6083,10 @@ async function refreshInBackground(loadId) {
     const chainRequest = refreshResult?.chain?.data?.length
       ? Promise.resolve(refreshResult.chain)
       : request(`/api/chain/${encodedSymbol}?expiration=${encodedExpiration}`);
-    const [payload, quote, expirations, flow] = await Promise.all([
+    const [payload, quote, expirations] = await Promise.all([
       chainRequest,
       quoteRequest,
       expirationRequest,
-      request(`/api/flow/${encodedSymbol}?expiration=${encodeURIComponent(currentExpiration)}`).catch(() => null),
     ]);
     if (!isCurrentLoad(loadId) || state.symbol !== symbol) return;
     // 响应期间用户切了到期日：这批结果属于旧期限，整体作废并按新选择重来——
@@ -6396,7 +6120,6 @@ async function refreshInBackground(loadId) {
     // Gamma 窗口继续后台刷新；选中期限的综合价位已在这里与窗口任务并行请求。
     renderChain(payload, resolvedQuote, state.lastAnalysis?.analysisPayload || null);
     if (!payload?.data?.length) scheduleSnapshotRetry(loadId);
-    renderOptionFlow(flow);
     state.view.lastStatus = `最近更新 ${formatTime(payload.fetched_at)}`;
     syncPageQuery();
     // Gamma 轮询自己收尾。这里再抛错会被下面的 catch 当成快照失败，转去回源全部到期日。
@@ -6649,8 +6372,6 @@ async function loadSymbol() {
   state.loading = true;
   state.symbolInput = symbol;
   state.symbol = symbol;
-  chainProfileRequestToken += 1;
-  chainProfileRequestKey = "";
   clearQuoteRecovery();
   clearSnapshotRetry();
   resetChanAnalysis();
@@ -6692,13 +6413,11 @@ async function loadSymbol() {
   if (state.chanExpanded) refreshChanAnalysis();
   else refreshChanMarketAnalysis(true);
   if (isIndexMarketSymbol(symbol) && supportsIndexOptions(symbol)) {
-    resetOptionFlow("指数期权快照无法确认主动成交方向");
   }
   if (isIndexMarketSymbol(symbol) && !supportsIndexOptions(symbol)) {
     state.expiration = null;
     state.expirationOptions = [];
     state.expirationPlaceholder = "该指数暂不支持期权链";
-    resetOptionFlow("指数不适用期权分析");
     await renderCachedHistoryOnly(loadId);
     if (isCurrentLoad(loadId)) {
       state.view.chainTitle = `指数行情 · ${symbol}`;
@@ -6787,7 +6506,6 @@ async function switchExpiration(expiration) {
   if (state.chainView === "profile") renderChainProfileView();
   state.view.chainTitle = chainViewTitle(state.symbol, expiration);
   connectPushStream(state.symbol);
-  resetOptionFlow("正在读取当前期限的相邻快照…");
   setError("");
   setBusy(true);
   // 兜底：请求万一一直不落地（例如上游卡住），20 秒后强制放开下拉框，避免控件被永久禁用。
@@ -6930,6 +6648,27 @@ const optionScopeApp = new Vue({
     },
   },
   methods: {
+    setGammaView(view) {
+      if ((view !== "gamma" && view !== "maxPain") || state.gammaViewMode === view) return;
+      state.gammaViewMode = view;
+      analysisChartSignatureValue = "";
+      if (!state.lastAnalysis) {
+        if (view === "maxPain") {
+          OptionScopeCharts.renderSignedChart("gex-chart", [], "callPayoff", "putPayoff", "M", "当前到期日缺少有效未平仓量，暂无法计算最大痛点", { positiveBoth: true, ariaLabel: "最大痛点赔付图" });
+        } else {
+          OptionScopeCharts.renderChartSkeleton("gex-chart", { ariaLabel: "Gamma 敞口图" });
+        }
+        return;
+      }
+      const previousForceChartRedraw = forceChartRedraw;
+      forceChartRedraw = true;
+      try {
+        const { rows, spot, analysisPayload, expirationRows, ivModel, basis } = state.lastAnalysis;
+        renderAnalysis(rows, spot, analysisPayload, expirationRows || [], ivModel || {}, basis || null);
+      } finally {
+        forceChartRedraw = previousForceChartRedraw;
+      }
+    },
     toggleFavorites() {
       this.favoritesOpen = !this.favoritesOpen;
     },
@@ -7258,7 +6997,7 @@ const optionScopeApp = new Vue({
           supertrend: enabled && layer === "supertrend",
           wyckoff: enabled && layer === "wyckoff",
         };
-      } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "structureSupports" || layer === "trendlines") {
+      } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "trendlines") {
         this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };
       } else {
         const level = Number(layer);
@@ -7449,19 +7188,14 @@ const optionScopeApp = new Vue({
       rememberChainViewPreference(view);
       this.view.chainTitle = chainViewTitle(state.symbol, state.expiration, view);
       if (view === "heatmap") {
-        chainProfileRequestToken += 1;
-        chainProfileRequestKey = "";
         void loadChainHeatmapBackground();
       } else if (view === "profile") {
         this.$nextTick(() => {
           if (state.chainView === "profile") renderChainProfileView();
         });
         if (chainHeatmapLoadingSymbol !== state.symbol) void loadChainHeatmapBackground();
-        void loadChainProfileHistory();
       } else {
         cancelChainHeatmapDiscovery();
-        chainProfileRequestToken += 1;
-        chainProfileRequestKey = "";
         renderChainTable();
       }
     },
@@ -7478,7 +7212,7 @@ initDetailGroup();
 initChainGroup();
 initChainHeatmapDrag();
 initChartGroup();
-initOptionAnalysisGroup();
+initBuyerStructureGroup();
 // 时钟是独立的高频显示，不进入 Vue 响应式树，避免每秒遍历整张期权链的虚拟 DOM。
 function updateClock() {
   const clock = byId("clock");

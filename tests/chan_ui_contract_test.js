@@ -8,6 +8,12 @@ const readme = fs.readFileSync("README.md", "utf8");
 const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
 const styles = fs.readFileSync("web/static/common/css/styles.css", "utf8");
 
+for (const page of [template, fs.readFileSync("web/static/futures.html", "utf8")]) {
+  assert.equal((page.match(/>支撑\/压力线<\/button>/g) || []).length, 1, "each page must have one combined support/resistance switch");
+  assert.doesNotMatch(page, /toggle(?:Chan)?ChartLayer\('structureSupports'\)/, "the independent structure support switch must be removed");
+  assert.match(page, /:aria-pressed="(?:chanChartLayers|chartLayers)\.supportResistance[^>]+aria-describedby="(?:chan|futures)-structure-support-help"/, "the combined switch must expose its selected state and layer description");
+}
+
 assert.match(template, /<div class="chan-summary">[\s\S]*?<h2>\{\{ chanFrame\.recursive\.heading \}\}<\/h2>[\s\S]*?<div class="chan-meta">[\s\S]*?chanStatusLine/, "Chan summary and status must be rendered in the dedicated structure summary");
 assert.match(template, /isChanRecursiveCenterLevelVisible\(level\)/, "recursive center controls must read the guarded visibility accessor");
 assert.match(template, /aria-label="显示或隐藏全部级别的线段"[^>]*@click="toggleChanChartLayer\('segments'\)"/, "the all-segments master switch must remain available and connected regardless of the currently available levels");

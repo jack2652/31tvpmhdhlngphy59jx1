@@ -53,6 +53,22 @@ assert.equal(window.OptionScopeChan.allSegmentLevelsVisible(layerState, [0, 1]),
 layerState = window.OptionScopeChan.toggleAllSegmentLevels(layerState, [0, 1]);
 assert.equal(layerState.segments, true, "master switch should restore every level from mixed state");
 assert.deepEqual(Object.keys(layerState.segmentLevels), [], "master switch should clear stale per-level overrides");
+// 日期：2026-11-23；执行者：Codex。总开关必须实际恢复每一级及图表，不能只修改无效的布尔值。
+assert.equal(window.OptionScopeChan.allSegmentLevelsVisible(layerState, [0, 1]), true, "点击显示全部级别后实际每一级都应开启");
+assert.ok([0, 1].every((level) => window.OptionScopeChan.isSegmentLevelVisible(layerState, level)));
+const masterShown = window.OptionScopeChan.view(payload, false, false, 30, null, layerState).daily.chart;
+assert.equal(masterShown.segments.length, 2, "全部级别显示必须实际生成两级线段");
+assert.equal(masterShown.layers.segments, true, "Canvas绘制门应随实际恢复的线段开启");
+const masterHidden = window.OptionScopeChan.toggleAllSegmentLevels(layerState, [0, 1]);
+assert.equal(window.OptionScopeChan.view(payload, false, false, 30, null, masterHidden).daily.chart.segments.length, 0);
+assert.equal(window.OptionScopeChan.allSegmentLevelsVisible(masterHidden, [0, 1]), false);
+const oneHidden = window.OptionScopeChan.toggleSegmentLevel(layerState, 0);
+assert.equal(window.OptionScopeChan.isSegmentLevelVisible(oneHidden, 0), false);
+assert.equal(window.OptionScopeChan.isSegmentLevelVisible(oneHidden, 1), true, "单独隐藏一级应保留总开关提供的其它级别");
+const shownAgain = window.OptionScopeChan.toggleAllSegmentLevels(oneHidden, [0, 1]);
+assert.equal(window.OptionScopeChan.view(payload, false, false, 30, null, shownAgain).daily.chart.segments.length, 2);
+assert.equal(window.OptionScopeChan.isSegmentLevelVisible({}, 0), false, "初始默认仍隐藏线段");
+assert.equal(window.OptionScopeChan.allSegmentLevelsVisible(window.OptionScopeChan.toggleAllSegmentLevels({ segments: false }, []), []), true, "无已加载级别时总开关仍可打开以应用于之后的行情");
 const chart = allLayers.daily.chart;
 assert.equal(allLayers.daily.recursive.emptySignalNotice, "", "a plottable recursive signal should suppress the empty-signal notice");
 assert.equal(chart.segments.length, 2, "chart should include base and recursive-level segments");

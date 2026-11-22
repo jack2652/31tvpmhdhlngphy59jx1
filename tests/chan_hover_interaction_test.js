@@ -147,6 +147,78 @@ assert.equal(horizontalMacd.attributes.visibility, "hidden", "the MACD crosshair
 assert.equal(tagVolume.querySelector("text").textContent, "100.00万", "the volume tag must show the value at the cursor");
 assert.equal(tagMacd.attributes.visibility, "hidden", "the MACD tag must hide while hovering volume");
 
+// CSS 像素标签反算后的高度和位置必须用于命中，避让后仍可查看结构详情。
+const support = { x1: 80, x2: 450, lineEndX: 360, y: 120, lineHitPadding: 5,
+  labelX: 450, labelY: 150, labelWidth: 82, labelHeight: 28,
+  status: "active", statusLabel: "结构支撑", zoneLabel: "100.00", sources: "确认笔",
+  date: "2026-10-01", confirmedAt: "2026-10-03", lastCloseDate: "2026-10-15" };
+directive.componentUpdated(target, { value: { ...model, structureSupports: [support], layers: { supportResistance: true } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 161, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+let supportDetail = tooltip.children.find((child) => child.className === "chan-structure-tooltip");
+assert.equal(supportDetail.hidden, false, "the full rendered label height must remain hoverable after collision avoidance");
+assert.equal(supportDetail.children[0].textContent, "结构支撑 · 100.00");
+targetListeners.get("pointermove")({ clientX: 420, clientY: 120, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.equal(supportDetail.hidden, true, "the empty line tail removed before a moved label must not be hoverable");
+directive.componentUpdated(target, { value: { ...model, structureSupports: [support], layers: { supportResistance: false } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+supportDetail = tooltip.children.find((child) => child.className === "chan-structure-tooltip");
+assert.equal(supportDetail.hidden, true, "the shared off state must hide support details");
+
+const reboundSupport = { ...support, statusLabel: "回踩确认支撑", testCount: 2, lastTestDate: "2026-10-12", reactionAtr: 1.8, reestablished: true };
+directive.componentUpdated(target, { value: { ...model, structureSupports: [reboundSupport], layers: { supportResistance: true } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+supportDetail = tooltip.children.find((child) => child.className === "chan-structure-tooltip");
+assert.equal(supportDetail.children[0].textContent, "回踩确认支撑 · 100.00");
+assert.match(supportDetail.children[1].textContent, /有效反弹 2 次.*最近测试 2026-10-12.*平均反弹 1.80 ATR.*失守后重新确认/);
+
+// 日期：2026-11-23；执行者：Codex。待确认悬浮显示完成收盘证据，不能再宣称未跌破。
+const pendingSupport = { ...reboundSupport, status: "pending-break", statusLabel: "跌破待确认",
+  pendingBreakAt: "2026-10-13", lastCloseLabel: "96.00", breakThresholdLabel: "99.40" };
+directive.componentUpdated(target, { value: { ...model, structureSupports: [pendingSupport], layers: { supportResistance: true } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+supportDetail = tooltip.children.find((child) => child.className === "chan-structure-tooltip");
+assert.equal(supportDetail.children[0].textContent, "跌破待确认 · 100.00");
+assert.match(supportDetail.children[1].textContent, /首次有效收盘跌破 2026-10-13.*收盘 96.00.*有效跌破阈值 99.40.*尚需下一根完成收盘确认/);
+assert.doesNotMatch(supportDetail.children[1].textContent, /未被有效收盘跌破/);
+
+const historicalSupport = { ...support, statusLabel: "历史结构支撑", kind: "historical", hasHistoricalStructure: true,
+  historicalDate: "2025-07-02", testCount: 0, reactionAtr: null };
+directive.componentUpdated(target, { value: { ...model, structureSupports: [historicalSupport], layers: { supportResistance: true } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+supportDetail = tooltip.children.find((child) => child.className === "chan-structure-tooltip");
+assert.equal(supportDetail.children[0].textContent, "历史结构支撑 · 100.00");
+assert.match(supportDetail.children[1].textContent, /历史结构确认 2025-07-02.*长期参考/);
+assert.doesNotMatch(supportDetail.children[1].textContent, /有效反弹|平均反弹/);
+
+const styledSignal = { type: "三买", label: "三买", side: "buy", status: "confirmed", signalStatus: "已确认",
+  x: 120, y: 90, markerY: 95, labelX: 120, labelY: 65, start: "2026-10-12", endPrice: 100,
+  renderedMarker: { x: 120, y: 95, hitX: 9, hitY: 9 }, renderedLabel: { x: 420, y: 150, width: 70, height: 20 } };
+directive.componentUpdated(target, { value: { ...model, signals: [styledSignal], layers: { signals: true } } });
+targetListeners.get("pointermove")({ clientX: 440, clientY: 154, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+supportDetail = tooltip.children.find((child) => child.className === "chan-structure-tooltip");
+assert.equal(supportDetail.hidden, false, "CSS-pixel signal badges must be hit by their rendered geometry");
+assert.equal(supportDetail.children[0].textContent, "三买 · 已确认");
+assert.equal(styledSignal.labelX, 120); assert.equal(styledSignal.labelY, 65);
+
+const pressure = { ...support, tone: "resistance", label: "反复受阻压力区", priceLabel: "100.00", zoneLabel: "99.90–100.30", testCount: 3,
+  lastTestDate: "2026-10-12", reestablished: true, sources: "已收盘反弹高点" };
+directive.componentUpdated(target, { value: { ...model, keyLevels: [pressure], layers: { supportResistance: true } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+supportDetail = tooltip.children.find((child) => child.className === "chan-structure-tooltip");
+assert.equal(supportDetail.hidden, false, "a pressure label exposes the existing structure tooltip");
+assert.equal(supportDetail.children[0].textContent, "反复受阻压力 · 99.90–100.30");
+assert.match(supportDetail.children[1].textContent, /独立受阻 3 次.*突破后重新确认/);
+const historicalPressure = { ...pressure, kind: "historical-retest", testCount: 1, historicalTestCount: 2,
+  historicalBrokenAt: "2026-04-17", sources: "历史多次受阻与突破后新回测" };
+directive.componentUpdated(target, { value: { ...model, keyLevels: [historicalPressure], layers: { supportResistance: true } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.equal(supportDetail.children[0].textContent, "历史压力回测 · 99.90–100.30");
+assert.match(supportDetail.children[1].textContent, /历史受阻 2 次.*旧压力突破 2026-04-17.*本轮回测 1 次/);
+assert.doesNotMatch(supportDetail.children[1].textContent, /独立受阻 3 次/, "历史与本轮回测不得混算");
+directive.componentUpdated(target, { value: { ...model, keyLevels: [pressure], layers: { supportResistance: false } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.equal(tooltip.children.find((child) => child.className === "chan-structure-tooltip").hidden, true, "pressure tooltip obeys the shared switch");
+
 // The empty future area must expose a pending daily candle, including its date
 // card, horizontal price guide, and left axis readout.
 directive.componentUpdated(target, { value: {

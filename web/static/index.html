@@ -139,9 +139,45 @@
       </div>
       <div class="detail-body chart-fold" id="chart-fold">
         <section class="analysis-grid">
-          <article class="analysis-panel panel">
-            <div class="analysis-heading"><div><span class="eyebrow">GAMMA EXPOSURE</span><h2>Gamma 敞口</h2><p>基于 Black-Scholes 的估算 GEX，正值代表看涨支撑，负值代表看跌压力</p></div><div class="wall-badges"><span id="net-gex" :title="view.chart.netGexTitle" v-text="view.chart.netGex">净 Gamma --</span><span id="gamma-flip" :title="view.chart.gammaFlipTitle" v-text="view.chart.gammaFlip">零 Gamma --</span><span id="call-wall" v-text="view.chart.callWall">看涨墙 --</span><span id="put-wall" v-text="view.chart.putWall">看跌墙 --</span><span id="gamma-scope-date" v-text="view.chart.gammaScopeDate">柱状图 到期日 --</span><span id="gamma-scope-stats" v-text="view.chart.gammaScopeStats">0 个合约</span></div></div>
-            <div id="gex-chart" class="chart" aria-label="Gamma 敞口图"></div>
+          <article class="analysis-panel panel" :class="{ 'max-pain-panel': gammaViewMode === 'maxPain' }">
+            <div class="analysis-heading gamma-analysis-heading">
+              <div>
+                <span class="eyebrow" v-if="gammaViewMode === 'gamma'">期权风险分析</span>
+                <h2 v-if="gammaViewMode === 'gamma'">Gamma 敞口</h2>
+                <h2 v-else class="max-pain-title">最大痛点价：<strong id="max-pain-strike" v-text="view.chart.maxPainStrike">--</strong></h2>
+                <p v-if="gammaViewMode === 'gamma'">基于布莱克-斯科尔斯模型估算 GEX，正值代表看涨支撑，负值代表看跌压力</p>
+              </div>
+              <div class="gamma-heading-tools">
+                <div class="gamma-view-switch detail-segmented" role="group" aria-label="Gamma 图表视图">
+                  <button class="detail-seg" type="button" :aria-pressed="gammaViewMode === 'gamma' ? 'true' : 'false'" @click="setGammaView('gamma')">Gamma 敞口</button>
+                  <button class="detail-seg" type="button" :aria-pressed="gammaViewMode === 'maxPain' ? 'true' : 'false'" @click="setGammaView('maxPain')">最大痛点</button>
+                </div>
+                <div v-if="gammaViewMode === 'gamma'" class="wall-badges">
+                  <span id="net-gex" :title="view.chart.netGexTitle" v-text="view.chart.netGex">净 Gamma --</span>
+                  <span id="gamma-flip" :title="view.chart.gammaFlipTitle" v-text="view.chart.gammaFlip">零 Gamma --</span>
+                  <span id="call-wall" v-text="view.chart.callWall">看涨墙 --</span>
+                  <span id="put-wall" v-text="view.chart.putWall">看跌墙 --</span>
+                  <span id="gamma-scope-date" v-text="view.chart.gammaScopeDate">柱状图 到期日 --</span>
+                  <span id="gamma-scope-stats" v-text="view.chart.gammaScopeStats">0 个合约</span>
+                </div>
+              </div>
+            </div>
+            <div v-if="gammaViewMode === 'maxPain'" class="max-pain-meta">
+              <span id="max-pain-scope-date" v-text="view.chart.maxPainScopeDate">到期日 --</span>
+              <span v-text="view.chart.maxPainRange">行权价 --</span>
+            </div>
+            <div id="gex-chart" key="gamma-shared-chart" class="chart" :aria-label="gammaViewMode === 'gamma' ? 'Gamma 敞口图' : '最大痛点赔付图'"></div>
+            <div v-if="gammaViewMode === 'maxPain'" class="chart-legend max-pain-legend" aria-label="最大痛点图例">
+              <span><i class="legend-dot call"></i>看涨</span>
+              <span><i class="legend-dot put"></i>看跌</span>
+              <span><i class="max-pain-legend-line pain"></i>最大痛点</span>
+              <span><i class="max-pain-legend-line spot"></i>现价</span>
+            </div>
+            <div v-if="gammaViewMode === 'maxPain'" class="max-pain-note">
+              <span id="max-pain-payout" v-text="view.chart.maxPainPayout">最低总赔付 --</span>
+              <span id="max-pain-scope-stats" v-text="view.chart.maxPainScopeStats">0 个有效合约</span>
+              <span>按当前未平仓量估算到期赔付</span>
+            </div>
           </article>
           <article class="analysis-panel panel">
             <div class="analysis-heading"><div><span class="eyebrow">KEY LEVELS</span><h2>压力位 / 支撑位</h2><p>柱高为综合强度，压力位向上、支撑位向下</p></div><div class="wall-badges"><span id="levels-basis" v-text="view.chart.levelsBasis">基准 --</span></div></div>
@@ -254,11 +290,10 @@
                 </section>
                 <section class="chan-layer-menu-display"><h4>价格图层</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="价格图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.supportResistance ? 'true' : 'false'" @click="toggleChanChartLayer('supportResistance')">支撑/压力线</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.structureSupports ? 'true' : 'false'" aria-describedby="chan-structure-support-help" @click="toggleChanChartLayer('structureSupports')">结构支撑</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.supportResistance ? 'true' : 'false'" aria-describedby="chan-structure-support-help" @click="toggleChanChartLayer('supportResistance')">支撑/压力线</button>
                   <button class="detail-seg" type="button" title="按已确认的笔与线段高低点绘制支撑和压力趋势线；收盘破位后结束" :aria-pressed="chanChartLayers.trendlines ? 'true' : 'false'" @click="toggleChanChartLayer('trendlines')">结构趋势线</button>
                 </div>
-                <small class="chan-layer-support-help" id="chan-structure-support-help">蓝色实线为已确认结构支撑，灰色虚线为收盘已失守；盘中下穿不改变状态。</small>
+                <small class="chan-layer-support-help" id="chan-structure-support-help">支撑包含历史结构参考与近期反弹确认，相近区域只画一次。蓝色为支撑，历史参考稍淡；灰虚线为失守，红虚线为压力。历史结构不因未近期回踩而删除，两根收盘有效跌破才标失守；悬浮查看来源与实际反弹记录。</small>
                 </section>
                 <section class="chan-layer-menu-recursive" aria-label="结构层级"><div class="chan-recursive-layer-groups" :class="{ 'chan-recursive-layer-groups-single': !chanSegmentLevels.length || !chanLayerLevels.length }">
                   <div v-if="chanSegmentLevels.length" class="chan-recursive-layer-group">
@@ -324,15 +359,15 @@
                       <small>结合指标强弱和价格转折提示买卖；两者走势不一致时标记背离（指标买卖与背离）。</small>
                     </div>
                     <div id="chan-turtle-help" class="chan-indicator-description-body" role="region" aria-label="海龟交易法说明" v-show="chanChartLayers.turtle">
-                      <small>20 根前序 K 线突破入场，10 根反向通道退出；须连续两根收盘守位、PDI/MDI 方向一致、ADX(14,6)&gt;25 且高于 3 根前，并通过 55 EMA 过滤。数据不足时不入场；这是过滤版，不含系统一获利过滤、ATR 仓位和加仓规则。</small>
+                      <small>20 根前序 K 线突破入场，10 根反向通道退出；须连续两根收盘守位、PDI/MDI 方向一致、ADX(14,6)&gt;25，并通过 55 EMA 同侧与方向过滤。首次入场还要求 ADX 高于 3 根前；2N 止损后原趋势持续有效时，可在 ADX 保持强势但不加速的情况下等待新突破，再经两根收盘确认再次入场。每次以前序 Wilder N(20) 重新设定固定 2N 止损，止损与通道选择先触及者。收盘标记不代表成交；这是过滤版，不含 55 根突破系统、获利过滤、账户仓位和加仓。</small>
                       <div class="chan-turtle-legend" role="list" aria-label="海龟通道图例">
                         <span role="listitem"><i class="chan-turtle-swatch chan-turtle-swatch-entry" aria-hidden="true"></i>20 根入场通道</span>
                         <span role="listitem"><i class="chan-turtle-swatch chan-turtle-swatch-exit" aria-hidden="true"></i>10 根退出通道</span>
-                        <small>方向或趋势强度不符时不产生新入场；已有仓位仍按通道退出。未收盘 K 线可能触发退出。</small>
+                        <small>多再入／空再入表示止损后的同向新突破；趋势变弱或反向即清除再次入场许可，通道退出后仍按首次入场规则筛选。持仓按通道或 2N 参考退出，跳空按开盘价。未收盘 K 线仅提示退出；无效行情或断链后重新预热。</small>
                       </div>
                     </div>
                     <div id="chan-granville-help" class="chan-indicator-description-body" role="region" aria-label="葛兰碧法则说明" v-show="chanChartLayers.granville">
-                      <small>当前周期 200 期简单均线；回踩阈值约 0.3 ATR，远离阈值约 2 ATR。买4同一轮低位乖离只提示一次，收盘价回到均线下方 0.5 ATR 内后重置。卖8同一轮高乖离只提示一次，回到均线 1 ATR 内后重置。八条定性规则的量化近似，信号仅在 K 线收盘后确认。</small>
+                      <small>当前周期 SMA200，以 20/5 期斜率及前序 Wilder ATR(14) 判断。买1/卖5识别转向交叉；买2/卖6识别趋势内短暂穿越后 10 根内恢复，最大越界深度 1 ATR；买3/卖7识别未穿越均线的 0.3 ATR 内回踩/反抽，同轮只提示一次。买4/卖8先出现 2 ATR 乖离再反向收盘确认。买4回到均线下方 0.5 ATR 内后重置；卖8同一轮高乖离只提示一次，回到均线 1 ATR 内后重置。规则为量化近似，仅收盘确认，断链重新预热。</small>
                       <div class="chan-granville-legend" role="list" aria-label="葛兰碧法则图例">
                         <span role="listitem"><i class="chan-granville-swatch" aria-hidden="true"></i>200 期 SMA</span>
                         <small><span class="chan-granville-buy">买1-买4</span> · <span class="chan-granville-sell">卖5-卖8</span></small>
@@ -356,7 +391,7 @@
                       </div>
                     </div>
                     <div id="chan-wyckoff-help" class="chan-indicator-description-body" role="region" aria-label="威科夫阶段说明" v-show="chanChartLayers.wyckoff">
-                      <small>结合成交量、波幅、区间与收盘位置自动识别 A–E 阶段，并标记抛售高潮、买入高潮、自动反弹/回落、二次测试、弹簧探底、派发冲高、回测、强势/弱势信号、最后支撑/供给点。事件只在已收盘 K 线上确认；这是项目适配版，不包含可拖动示意图和源码中的高周期扫描。</small>
+                      <small>以前序 30 根价格、20 根有效成交量及 Wilder ATR(14) 估计 A–E 阶段。自动反弹/回落与缩量窄幅二次测试分开确认；成功回测须较探底/冲高缩量并抬高低点/降低高点，突破需量价证据，最后支撑/供给限制回踩深度。缺量不当作缩量；突破失败回到区间，反向破坏或阶段过期后重新识别。允许没有弹簧探底/派发冲高的路径。只在收盘确认；这是阶段估计，断链重新预热。</small>
                       <div class="chan-wyckoff-legend" role="list" aria-label="威科夫阶段图例">
                         <span role="listitem"><i class="chan-wyckoff-swatch" aria-hidden="true"></i>吸筹区间</span>
                         <span role="listitem"><i class="chan-wyckoff-swatch chan-wyckoff-down" aria-hidden="true"></i>派发区间</span>
@@ -413,13 +448,14 @@
           <p class="chan-chart-gesture-help">鼠标按住左右拖动；Ctrl 或 ⌘ + 滚轮缩放。手机单指左右拖动、双指捏合缩放。</p>
         </div>
         <div v-if="!chanFrame.chart" class="levels-empty">历史行情到达后展示 K 线与多级结构</div>
-        <details v-if="chanFrame.chart && chanChartLayers.structureSupports" class="chan-structure-support-details">
-          <summary>结构支撑 · {{ chanFrame.chart.structureSupportLevels.length }} 处</summary>
-          <p>相近价位合并；支撑来源、起点、确认日期和失守日期见下表。</p>
+        <details v-if="chanFrame.chart && chanChartLayers.supportResistance" class="chan-structure-support-details">
+          <summary>支撑区域 · {{ chanFrame.chart.structureSupportLevels.length }} 处</summary>
+          <p>历史已确认低点与中枢下沿保留为结构参考，未近期回踩不等于失守。近期支撑须实际反弹验证；相近区域合并。首次有效收盘跌破显示金色“跌破待确认”，连续两根确认后标记“失守”；下一根不再有效跌破时恢复支撑。</p>
+          <p v-if="chanFrame.chart.supportStatus">{{ chanFrame.chart.supportStatus }}</p>
           <ul v-if="chanFrame.chart.structureSupportLevels.length">
-            <li v-for="level in chanFrame.chart.structureSupportLevels" :key="level.key"><strong>{{ level.zoneLabel }}</strong><span>{{ level.statusLabel }}</span><span>{{ level.sources }} · 起点 {{ level.date }} · 确认 {{ level.confirmedAt }}{{ level.brokenAt ? ' · 失守 ' + level.brokenAt : '' }}</span></li>
+            <li v-for="level in chanFrame.chart.structureSupportLevels" :key="level.key"><strong>{{ level.zoneLabel }}</strong><span>{{ level.statusLabel }}</span><span v-if="level.pendingBreakAt">首次跌破 {{ level.pendingBreakAt }} · 收盘 {{ level.lastCloseLabel }} · 有效跌破阈值 {{ level.breakThresholdLabel }} · 待下一根收盘确认</span><span>{{ level.sources }}{{ level.testCount ? ' · 有效反弹 ' + level.testCount + ' 次 · 最近测试 ' + level.lastTestDate : '' }} · 确认 {{ level.confirmedAt }}{{ level.brokenAt ? ' · 失守 ' + level.brokenAt : '' }}{{ level.reestablished ? ' · 失守后重新确认' : '' }}{{ level.kind === 'historical' ? ' · 历史结构参考' : '' }}</span></li>
           </ul>
-          <p v-else>当前连续行情中暂无已确认结构支撑。</p>
+          <p v-else>当前连续行情中暂无可用的历史结构或近期反弹支撑。</p>
         </details>
         <button v-if="chanSpotGuideVisible && isChanTouchInput()" type="button" class="chan-spot-guide-backdrop" aria-label="关闭现价结构观察" @click.stop="dismissChanSpotGuide"></button>
         <button v-if="chanHoveredScenario && isChanTouchInput()" type="button" class="chan-projection-backdrop" aria-label="关闭条件情景" @click.stop="hideChanScenario($event)"></button>
@@ -533,45 +569,12 @@
       <div class="detail-header" id="option-analysis-header">
         <button class="detail-toggle" id="option-analysis-toggle" type="button" aria-expanded="false" aria-controls="option-analysis-fold">
           <span class="detail-caret" aria-hidden="true"></span>
-          <span class="detail-text"><span class="eyebrow">OPTION ANALYSIS</span><span class="detail-title">期权流向与买方结构分析</span></span>
+          <span class="detail-text"><span class="eyebrow">OPTION ANALYSIS</span><span class="detail-title">期权买方结构分析</span></span>
         </button>
-        <div class="detail-modes option-analysis-tabs" id="option-analysis-tabs" role="group" aria-label="期权分析视图">
-          <div class="detail-segmented">
-            <button class="detail-seg" type="button" data-option-view="flow" aria-label="期权成交方向与流向分析" aria-pressed="true">成交流向</button>
-            <button class="detail-seg" type="button" data-option-view="buyer" aria-label="期权买方结构分析" aria-pressed="false">买方结构</button>
-          </div>
-        </div>
         <span class="detail-action" id="option-analysis-action">展开</span>
       </div>
       <div class="detail-body option-analysis-fold" id="option-analysis-fold" hidden>
-    <div class="option-flow-fold" id="option-flow-fold" data-option-view-panel="flow">
-        <div class="option-flow-panel">
-          <div class="flow-overview"><div><span class="flow-kicker">相邻快照</span><p>{{ indexSymbol ? '指数期权快照不提供可确认的主动成交方向' : '用成交量增量和买卖价位置判断主动买卖' }}</p></div><div class="flow-signal" :class="`flow-signal-${view.flow.signalClass}`"><strong v-text="view.flow.signalLabel">等待相邻快照</strong><span v-text="view.flow.signalDetail">需要两份相邻期权链快照才能估算流向</span></div></div>
-          <div class="flow-window"><span v-text="view.flow.windowLabel">快照窗口 --</span><span v-text="view.flow.methodLabel">成交量增量 · 买卖价方向估算 · 中性单列</span></div>
-          <div class="flow-kpi-strip" aria-label="期权流向汇总">
-            <div><span>新增成交量</span><strong v-text="view.flow.summary.totalVolume">--</strong><small>看涨 + 看跌</small></div>
-            <div><span>主动买入</span><strong class="flow-positive" v-text="view.flow.summary.buyVolume">--</strong><small>接近卖价</small></div>
-            <div><span>主动卖出</span><strong class="flow-negative" v-text="view.flow.summary.sellVolume">--</strong><small>接近买价</small></div>
-            <div><span>中性成交</span><strong class="flow-neutral" v-text="view.flow.summary.neutralVolume">--</strong><small>中间价 / 缺报价</small></div>
-          </div>
-          <div class="flow-directions">
-            <section class="flow-direction-card flow-direction-call">
-              <header><div><strong>CALL</strong><span>看涨方向</span></div><b>净量 <em v-text="view.flow.call.netVolume">--</em></b></header>
-              <div class="flow-direction-metrics"><div><span>买入成交量</span><strong v-text="view.flow.call.buyVolume">--</strong><small v-text="view.flow.call.buyPremium">权利金 --</small></div><div><span>卖出成交量</span><strong v-text="view.flow.call.sellVolume">--</strong><small v-text="view.flow.call.sellPremium">权利金 --</small></div><div><span>中性成交量</span><strong v-text="view.flow.call.unknownVolume">--</strong><small>中间价 / 缺报价</small></div></div>
-              <div class="flow-strikes"><div class="flow-strikes-title">集中执行价 <span>按成交量排序</span></div><div class="flow-strike-head" aria-hidden="true"><span>执行价 / 权利金</span><span>成交方向</span><span>成交量</span><span>占比</span></div><div v-if="!view.flow.call.rows.length" class="flow-strikes-empty">等待数据</div><div v-for="row in view.flow.call.rows" :key="row.key" class="flow-strike-row"><div><strong v-text="row.label">--</strong><small v-text="row.premium">权利金 --</small></div><span class="flow-direction-value" :class="`flow-direction-${row.className}`" v-text="row.direction">中性</span><b :class="`flow-volume-${row.className}`" v-text="row.volume">--</b><i v-text="row.share">--</i></div></div>
-            </section>
-            <section class="flow-direction-card flow-direction-put">
-              <header><div><strong>PUT</strong><span>看跌方向</span></div><b>净量 <em v-text="view.flow.put.netVolume">--</em></b></header>
-              <div class="flow-direction-metrics"><div><span>买入成交量</span><strong v-text="view.flow.put.buyVolume">--</strong><small v-text="view.flow.put.buyPremium">权利金 --</small></div><div><span>卖出成交量</span><strong v-text="view.flow.put.sellVolume">--</strong><small v-text="view.flow.put.sellPremium">权利金 --</small></div><div><span>中性成交量</span><strong v-text="view.flow.put.unknownVolume">--</strong><small>中间价 / 缺报价</small></div></div>
-              <div class="flow-strikes"><div class="flow-strikes-title">集中执行价 <span>按成交量排序</span></div><div class="flow-strike-head" aria-hidden="true"><span>执行价 / 权利金</span><span>成交方向</span><span>成交量</span><span>占比</span></div><div v-if="!view.flow.put.rows.length" class="flow-strikes-empty">等待数据</div><div v-for="row in view.flow.put.rows" :key="row.key" class="flow-strike-row"><div><strong v-text="row.label">--</strong><small v-text="row.premium">权利金 --</small></div><span class="flow-direction-value" :class="`flow-direction-${row.className}`" v-text="row.direction">中性</span><b :class="`flow-volume-${row.className}`" v-text="row.volume">--</b><i v-text="row.share">--</i></div></div>
-            </section>
-          </div>
-          <div class="flow-method-note">中性：成交价位于买卖价中间，或该合约缺少有效买卖报价；这部分不会被强行归入买入或卖出。</div>
-          <div class="flow-warning" v-if="view.flow.warning" v-text="view.flow.warning"></div>
-        </div>
-      </div>
-
-    <div class="buyer-structure-fold" id="buyer-structure-fold" data-option-view-panel="buyer" hidden>
+        <div class="buyer-structure-fold" id="buyer-structure-fold">
         <div class="buyer-structure-heading">
           <p>按当前方向、报价流动性和分析窗口筛选两侧各最多 5 条结构；排序按触及目标的概率加权，预计盈亏按到达目标价估算</p>
           <div class="buyer-structure-meta">
@@ -641,17 +644,6 @@
               <div><dt>成交量加权估算</dt><dd v-text="view.chainProfile.netVolumeGex">--</dd></div>
               <div><dt>更新时间</dt><dd v-text="view.chainProfile.updatedAt">--</dd></div>
             </dl>
-            <section class="chain-profile-history-summary" aria-label="按行权价的历史最大变化">
-              <h2>行权价 GEX 最大变化</h2>
-              <div class="chain-profile-change-list">
-                <div v-for="sample in view.chainProfile.history" :key="sample.key" class="chain-profile-change-row">
-                  <span :class="['chain-profile-history-dot', sample.markerClass]" aria-hidden="true"></span>
-                  <span>{{ sample.label }}</span>
-                  <b v-if="sample.maxChange">{{ sample.maxChange.strike }} · {{ sample.maxChange.value }}</b>
-                  <small v-else>{{ sample.status }}</small>
-                </div>
-              </div>
-            </section>
           </div>
           <p class="chain-profile-note" v-text="view.chainProfile.status">持仓量 GEX 为模型估算 · 成交量加权估算不代表真实方向性持仓</p>
         </div>

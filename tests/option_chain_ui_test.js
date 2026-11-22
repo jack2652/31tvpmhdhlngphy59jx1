@@ -12,8 +12,14 @@ assert.match(template, /<article v-if="!indexSymbol \|\| indexOptionsAvailable" 
 assert.match(template, /<section v-show="!indexSymbol \|\| indexOptionsAvailable" class="detail-group panel" id="chart-group"/, "supported indices must show the GEX and distribution charts");
 assert.match(template, /<section v-show="!indexSymbol \|\| indexOptionsAvailable" class="detail-group panel option-analysis-group" id="option-analysis-group"/, "supported indices must show the option analysis panel");
 assert.match(template, /id="chain-title"[^>]*>GEX 热力图/, "supported indices must show the option-chain heatmap panel");
-assert.match(app, /resetOptionFlow\("指数期权快照无法确认主动成交方向"\)/, "index flow must explain why trade direction is unavailable");
-assert.match(app, /available === false && payload\.reason[\s\S]*?signalLabel: "暂不可用"[\s\S]*?signalDetail: payload\.reason/, "an unavailable index flow response must remain visible in the panel");
+assert.ok(styles.includes(".headline-grid{grid-template-columns:minmax(240px,1.8fr) repeat(3,minmax(120px,.85fr)) repeat(2,minmax(220px,1.25fr));align-items:stretch}"), "desktop headline cards must share one six-column row");
+assert.ok(styles.includes("@media(max-width:900px){.headline-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.quote{grid-column:1/-1}}"), "headline cards must retain a responsive two-column layout on smaller screens");
+assert.match(template, /<span class="eyebrow">OPTION ANALYSIS<\/span><span class="detail-title">期权买方结构分析<\/span>/, "the option-analysis panel must use the English eyebrow and Chinese buyer-structure title");
+assert.match(template, /class="buyer-structure-fold" id="buyer-structure-fold"[\s\S]*?view\.buyer\.available/, "buyer structure must remain directly visible in the analysis panel");
+assert.doesNotMatch(template, /class="buyer-structure-fold"[^>]*hidden/, "buyer structure must not remain hidden behind the removed view toggle");
+assert.doesNotMatch(template, /期权流向|成交流向|data-option-view|option-flow|view\.flow/, "the option-flow view and its toggle must be removed from the template");
+assert.doesNotMatch(app, /\/api\/flow\/|renderOptionFlow|resetOptionFlow|formatFlow(?:Interval|Strike|Volume)|view\.flow/, "the browser must not retain option-flow requests or state handlers");
+assert.doesNotMatch(styles, /\.option-flow(?:-|\b)|\.flow-(?:overview|signal|window|kpi|directions|direction|strike|method|warning)/, "the stylesheet must not retain option-flow presentation rules");
 const symbolLoad = app.slice(app.indexOf("async function loadSymbol()"), app.indexOf("let expirationSwitchToken"));
 assert.match(symbolLoad, /await loadExpirations\(loadId, previousSnapshot\)/, "index expiry discovery must first reuse its cached catalog");
 assert.doesNotMatch(symbolLoad, /await loadExpirations\(loadId, previousSnapshot, isIndexMarketSymbol\(symbol\)\)/, "loading an index must not force a slow upstream catalog refresh");
@@ -69,7 +75,7 @@ const profileBatchRefreshButton = profileExpirationToolbar.match(/<button class=
 assert.match(heatmapBatchRefreshButton, /@click="refreshChainHeatmapExpirations"/, "heatmap batch refresh must remain available");
 assert.match(profileBatchRefreshButton, /@click="refreshChainHeatmapExpirations"/, "profile batch refresh must sit beside the expiry strip");
 assert.match(template, /class="chain-batch-refresh-status" role="status" aria-live="polite" v-show="chainView === 'profile' && !chainHeatmapRefreshRunning && chainBatchRefreshStatus"/, "profile batch refresh results must have a visible live status");
-assert.match(app, /chainBatchRefreshStatus: ""/, "batch refresh result must have state separate from profile history status");
+assert.match(app, /chainBatchRefreshStatus: ""/, "batch refresh result must have its own state");
 const batchRefreshMethod = app.slice(app.indexOf("async refreshChainHeatmapExpirations() {"), app.indexOf("filterChanged() {", app.indexOf("async refreshChainHeatmapExpirations() {")));
 assert.match(batchRefreshMethod, /this\.chainBatchRefreshStatus = status/, "batch refresh completion must populate the profile status");
 assert.match(styles, /\.chain-view-select\{[^}]*color:var\(--muted\)[^}]*font-size:12px/, "the view label must match the type filter label color and size");
@@ -78,10 +84,9 @@ assert.match(styles, /\.chain-profile-expiration-strip\{[^}]*overflow-x:auto/, "
 assert.match(styles, /\.chain-profile-expiration-button\{width:92px;height:auto;min-height:42px/, "profile expiry buttons must keep stable heatmap-sized tiles");
 assert.match(template, /<el-option value="heatmap" label="GEX 热力图"><\/el-option><el-option value="profile" label="按行权价"><\/el-option><el-option value="table" label="期权链"><\/el-option>/, "the selector must offer all three Chinese view choices");
 assert.match(template, /class="chain-profile-panel" v-show="chainView === 'profile'"/, "the strike-profile view must occupy the existing option-chain section");
-assert.match(template, /v-for="sample in view\.chainProfile\.history"/, "the strike-profile view must list each historical sample");
+assert.doesNotMatch(template, /view\.chainProfile\.history|chain-profile-history|行权价 GEX 最大变化/, "the strike-profile view must not expose browser-estimated historical samples");
 assert.match(template, /成交量加权估算不代表真实方向性持仓/, "volume-weighted GEX must be identified as an estimate");
-assert.match(template, /class="chain-profile-summary"[\s\S]*?行权价 GEX 最大变化/, "profile metrics and historical changes must be presented as one compact chart summary");
-assert.doesNotMatch(template, /chain-profile-history-grid|chain-profile-sample/, "historical samples must not be split into standalone cards");
+assert.match(template, /class="chain-profile-summary"[\s\S]*?netVolumeGex/, "profile metrics must remain available below the chart");
 const heatmapHeaders = template.match(/<th v-for="column in view\.chainHeatmap\.columns"[\s\S]*?<\/th>/)?.[0] || "";
 assert.match(heatmapHeaders, /<button class="chain-heatmap-expiration-button" type="button"/, "each heatmap expiry header must use a native button");
 assert.match(heatmapHeaders, /:aria-label="'选择到期日 ' \+ column\.expiration"/, "each expiry button must expose its full date as its accessible name");
@@ -94,10 +99,9 @@ assert.match(app, /function isGexChainView\(view = state\.chainView\)\s*\{\s*ret
 assert.match(app, /const labels = \{ heatmap: "GEX 热力图", profile: "按行权价 GEX", table: "期权链" \}/, "the title must track all three view modes");
 const changeView = app.slice(app.indexOf("changeChainView(view) {"), app.indexOf("toggleTheme() {"));
 assert.match(changeView, /this\.chainView = view;\s*rememberChainViewPreference\(view\)/, "each selected view must persist the selected mode");
-assert.match(changeView, /if \(view === "profile"\)[\s\S]*loadChainProfileHistory\(\)/, "selecting the strike-profile view must load historical samples");
 assert.match(changeView, /if \(chainHeatmapLoadingSymbol !== state\.symbol\) void loadChainHeatmapBackground\(\)/, "entering the strike-profile view must load the heatmap expiry cache when idle");
-assert.match(app, /aggregateByStrike\(chainProfileRows\(point\.data\), point\.spot, valuationTime\)/, "historical GEX must use each sample spot and actual snapshot time");
-assert.match(app, /token !== chainProfileRequestToken \|\| key !== `\$\{state\.symbol\}/, "late history requests must not overwrite a different symbol or expiry");
+assert.match(app, /aggregateByStrike\(rows, state\.chainSpot\)/, "the strike profile must estimate GEX from the currently displayed chain and spot");
+assert.doesNotMatch(app, /loadChainProfileHistory|chainProfileHistorySamples|chainProfileMaxChange|chainProfileRequestToken|\/api\/chain\/[`$\{][^\s]+\/history/, "the option-chain UI must not request historical profile samples");
 
 const loadSymbol = app.slice(app.indexOf("async function loadSymbol()"), app.indexOf("let expirationSwitchToken"));
 const loadExpirations = app.slice(app.indexOf("async function loadExpirations("), app.indexOf("function displayedSnapshotMatches()"));

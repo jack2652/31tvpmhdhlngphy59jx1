@@ -375,10 +375,15 @@ function bindChanChartHover(target, initialBinding) {
       return Math.hypot(localX - (item.x1 + ratio * dx), localY - (item.y1 + ratio * dy));
     };
     const signalHit = candle.pending ? null : (model.signals || []).map((signal) => {
-      const markerDistance = Math.hypot(localX - signal.x, localY - (Number.isFinite(signal.markerY) ? signal.markerY : signal.y));
+      const marker = signal.renderedMarker;
+      const markerDistance = marker ? (Math.hypot((localX - marker.x) / marker.hitX, (localY - marker.y) / marker.hitY) <= 1 ? 0 : Infinity)
+        : Math.hypot(localX - signal.x, localY - (Number.isFinite(signal.markerY) ? signal.markerY : signal.y));
       const halfLabel = (signal.hitLabelWidth || 48) / 2;
       const labelX = Number.isFinite(signal.labelX) ? signal.labelX : signal.x;
-      const labelDistance = signal.labelVisible !== false && localY >= signal.labelY - 12 && localY <= signal.labelY + 4 && Math.abs(localX - labelX) <= halfLabel ? 0 : Infinity;
+      const label = signal.renderedLabel;
+      const onLabel = label ? Math.abs(localY - label.y) <= label.height / 2 && Math.abs(localX - label.x) <= label.width / 2
+        : localY >= signal.labelY - 12 && localY <= signal.labelY + 4 && Math.abs(localX - labelX) <= halfLabel;
+      const labelDistance = signal.labelVisible !== false && onLabel ? 0 : Infinity;
       return { signal, distance: Math.min(markerDistance, labelDistance) };
     }).filter(({ signal, distance }) => model.layers?.signals === true && distance <= 12)
       .sort((left, right) => left.distance - right.distance)[0]?.signal;
@@ -399,10 +404,11 @@ function bindChanChartHover(target, initialBinding) {
       structureBody.textContent = `${afSignalHit.date} · 确认于 ${afSignalHit.confirmedAt || "未知"} · Z ${formatIndicator(afSignalHit.z)}`;
       structureDetail.hidden = false;
     }
-    const supportHit = model.layers?.structureSupports === false ? null : (model.structureSupports || []).find((item) => {
-      const onLine = localX >= item.x1 && localX <= item.x2 && Math.abs(localY - item.y) <= 7;
+    const priceReferences = [...(model.structureSupports || []), ...(model.keyLevels || []).filter((item) => item.tone === "resistance")];
+    const supportHit = model.layers?.supportResistance === false ? null : priceReferences.find((item) => {
+      const onLine = localX >= item.x1 && localX <= (item.lineEndX ?? item.x2) && Math.abs(localY - item.y) <= (item.lineHitPadding || 7);
       const onLabel = localX >= item.labelX - (item.labelWidth || 100) && localX <= item.labelX
-        && Math.abs(localY - item.labelY) <= 9;
+        && Math.abs(localY - item.labelY) <= (item.labelHeight || 18) / 2;
       return onLine || onLabel;
     });
     const structure = candle.pending ? null : (model.structures || []).map((item) => {
@@ -413,8 +419,29 @@ function bindChanChartHover(target, initialBinding) {
       .filter(({ item, distance }) => distance <= (item.area ? 0 : 8))
       .sort((left, right) => left.distance - right.distance)[0]?.item;
     if (!signalHit && !afSignalHit && supportHit) {
-      structureTitle.textContent = `${supportHit.statusLabel} · ${supportHit.zoneLabel}`;
-      structureBody.textContent = `${supportHit.sources} · 起点 ${supportHit.date} · 确认 ${supportHit.confirmedAt}${supportHit.status === "broken" ? " · 失守 " + supportHit.brokenAt : " · 截至 " + supportHit.lastCloseDate + " 未被收盘跌破"}`;
+      if (supportHit.tone === "resistance") {
+        const historicalRetest = supportHit.kind === "historical-retest";
+        structureTitle.textContent = historicalRetest ? `历史压力回测 · ${supportHit.zoneLabel}`
+          : supportHit.testCount ? `反复受阻压力 · ${supportHit.zoneLabel}` : `结构前高压力 · ${supportHit.priceLabel}`;
+        structureBody.textContent = historicalRetest
+          ? `${supportHit.sources} · 历史受阻 ${supportHit.historicalTestCount} 次 · 旧压力突破 ${supportHit.historicalBrokenAt} · 本轮回测 ${supportHit.testCount} 次 · 最近测试 ${supportHit.lastTestDate} · 确认 ${supportHit.confirmedAt}`
+          : supportHit.testCount ? `${supportHit.sources} · 独立受阻 ${supportHit.testCount} 次 · 最近测试 ${supportHit.lastTestDate} · 确认 ${supportHit.confirmedAt}${supportHit.reestablished ? " · 突破后重新确认" : ""}`
+            : `${supportHit.date} · ${supportHit.label}`;
+      } else {
+        structureTitle.textContent = `${supportHit.statusLabel} · ${supportHit.zoneLabel}`;
+        const supportState = supportHit.status === "broken" ? " · 失守 " + supportHit.brokenAt
+          : supportHit.status === "pending-break" ? ` · 首次有效收盘跌破 ${supportHit.pendingBreakAt} · 收盘 ${supportHit.lastCloseLabel} · 有效跌破阈值 ${supportHit.breakThresholdLabel} · 尚需下一根完成收盘确认`
+            : " · 截至 " + supportHit.lastCloseDate + " 未确认收盘失守";
+        structureBody.textContent = `${supportHit.sources} · 起点 ${supportHit.date} · 确认 ${supportHit.confirmedAt}${supportState}`;
+        if (supportHit.resistanceZone) {
+          const pressure = supportHit.resistanceZone;
+          structureBody.textContent += pressure.kind === "historical-retest"
+            ? ` · 同区历史压力回测 ${pressure.testCount} 次（历史受阻 ${pressure.historicalTestCount} 次）`
+            : ` · 同区反弹受阻 ${pressure.testCount} 次`;
+        }
+        if (supportHit.testCount) structureBody.textContent += ` · 有效反弹 ${supportHit.testCount} 次 · 最近测试 ${supportHit.lastTestDate} · 平均反弹 ${supportHit.reactionAtr.toFixed(2)} ATR${supportHit.reestablished ? " · 失守后重新确认" : ""}`;
+        if (supportHit.hasHistoricalStructure) structureBody.textContent += ` · 历史结构确认 ${supportHit.historicalDate}${supportHit.kind === "historical" ? " · 长期参考，未近期回踩不等于失守" : ""}`;
+      }
       structureDetail.hidden = false;
     } else if (!signalHit && !afSignalHit && structure) {
       const detail = chanStructureTooltipDetails(structure);
@@ -844,6 +871,7 @@ function drawChanCanvas(target, binding) {
     field: chanThemeColor(target, "--field", "#0b141d"), line: chanThemeColor(target, "--line", "#253543"),
     fieldLine: chanThemeColor(target, "--field-line", "#3b5263"),
     amber: chanThemeColor(target, "--amber", "#e7b45c"), net: chanThemeColor(target, "--net", "#5478ff"), gex: chanThemeColor(target, "--gex", "#ff7c45"),
+    supportPending: chanThemeColor(target, "--chan-support-pending", chanThemeColor(target, "--amber", "#e7b45c")),
   };
   const levelColors = [colors.blue, colors.amber, colors.net, colors.gex, colors.up, colors.down, colors.text, colors.textPrimary];
   const levelColor = (level) => levelColors[Math.max(0, Number(level) || 0) % levelColors.length];
@@ -1348,63 +1376,159 @@ function drawChanCanvas(target, binding) {
     context.lineWidth = 3; context.strokeStyle = colors.panel; context.strokeText(marker.label, marker.labelX, marker.labelY);
     context.fillStyle = markerColor; context.fillText(marker.label, marker.labelX, marker.labelY);
   }
-  // Chan structural reference levels: recent swing highs/lows and the latest center boundaries.
+  // 普通低点和中枢边界保留原参考线；压力参考与结构支撑共用价格标签。
   for (const level of model.keyLevels || []) {
-    if (model.layers?.supportResistance === false && ["support", "resistance"].includes(level.tone)) continue;
-    const color = level.tone === "support" ? colors.up : level.tone === "resistance" ? colors.down : colors.blue;
+    if (level.tone === "resistance") continue;
+    if (model.layers?.supportResistance === false && level.tone === "support") continue;
+    const color = level.tone === "support" ? colors.up : colors.blue;
     line(level.x1, level.y, level.x2, level.y, color, [3, 4], 1);
   }
-  // 自动结构支撑与实时价无关；有效线为蓝色，收盘失守线同时用虚线和文字区分。
-  if (model.layers?.structureSupports !== false) for (const level of model.structureSupports || []) {
-    const color = level.status === "broken" ? colors.text : colors.blue;
-    line(level.x1, level.y, level.x2, level.y, color, level.status === "broken" ? [5, 4] : [], 1.6);
-    if (level.pointX != null) {
-      if (level.pointX < level.x1) line(level.pointX, level.y, level.x1, level.y, color, [2, 3], 1);
-      context.beginPath(); context.arc(level.pointX, level.pointY, 3.2, 0, Math.PI * 2);
-      context.fillStyle = colors.panel; context.fill(); context.strokeStyle = color; context.lineWidth = 1.6; context.stroke();
+  // 支撑、跌破待确认、失守与压力标签统一避让；价位和状态仍使用模型计算结果。
+  const labeledLevels = [...(model.structureSupports || []), ...(model.keyLevels || []).filter((level) => level.tone === "resistance")];
+  if (model.layers?.supportResistance !== false && labeledLevels.length) {
+    // 只缩放价位坐标，线宽、圆点和字体使用 CSS 像素，避免宽屏显示粗重。
+    context.save();
+    context.setTransform(pixelScale, 0, 0, pixelHeight / height, pixelScale * leftBleed, 0);
+    const scaleX = width / model.width, scaleY = height / model.height;
+    const labelHeight = 20, labelGap = 20;
+    const labelTop = model.plotTop * scaleY + labelHeight / 2;
+    // 右下角保留情景按钮的空间，低价位标签不会被按钮遮挡。
+    const labelBottom = (model.priceBottom ?? model.plotBottom) * scaleY - labelHeight / 2 - 28;
+    const priceLevels = labeledLevels.map((level) => ({ level, y: level.y * scaleY, labelY: level.y * scaleY }))
+      .sort((a, b) => a.y - b.y);
+    let previousY = labelTop - labelGap;
+    for (const row of priceLevels) {
+      row.labelY = Math.max(row.labelY, previousY + labelGap);
+      previousY = row.labelY;
     }
-    context.font = `550 ${model.mobileChart ? 12 : 11}px Inter, ui-sans-serif, system-ui, sans-serif`;
-    context.textAlign = "right"; context.textBaseline = "middle";
-    const measured = context.measureText?.(level.label).width ?? level.label.length * 8;
-    level.labelWidth = Math.min(measured + 8, model.historyRight - model.plotLeft - 8);
-    context.fillStyle = colors.panel;
-    context.fillRect(level.labelX - level.labelWidth - 2, level.labelY - 8, level.labelWidth + 4, 16);
-    if (Math.abs(level.labelY - level.y) > 10) line(level.labelX - level.labelWidth - 5, level.y, level.labelX - level.labelWidth - 5, level.labelY, color, [], 1);
-    context.fillStyle = color;
-    context.fillText(level.label, level.labelX, level.labelY);
+    if (priceLevels[priceLevels.length - 1].labelY > labelBottom) {
+      priceLevels[priceLevels.length - 1].labelY = labelBottom;
+      for (let index = priceLevels.length - 2; index >= 0; index -= 1) {
+        priceLevels[index].labelY = Math.min(priceLevels[index].labelY, priceLevels[index + 1].labelY - labelGap);
+      }
+    }
+    for (const row of priceLevels) {
+      const { level, y, labelY } = row;
+      const broken = level.status === "broken";
+      const pending = level.status === "pending-break";
+      const resistance = level.tone === "resistance";
+      const color = broken ? colors.text : resistance ? colors.down : pending ? colors.supportPending : colors.blue;
+      const statusText = broken ? "失守" : resistance ? "压力" : pending ? "跌破待确认" : "支撑";
+      const priceText = level.priceLabel || level.label.replace(/^(跌破待确认|支撑|失守)\s*/, "");
+      const labelX = (level.labelX ?? level.x2 - 5) * scaleX;
+      context.font = "500 12px Inter, ui-sans-serif, system-ui, sans-serif";
+      const priceWidth = context.measureText(priceText).width;
+      context.font = "400 12px Inter, ui-sans-serif, system-ui, sans-serif";
+      const statusWidth = context.measureText(statusText).width;
+      const labelWidth = statusWidth + 6 + priceWidth;
+      const labelLeft = labelX - labelWidth;
+      const startX = level.x1 * scaleX;
+      const endX = Math.max(startX, Math.min(level.x2 * scaleX, labelLeft - 8));
+      // 记录实际绘制范围，悬浮提示仍按模型坐标命中。
+      level.labelWidth = (labelWidth + 4) / scaleX;
+      level.labelX = labelX / scaleX;
+      level.labelHeight = labelHeight / scaleY;
+      level.labelY = labelY / scaleY;
+      level.lineEndX = endX / scaleX;
+      level.lineHitPadding = 5 / scaleY;
+      context.globalAlpha = broken ? 0.58 : pending ? 0.85 : resistance ? 0.82 : (level.lineAlpha ?? 0.68);
+      if (endX > startX) line(startX, y, endX, y, color, broken ? [4, 4] : pending ? [6, 3] : resistance ? [3, 4] : [], broken || resistance ? 1 : 1.25);
+      if (Math.abs(labelY - y) > 2) line(endX, y, labelLeft - 4, labelY, color, [], 1);
+      if (level.pointX != null) {
+        const pointX = level.pointX * scaleX;
+        if (pointX < startX) line(pointX, y, startX, y, color, [2, 3], 1);
+        context.beginPath(); context.arc(pointX, level.pointY * scaleY, 2.5, 0, Math.PI * 2);
+        context.fillStyle = colors.panel; context.globalAlpha = 1; context.fill();
+        context.strokeStyle = color; context.lineWidth = 1.25; context.globalAlpha = 0.8; context.stroke();
+      }
+      context.globalAlpha = 1;
+      context.fillStyle = colors.panel;
+      context.fillRect(labelLeft - 4, labelY - labelHeight / 2, labelWidth + 4, labelHeight);
+      context.textAlign = "left"; context.textBaseline = "middle";
+      context.fillStyle = color;
+      context.globalAlpha = broken ? 0.85 : pending ? 1 : 0.9;
+      context.fillText(statusText, labelLeft, labelY);
+      context.font = "500 12px Inter, ui-sans-serif, system-ui, sans-serif";
+      context.fillStyle = colors.textPrimary; context.globalAlpha = broken ? 0.7 : 0.85;
+      context.fillText(priceText, labelLeft + statusWidth + 6, labelY);
+    }
+    context.restore();
   }
-  if (model.layers?.signals === true) for (const signal of model.signals || []) {
-    const color = signal.invalidated ? colors.text : signal.side === "buy" ? colors.up : colors.down;
-    const markerY = Number.isFinite(signal.markerY) ? signal.markerY : signal.y;
-    context.beginPath();
-    context.moveTo(signal.x, markerY + (signal.side === "buy" ? 6 : -6));
-    context.lineTo(signal.x - 5, markerY + (signal.side === "buy" ? -2 : 2));
-    context.lineTo(signal.x + 5, markerY + (signal.side === "buy" ? -2 : 2));
-    context.closePath();
-    context.fillStyle = colors.panel; context.strokeStyle = color; context.lineWidth = signal.invalidated ? 1.5 : 0;
-    context.setLineDash(signal.invalidated ? [2, 2] : []);
-    if (signal.invalidated) context.stroke();
-    else { context.fillStyle = color; context.globalAlpha = signal.status === "confirmed" ? 0.95 : 0.64; context.fill(); context.globalAlpha = 1; }
-    context.setLineDash([]);
-    if (signal.invalidated) {
-      context.beginPath(); context.moveTo(signal.x - 3, markerY - 3); context.lineTo(signal.x + 3, markerY + 3);
-      context.moveTo(signal.x + 3, markerY - 3); context.lineTo(signal.x - 3, markerY + 3);
-      context.strokeStyle = color; context.lineWidth = 1.2; context.stroke();
+  if (model.layers?.signals === true) {
+    // 只缩放信号坐标；标记、边线和字号固定为CSS像素，不改变信号数据与原布局。
+    context.save();
+    context.setTransform(pixelScale, 0, 0, pixelHeight / height, pixelScale * leftBleed, 0);
+    const scaleX = width / model.width, scaleY = height / model.height;
+    const occupiedLabels = [];
+    for (const signal of model.signals || []) {
+      const invalidated = signal.invalidated, confirmed = signal.status === "confirmed";
+      const color = invalidated ? colors.text : signal.side === "buy" ? colors.up : colors.down;
+      const markerX = signal.x * scaleX;
+      const markerY = (Number.isFinite(signal.markerY) ? signal.markerY : signal.y) * scaleY;
+      context.setLineDash([]); context.lineWidth = 1.15; context.strokeStyle = color;
+      context.globalAlpha = invalidated ? 0.65 : 0.95;
+      context.beginPath();
+      if (invalidated) {
+        context.arc(markerX, markerY, 3.5, 0, Math.PI * 2);
+        context.stroke();
+        context.beginPath(); context.moveTo(markerX - 2.5, markerY + 2.5); context.lineTo(markerX + 2.5, markerY - 2.5); context.stroke();
+      } else {
+        const direction = signal.side === "buy" ? 1 : -1;
+        context.moveTo(markerX, markerY + direction * 4.5);
+        context.lineTo(markerX - 4, markerY - direction * 2.5);
+        context.lineTo(markerX + 4, markerY - direction * 2.5); context.closePath();
+        context.fillStyle = confirmed ? color : colors.panel; context.fill();
+        context.stroke();
+      }
+      signal.renderedMarker = { x: signal.x, y: markerY / scaleY, hitX: 9 / scaleX, hitY: 9 / scaleY };
+      signal.renderedLabel = null;
+      if (signal.labelVisible === false) continue;
+      const title = signal.type || signal.label.replace(/\s*·\s*已失效$/, "");
+      const status = invalidated ? "失效" : confirmed ? "确认" : "待确认";
+      context.font = "500 12px Inter, ui-sans-serif, system-ui, sans-serif";
+      const titleWidth = context.measureText(title).width;
+      context.font = "400 10px Inter, ui-sans-serif, system-ui, sans-serif";
+      const statusWidth = context.measureText(status).width;
+      const labelWidth = titleWidth + statusWidth + 20, labelHeight = 20;
+      const minimumX = model.plotLeft * scaleX + labelWidth / 2 + 2;
+      const maximumX = model.historyRight * scaleX - labelWidth / 2 - 2;
+      const preferredX = (Number.isFinite(signal.labelX) ? signal.labelX : signal.x) * scaleX;
+      const labelX = minimumX <= maximumX ? Math.max(minimumX, Math.min(maximumX, preferredX)) : (minimumX + maximumX) / 2;
+      const preferredY = (Number.isFinite(signal.labelY) ? signal.labelY : signal.y + (signal.side === "buy" ? 16 : -10)) * scaleY - 4;
+      const minimumY = model.plotTop * scaleY + 12, maximumY = (model.priceBottom ?? model.plotBottom) * scaleY - 12;
+      let labelY = Math.max(minimumY, Math.min(maximumY, preferredY));
+      const baseY = labelY, direction = labelY >= markerY ? 1 : -1;
+      const overlapsLabel = (candidateY) => occupiedLabels.some((box) => Math.abs(labelX - box.x) < (labelWidth + box.width) / 2 + 3
+        && Math.abs(candidateY - box.y) < (labelHeight + box.height) / 2 + 3);
+      // 只调整绘制框：扩大字号后仍保留3px标签间距，不回写信号坐标。
+      for (let step = 1; overlapsLabel(labelY) && step <= Math.ceil((maximumY - minimumY) / 24); step += 1) {
+        const candidates = [baseY + direction * step * 24, baseY - direction * step * 24];
+        const availableY = candidates.find((candidateY) => candidateY >= minimumY && candidateY <= maximumY && !overlapsLabel(candidateY));
+        if (availableY != null) { labelY = availableY; break; }
+      }
+      occupiedLabels.push({ x: labelX, y: labelY, width: labelWidth, height: labelHeight });
+      const left = labelX - labelWidth / 2, top = labelY - labelHeight / 2, right = left + labelWidth, bottom = top + labelHeight;
+      // 避让后离端点较远的标签使用淡连接线，便于对应K线位置。
+      if (Math.hypot(labelX - markerX, labelY - markerY) > 24) {
+        const direction = labelY >= markerY ? 1 : -1;
+        context.globalAlpha = invalidated ? 0.16 : 0.24;
+        line(markerX, markerY + direction * 6, labelX, labelY - direction * 10, color, [], 0.75);
+      }
+      context.beginPath(); context.moveTo(left + 4, top);
+      context.arcTo(right, top, right, bottom, 4); context.arcTo(right, bottom, left, bottom, 4);
+      context.arcTo(left, bottom, left, top, 4); context.arcTo(left, top, right, top, 4); context.closePath();
+      context.fillStyle = colors.panel; context.globalAlpha = 0.97; context.fill();
+      context.fillStyle = color; context.globalAlpha = invalidated ? 0.03 : 0.06; context.fill();
+      context.strokeStyle = color; context.lineWidth = 0.75; context.globalAlpha = invalidated ? 0.18 : 0.28; context.stroke();
+      context.textAlign = "left"; context.textBaseline = "middle";
+      context.font = "500 12px Inter, ui-sans-serif, system-ui, sans-serif";
+      context.fillStyle = color; context.globalAlpha = 1; context.fillText(title, left + 7, labelY);
+      context.font = "400 10px Inter, ui-sans-serif, system-ui, sans-serif";
+      context.fillStyle = colors.textPrimary; context.globalAlpha = invalidated ? 0.62 : 0.72; context.fillText(status, left + 13 + titleWidth, labelY);
+      // 保存真实绘制框供悬浮命中；原labelX/labelY、日期、价格和状态保持不变。
+      signal.renderedLabel = { x: labelX / scaleX, y: labelY / scaleY, width: labelWidth / scaleX, height: labelHeight / scaleY };
     }
-    if (signal.labelVisible === false) continue;
-    const status = signal.invalidated ? "" : signal.status === "confirmed" ? "✓" : "?";
-    const signalLabel = signal.label + status;
-    const labelY = Number.isFinite(signal.labelY) ? signal.labelY : signal.y + (signal.side === "buy" ? 16 : -10);
-    context.font = model.mobileChart ? "550 12px Inter, ui-sans-serif, system-ui, sans-serif" : "9px Inter, ui-sans-serif, system-ui, sans-serif"; context.textAlign = "center"; context.textBaseline = "alphabetic";
-    const labelWidth = context.measureText(signalLabel).width;
-    const labelMinX = model.plotLeft + labelWidth / 2 + 2;
-    const labelMaxX = model.historyRight - labelWidth / 2 - 2;
-    const preferredLabelX = Number.isFinite(signal.labelX) ? signal.labelX : signal.x;
-    const labelX = labelMinX <= labelMaxX
-      ? Math.max(labelMinX, Math.min(labelMaxX, preferredLabelX))
-      : (model.plotLeft + model.historyRight) / 2;
-    context.lineWidth = 3; context.lineJoin = "round"; context.strokeStyle = colors.panel; context.strokeText(signalLabel, labelX, labelY);
-    context.fillStyle = color; context.fillText(signalLabel, labelX, labelY);
+    context.restore();
   }
   // AF StochZ overlays confirmed price pivots after the oscillator condition.
   // The marker is painted separately from Chan signals so either layer can be
@@ -2066,23 +2190,65 @@ const chanChartInteraction = {
 
 function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emptyMessage, options = {}) {
   const target = document.getElementById(targetId);
-  if (!points.length || points.every((point) => !(Math.abs(point[positiveKey]) + Math.abs(point[negativeKey])))) { target.innerHTML = `<div class="chart-empty">${emptyMessage}</div>`; return; }
+  const positiveBoth = options.positiveBoth === true;
+  if (!points.length || (!positiveBoth && points.every((point) => !(Math.abs(point[positiveKey]) + Math.abs(point[negativeKey]))))) { target.innerHTML = `<div class="chart-empty">${emptyMessage}</div>`; return; }
   // 按容器实际像素绘制：viewBox 与元素 1:1，手机窄屏不会再把柱子和坐标文字整体等比缩小。
   const { width, height } = chartContentBox(target);
   target.dataset.chartWidth = String(width); target.dataset.chartHeight = String(height);
   // 成交量/持仓量图按行情软件样式把数值列放在右侧，Gamma 图保留左侧数值列。
   const axisOnRight = options.axis === "right";
-  const pad = axisOnRight ? { left: 16, right: 56, top: 14, bottom: 26 } : { left: 48, right: 12, top: 14, bottom: 26 }; const innerWidth = width - pad.left - pad.right; const innerHeight = height - pad.top - pad.bottom; const baseline = pad.top + innerHeight / 2;
+  const pad = positiveBoth ? { left: 62, right: 18, top: 14, bottom: 48 } : axisOnRight ? { left: 16, right: 56, top: 14, bottom: 26 } : { left: 48, right: 12, top: 14, bottom: 26 }; const innerWidth = width - pad.left - pad.right; const innerHeight = height - pad.top - pad.bottom;
   // 上下各留一条固定高度的「标签通道」：柱子最高只顶到通道内侧的标高线，柱端文字与方向角标住在通道里，不会再压到坐标刻度。
-  const gutter = Math.min(44, Math.max(16, innerHeight / 2 - 16)); const scaleTop = pad.top + gutter; const scaleBottom = height - pad.bottom - gutter; const maxBarHeight = innerHeight / 2 - gutter;
-  const maxValue = Math.max(1, ...points.map((point) => Math.max(Math.abs(point[positiveKey]), Math.abs(point[negativeKey])))); const slot = innerWidth / points.length; const barWidth = Math.max(3, Math.min(26, slot * 0.68));
+  const gutter = Math.min(44, Math.max(16, innerHeight / 2 - 16)); const scaleTop = pad.top + gutter; const scaleBottom = height - pad.bottom - gutter;
+  const baseline = positiveBoth ? height - pad.bottom : pad.top + innerHeight / 2;
+  const maxBarHeight = positiveBoth ? baseline - scaleTop : innerHeight / 2 - gutter;
+  const rawMaxValue = Math.max(0, ...points.map((point) => positiveBoth
+    ? Math.abs(Number(point[positiveKey]) || 0) + Math.abs(Number(point[negativeKey]) || 0)
+    : Math.max(Math.abs(point[positiveKey]), Math.abs(point[negativeKey]))));
+  // 正赔付图用总柱高定标，四个等距区间并给最高柱留余量。
+  const tickSize = Math.max(rawMaxValue * 1.05 / 4, 0.000001);
+  const tickMagnitude = 10 ** Math.floor(Math.log10(tickSize));
+  const tickStep = [1, 2, 2.5, 5, 10].find((step) => step * tickMagnitude >= tickSize) * tickMagnitude;
+  const maxValue = positiveBoth ? tickStep * 4 : Math.max(rawMaxValue, 1);
+  const slot = innerWidth / points.length; const barWidth = Math.max(3, Math.min(26, slot * 0.68));
   const yLabel = formatChartValue(maxValue, 2, unit);
   // 左侧数值列右边界：最左行权价的柱端文字压到数值时向右避让。
   const axisColumnWidth = 6 + Math.max(markerLabelWidth(yLabel, 400), markerLabelWidth(`-${yLabel}`, 400));
   const labelColumnRight = axisOnRight ? 0 : axisColumnWidth + 4;
   // 刻度文字按可用宽度决定数量：桌面宽屏约每 84px 一个，手机上自动减少避免重叠。
   const labelEvery = Math.max(1, Math.ceil(points.length / Math.max(2, Math.floor(innerWidth / 84))));
-  const bars = points.map((point, index) => { const x = pad.left + index * slot + (slot - barWidth) / 2; const positive = Number(point[positiveKey]) || 0; const negative = Number(point[negativeKey]) || 0; const positiveHeight = Math.abs(positive) / maxValue * maxBarHeight; const negativeHeight = Math.abs(negative) / maxValue * maxBarHeight; const label = index % labelEvery === 0 ? `<text class="chart-label" x="${x + barWidth / 2}" y="${height - 8}" text-anchor="middle">${formatMoney(point.strike)}</text>` : ""; return `<rect class="chart-call" x="${x}" y="${baseline - positiveHeight}" width="${barWidth}" height="${positiveHeight}" rx="1"></rect><rect class="chart-put" x="${x}" y="${baseline}" width="${barWidth}" height="${negativeHeight}" rx="1"></rect>${label}`; }).join("");
+  const painLabelCount = Math.min(points.length, Math.max(2, Math.floor(innerWidth / 130) + 1));
+  const painLabelIndices = new Set(Array.from({ length: painLabelCount }, (_, index) => Math.round(index * (points.length - 1) / Math.max(1, painLabelCount - 1))));
+  const bars = points.map((point, index) => {
+    const centerX = pad.left + index * slot + slot / 2;
+    const positive = Number(point[positiveKey]) || 0;
+    const negative = Number(point[negativeKey]) || 0;
+    const positiveHeight = Math.abs(positive) / maxValue * maxBarHeight;
+    const negativeHeight = Math.abs(negative) / maxValue * maxBarHeight;
+    const showLabel = positiveBoth ? painLabelIndices.has(index) : index % labelEvery === 0;
+    const label = showLabel ? `<text class="chart-label" x="${centerX}" y="${positiveBoth ? baseline + 22 : height - 8}" text-anchor="${positiveBoth && index === 0 ? "start" : positiveBoth && index === points.length - 1 ? "end" : "middle"}">${positiveBoth ? formatMoney(point.strike).replace(/\.00$/, "") : formatMoney(point.strike)}</text>` : "";
+    if (positiveBoth) {
+      const stackWidth = Math.min(18, slot * 0.68);
+      const stackX = centerX - stackWidth / 2;
+      return `<rect class="chart-max-pain-put" x="${stackX}" y="${baseline - negativeHeight}" width="${stackWidth}" height="${negativeHeight}"></rect><rect class="chart-max-pain-call" x="${stackX}" y="${baseline - negativeHeight - positiveHeight}" width="${stackWidth}" height="${positiveHeight}"></rect>${label}`;
+    }
+    const x = centerX - barWidth / 2;
+    return `<rect class="chart-call" x="${x}" y="${baseline - positiveHeight}" width="${barWidth}" height="${positiveHeight}" rx="1"></rect><rect class="chart-put" x="${x}" y="${baseline}" width="${barWidth}" height="${negativeHeight}" rx="1"></rect>${label}`;
+  }).join("");
+  const placedPriceLabels = [];
+  const priceMarkers = positiveBoth ? (options.priceMarkers || []).filter((marker) => marker.value != null && Number.isFinite(Number(marker.value))).map((marker) => {
+    const position = strikePosition(points, Number(marker.value));
+    if (position == null) return "";
+    const x = pad.left + position * slot + slot / 2;
+    const label = formatMoney(Number(marker.value)).replace(/\.00$/, "");
+    const halfLabel = markerLabelWidth(label) * 0.7 + 4;
+    const labelX = Math.min(Math.max(x, pad.left + halfLabel), width - pad.right - halfLabel);
+    // 价格靠近时错行显示，两条参考线仍准确落在原价位上。
+    const overlaps = placedPriceLabels.some((previous) => Math.abs(previous.x - labelX) < previous.halfWidth + halfLabel + 8);
+    const labelY = scaleTop - (overlaps ? 6 : 28);
+    placedPriceLabels.push({ x: labelX, halfWidth: halfLabel });
+    return `<line class="${marker.className}" x1="${x}" x2="${x}" y1="${scaleTop}" y2="${baseline}"/><text class="${marker.className}-label chart-price-marker-label" x="${labelX}" y="${labelY}" text-anchor="middle">${label}<title>${marker.label} ${label}</title></text>`;
+  }).join("") : "";
   // 柱端标记：Gamma 图标注看涨墙/看跌墙，成交量与持仓量图标注最高看涨柱/最高看跌柱。
   const markers = (options.markers || []).filter((marker) => marker.point).map((marker) => {
     const index = points.indexOf(marker.point);
@@ -2115,14 +2281,19 @@ function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emp
   // 右轴图表给出参考样式的 5 档刻度（±最大 / ±一半 / 0），Gamma 图保持 3 档。
   const halfTop = (scaleTop + baseline) / 2; const halfBottom = (scaleBottom + baseline) / 2;
   const halfLabel = formatChartValue(maxValue / 2, 2, unit);
-  const axisLabels = axisOnRight
+  const axisLabels = positiveBoth
+    ? Array.from({ length: 5 }, (_, index) => `<text class="chart-label" x="${pad.left - 14}" y="${baseline - maxBarHeight * index / 4 + 4}" text-anchor="end">${index ? formatChartValue(maxValue * index / 4, 2, unit) : "0"}</text>`).join("")
+    : axisOnRight
     ? `<text class="chart-label" x="${width - 6}" y="${scaleTop + 4}" text-anchor="end">${yLabel}</text><text class="chart-label" x="${width - 6}" y="${halfTop + 4}" text-anchor="end">${halfLabel}</text><text class="chart-label" x="${width - 6}" y="${baseline + 4}" text-anchor="end">0</text><text class="chart-label" x="${width - 6}" y="${halfBottom + 4}" text-anchor="end">-${halfLabel}</text><text class="chart-label" x="${width - 6}" y="${scaleBottom + 4}" text-anchor="end">-${yLabel}</text>`
     : `<text class="chart-label" x="4" y="${scaleTop + 4}">${yLabel}</text><text class="chart-label" x="4" y="${baseline + 4}">0</text><text class="chart-label" x="4" y="${scaleBottom + 4}">-${yLabel}</text>`;
-  const gridLines = axisOnRight ? `<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${halfTop}" y2="${halfTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${halfBottom}" y2="${halfBottom}"/>` : "";
+  const gridLines = positiveBoth
+    ? [1, 2, 3].map((index) => `<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline - maxBarHeight * index / 4}" y2="${baseline - maxBarHeight * index / 4}"/>`).join("")
+    : axisOnRight ? `<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${halfTop}" y2="${halfTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${halfBottom}" y2="${halfBottom}"/>` : "";
   // 右轴图表不再画角落方向文字，方向改由图例说明，避免与右侧数值列抢位。
-  const cornerLabels = axisOnRight ? "" : `<text class="chart-label" x="${width - 12}" y="${pad.top + 10}" text-anchor="end">看涨 ↑</text><text class="chart-label" x="${width - 12}" y="${height - pad.bottom - 3}" text-anchor="end">看跌 ↓</text>`;
+  const cornerLabels = axisOnRight || positiveBoth ? "" : `<text class="chart-label" x="${width - 12}" y="${pad.top + 10}" text-anchor="end">看涨 ↑</text><text class="chart-label" x="${width - 12}" y="${height - pad.bottom - 3}" text-anchor="end">看跌 ↓</text>`;
+  const axisTitle = positiveBoth ? `<text class="chart-label chart-axis-title" x="${width - pad.right}" y="${height - 4}" text-anchor="end">（行权价）</text>` : "";
   const tagElements = options.crosshairTags ? `<line class="chart-crosshair-h" x1="${pad.left}" x2="${width - pad.right}" y1="0" y2="0" visibility="hidden"/><g class="chart-tag chart-tag-x" visibility="hidden"><rect rx="2" height="16" width="0"/><text></text></g><g class="chart-tag chart-tag-y" visibility="hidden"><rect rx="2" height="16" width="0"/><text></text></g>` : "";
-  const svg = `<svg viewBox="0 0 ${width} ${height}" role="img" tabindex="0" aria-label="${target.getAttribute("aria-label") || "期权分布图"}">${gridLines}<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleTop}" y2="${scaleTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleBottom}" y2="${scaleBottom}"/><line class="chart-zero" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/>${axisLabels}${gammaFlipMarker}${bars}${markers}<line class="chart-crosshair" x1="0" x2="0" y1="${pad.top}" y2="${height - pad.bottom}" visibility="hidden"/>${tagElements}${cornerLabels}</svg><div class="chart-tooltip" hidden></div>`; target.innerHTML = svg;
+  const svg = `<svg viewBox="0 0 ${width} ${height}" role="img" tabindex="0" aria-label="${options.ariaLabel || target.getAttribute("aria-label") || "期权分布图"}">${gridLines}<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleTop}" y2="${scaleTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/>${positiveBoth ? "" : `<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleBottom}" y2="${scaleBottom}"/>`}<line class="chart-zero" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/>${axisLabels}${gammaFlipMarker}${bars}${priceMarkers}${markers}<line class="chart-crosshair" x1="0" x2="0" y1="${pad.top}" y2="${height - pad.bottom}" visibility="hidden"/>${tagElements}${cornerLabels}${axisTitle}</svg><div class="chart-tooltip" hidden></div>`; target.innerHTML = svg;
 
   const chartSvg = target.querySelector("svg");
   const crosshair = target.querySelector(".chart-crosshair");
@@ -2193,7 +2364,7 @@ function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emp
     if (!point) return;
     const positive = Number(point[positiveKey]) || 0;
     const negative = Number(point[negativeKey]) || 0;
-    const isGamma = targetId === "gex-chart";
+    const isGamma = targetId === "gex-chart" && !positiveBoth;
     const net = isGamma ? positive + negative : positive - negative;
     const valueLabel = isGamma ? " GEX" : (options.valueLabel || "");
     const rows = [
@@ -2203,6 +2374,9 @@ function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emp
     if (isGamma) {
       rows.push(`<div class="chart-tooltip-row"><span><i class="tooltip-dot net"></i>净 GEX</span><strong>${formatChartValue(net, 2, unit)}</strong></div>`);
       if (options.spot != null) rows.unshift(`<div class="chart-tooltip-sub">行情价 ${formatMoney(options.spot)}</div>`);
+    } else if (positiveBoth) {
+      rows.push(`<div class="chart-tooltip-row"><span><i class="tooltip-dot net"></i>总${options.valueLabel || "数值"}</span><strong>${formatChartValue(Math.abs(positive) + Math.abs(negative), 2, unit)}</strong></div>`);
+      if (options.spot != null) rows.unshift(`<div class="chart-tooltip-sub">当前价格 ${formatMoney(options.spot)}</div>`);
     } else if (options.valueLabel) {
       rows.push(`<div class="chart-tooltip-row"><span><i class="tooltip-dot net"></i>总${options.valueLabel}</span><strong>${formatChartValue(Math.abs(positive) + Math.abs(negative), 2, unit)}</strong></div>`);
     }
@@ -2259,7 +2433,6 @@ function renderStrikeGexProfile(targetId, points, options = {}) {
   const target = document.getElementById(targetId);
   if (!target) return;
   const currentPoints = points || [];
-  const history = options.history || [];
   const hasGex = currentPoints.some((point) => point.callGex || point.putGex || point.callVolumeGex || point.putVolumeGex);
   if (!currentPoints.length || !hasGex) {
     target.innerHTML = "";
@@ -2272,16 +2445,10 @@ function renderStrikeGexProfile(targetId, points, options = {}) {
   }
 
   const { width } = chartContentBox(target);
-  const rowHeight = 28;
+  const rowHeight = 26;
   const footerHeight = 42;
   const currentByStrike = new Map(currentPoints.map((point) => [point.strike, point]));
-  const profileByStrike = new Map(currentPoints.map((point) => [point.strike, point]));
-  history.forEach((sample) => {
-    (sample.points || []).forEach((point) => {
-      if (!profileByStrike.has(point.strike)) profileByStrike.set(point.strike, null);
-    });
-  });
-  const allStrikes = [...profileByStrike.keys()].sort((left, right) => right - left);
+  const allStrikes = [...currentByStrike.keys()].sort((left, right) => right - left);
   const nearestStrikeIndex = (value, strikeList = allStrikes) => {
     const targetStrike = Number(value);
     if (!Number.isFinite(targetStrike) || !strikeList.length) return -1;
@@ -2304,7 +2471,6 @@ function renderStrikeGexProfile(targetId, points, options = {}) {
   const maxDataValue = Math.max(
     0.000001,
     ...currentPoints.filter((point) => visibleStrikes.has(point.strike)).flatMap((point) => [point.callGex, point.putGex, point.callVolumeGex, point.putVolumeGex].map((value) => Math.abs(Number(value) || 0))),
-    ...history.flatMap((sample) => (sample.points || []).filter((point) => visibleStrikes.has(point.strike)).map((point) => Math.abs(Number(point.value) || 0))),
   );
   const rawMaximumBillions = maxDataValue / 1000;
   const magnitude = 10 ** Math.floor(Math.log10(rawMaximumBillions));
@@ -2335,29 +2501,19 @@ function renderStrikeGexProfile(targetId, points, options = {}) {
   const bars = strikes.map((strike, index) => {
     const point = currentByStrike.get(strike);
     if (!point) return "";
-    const y = index * rowHeight;
+    const centerY = index * rowHeight + rowHeight / 2;
     const callOpenInterest = Number(point.callGex) || 0;
     const putOpenInterest = Number(point.putGex) || 0;
     const callVolume = Number(point.callVolumeGex) || 0;
     const putVolume = Number(point.putVolumeGex) || 0;
     const title = `行权价 ${formatMoney(strike)} · 看涨持仓量 GEX ${formatChartValue(callOpenInterest, 2, "M")} · 看跌持仓量 GEX ${formatChartValue(putOpenInterest, 2, "M")} · 看涨成交量 GEX ${formatChartValue(callVolume, 2, "M")} · 看跌成交量 GEX ${formatChartValue(putVolume, 2, "M")}`;
-    const rect = (value, rowY, className, label) => {
+    const rect = (value, className, label) => {
       const x = value < 0 ? xOf(value) : zeroX;
-      return `<rect class="${className}" x="${x}" y="${rowY}" width="${barLength(value)}" height="7" rx="1"><title>${label}</title></rect>`;
+      return `<rect class="${className}" x="${x}" y="${centerY - 3}" width="${barLength(value)}" height="6" rx="1"><title>${label}</title></rect>`;
     };
-    return `${rect(callOpenInterest, y + 3, "chain-profile-oi-positive", title)}${rect(putOpenInterest, y + 3, "chain-profile-oi-negative", title)}${rect(callVolume, y + 13, "chain-profile-volume-positive", title)}${rect(putVolume, y + 13, "chain-profile-volume-negative", title)}`;
+    // 同侧指标共用行中心和6px厚度，深色持仓量覆盖亮色成交量。
+    return `${rect(callVolume, "chain-profile-volume-positive", title)}${rect(putVolume, "chain-profile-volume-negative", title)}${rect(callOpenInterest, "chain-profile-oi-positive", title)}${rect(putOpenInterest, "chain-profile-oi-negative", title)}`;
   }).join("");
-  const historyDots = history.map((sample, sampleIndex) => (sample.points || []).map((point) => {
-    const index = strikes.indexOf(point.strike);
-    const value = Number(point.value);
-    if (index < 0 || !Number.isFinite(value)) return "";
-    const title = `${sample.label} · 行权价 ${formatMoney(point.strike)} · 净持仓量 GEX ${formatChartValue(value, 2, "M")}`;
-    const markerClass = `chain-profile-history-${sampleIndex}`;
-    const markerX = xOf(value);
-    const markerY = index * rowHeight + rowHeight / 2 + (sampleIndex - (history.length - 1) / 2) * 5;
-    const markerTitle = `<title>${title}</title>`;
-    return `<circle class="${markerClass}" cx="${markerX}" cy="${markerY}" r="2.8">${markerTitle}</circle>`;
-  }).join("")).join("");
   const gridLines = Array.from({ length: 7 }, (_, index) => {
     const tick = (index - 3) / 3 * axisMaximum;
     const x = xOf(tick);
@@ -2366,7 +2522,7 @@ function renderStrikeGexProfile(targetId, points, options = {}) {
   }).join("");
   const rowLines = strikes.map((strike, index) => {
     const y = index * rowHeight;
-    return `<line class="chain-profile-row" x1="0" x2="${width}" y1="${y + rowHeight - 1}" y2="${y + rowHeight - 1}"/><text class="chain-profile-strike" x="${strikeLabelX}" y="${y + 17}" text-anchor="end">${formatMoney(strike)}</text>`;
+    return `<line class="chain-profile-row" x1="0" x2="${width}" y1="${y + rowHeight - 1}" y2="${y + rowHeight - 1}"/><text class="chain-profile-strike" x="${strikeLabelX}" y="${y + rowHeight / 2 + 4}" text-anchor="end">${formatMoney(strike)}</text>`;
   }).join("");
   const plotDivider = `<line class="chain-profile-label-divider" x1="${plotLeft}" x2="${plotLeft}" y1="0" y2="${strikes.length * rowHeight}"/>`;
   const currentLegend = [
@@ -2381,9 +2537,8 @@ function renderStrikeGexProfile(targetId, points, options = {}) {
     { className: "chain-profile-positive-key", label: "主要正伽马" },
     { className: "chain-profile-negative-key", label: "主要负伽马" },
   ];
-  const legendGroup = (label, items) => `<section class="chain-profile-legend-group"><h3>${label}</h3><div class="chain-profile-legend-items">${items.map((item) => `<span class="chain-profile-legend-item"><i class="${item.className}${item.marker ? " chain-profile-legend-dot" : ""}"></i>${item.label}</span>`).join("")}</div></section>`;
+  const legendGroup = (label, items) => `<section class="chain-profile-legend-group"><h3>${label}</h3><div class="chain-profile-legend-items">${items.map((item) => `<span class="chain-profile-legend-item"><i class="${item.className}"></i>${item.label}</span>`).join("")}</div></section>`;
   const legendItems = [
-    legendGroup("历史快照", history.map((sample, index) => ({ className: `chain-profile-history-${index}`, label: sample.label, marker: true }))),
     legendGroup("关键价位", levelLegend),
     legendGroup("当前伽马敞口", currentLegend),
   ].join("");
@@ -2398,7 +2553,7 @@ function renderStrikeGexProfile(targetId, points, options = {}) {
   const axisFooter = `<svg class="chain-profile-axis-footer" viewBox="0 0 ${width} ${footerHeight}" width="100%" height="${footerHeight}" aria-hidden="true"><line class="chain-profile-axis-baseline" x1="${plotLeft}" x2="${plotRight}" y1="1" y2="1"/>${axisLabels}<text class="chain-profile-axis-title" x="${zeroX}" y="36" text-anchor="middle">伽马敞口（十亿美元）</text></svg>`;
   const scrollKey = String(options.scrollKey || "");
   target.dataset.chartWidth = String(width);
-  target.innerHTML = `<div class="chain-profile-axis-header"><h2 class="chain-profile-chart-title"></h2><div class="chain-profile-legend">${legendItems}</div></div><svg class="chain-profile-svg" viewBox="0 0 ${width} ${strikes.length * rowHeight}" width="100%" height="${strikes.length * rowHeight}" role="img" aria-label="按行权价显示的 GEX 分布图" tabindex="0">${gridLines}${referenceLines}${bars}${historyDots}${rowLines}${plotDivider}</svg>${axisFooter}`;
+  target.innerHTML = `<div class="chain-profile-axis-header"><h2 class="chain-profile-chart-title"></h2><div class="chain-profile-legend">${legendItems}</div></div><svg class="chain-profile-svg" viewBox="0 0 ${width} ${strikes.length * rowHeight}" width="100%" height="${strikes.length * rowHeight}" role="img" aria-label="按行权价显示的 GEX 分布图" tabindex="0">${gridLines}${referenceLines}${bars}${rowLines}${plotDivider}</svg>${axisFooter}`;
   target.querySelector(".chain-profile-chart-title").textContent = options.title || "按行权价伽马敞口";
   const headerHeight = target.querySelector(".chain-profile-axis-header")?.offsetHeight || 42;
   target.dataset.chartHeight = String(headerHeight + strikes.length * rowHeight + footerHeight);
@@ -2621,7 +2776,7 @@ function renderChartSkeleton(targetId, options = {}) {
   const cornerLabels = options.corners === "levels"
     ? `<text class="chart-label" x="${width - 12}" y="${pad.top + 10}" text-anchor="end">压力 ↑</text><text class="chart-label" x="${width - 12}" y="${height - pad.bottom - 3}" text-anchor="end">支撑 ↓</text>`
     : (axisOnRight ? "" : `<text class="chart-label" x="${width - 12}" y="${pad.top + 10}" text-anchor="end">看涨 ↑</text><text class="chart-label" x="${width - 12}" y="${height - pad.bottom - 3}" text-anchor="end">看跌 ↓</text>`);
-  const label = target.getAttribute("aria-label") || "图表";
+  const label = options.ariaLabel || target.getAttribute("aria-label") || "图表";
   target.innerHTML = `<svg data-skeleton="1" viewBox="0 0 ${width} ${height}" role="img" aria-label="${label}">${gridLines}<line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleTop}" y2="${scaleTop}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/><line class="chart-grid" x1="${pad.left}" x2="${width - pad.right}" y1="${scaleBottom}" y2="${scaleBottom}"/><line class="chart-zero" x1="${pad.left}" x2="${width - pad.right}" y1="${baseline}" y2="${baseline}"/>${axisLabels}${strikes}${cornerLabels}</svg>`;
 }
 
