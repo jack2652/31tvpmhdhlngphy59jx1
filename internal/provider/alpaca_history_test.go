@@ -14,6 +14,8 @@ import (
 func TestAlpacaFetchIntradayUsesHistoricalBarsPaginationAndCache(t *testing.T) {
 	const key, secret = "test-key", "test-secret"
 	now := time.Date(2026, 10, 23, 20, 0, 0, 0, time.UTC)
+	backfillStart := now.AddDate(0, -6, 0)
+	wantStart := backfillStart
 	var requests atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != alpacaHistoricalBarsPath {
@@ -28,7 +30,7 @@ func TestAlpacaFetchIntradayUsesHistoricalBarsPaginationAndCache(t *testing.T) {
 		query := r.URL.Query()
 		for name, want := range map[string]string{
 			"symbols": "AAPL", "timeframe": "15Min", "feed": "iex", "adjustment": "raw",
-			"limit": "10000", "sort": "asc", "start": now.AddDate(0, -6, 0).UTC().Format(time.RFC3339Nano),
+			"limit": "10000", "sort": "asc", "start": wantStart.UTC().Format(time.RFC3339Nano),
 			"end": now.UTC().Format(time.RFC3339Nano),
 		} {
 			if got := query.Get(name); got != want {
@@ -66,12 +68,27 @@ func TestAlpacaFetchIntradayUsesHistoricalBarsPaginationAndCache(t *testing.T) {
 	if requests.Load() != 2 {
 		t.Fatalf("requests after cached read = %d, want 2", requests.Load())
 	}
-	now = now.Add(24*time.Hour + time.Minute)
-	if _, err := client.FetchIntraday(context.Background(), "AAPL", "15m"); err != nil {
+	now = now.Add(35 * time.Second)
+	// 最近一周重取不能丢失较早历史；每日完整重取仍以供应商最新版本为准。
+	seed := client.historyCache["AAPL:15m"]
+	seed.result.Bars = append([]map[string]any{{"date": "2026-09-22 09:30", "open": 90.0, "high": 92.0, "low": 89.0, "close": 91.0, "volume": int64(50)}}, result.Bars...)
+	client.historyCache["AAPL:15m"] = seed
+	wantStart = now.AddDate(0, 0, -7)
+	updated, err := client.FetchIntraday(context.Background(), "AAPL", "15m")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if requests.Load() != 4 {
 		t.Fatalf("requests after cache expiration = %d, want 4", requests.Load())
+	}
+	if len(updated.Bars) != 3 || updated.Bars[0]["date"] != "2026-09-22 09:30" || updated.Source != "alpaca-iex" {
+		t.Fatalf("盘中增量丢失长历史：%+v", updated)
+	}
+	now = now.Add(24 * time.Hour)
+	wantStart = now.AddDate(0, -6, 0)
+	updated, err = client.FetchIntraday(context.Background(), "AAPL", "15m")
+	if err != nil || requests.Load() != 6 || len(updated.Bars) != 2 {
+		t.Fatalf("每日完整历史没有重取：requests=%d err=%v", requests.Load(), err)
 	}
 }
 

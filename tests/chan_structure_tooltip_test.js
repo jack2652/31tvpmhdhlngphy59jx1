@@ -30,4 +30,26 @@ assert.match(forming.body, /形成时间未知 · 尚未确认/);
 assert.match(forming.body, /规则 strict-old-bi-v3/);
 assert.equal(window.OptionScopeCharts.chanStructureTooltipDetails(null), null);
 
+// 2026-11-23，Codex：预警详情须显示真实状态和观察/确认时间。
+const warning = window.OptionScopeCharts.chanStructureTooltipDetails({
+  type: "反弹承压", signalTarget: true, signalStatus: "已失效", signalPhase: "已失效", confirmed: false,
+  start: "2026-10-06", endPrice: 146.4, invalidationPrice: 146.4, formedAt: "2026-10-08", confirmedAt: "2026-10-22",
+});
+assert.equal(warning.title, "反弹承压 · 已失效");
+assert.match(warning.body, /可观察 2026-10-08 · 确认 2026-10-22/);
+const unconfirmedWarning = window.OptionScopeCharts.chanStructureTooltipDetails({
+  type: "底背驰预警", signalStatus: "已失效", formedAt: "2026-10-26", confirmedAt: "",
+});
+assert.match(unconfirmedWarning.body, /确认 未确认/);
+assert.doesNotMatch(unconfirmedWarning.title, /形成中/);
+// 日期：2026-11-23；执行者：Codex。独立早风险详情保留实际观察日和固定保护价。
+const earlyWarning = window.OptionScopeCharts.chanStructureTooltipDetails({
+  key: "early", type: "顶部早预警", signalStatus: "收盘失守预警保护价", start: "2026-10-07",
+  formedAt: "2026-10-07", confirmedAt: "", pivotDate: "2026-10-06", endPrice: 762.86,
+  protectionPrice: 751.75, invalidationPrice: 762.86,
+});
+assert.match(earlyWarning.title, /顶部早预警.*收盘失守/);
+assert.match(earlyWarning.body, /可观察 2026-10-07 · 确认 未确认/);
+assert.match(earlyWarning.body, /预警保护价 751.75 · 参考顶部日期 2026-10-06/);
+
 console.log("Chan structure tooltip detail checks passed");

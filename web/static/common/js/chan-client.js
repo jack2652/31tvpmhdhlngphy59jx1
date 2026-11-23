@@ -402,15 +402,28 @@
     class2_buy: "二买", class2_sell: "二卖",
     class3_buy: "三买", class3_sell: "三卖",
   };
+  const v4WarningLabels = {
+    center_divergence_buy: "底背驰预警", center_divergence_sell: "顶背驰预警",
+    rebound_failure_sell: "反弹承压", pullback_hold_buy: "回踩支撑",
+    early_top_sell: "顶部早预警", early_rebound_sell: "反弹早预警",
+  };
+  const isStructureWarning = (signal) => Boolean(v4WarningLabels[signal.kind]);
+  const displayStructureSignals = (frame) => [...(frame?.signals_v4 || []), ...(frame?.structure_warnings_v4 || []), ...(frame?.early_risk_warnings_v4 || [])];
+  // 主图恢复严格买卖点与结构预警；早期风险仍保留在完整详情和持仓提示中。
+  const chartStructureSignals = (frame) => [...(frame?.signals_v4 || []), ...(frame?.structure_warnings_v4 || [])];
   const v4PhaseLabels = {
-    observation: "观察中", divergence_confirmed: "背驰已确认", reversal_confirmed: "反向结构已确认",
+    observation: "观察中", divergence_confirmed: "背驰已确认", reversal_confirmed: "反向结构已确认", warning_confirmed: "预警结构已确认",
     first_retest: "首次回试", awaiting_first_retest: "等待首次回试", class2_confirmed: "二类点已确认",
     class3_confirmed: "三类点已确认", awaiting_lower_level: "等待下级别确认", awaiting_class1_confirmation: "等待一类点确认", invalidated: "已失效",
     awaiting_reversal: "等待反向确认", awaiting_retest: "等待回试",
+    risk_triggered: "收盘失守预警保护价",
   };
   const v4StatusLabels = {
     awaiting_lower_level: "等待下级别确认", awaiting_class1_confirmation: "等待一类点确认", observing: "观察中", candidate: "候选",
     confirmed: "已确认", invalidated: "已失效", unfiltered: "未过滤", unconfirmed: "未确认",
+    divergence_confirmed: "背驰已确认", reversal_confirmed: "反向结构已确认",
+    warning_confirmed: "预警结构已确认",
+    risk_triggered: "收盘失守预警保护价",
     awaiting_reversal: "等待反向确认", awaiting_retest: "等待回试",
   };
   const v4MarketFilterLabels = {
@@ -432,9 +445,11 @@
     awaiting_class1_confirmation: "等待一类点确认",
     awaiting_lower_timeframe: "等待下级周期数据", awaiting_confirmation: "等待下级周期走势确认",
     incompatible_price_basis: "上下级价格基准不一致", not_applicable: "没有更低周期",
+    not_required: "本级独立预警",
   };
   function timeframeConfirmationLabel(confirmation) {
     if (!confirmation) return "跨周期确认：未提供";
+    if (confirmation.status === "not_required") return "本级结构预警：确认仅指当前周期的预警结构";
     const state = v4LowerLevelLabels[confirmation.status] || confirmation.status || "状态未知";
     const path = confirmation.lower_timeframe ? `${confirmation.higher_timeframe || "当前周期"} → ${confirmation.lower_timeframe}` : confirmation.higher_timeframe || "当前周期";
     return `跨周期确认 ${path}：${state}${confirmation.confirmed_at ? ` · ${confirmation.confirmed_at}` : ""}${confirmation.reason ? ` · ${confirmation.reason}` : ""}`;
@@ -446,7 +461,7 @@
     const path = [mapping.lower_timeframe, mapping.higher_timeframe].filter(Boolean).map((value) => periods[value] || value).join(" ← ") || "无相邻周期";
     return `关联周期 ${path} · ${state}`;
   }
-  function v4SignalLabel(kind) { return v4ClassLabels[kind] || kind || "递归买卖点"; }
+  function v4SignalLabel(kind) { return v4ClassLabels[kind] || v4WarningLabels[kind] || kind || "递归买卖点"; }
   function placeOverlaySignalLabels(signals, recursiveSignals, legacySignals, chart) {
     if (!signals?.length) return [];
     const gap = 4;
@@ -579,6 +594,7 @@
       `${v4SignalLabel(signal.kind)} · L${Number(signal.level ?? 0)} · ${v4StatusLabels[signal.status] || signal.status || "状态未知"} · ${v4PhaseLabels[signal.phase] || signal.phase || "阶段未知"}`,
       `标的 ${signal.symbol || "未知"}`,
       `结构日期 ${signal.date || "未知"} · 可观察 ${signal.observed_at || "未知"} · 确认 ${signal.confirmed_at || "未确认"}`,
+      signal.protection_price != null ? `参考顶部 ${signal.pivot_date || "未知"} · ${money(signal.price)}；预警保护价 ${money(signal.protection_price)}；标记位于实际观察日` : "",
       (signal.conditions || []).length ? `规则证据：${signal.conditions.join("；")}` : "规则证据：暂无",
       (signal.missing_conditions || []).length ? `待满足：${signal.missing_conditions.join("；")}` : "待满足：无",
       `市场环境：${marketEnvironmentLabel(signal.market_environment)}（${v4MarketFilterLabels[signal.market_filter] || signal.market_filter || "未过滤"}）`,
@@ -609,8 +625,25 @@
         .map(structureReferenceLabel),
     };
   }
-  const buyKinds = new Set(["class1_buy", "class2_buy", "class3_buy", "bottom_reversal_candidate"]);
-  const sellKinds = new Set(["class1_sell", "class2_sell", "class3_sell", "top_exit_candidate"]);
+  const buyKinds = new Set(["class1_buy", "class2_buy", "class3_buy", "bottom_reversal_candidate", "center_divergence_buy", "pullback_hold_buy"]);
+  const sellKinds = new Set(["class1_sell", "class2_sell", "class3_sell", "top_exit_candidate", "center_divergence_sell", "rebound_failure_sell", "early_top_sell", "early_rebound_sell"]);
+
+  // 风险保护价独立于新仓低点，首次触及后保留事件，报价反弹不能抹去提醒。
+  function withEarlyRisk(frame, spot, observed = null, quote = null) {
+    if (!frame) return frame;
+    const risks = (frame.early_risk_warnings_v4 || []).filter((risk) => risk.status !== "invalidated" && Number(risk.protection_price) > 0);
+    const latest = risks.slice().sort((a, b) => a.observed_at.localeCompare(b.observed_at)).at(-1);
+    if (!latest) return { ...frame, early_risk: null };
+    const prior = observed?.early_risk || frame.early_risk;
+    const state = prior?.signal_id === latest.signal_id && prior.boundary === latest.protection_price
+      ? { ...prior } : { signal_id: latest.signal_id, boundary: latest.protection_price, observed_at: latest.observed_at, touched: false, touched_at: "" };
+    const touchedBar = (frame.candles || []).find((bar) => bar.date > latest.observed_at && bar.low <= state.boundary);
+    if (!state.touched && (touchedBar || Number.isFinite(spot) && spot > 0 && spot <= state.boundary)) {
+      state.touched = true;
+      state.touched_at = touchedBar?.date || quoteEasternDate(quote) || "页面行情更新时";
+    }
+    return { ...frame, early_risk: state };
+  }
 
   // Keep the protection observed for this continuous pen chain through
   // quote recovery and a history refresh. A lower new low cannot move it down.
@@ -1118,7 +1151,12 @@
     const supportCacheKey = supportLevels.map((level) => [level.key, level.zoneLow, level.zoneHigh, level.kind, level.lineAlpha, level.confirmedAt, level.brokenAt, level.lastCloseDate, level.sources].join(":")).join("|");
     const resistanceLevels = layers?.supportResistance === false ? [] : resistanceZoneLevels(frame, priceLevelCutoff, priceLevelHistory);
     const resistanceCacheKey = resistanceLevels.map((level) => [level.key, level.zoneLow, level.zoneHigh, level.confirmedAt, level.testCount, level.kind, level.historicalTestCount, level.historicalBrokenAt].join(":")).join("|");
-    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${ruleVersion || ""}-${supportCacheKey}-${resistanceCacheKey}`;
+    // 行情数组未变时，信号状态或预警数组仍可能更新；不能复用上一阶段的标签与详情。
+    const signalCacheKey = JSON.stringify(displayStructureSignals(frame).map((signal) => [signal.signal_id,
+      signal.source_kind, signal.level, signal.kind, signal.side, signal.status, signal.phase, signal.phase_at,
+      signal.date, signal.observed_at, signal.confirmed_at, signal.pivot_date, signal.price,
+      signal.invalidation_price, signal.protection_price, signal.structure_refs, signal.rule_version]));
+    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${ruleVersion || ""}-${supportCacheKey}-${resistanceCacheKey}-${signalCacheKey}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
@@ -1246,7 +1284,7 @@
     const allSegments = recursiveLevels.length ? recursiveLevels.flatMap((level) => level.segments || []) : (frame.segments || []);
     const visibleSegments = allSegments
       .filter((segment) => segment.end >= firstDate && segment.start <= lastDate);
-    const visibleV4Signals = (frame.signals_v4 || []).filter((signal) => signal.date >= firstDate && signal.date <= lastDate);
+    const visibleV4Signals = chartStructureSignals(frame).filter((signal) => signal.date >= firstDate && signal.date <= lastDate);
     const selectedStrokes = layers?.pens === true ? visibleStrokes : [];
     const selectedSegments = visibleSegments.filter((segment) => isSegmentLevelVisible(layers, segment.level));
     const selectedRecursiveCenters = visibleRecursiveCenters.filter((center) => isRecursiveCenterLevelVisible(layers, center.level));
@@ -1296,7 +1334,7 @@
     const wyckoffSnapshotIndex = Math.min(dataEndIndex - 1, sourceCandles.length - 1);
     const wyckoffWindowSnapshot = wyckoffResult?.snapshots?.[wyckoffSnapshotIndex] || null;
     const legacyRule = "strict-old-bi-v3";
-    const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.23";
+    const recursiveRule = ruleVersion || frame.signals_v4?.[0]?.rule_version || "chan-recursive-v4-preview.25";
     let minimum = Infinity, maximum = -Infinity;
     bars.forEach((bar) => { minimum = Math.min(minimum, bar.low); maximum = Math.max(maximum, bar.high); });
     selectedStrokes.forEach((stroke) => {
@@ -1718,14 +1756,16 @@
     const signalLayouts = selectedV4Signals.filter((signal) => Number.isFinite(Number(signal.price)) && Number(signal.price) > 0).map((signal, index) => {
       const date = signal.date, price = Number(signal.price);
       const labelText = v4SignalLabel(signal.kind), invalidated = signal.status === "invalidated";
+      const structurallyConfirmed = !invalidated && (signal.status === "confirmed"
+        || ["divergence_confirmed", "reversal_confirmed", "warning_confirmed"].includes(signal.status) && Boolean(signal.confirmed_at));
       const xPosition = x(dateIndex(date)), yPosition = y(price);
       const side = signal.side === "buy" ? "buy" : "sell";
       const endpoint = points.find((point) => point.date === date && point.kind === (side === "buy" ? "bottom" : "top"));
       const endpointKind = endpoint?.kind || (side === "buy" ? "bottom" : "top");
       const markerY = yPosition + (endpointKind === "top" ? -8 : 8);
       const labelOffset = endpointKind === "top" ? -30 : 35;
-      const status = invalidated ? "" : signal.status === "confirmed" ? "✓" : "?";
       const label = invalidated ? labelText + " · 已失效" : labelText;
+      const status = invalidated ? "" : structurallyConfirmed ? "✓" : "?";
       const visibleLabel = label + status;
       const labelKey = `${date}\u0000${visibleLabel}`;
       const labelVisible = !seenSignalLabels.has(labelKey);
@@ -1742,7 +1782,7 @@
       let labelY = yPosition + labelOffset;
       if (labelY < labelTop || labelY > labelBottom) labelY = yPosition - labelOffset;
       labelY = Math.max(labelTop, Math.min(labelBottom, labelY));
-      return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, labelVisible, side, status: signal.status, invalidated, label, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, start: date, end: date, startPrice: price, endPrice: price, confirmed: signal.status === "confirmed", formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || signal.phase_at, composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
+      return { key: String(signal.level) + "-" + signal.kind + "-" + date + "-" + index, signal, signalTarget: true, type: labelText, x: xPosition, y: yPosition, x1: xPosition, y1: yPosition, x2: xPosition, y2: yPosition, markerY, labelX, labelY, hitLabelWidth: labelHalfWidth * 2, labelVisible, side, status: signal.status, invalidated, label, signalStatus: v4StatusLabels[signal.status] || signal.status || "状态未知", signalPhase: v4PhaseLabels[signal.phase] || "", invalidationPrice: signal.invalidation_price, protectionPrice: signal.protection_price, pivotDate: signal.pivot_date, start: date, end: date, startPrice: price, endPrice: price, confirmed: structurallyConfirmed, formedAt: signal.observed_at || date, confirmedAt: signal.confirmed_at || "", composition: v4SignalEvidence(signal), ruleVersion: signal.rule_version || recursiveRule };
     });
     const afSignalLayouts = visibleAFSignals.map((signal, index) => {
       const price = Number(signal.price), markerPrice = Number(signal.markerPrice ?? signal.price);
@@ -1838,9 +1878,7 @@
         x1: x(dateIndex(segment.start)), y1: y(segment.start_price), x2: x(dateIndex(segment.end)), y2: y(segment.end_price),
         title: (Number(segment.level) === 0 ? "基础线段" : "第" + (Number(segment.level) + 1) + "层走势类型") + (segment.trend_kind ? " · " + segment.trend_kind : segment.direction ? (segment.direction === "up" ? "向上" : "向下") : "") + " · " + displayBarTime(segment.start, frame.period) + " " + money(segment.start_price) + " → " + displayBarTime(segment.end, frame.period) + " " + money(segment.end_price) + " · " + (segment.confirmed ? "确认于 " + displayBarTime(segment.confirmed_at, frame.period) : "形成中"),
       })),
-      signals: signalLayouts.map(({ signal: _signal, key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, labelVisible, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice }) => ({
-        key, type, x: signalX, y: signalY, markerY, labelX, labelY, hitLabelWidth, labelVisible, side, status, invalidated, label, signalStatus, signalPhase, invalidationPrice, start, endPrice,
-      })),
+      signals: signalLayouts.map(({ signal: _signal, ...layout }) => layout),
       afSignals: afSignalLayouts,
       trendlines: trendlineLayouts,
       turtleChannels: turtleChannelLayouts,
@@ -1858,8 +1896,8 @@
       // Count only signals that can actually be drawn. The visible signal list
       // is intentionally limited to the current chart window so panning does
       // not pull off-screen markers onto the plot edge.
-      totalSignalCount: (frame.signals_v4 || []).length,
-      totalPlottableSignalCount: (frame.signals_v4 || []).filter((signal) => {
+      totalSignalCount: chartStructureSignals(frame).length,
+      totalPlottableSignalCount: chartStructureSignals(frame).filter((signal) => {
         const price = Number(signal.price);
         return signal.date && Number.isFinite(price) && price > 0;
       }).length,
@@ -2210,7 +2248,9 @@
     const invalidatedSignals = allSignals.filter((signal) => signal.status === "invalidated");
     const readiness = recursiveReadinessReason(frame) || (levels.length ? "多级结构已计算。" : "当前周期还没有可用的结构。");
     const plottableSignals = activeSignals.filter((signal) => Number.isFinite(Number(signal.price)) && Number(signal.price) > 0);
-    const emptySignalNotice = plottableSignals.length ? "" : readiness;
+    const warnings = frame?.structure_warnings_v4 || [];
+    const activeWarnings = warnings.filter((signal) => signal.status !== "invalidated");
+    const emptySignalNotice = plottableSignals.length || activeWarnings.some((signal) => Number(signal.price) > 0) ? "" : readiness;
     const heading = activeSignals.length ? `有 ${activeSignals.length} 条递归买卖点`
       : invalidatedSignals.length ? `${invalidatedSignals.length} 条候选已失效`
       : closedCenters.length ? "中枢已闭合，等待信号条件"
@@ -2243,7 +2283,7 @@
         waitingFor: level.waiting_for || "",
       };
     });
-    const signalCards = allSignals.map((signal, index) => ({
+    const signalCards = displayStructureSignals(frame).map((signal, index) => ({
       key: `recursive-${signal.signal_id || signal.kind}-${index}` ,
       label: v4SignalLabel(signal.kind), level: (Number(signal.level) || 0) + 1, side: signal.side,
       status: v4StatusLabels[signal.status] || signal.status || "状态未知",
@@ -2253,7 +2293,7 @@
       invalidation: signal.invalidation_price == null ? "失效边界未知" : `失效边界 ${money(signal.invalidation_price)}`,
     }));
     return {
-      heading, readiness, emptySignalNotice, trend: recursiveTrendLabels[frame?.trend_state_v4] || "趋势待确认",
+      heading, readiness: readiness + (warnings.length ? ` 另列 ${warnings.length} 条独立结构预警，其中 ${activeWarnings.length} 条尚未失效；不计入一二三类点。` : "") + (frame?.early_risk_warnings_v4?.length ? ` 另有 ${frame.early_risk_warnings_v4.length} 条顶部早预警，详情记录实际观察日。` : ""), emptySignalNotice, trend: recursiveTrendLabels[frame?.trend_state_v4] || "趋势待确认",
       quality: qualityStatus, qualityCode: quality.status || "unknown",
       qualityClass: quality.status === "ok" ? "good" : quality.status === "partial" ? "partial" : quality.status === "degraded" ? "degraded" : "unknown", priceBasis,
       acceptedBars: quality.accepted_bars ?? frame?.bar_count ?? 0,
@@ -2397,7 +2437,7 @@
       ratioLabel: signal.strength_ratio == null ? "" : `同向 MACD 面积比 ${(signal.strength_ratio * 100).toFixed(0)}%`,
       evidenceLabel: signal.detail || "",
     }));
-    const recursiveSignals = (frame.signals_v4 || []).map((signal, index) => ({ ...signal, key: `v4-${signal.signal_id || signal.kind}-${index}`,
+    const recursiveSignals = displayStructureSignals(frame).map((signal, index) => ({ ...signal, key: `v4-${signal.signal_id || signal.kind}-${index}`,
       label: v4SignalLabel(signal.kind),
       dateLabel: `发生 ${signal.date || "未知"} · 可观察 ${signal.observed_at || "未知"} · 确认 ${signal.confirmed_at || "未确认"}`,
       statusLabel: v4StatusLabels[signal.status] || signal.status || "状态未知",
@@ -2469,6 +2509,12 @@
   // The daily/weekly structure remains tied to completed candles.
   function withSpot(payload, spot, observed = null, quote = undefined) {
     if (!payload) return payload;
+    // 盘中周期沿用相同生命周期，并将事件写回payload供后续报价和历史刷新保留。
+    if (payload.frame) {
+      const updated = withSpot({ ...payload, frame: null, daily: payload.frame }, spot,
+        observed?.frame ? { ...observed, frame: null, daily: observed.frame } : null, quote);
+      return { ...payload, spot: updated.spot, frame: updated.daily };
+    }
     // Keep an observed intraday boundary break across a history refetch.
     // A later price recovery cannot reactivate the same candidate.
     if (observed?.symbol === payload.symbol) {
@@ -2479,15 +2525,24 @@
         const preserveInvalidations = (key) => {
           const invalidated = (observed[period]?.[key] || []).filter((signal) => signal.status === "invalidated");
           return (frame[key] || []).map((signal) => {
-            const invalidation = key === "signals_v4" ? signal.invalidation_price : signal.invalidation;
+            const invalidation = key !== "signals" ? signal.invalidation_price : signal.invalidation;
             const previous = invalidated.find((old) => old.kind === signal.kind && old.date === signal.date
-              && (turningKinds.has(signal.kind) || old.confirmed_at === signal.confirmed_at)
-              && (key === "signals_v4" ? old.invalidation_price : old.invalidation) === invalidation);
+              && (turningKinds.has(signal.kind) || isStructureWarning(signal) || old.confirmed_at === signal.confirmed_at)
+              && (!isStructureWarning(signal) || samePriceCoordinate(observed, payload)
+                && old.source_kind === signal.source_kind && old.level === signal.level
+                && old.signal_id === signal.signal_id)
+              && (key !== "signals" ? old.invalidation_price : old.invalidation) === invalidation);
+            // 本级预警失效后不得被后来固定的端点复活，也不得补入失效后的确认。
+            if (previous && signal.status !== "invalidated" && isStructureWarning(signal)) {
+              return { ...signal, status: "invalidated", phase: "invalidated", phase_at: previous.phase_at || "",
+                phase_history: previous.phase_history || [], confirmed_at: previous.confirmed_at || "",
+                live_invalidated_at: previous.live_invalidated_at || "", detail: previous.detail };
+            }
             return previous && signal.status !== "invalidated"
               ? { ...signal, status: "invalidated", phase: "invalidated", detail: previous.detail } : signal;
           });
         };
-        payload[period] = { ...frame, signals: preserveInvalidations("signals"), signals_v4: preserveInvalidations("signals_v4") };
+        payload[period] = { ...frame, signals: preserveInvalidations("signals"), signals_v4: preserveInvalidations("signals_v4"), structure_warnings_v4: preserveInvalidations("structure_warnings_v4"), early_risk_warnings_v4: preserveInvalidations("early_risk_warnings_v4") };
       });
     }
     let livePrice = spot != null && Number.isFinite(Number(spot)) && Number(spot) > 0 ? Number(spot) : null;
@@ -2509,7 +2564,28 @@
     if (price == null || !Number.isFinite(Number(price)) || Number(price) <= 0) return payload;
     spot = price;
     const locate = (frame) => {
-      if (!frame?.position?.center) return frame;
+      if (!frame) return frame;
+      const invalidate = (items, boundaryField) => (items || []).map((signal) => {
+        const boundary = signal[boundaryField];
+        const invalidated = boundary != null && (
+          buyKinds.has(signal.kind) && spot <= boundary
+          || sellKinds.has(signal.kind) && spot >= boundary
+        );
+        if (!invalidated || signal.status === "invalidated") return signal;
+        const detail = (signal.detail || "") + "；现价已触及失效边界";
+        if (!isStructureWarning(signal)) return { ...signal, status: "invalidated", detail };
+        // 日期来自报价；缺少报价时间时不编造历史失效日期。
+        const at = quote?.symbol === payload.symbol ? quoteEasternDate(quote) : "";
+        const history = (signal.phase_history || []).filter((phase) => !at || phase.at < at);
+        if (at) history.push({ phase: "invalidated", at });
+        return { ...signal, status: "invalidated", phase: "invalidated", phase_at: at,
+          phase_history: history, live_invalidated_at: at,
+          confirmed_at: at && signal.confirmed_at >= at ? "" : signal.confirmed_at || "", detail };
+      });
+      frame = { ...frame, signals: invalidate(frame.signals, "invalidation"), signals_v4: invalidate(frame.signals_v4, "invalidation_price"),
+        structure_warnings_v4: invalidate(frame.structure_warnings_v4, "invalidation_price"), early_risk_warnings_v4: invalidate(frame.early_risk_warnings_v4, "invalidation_price") };
+      frame = withEarlyRisk(frame, spot, observed?.symbol === payload.symbol && samePriceCoordinate(observed, payload) ? observed[frame.period === "1wk" ? "weekly" : "daily"] : null, quote?.symbol === payload.symbol ? quote : null);
+      if (!frame.position?.center) return frame;
       const center = frame.position.center;
       let code = "inside", label = "位于最近中枢内部", detail = "现价处于中枢重叠区，优先观察边界突破及随后的回试";
       let support = center.lower, resistance = center.upper;
@@ -2522,17 +2598,7 @@
         detail = "现价向下离开中枢；需观察反抽能否重新进入中枢";
         support = null; resistance = center.lower;
       }
-      const invalidate = (items, boundaryField) => (items || []).map((signal) => {
-        const boundary = signal[boundaryField];
-        const invalidated = boundary != null && (
-          buyKinds.has(signal.kind) && spot <= boundary
-          || sellKinds.has(signal.kind) && spot >= boundary
-        );
-        return invalidated && signal.status !== "invalidated"
-          ? { ...signal, status: "invalidated", detail: (signal.detail || "") + "；现价已触及失效边界" } : signal;
-      });
-      return { ...frame, signals: invalidate(frame.signals, "invalidation"),
-        signals_v4: invalidate(frame.signals_v4, "invalidation_price"), position: { ...frame.position, code, label, detail, support, resistance } };
+      return { ...frame, position: { ...frame.position, code, label, detail, support, resistance } };
     };
     const daily = locate(payload.daily), weekly = locate(payload.weekly);
     let summary = payload.summary;

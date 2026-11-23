@@ -101,6 +101,9 @@
     const thirdBuy = activeClassSignals.find((signal) => signal.kind === "class3_buy" && Number(signal.price) > 0);
     const thirdSell = activeClassSignals.find((signal) => signal.kind === "class3_sell" && Number(signal.price) > 0);
     const topWatch = (frame.signals || []).find((signal) => signal.kind === "top_exit_candidate" && signal.status === "watch");
+    const early = (frame.early_risk_warnings_v4 || []).filter((signal) => signal.status !== "invalidated" && number(signal.protection_price) > 0)
+      .sort((a, b) => a.observed_at.localeCompare(b.observed_at)).at(-1);
+    const earlyTouched = early && frame.early_risk?.signal_id === early.signal_id && frame.early_risk.touched;
     const atr = atr14(frame.candles || []);
     const stop = low.price;
     // A later lower low must not silently move an existing holding's
@@ -207,6 +210,17 @@
       hold = card("hold", holdingBrokeOnClose ? "先减仓，反弹未收回再退出" : "现价触及保护位，先控风险", `${retreat}${holdingBrokeOnClose ? `最近收盘已触及或跌破持仓保护位 ${money(holdingStop)}；重新涨回后仍需等待止跌确认。` : `现价触及 ${money(holdingStop)}，这是盘中风险提示，收盘结果仍需核对。`}`, `先减少风险；随后反弹仍未能涨回 ${money(holdingStop)}，或反弹最高价比前一次更低时，退出剩余仓位。`, holdingProtection, "risk");
     } else if (holdingTouched) {
       hold = card("hold", "保护位曾触及，等待重新企稳", `价格在 ${frame.holding_risk.touched_at} 曾跌至保护位 ${money(holdingStop)}；现价已涨回，之前的风险提示继续保留。`, "继续沿用减仓后的风险计划；等待下一次回落的低点抬高并得到确认，再重新评估持有与加仓。", holdingProtection);
+    } else if (early && (price <= early.protection_price || early.status === "risk_triggered" || earlyTouched)) {
+      const under = price <= early.protection_price;
+      hold = card("hold", under ? "预警保护价失守，优先减仓" : "预警保护价曾失守，等待修复",
+        `${early.observed_at} 出现${early.kind === "early_rebound_sell" ? "反弹承压" : "顶部"}早预警，参考顶部 ${money(early.price)}；${under ? "现价已触及" : "此前价格已触及"}观察K线低点 ${money(early.protection_price)}${early.status === "risk_triggered" ? `，${early.phase_history?.find((phase) => phase.phase === "risk_triggered")?.at || early.phase_at} 收盘也已失守` : ""}。`,
+        under ? `先处理持仓风险；反弹仍未收回 ${money(early.protection_price)} 时继续减少仓位，不等待完整三卖。` : "反弹不会撤销已发生的风险；等待收回预警保护价后回踩守住，再重新评估持有。",
+        `早期预警保护价 ${money(early.protection_price)}；重新触及顶部 ${money(early.invalidation_price)} 时本条预警失效。${holdingProtection}`, "risk");
+    } else if (early) {
+      hold = card("hold", "顶部早预警，先评估减仓",
+        `${early.observed_at} 的三根已收盘K线出现${early.kind === "early_rebound_sell" ? "反弹承压" : "顶部衰减"}形态，参考顶部 ${money(early.price)}；严格卖点尚需后续结构确认。`,
+        `可先减少部分风险；现价跌至观察K线低点 ${money(early.protection_price)} 时及时处理，不等待完整反向笔或三卖。`,
+        `早期预警保护价 ${money(early.protection_price)}；重新触及顶部 ${money(early.invalidation_price)} 时本条预警失效。${holdingProtection}`, "risk");
     } else if (top) {
       hold = card("hold", "可先减仓，剩余守保护位", `${retreat}上涨后已出现一段符合规则的下跌，原高点已确认，顶部观察候选仍有效。`, top.trigger_price != null
         ? `${top.trigger_confirmed ? "" : "这段下跌的低点由后续走势确认后，"}收盘再跌破 ${money(top.trigger_price)} 且现价仍在下方时，退出优先${top.trigger_confirmed ? "。" : "；目前低点还会更新。"}`

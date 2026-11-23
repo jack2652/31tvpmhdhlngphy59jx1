@@ -8,6 +8,26 @@ const readme = fs.readFileSync("README.md", "utf8");
 const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
 const styles = fs.readFileSync("web/static/common/css/styles.css", "utf8");
 
+// 日期：2026-11-23；执行者：Codex。使用项目实际Vue编译器验证首次空状态，避免只测加载完成后的图表。
+const Vue = require("../web/static/vue@2.7.16/vue.min.js");
+global.document = { createElement: () => ({ innerHTML: "", get textContent() { return this.innerHTML; } }) };
+const legendTemplate = template.match(/<div class="chan-legend">[^\n]+<\/div>/)[0];
+const legendRender = Vue.compile(legendTemplate);
+function renderLegend(chart) {
+  const instance = new Vue({ ...legendRender, data: { chanFrame: { chart } } });
+  return legendRender.render.call(instance);
+}
+function vnodeText(node) {
+  return (node.text || "") + (node.children || []).map(vnodeText).join("");
+}
+for (const chart of [null, {}, { layers: null }, { layers: { signals: false } }, { layers: { signals: true } }]) {
+  let tree;
+  assert.doesNotThrow(() => { tree = renderLegend(chart); }, "空图表或隐藏信号必须正常渲染图例");
+  assert.ok(!vnodeText(tree).includes("灰点为失效信号"));
+  assert.ok(vnodeText(tree).includes("多级线段与中枢"), "恢复原图例并保留首次空状态渲染");
+}
+delete global.document;
+
 for (const page of [template, fs.readFileSync("web/static/futures.html", "utf8")]) {
   assert.equal((page.match(/>支撑\/压力线<\/button>/g) || []).length, 1, "each page must have one combined support/resistance switch");
   assert.doesNotMatch(page, /toggle(?:Chan)?ChartLayer\('structureSupports'\)/, "the independent structure support switch must be removed");

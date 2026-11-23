@@ -199,6 +199,19 @@ supportDetail = tooltip.children.find((child) => child.className === "chan-struc
 assert.equal(supportDetail.hidden, false, "CSS-pixel signal badges must be hit by their rendered geometry");
 assert.equal(supportDetail.children[0].textContent, "三买 · 已确认");
 assert.equal(styledSignal.labelX, 120); assert.equal(styledSignal.labelY, 65);
+// 日期：2026-11-23；执行者：Codex。失效圆斜杠与完整文字框均可查看原信号详情。
+const historicalSignal = { ...styledSignal, type: "一买", status: "invalidated", signalStatus: "已失效", invalidated: true };
+directive.componentUpdated(target, { value: { ...model, signals: [historicalSignal], layers: { signals: true } } });
+targetListeners.get("pointermove")({ clientX: 120, clientY: 95, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.equal(supportDetail.hidden, false, "历史失效圆斜杠仍能查看详情");
+assert.match(supportDetail.children[0].textContent, /一买 · 已失效/);
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.equal(supportDetail.hidden, false, "历史失效完整文字框仍能查看详情");
+const structureWarning = { ...styledSignal, type: "顶背驰预警", start: "2026-10-14", formedAt: "2026-10-15", confirmedAt: "2026-10-16" };
+directive.componentUpdated(target, { value: { ...model, signals: [structureWarning], layers: { signals: true } } });
+targetListeners.get("pointermove")({ clientX: 120, clientY: 95, buttons: 0, pointerType: "touch", target: { closest: () => null } });
+assert.match(supportDetail.children[0].textContent, /顶背驰预警/);
+assert.match(supportDetail.children[1].textContent, /可观察 2026-10-15.*确认 2026-10-16/);
 
 const pressure = { ...support, tone: "resistance", label: "反复受阻压力区", priceLabel: "100.00", zoneLabel: "99.90–100.30", testCount: 3,
   lastTestDate: "2026-10-12", reestablished: true, sources: "已收盘反弹高点" };

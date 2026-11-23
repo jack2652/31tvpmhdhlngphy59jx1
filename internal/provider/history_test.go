@@ -36,6 +36,34 @@ func TestNormalizeYFinanceHistoryPreservesBarsAndExtremes(t *testing.T) {
 	}
 }
 
+// 2026-11-23，Codex：跨K线边界35秒内两次读取必须得到更新行情，短时重复读取仍复用缓存。
+func TestYFinanceIntradayCacheRefreshesWithinThirtySeconds(t *testing.T) {
+	location, _ := time.LoadLocation("America/New_York")
+	now := time.Date(2026, 10, 23, 14, 0, 0, 0, time.UTC)
+	calls := 0
+	client := &YFinanceHistoryClient{TimeNow: func() time.Time { return now }, Location: location,
+		TickerFactory: func(string) (yahooTicker, error) {
+			return &yahooSDKTestTicker{historyFunc: func(params ym.HistoryParams) ([]ym.Bar, error) {
+				calls++
+				return []ym.Bar{{Date: time.Date(2026, 10, 23, 13, 30, 0, 0, time.UTC), Open: 100, High: 104, Low: 99, Close: float64(100 + calls), Volume: 100}}, nil
+			}}, nil
+		}}
+	first, err := client.FetchIntraday(context.Background(), "QQQ", "15m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(20 * time.Second)
+	client.FetchIntraday(context.Background(), "QQQ", "15m")
+	if calls != 1 {
+		t.Fatal("短时间重复读取没有复用缓存")
+	}
+	now = now.Add(15 * time.Second)
+	second, err := client.FetchIntraday(context.Background(), "QQQ", "15m")
+	if err != nil || calls != 2 || second.Bars[0]["close"] == first.Bars[0]["close"] || !second.FetchedAt.Equal(now) {
+		t.Fatalf("35秒后仍沿用旧盘中数据：calls=%d err=%v", calls, err)
+	}
+}
+
 func TestNormalizeYFinanceExtremePointsMatchesHistoryOHLCValidity(t *testing.T) {
 	location, err := time.LoadLocation("America/New_York")
 	if err != nil {

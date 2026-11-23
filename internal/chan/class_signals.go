@@ -5,6 +5,139 @@ import (
 	"sort"
 )
 
+// 比较同一中枢之前的进入段与其后的离开段，补齐盘整背驰路径。
+// 高层中枢的组成索引属于下一级输入，只在笔和基础线段层使用此索引关系。
+func buildCenterEntryExitSignals(frame Frame, levels []LevelAnalysis, strengths []Strength, divergenceRatio float64) []V4Signal {
+	result := []V4Signal{}
+	for _, level := range levels {
+		if level.Level != 0 {
+			continue
+		}
+		for centerIndex, center := range level.Centers {
+			entryIndex := center.StartSegment - 1
+			if entryIndex < 0 || center.StartSegment+2 >= len(level.Segments) || center.FormedAt == "" {
+				continue
+			}
+			entry := level.Segments[entryIndex]
+			if !entry.Confirmed || entry.ConfirmedAt == "" || entry.Chain != center.Chain || entry.Level != level.Level {
+				continue
+			}
+			entryCrosses := entry.Direction == "up" && priceLess(entry.StartPrice, center.Lower) && priceGreater(entry.EndPrice, center.Upper) ||
+				entry.Direction == "down" && priceGreater(entry.StartPrice, center.Upper) && priceLess(entry.EndPrice, center.Lower)
+			left := findSegmentStrength(strengths, entry, signalSourceKind(level))
+			if !entryCrosses || left == nil || !left.WarmupComplete || left.MACDArea <= 0 {
+				continue
+			}
+			for currentIndex := center.StartSegment + 3; currentIndex < len(level.Segments); currentIndex++ {
+				current := level.Segments[currentIndex]
+				if current.Direction != entry.Direction || current.TrendKind != entry.TrendKind || current.Level != level.Level || !chanSegmentRangeIsContiguous(level.Segments, entryIndex, currentIndex) || !segmentMovesAway(current, &center) {
+					continue
+				}
+				newExtreme := current.Direction == "up" && priceGreater(current.EndPrice, entry.EndPrice) || current.Direction == "down" && priceLess(current.EndPrice, entry.EndPrice)
+				observedAt := entryExitObservationAt(frame, level, current, currentIndex)
+				if !newExtreme || observedAt == "" || observedAt < current.End || center.FormedAt > observedAt || entry.ConfirmedAt > observedAt || frame.AsOf != "" && observedAt > frame.AsOf {
+					continue
+				}
+				if centerSupersededAt(level.Centers, centerIndex, currentIndex, observedAt) {
+					break
+				}
+				ready := true
+				for index := center.StartSegment; index < currentIndex; index++ {
+					segment := level.Segments[index]
+					if !segment.Confirmed || segment.ConfirmedAt == "" || segment.ConfirmedAt > observedAt {
+						ready = false
+						break
+					}
+				}
+				if !ready {
+					continue
+				}
+				right := findSegmentStrength(strengths, current, signalSourceKind(level))
+				if right == nil {
+					measured, ok := measureSegmentStrength(frame.Candles, frame.MACD, level, current)
+					if !ok {
+						continue
+					}
+					right = &measured
+				}
+				if !right.WarmupComplete || right.MACDArea <= 0 {
+					continue
+				}
+				ratio := right.MACDArea / left.MACDArea
+				if ratio >= divergenceRatio {
+					continue
+				}
+				result = append(result, centerEntryExitSignal(frame, level, center, entryIndex, currentIndex, observedAt, ratio, divergenceRatio))
+			}
+		}
+	}
+	return result
+}
+
+func centerSupersededAt(centers []RecursiveCenter, index, moveIndex int, observedAt string) bool {
+	for _, next := range centers[index+1:] {
+		// 高阶中枢索引属于下一级输入，须通过所属走势索引判断是否已替代旧背景。
+		nextIndex := next.StartSegment
+		if next.Level > 0 {
+			nextIndex = centerOwnerMoveIndex(next)
+		}
+		if next.Chain == centers[index].Chain && nextIndex <= moveIndex && next.FormedAt != "" && next.FormedAt <= observedAt {
+			return true
+		}
+	}
+	return false
+}
+
+func entryExitObservationAt(frame Frame, level LevelAnalysis, current Segment, index int) string {
+	if signalSourceKind(level) == "pen" && index < len(frame.StrokesV4) {
+		stroke := frame.StrokesV4[index]
+		if stroke.Chain == current.Chain && stroke.End.Date == current.End && priceEqual(stroke.End.Price, current.EndPrice) && stroke.End.ConfirmedAt != "" {
+			return stroke.End.ConfirmedAt
+		}
+	}
+	if current.Confirmed {
+		return current.ConfirmedAt
+	}
+	return ""
+}
+
+func centerEntryExitSignal(frame Frame, level LevelAnalysis, center RecursiveCenter, entryIndex, currentIndex int, observedAt string, ratio, threshold float64) V4Signal {
+	entry, current := level.Segments[entryIndex], level.Segments[currentIndex]
+	kind, side := "class1_sell", "sell"
+	if current.Direction == "down" {
+		kind, side = "class1_buy", "buy"
+	}
+	signal := V4Signal{
+		Level: level.Level, SourceKind: signalSourceKind(level), Kind: kind, Side: side,
+		Status: "observing", Phase: "observation", PhaseAt: observedAt, ObservedAt: observedAt, Date: current.End,
+		PhaseHistory: []SignalPhase{{Phase: "observation", At: observedAt}}, RuleVersion: RecursivePreviewVersion,
+		StructureRefs: []int{entryIndex, currentIndex}, RelatedCenterID: center.CenterID,
+		StructureIDs: []string{center.CenterID, chanSegmentID(level.Level, entry, signalSourceKind(level)), chanSegmentID(level.Level, current, signalSourceKind(level))},
+		Conditions:   []string{"同级同链的中枢进入段与离开段同向", "中枢初始三段在观察前已确认，边界固定", "离开端点严格超越进入端点", fmt.Sprintf("MACD 同向面积比低于版本参数 %.2f", threshold)},
+		Missing:      []string{"等待后续有效反向结构固定离开端点"}, Invalidation: ptr(current.EndPrice), Price: ptr(current.EndPrice), StrengthRatio: ptr(ratio),
+		MarketFilter: "unfiltered", LowerLevelStatus: "unconfirmed", Detail: "同一中枢进入/离开段出现盘整背驰；分型可观察后预警，反向结构固定端点后才确认",
+	}
+	if current.Confirmed && current.ConfirmedAt != "" && current.ConfirmedAt >= observedAt && (frame.AsOf == "" || current.ConfirmedAt <= frame.AsOf) {
+		signal.Status, signal.Phase, signal.PhaseAt = "divergence_confirmed", "divergence_confirmed", current.ConfirmedAt
+		signal.ConfirmedAt, signal.Missing = current.ConfirmedAt, []string{}
+		signal.PhaseHistory = append(signal.PhaseHistory, SignalPhase{Phase: signal.Phase, At: current.ConfirmedAt})
+	}
+	if at := firstV4InvalidationAt(frame.Candles, observedAt, current.Direction, current.EndPrice); at != "" {
+		kept := signal.PhaseHistory[:0]
+		for _, phase := range signal.PhaseHistory {
+			if phase.At < at {
+				kept = append(kept, phase)
+			}
+		}
+		signal.PhaseHistory = append(kept, SignalPhase{Phase: "invalidated", At: at})
+		signal.Status, signal.Phase, signal.PhaseAt, signal.Missing = "invalidated", "invalidated", at, []string{}
+		if signal.ConfirmedAt >= at {
+			signal.ConfirmedAt = ""
+		}
+	}
+	return signal
+}
+
 // buildClass23Signals emits explicit waiting candidates when the direct lower
 // level is unavailable, and only confirms a signal from structures already
 // confirmed in the supplied prefix.
@@ -325,126 +458,120 @@ func attachMappedClass2Signals(higher *Frame, lower Frame) {
 func class3Signals(frame Frame, levels []LevelAnalysis) []V4Signal {
 	result := make([]V4Signal, 0)
 	for _, level := range levels {
-		for _, center := range level.Centers {
-			if center.Forming || center.ConfirmedAt == "" {
+		for centerIndex, center := range level.Centers {
+			if center.Forming || center.ConfirmedAt == "" || frame.AsOf != "" && center.ConfirmedAt > frame.AsOf {
 				continue
 			}
 			ownerIndex := centerOwnerMoveIndex(center)
-			firstDeparture := ownerIndex
-			if firstDeparture < 0 || firstDeparture >= len(level.Segments) {
+			if ownerIndex < 0 || ownerIndex >= len(level.Segments) {
 				continue
 			}
-			departureIndex := -1
-			for index := firstDeparture; index < len(level.Segments); index++ {
-				segment := level.Segments[index]
-				if segment.Chain != center.Chain || segment.Level != center.Level || index != ownerIndex && (segment.End <= center.End || segment.ConfirmedAt != "" && segment.ConfirmedAt < center.ConfirmedAt) {
+			// 每次重新进入中枢后的离开都是独立回试事件；中枢外延续不重复触发。
+			for departureIndex := ownerIndex; departureIndex < len(level.Segments); departureIndex++ {
+				departure := level.Segments[departureIndex]
+				departureObservedAt := departure.ConfirmedAt
+				if !departure.Confirmed {
+					departureObservedAt = frame.AsOf
+				}
+				if centerSupersededAt(level.Centers, centerIndex, departureIndex, departureObservedAt) {
+					break
+				}
+				if departure.Chain != center.Chain || departure.Level != center.Level || departureIndex != ownerIndex && (departure.End <= center.End || departure.ConfirmedAt != "" && departure.ConfirmedAt < center.ConfirmedAt) {
 					continue
 				}
-				if index > ownerIndex && !chanSegmentsAreContiguous(level.Segments[index-1], segment) {
+				if departureIndex > ownerIndex && !chanSegmentsAreContiguous(level.Segments[departureIndex-1], departure) {
 					break
 				}
-				if recursiveSegmentLeavesCenter(segment, &center) {
-					departureIndex = index
-					break
+				if !recursiveSegmentLeavesCenter(departure, &center) || frame.AsOf != "" && (departure.End > frame.AsOf || departure.ConfirmedAt > frame.AsOf) {
+					continue
 				}
-			}
-			if departureIndex < 0 {
-				for index := firstDeparture; index < len(level.Segments); index++ {
-					segment := level.Segments[index]
-					if segment.Chain != center.Chain || segment.Level != center.Level || index != ownerIndex && segment.End <= center.End {
-						continue
-					}
-					if index > ownerIndex && !chanSegmentsAreContiguous(level.Segments[index-1], segment) {
-						break
-					}
-					if !segment.Confirmed && recursiveSegmentLeavesCenter(segment, &center) {
-						result = append(result, class3WaitingSignal(level, center, segment, index, nil, frame.AsOf))
-						break
-					}
+				if !departure.Confirmed || departure.ConfirmedAt == "" {
+					result = append(result, class3WaitingSignal(level, center, departure, departureIndex, nil, frame.AsOf))
+					continue
 				}
-				continue
-			}
-			departure := level.Segments[departureIndex]
-			if !departure.Confirmed || departure.ConfirmedAt == "" {
-				result = append(result, class3WaitingSignal(level, center, departure, departureIndex, nil, frame.AsOf))
-				continue
-			}
-			if departureIndex+1 >= len(level.Segments) {
-				result = append(result, class3WaitingSignal(level, center, departure, departureIndex, nil, frame.AsOf))
-				continue
-			}
-			retest := level.Segments[departureIndex+1]
-			if retest.Chain != center.Chain || retest.Level != center.Level || retest.Direction == departure.Direction || !chanSegmentRangeIsContiguous(level.Segments, ownerIndex, departureIndex+1) {
-				continue
-			}
-			buy := departure.Direction == "up" && retest.Direction == "down" && priceGreater(retest.Low, center.Upper)
-			sell := departure.Direction == "down" && retest.Direction == "up" && priceLess(retest.High, center.Lower)
-			if !retest.Confirmed {
-				waiting := class3WaitingSignal(level, center, departure, departureIndex, &retest, frame.AsOf)
-				if priceLessOrEqual(retest.Low, center.Upper) && priceGreaterOrEqual(retest.High, center.Lower) {
-					waiting.Status, waiting.Phase, waiting.PhaseAt = "invalidated", "invalidated", frame.AsOf
-					waiting.PhaseHistory = append(waiting.PhaseHistory, SignalPhase{Phase: "invalidated", At: frame.AsOf})
-					waiting.Missing = []string{}
-					waiting.Detail = "首次回试已进入中枢范围，三类候选失效"
-				} else if retest.Direction == departure.Direction {
-					waiting.Status, waiting.Phase, waiting.PhaseAt = "invalidated", "invalidated", frame.AsOf
-					waiting.PhaseHistory = append(waiting.PhaseHistory, SignalPhase{Phase: "invalidated", At: frame.AsOf})
-					waiting.Missing = []string{}
-					waiting.Detail = "首次反方向回试结束并继续离开，三类回试条件已失效"
+				if departureIndex+1 >= len(level.Segments) {
+					result = append(result, class3WaitingSignal(level, center, departure, departureIndex, nil, frame.AsOf))
+					continue
 				}
-				result = append(result, waiting)
-				continue
-			}
-			if retest.ConfirmedAt == "" || retest.ConfirmedAt <= departure.ConfirmedAt {
-				continue
-			}
-			if center.ConfirmedAt > retest.ConfirmedAt {
-				continue
-			}
-			if !buy && !sell {
+				retest := level.Segments[departureIndex+1]
+				if frame.AsOf != "" && retest.End > frame.AsOf {
+					continue
+				}
+				if retest.Chain != center.Chain || retest.Level != center.Level || retest.Direction == departure.Direction || !chanSegmentRangeIsContiguous(level.Segments, ownerIndex, departureIndex+1) {
+					continue
+				}
+				buy := departure.Direction == "up" && retest.Direction == "down" && priceGreater(retest.Low, center.Upper)
+				sell := departure.Direction == "down" && retest.Direction == "up" && priceLess(retest.High, center.Lower)
+				if !retest.Confirmed {
+					waiting := class3WaitingSignal(level, center, departure, departureIndex, &retest, frame.AsOf)
+					if priceLessOrEqual(retest.Low, center.Upper) && priceGreaterOrEqual(retest.High, center.Lower) {
+						waiting.Status, waiting.Phase, waiting.PhaseAt = "invalidated", "invalidated", frame.AsOf
+						waiting.PhaseHistory = append(waiting.PhaseHistory, SignalPhase{Phase: "invalidated", At: frame.AsOf})
+						waiting.Missing = []string{}
+						waiting.Detail = "首次回试已进入中枢范围，三类候选失效"
+					} else if retest.Direction == departure.Direction {
+						waiting.Status, waiting.Phase, waiting.PhaseAt = "invalidated", "invalidated", frame.AsOf
+						waiting.PhaseHistory = append(waiting.PhaseHistory, SignalPhase{Phase: "invalidated", At: frame.AsOf})
+						waiting.Missing = []string{}
+						waiting.Detail = "首次反方向回试结束并继续离开，三类回试条件已失效"
+					}
+					result = append(result, waiting)
+					continue
+				}
+				if retest.ConfirmedAt == "" || retest.ConfirmedAt <= departure.ConfirmedAt {
+					continue
+				}
+				if frame.AsOf != "" && (retest.End > frame.AsOf || retest.ConfirmedAt > frame.AsOf) {
+					continue
+				}
+				if center.ConfirmedAt > retest.ConfirmedAt {
+					continue
+				}
+				if !buy && !sell {
+					kind, side, invalidation := "class3_sell", "sell", center.Lower
+					if departure.Direction == "up" {
+						kind, side, invalidation = "class3_buy", "buy", center.Upper
+					}
+					at := retest.ConfirmedAt
+					result = append(result, V4Signal{
+						SignalID: classSignalID(signalSourceKind(level), level.Level, kind, departure.End, center.CenterID), Level: level.Level, SourceKind: signalSourceKind(level), Kind: kind, Side: side,
+						Status: "invalidated", Phase: "invalidated", PhaseAt: at, PhaseHistory: []SignalPhase{{Phase: "invalidated", At: at}}, RuleVersion: RecursivePreviewVersion,
+						Date: retest.End, ObservedAt: at, StructureRefs: []int{departureIndex, departureIndex + 1},
+						StructureIDs: []string{center.CenterID, chanSegmentID(level.Level, departure, signalSourceKind(level)), chanSegmentID(level.Level, retest, signalSourceKind(level))},
+						Conditions:   []string{"已确认中枢闭合", "已确认走势段离开中枢", "首次反方向回试已确认"}, Missing: []string{}, Invalidation: ptr(invalidation), Price: ptr(retest.EndPrice),
+						MarketFilter: "unfiltered", LowerLevelStatus: "unconfirmed", RelatedCenterID: center.CenterID,
+						Detail: fmt.Sprintf("首次反方向回试触及或进入中枢范围，三类候选失效；边界 %.4f", invalidation),
+					})
+					continue
+				}
 				kind, side, invalidation := "class3_sell", "sell", center.Lower
-				if departure.Direction == "up" {
+				if buy {
 					kind, side, invalidation = "class3_buy", "buy", center.Upper
 				}
-				at := retest.ConfirmedAt
+				observedAt := retest.ConfirmedAt
+				status, phase, phaseAt := "confirmed", "class3_confirmed", observedAt
+				phaseHistory := []SignalPhase{{Phase: phase, At: phaseAt}}
+				if at := firstClass3InvalidationAt(frame.Candles, observedAt, buy, invalidation); at != "" {
+					status, phase, phaseAt = "invalidated", "invalidated", at
+					phaseHistory = append(phaseHistory, SignalPhase{Phase: phase, At: phaseAt})
+				}
+				conditions := []string{"已确认中枢闭合", "已确认走势段离开中枢", "首次反方向回试全段严格留在中枢外"}
+				if buy {
+					conditions = append(conditions, "回试低点严格高于 ZG")
+				} else {
+					conditions = append(conditions, "回试高点严格低于 ZD")
+				}
+				date := retest.End
 				result = append(result, V4Signal{
-					SignalID: classSignalID(signalSourceKind(level), level.Level, kind, departure.End, center.CenterID), Level: level.Level, SourceKind: signalSourceKind(level), Kind: kind, Side: side,
-					Status: "invalidated", Phase: "invalidated", PhaseAt: at, PhaseHistory: []SignalPhase{{Phase: "invalidated", At: at}}, RuleVersion: RecursivePreviewVersion,
-					Date: retest.End, ObservedAt: at, StructureRefs: []int{departureIndex, departureIndex + 1},
+					SignalID: classSignalID(signalSourceKind(level), level.Level, kind, date, center.CenterID), Level: level.Level, SourceKind: signalSourceKind(level), Kind: kind, Side: side,
+					Status: status, Phase: phase, PhaseAt: phaseAt, PhaseHistory: phaseHistory, RuleVersion: RecursivePreviewVersion,
+					Date: date, ObservedAt: observedAt, ConfirmedAt: observedAt, StructureRefs: []int{departureIndex, departureIndex + 1},
 					StructureIDs: []string{center.CenterID, chanSegmentID(level.Level, departure, signalSourceKind(level)), chanSegmentID(level.Level, retest, signalSourceKind(level))},
-					Conditions:   []string{"已确认中枢闭合", "已确认走势段离开中枢", "首次反方向回试已确认"}, Missing: []string{}, Invalidation: ptr(invalidation), Price: ptr(retest.EndPrice),
+					Conditions:   conditions, Missing: []string{}, Invalidation: ptr(invalidation), Price: ptr(retest.EndPrice),
 					MarketFilter: "unfiltered", LowerLevelStatus: "unconfirmed", RelatedCenterID: center.CenterID,
-					Detail: fmt.Sprintf("首次反方向回试触及或进入中枢范围，三类候选失效；边界 %.4f", invalidation),
+					Detail: fmt.Sprintf("中枢首次回试严格留在外侧；失效边界 %.4f；市场过滤状态未提供", invalidation),
 				})
-				continue
 			}
-			kind, side, invalidation := "class3_sell", "sell", center.Lower
-			if buy {
-				kind, side, invalidation = "class3_buy", "buy", center.Upper
-			}
-			observedAt := retest.ConfirmedAt
-			status, phase, phaseAt := "confirmed", "class3_confirmed", observedAt
-			phaseHistory := []SignalPhase{{Phase: phase, At: phaseAt}}
-			if at := firstClass3InvalidationAt(frame.Candles, observedAt, buy, invalidation); at != "" {
-				status, phase, phaseAt = "invalidated", "invalidated", at
-				phaseHistory = append(phaseHistory, SignalPhase{Phase: phase, At: phaseAt})
-			}
-			conditions := []string{"已确认中枢闭合", "已确认走势段离开中枢", "首次反方向回试全段严格留在中枢外"}
-			if buy {
-				conditions = append(conditions, "回试低点严格高于 ZG")
-			} else {
-				conditions = append(conditions, "回试高点严格低于 ZD")
-			}
-			date := retest.End
-			result = append(result, V4Signal{
-				SignalID: classSignalID(signalSourceKind(level), level.Level, kind, date, center.CenterID), Level: level.Level, SourceKind: signalSourceKind(level), Kind: kind, Side: side,
-				Status: status, Phase: phase, PhaseAt: phaseAt, PhaseHistory: phaseHistory, RuleVersion: RecursivePreviewVersion,
-				Date: date, ObservedAt: observedAt, ConfirmedAt: observedAt, StructureRefs: []int{departureIndex, departureIndex + 1},
-				StructureIDs: []string{center.CenterID, chanSegmentID(level.Level, departure, signalSourceKind(level)), chanSegmentID(level.Level, retest, signalSourceKind(level))},
-				Conditions:   conditions, Missing: []string{}, Invalidation: ptr(invalidation), Price: ptr(retest.EndPrice),
-				MarketFilter: "unfiltered", LowerLevelStatus: "unconfirmed", RelatedCenterID: center.CenterID,
-				Detail: fmt.Sprintf("中枢首次回试严格留在外侧；失效边界 %.4f；市场过滤状态未提供", invalidation),
-			})
 		}
 	}
 	return result
@@ -471,6 +598,8 @@ func class3WaitingSignal(level LevelAnalysis, center RecursiveCenter, departure 
 	refs := []int{departureIndex}
 	ids := []string{center.CenterID, chanSegmentID(level.Level, departure, signalSourceKind(level))}
 	missing := []string{"等待中枢离开后的首次反方向线段"}
+	conditions := []string{"已确认中枢闭合", "已确认走势段离开中枢", "只评估离开后的第一次反方向回试"}
+	detail := "中枢离开已确认；等待首次反方向回试及其严格留在中枢外的确认条件"
 	if retest != nil {
 		date, price = retest.End, retest.EndPrice
 		refs = append(refs, departureIndex+1)
@@ -483,14 +612,18 @@ func class3WaitingSignal(level LevelAnalysis, center RecursiveCenter, departure 
 		// 形成中的离开段尚无已确认的离开端点；临时标记锚定当前可见边界，
 		// 并在缺失条件中说明仍待确认。
 		date = departure.End
+		observedAt = asOf
+		missing = []string{"等待中枢离开段确认", "等待离开后的首次反方向回试"}
+		conditions = []string{"已确认中枢闭合", "形成中走势端点暂时离开中枢", "只评估离开后的第一次反方向回试"}
+		detail = "形成中的离开段尚未确认，端点仍可能延伸；等待离开确认及首次反方向回试"
 	}
 	return V4Signal{
 		SignalID: classSignalID(signalSourceKind(level), level.Level, kind, date, center.CenterID), Level: level.Level, SourceKind: signalSourceKind(level), Kind: kind, Side: side,
 		Status: "observing", Phase: "awaiting_first_retest", PhaseAt: observedAt,
 		PhaseHistory: []SignalPhase{{Phase: "awaiting_first_retest", At: observedAt}}, RuleVersion: RecursivePreviewVersion,
-		Date: date, ObservedAt: observedAt, StructureRefs: refs, StructureIDs: ids, Conditions: []string{"已确认中枢闭合", "已确认走势段离开中枢", "只评估离开后的第一次反方向回试"},
+		Date: date, ObservedAt: observedAt, StructureRefs: refs, StructureIDs: ids, Conditions: conditions,
 		Missing: missing, Invalidation: ptr(boundary), Price: ptr(price), MarketFilter: "unfiltered", LowerLevelStatus: "unconfirmed", RelatedCenterID: center.CenterID,
-		Detail: "中枢离开已确认；等待首次反方向回试及其严格留在中枢外的确认条件",
+		Detail: detail,
 	}
 }
 

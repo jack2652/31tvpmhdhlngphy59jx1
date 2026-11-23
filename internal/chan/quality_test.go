@@ -154,6 +154,9 @@ func TestAnalyzeIntradayExposesTimeframeLevelRawBasisAndFormingState(t *testing.
 				t.Fatal(analyzeErr)
 			}
 			frame := result.Daily
+			if frame.StructureWarnings == nil || result.Weekly.StructureWarnings == nil || frame.EarlyRiskWarnings == nil || result.Weekly.EarlyRiskWarnings == nil {
+				t.Fatal("盘中入口的独立预警数组不能为 null")
+			}
 			if result.RuleVersion != RecursivePreviewVersion || result.LegacyRuleVersion != RuleVersion || frame.Timeframe != period || frame.Level != 0 || frame.Quality.PriceBasis != "raw" {
 				t.Fatalf("intraday response metadata=%+v rule=%s legacy=%s, want preview version, timeframe=%s, level=0 and raw basis", frame, result.RuleVersion, result.LegacyRuleVersion, period)
 			}

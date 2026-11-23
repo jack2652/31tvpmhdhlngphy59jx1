@@ -251,7 +251,7 @@ func (c *YFinanceHistoryClient) FetchIntraday(ctx context.Context, rawSymbol, in
 	}
 	cacheKey := symbol + ":" + interval
 	c.intradayMu.Lock()
-	if cached, found := c.intradayCache[cacheKey]; found && now.Sub(cached.fetchedAt) < 3*time.Minute {
+	if cached, found := c.intradayCache[cacheKey]; found && now.Sub(cached.fetchedAt) < 30*time.Second {
 		c.intradayMu.Unlock()
 		return cached.result, nil
 	}

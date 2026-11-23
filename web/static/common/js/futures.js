@@ -42,7 +42,7 @@
   let chanPayloadLoading = false;
   let chanPayloadRefreshPending = false;
   let intradayRefreshTimer = null;
-  const intradayRefreshDelay = 3 * 60 * 1000 + 5000;
+  const intradayRefreshDelay = 35000;
   let historyCheckTimer = null;
   const historyCheckDelay = 5 * 60 * 1000;
 
@@ -176,6 +176,17 @@
       chartLayers: chartPreferences.layers, subcharts: chartPreferences.subcharts,
       quote: null, payload: null, intradayPayload: {}, intradayLoading: { "15m": false, "1h": false, "2h": false, "4h": false }, intradayRetryTimers: { "15m": null, "1h": null, "2h": null, "4h": null }, intradayRetryAttempts: { "15m": 0, "1h": 0, "2h": 0, "4h": 0 }, loading: false, error: "", mfiBenchmarkRetryCount: 0, clock: "--:--:--", theme: document.documentElement.dataset.theme || "light", mobileChart: mobileChartViewport(), chanExpanded: readFoldState(foldStorageKeys.panel, true), chanStatsExpanded: readFoldState(foldStorageKeys.stats, false), chanMoreExpanded: readFoldState(foldStorageKeys.more, false), chanScenariosVisible: readScenarioVisibility(), chanHoveredScenario: null, chanScenarioCardX: 0,
       viewport: { daily: { visibleBars: 0, endOffset: 0 }, weekly: { visibleBars: 0, endOffset: 0 }, "15m": { visibleBars: 0, endOffset: 0 }, "1h": { visibleBars: 0, endOffset: 0 }, "2h": { visibleBars: 0, endOffset: 0 }, "4h": { visibleBars: 0, endOffset: 0 } },
+    },
+    // 已触及的早期保护价跨报价恢复保留，盘中与日周周期使用同一生命周期。
+    watch: {
+      quote(quote) {
+        if (!quote || quote.symbol !== this.symbol) return;
+        if (this.payload) this.payload = OptionScopeChan.withSpot(this.payload, quote.price, this.payload, quote);
+        for (const period of intradayPeriods) {
+          const payload = this.intradayPayload[period];
+          if (payload) this.$set(this.intradayPayload, period, OptionScopeChan.withSpot(payload, quote.price, payload, quote));
+        }
+      },
     },
     computed: {
       displaySymbol() { return this.symbol.replace("=F", ""); },
@@ -403,10 +414,13 @@
         if (intradayRefreshTimer) window.clearTimeout(intradayRefreshTimer);
         intradayRefreshTimer = null;
         if (this.period !== value || document.hidden) return;
+        const elapsed = Date.now() % (15 * 60 * 1000);
+        const delay = elapsed < intradayRefreshDelay ? intradayRefreshDelay - elapsed
+          : 15 * 60 * 1000 - elapsed + intradayRefreshDelay;
         intradayRefreshTimer = window.setTimeout(() => {
           intradayRefreshTimer = null;
           if (this.period === value) this.loadIntraday(value, true);
-        }, intradayRefreshDelay);
+        }, delay);
       },
       scheduleHistoryCheck() {
         if (historyCheckTimer) window.clearTimeout(historyCheckTimer);
@@ -460,7 +474,7 @@
           const queryString = spot ? `?period=${value}&spot=${encodeURIComponent(spot)}` : `?period=${value}`;
           const payload = await request(`/api/chan/${encodeURIComponent(token)}/intraday${queryString}`, { timeout: 60000 });
           if (this.symbol !== token) return;
-          if (intradayFrameReady(payload) || !intradayFrameReady(existing)) this.$set(this.intradayPayload, value, payload);
+          if (intradayFrameReady(payload) || !intradayFrameReady(existing)) this.$set(this.intradayPayload, value, OptionScopeChan.withSpot(payload, finite(this.quote?.price), existing, this.quote));
           if (intradayFrameReady(payload) && !payload.refreshing) {
             window.clearTimeout(this.intradayRetryTimers[value]);
             this.$set(this.intradayRetryTimers, value, null);

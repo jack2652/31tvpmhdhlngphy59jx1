@@ -109,13 +109,17 @@ function chanStructureTooltipDetails(structure) {
   const ruleVersion = structure.ruleVersion ? ` · 规则 ${structure.ruleVersion}` : "";
   const level = structure.level == null ? "" : `第${Number(structure.level) + 1}层`;
   const signalTypes = ["一买", "一卖", "二买", "二卖", "三买", "三卖"];
-  if (signalTypes.includes(structure.type)) {
+  const warningTypes = ["顶背驰预警", "底背驰预警", "反弹承压", "回踩支撑", "顶部早预警", "反弹早预警"];
+  if (signalTypes.includes(structure.type) || warningTypes.includes(structure.type)) {
     const phase = structure.signalPhase && structure.signalPhase !== structure.signalStatus ? ` · ${structure.signalPhase}` : "";
     const status = structure.signalStatus || (structure.confirmed ? "已确认" : "观察中");
     const boundary = displayPrice(structure.invalidationPrice);
+    // 预警确认只指本级结构，失效阶段时间不能冒充确认时间。
+    const dates = warningTypes.includes(structure.type)
+      ? ` · 可观察 ${structure.formedAt || "未知"} · 确认 ${structure.confirmedAt || "未确认"}` : "";
     return {
       title: `${structure.type} · ${status}${phase}`,
-      body: `${start} · 参考价 ${endPrice} · 失效边界 ${boundary}${ruleVersion}`,
+      body: `${start}${dates} · 参考价 ${endPrice}${structure.protectionPrice != null ? ` · 预警保护价 ${displayPrice(structure.protectionPrice)} · 参考顶部日期 ${structure.pivotDate || "未知"}` : ""} · 失效边界 ${boundary}${ruleVersion}`,
     };
   }
   const type = structure.type === "线段" ? `${level}线段`
@@ -396,8 +400,9 @@ function bindChanChartHover(target, initialBinding) {
     }).filter(({ distance }) => model.layers?.afStochZ === true && distance <= 14)
       .sort((left, right) => left.distance - right.distance)[0]?.signal;
     if (signalHit) {
-      structureTitle.textContent = `${signalHit.type} · ${signalHit.signalStatus}${signalHit.signalPhase && signalHit.signalPhase !== signalHit.signalStatus ? ` · ${signalHit.signalPhase}` : ""}`;
-      structureBody.textContent = `${signalHit.start} · 参考价 ${formatMoney(signalHit.endPrice)} · 失效边界 ${signalHit.invalidationPrice == null ? "未知" : formatMoney(signalHit.invalidationPrice)}`;
+      const details = chanStructureTooltipDetails(signalHit);
+      structureTitle.textContent = details.title;
+      structureBody.textContent = details.body;
       structureDetail.hidden = false;
     } else if (afSignalHit) {
       structureTitle.textContent = afSignalHit.type || afSignalHit.label?.replace("\n", " · ") || "自适应随机Z信号";
@@ -411,7 +416,8 @@ function bindChanChartHover(target, initialBinding) {
         && Math.abs(localY - item.labelY) <= (item.labelHeight || 18) / 2;
       return onLine || onLabel;
     });
-    const structure = candle.pending ? null : (model.structures || []).map((item) => {
+    // 信号统一命中真实绘制标记，避免隐藏预警及标记下方价格点出现幽灵命中。
+    const structure = candle.pending ? null : (model.structures || []).filter((item) => !item.signalTarget).map((item) => {
       const inArea = item.area && localX >= Math.min(item.x1, item.x2) && localX <= Math.max(item.x1, item.x2)
         && localY >= Math.min(item.y1, item.y2) && localY <= Math.max(item.y1, item.y2);
       return { item, distance: item.area ? (inArea ? 5 : Infinity) : distanceToSegment(item) };
@@ -1166,7 +1172,7 @@ function drawChanCanvas(target, binding) {
       const previous = trendAverage[index - 1], current = trendAverage[index];
       if (!previous || !current || !Number.isFinite(previous.x) || !Number.isFinite(previous.y)
         || !Number.isFinite(current.x) || !Number.isFinite(current.y)) continue;
-      line(previous.x, previous.y, current.x, current.y, current.rising ? colors.up : colors.down, [], model.mobileChart ? 3 : 4);
+      line(previous.x, previous.y, current.x, current.y, current.rising ? colors.up : colors.down, [], model.mobileChart ? 2 : 2.5);
     }
     for (const event of model.macdSma200Events || []) {
       const color = event.side === "buy" ? colors.up : colors.down;
@@ -1461,7 +1467,9 @@ function drawChanCanvas(target, binding) {
     const scaleX = width / model.width, scaleY = height / model.height;
     const occupiedLabels = [];
     for (const signal of model.signals || []) {
-      const invalidated = signal.invalidated, confirmed = signal.status === "confirmed";
+      signal.renderedMarker = null;
+      signal.renderedLabel = null;
+      const invalidated = signal.invalidated, confirmed = signal.confirmed === true || signal.status === "confirmed";
       const color = invalidated ? colors.text : signal.side === "buy" ? colors.up : colors.down;
       const markerX = signal.x * scaleX;
       const markerY = (Number.isFinite(signal.markerY) ? signal.markerY : signal.y) * scaleY;
@@ -1484,7 +1492,7 @@ function drawChanCanvas(target, binding) {
       signal.renderedLabel = null;
       if (signal.labelVisible === false) continue;
       const title = signal.type || signal.label.replace(/\s*·\s*已失效$/, "");
-      const status = invalidated ? "失效" : confirmed ? "确认" : "待确认";
+      const status = invalidated ? "失效" : signal.status === "risk_triggered" ? "失守" : confirmed ? "确认" : "待确认";
       context.font = "500 12px Inter, ui-sans-serif, system-ui, sans-serif";
       const titleWidth = context.measureText(title).width;
       context.font = "400 10px Inter, ui-sans-serif, system-ui, sans-serif";
@@ -2190,6 +2198,8 @@ const chanChartInteraction = {
 
 function renderSignedChart(targetId, points, positiveKey, negativeKey, unit, emptyMessage, options = {}) {
   const target = document.getElementById(targetId);
+  // 异步行情绘制时，容器可能尚未生成或已经移除；跳过本次绘制，等待下一次有效更新。
+  if (!target) return;
   const positiveBoth = options.positiveBoth === true;
   if (!points.length || (!positiveBoth && points.every((point) => !(Math.abs(point[positiveKey]) + Math.abs(point[negativeKey]))))) { target.innerHTML = `<div class="chart-empty">${emptyMessage}</div>`; return; }
   // 按容器实际像素绘制：viewBox 与元素 1:1，手机窄屏不会再把柱子和坐标文字整体等比缩小。

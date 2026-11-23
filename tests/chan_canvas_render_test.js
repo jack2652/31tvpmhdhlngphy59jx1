@@ -18,6 +18,16 @@ const target = { querySelector: (selector) => selector.startsWith("canvas") ? ca
 const sandbox = { window, document: {}, getComputedStyle: () => ({ getPropertyValue: () => "" }), ResizeObserver: undefined, MutationObserver: undefined };
 vm.runInNewContext(fs.readFileSync("web/static/common/js/charts.js", "utf8"), sandbox);
 
+// 日期：2026-11-23；执行者：Codex。异步绘制可能遇到尚未生成或已移除的容器，直接跳过该目标。
+const initialWindow = {};
+vm.runInNewContext(fs.readFileSync("web/static/common/js/charts.js", "utf8"), {
+  window: initialWindow, document: { getElementById: () => null },
+  getComputedStyle() { throw new Error("缺失容器不应进入尺寸计算"); },
+});
+for (const points of [[], [{ strike: 100, callGex: 1, putGex: -1 }]]) {
+  assert.doesNotThrow(() => initialWindow.OptionScopeCharts.renderSignedChart("gex-chart", points, "callGex", "putGex", "M", "等待行情"), "缺失容器不得读取getBoundingClientRect或innerHTML");
+}
+
 function render(segments, enabled) {
   context.strokes = [];
   window.OptionScopeCharts.renderChanCanvas(target, {
@@ -245,6 +255,16 @@ const duplicateSignalRender = renderChanSignals([
 assert.equal(duplicateSignalRender.texts.filter((item) => item.text === "一买").length, 1, "duplicate signal labels paint only once");
 assert.equal(duplicateSignalRender.texts.filter((item) => item.text === "待确认").length, 1);
 assert.ok(duplicateSignalRender.strokes.some((stroke) => stroke.start?.[0] === 180 && stroke.start?.[1] === 194.5), "hiding a duplicate label keeps its signal marker visible");
+// 2026-11-23，Codex：保护价已失守须直接显示风险，不能继续画成等待确认。
+const triggeredRender = renderChanSignals([{ side: "sell", status: "risk_triggered", confirmed: false, x: 180, y: 100, labelX: 180, labelY: 70, label: "顶部早预警", type: "顶部早预警" }]);
+assert.ok(triggeredRender.texts.some((text) => text.text === "失守"));
+assert.ok(!triggeredRender.texts.some((text) => text.text === "确认" || text.text === "待确认"));
+// 2026-11-23，Codex：Canvas 必须消费模型确认标记，背驰和预警使用各自状态名。
+for (const [status, title] of [["divergence_confirmed", "一卖"], ["warning_confirmed", "顶背驰预警"]]) {
+  const confirmedRender = renderChanSignals([{ side: "sell", status, confirmed: true, x: 180, y: 100, labelX: 180, labelY: 70, label: title, type: title }]);
+  assert.ok(confirmedRender.texts.some((text) => text.text === "确认"), `${title}确认不能误画为待确认`);
+  assert.ok(!confirmedRender.texts.some((text) => text.text === "待确认"));
+}
 for (const [width, height, ratio] of [[1326, 470, 1], [328, 406, 2]]) {
   displayBounds = { width, height }; window.devicePixelRatio = ratio;
   const signals = [
@@ -254,19 +274,29 @@ for (const [width, height, ratio] of [[1326, 470, 1], [328, 406, 2]]) {
   ];
   const original = JSON.parse(JSON.stringify(signals));
   const visual = renderChanSignals(signals);
-  assert.ok(["确认", "待确认", "失效"].every((status) => visual.texts.some((text) => text.text === status)), "all states have separate Chinese labels");
+  assert.ok(["确认", "待确认", "失效"].every((status) => visual.texts.some((text) => text.text === status)), "确认、待确认和历史失效状态均须显示");
   const labels = visual.texts.filter((text) => ["三买", "三卖"].includes(text.text));
   assert.equal(labels.length, 3);
   assert.ok(labels.every((text) => Math.abs(Number(text.font.match(/(\d+)px/)[1]) * text.transform[3] / ratio - 12) < 0.1), "signal title font stays at 12 CSS pixels across chart widths and DPR");
   assert.equal(labels[0].color, "#19bd83"); assert.equal(labels[1].color, "#f04d68");
-  assert.notEqual(labels[2].color, labels[0].color, "invalidated signals use the existing muted theme color");
+  assert.equal(labels[2].color, "#81909c");
+  assert.ok(signals[2].renderedLabel, "失效标签恢复完整文字框");
+  assert.ok(signals[2].renderedMarker, "失效圆斜杠仍可查看详情");
   signals.forEach((signal, index) => {
-    assert.ok(Math.abs(signal.renderedLabel.height * height / 340 - 20) < 0.1);
+    if (signal.renderedLabel) assert.ok(Math.abs(signal.renderedLabel.height * height / 340 - 20) < 0.1);
     const { renderedLabel, renderedMarker, ...unchanged } = signal;
     assert.deepEqual(unchanged, original[index], "styling cannot change signal status, text or model coordinates");
   });
 }
 displayBounds = { width: 960, height: 340 }; window.devicePixelRatio = 1;
+// 日期：2026-11-23；执行者：Codex。完整结构预警和失效连接线恢复为参考截图样式。
+const historicalWarning = { type: "反弹承压", label: "反弹承压 · 已失效", side: "sell", invalidated: true,
+  status: "invalidated", x: 180, y: 100, labelX: 180, labelY: 250 };
+const historicalRender = renderChanSignals([historicalWarning]);
+assert.ok(["反弹承压", "失效"].every((title) => historicalRender.texts.some((text) => text.text === title)));
+assert.ok(historicalWarning.renderedLabel && historicalWarning.renderedMarker);
+assert.ok(historicalRender.strokes.some((stroke) => stroke.start?.[0] === 180 && stroke.end?.[0] === 180
+  && Math.abs(stroke.end[1] - stroke.start[1]) > 50), "历史失效文字框仍连接原信号位置");
 const turningWarningRender = renderTurningWarnings();
 assert.ok(turningWarningRender.texts.some((item) => item.text === "109.21"), "pivot price labels remain painted next to turning warnings");
 assert.ok(turningWarningRender.texts.some((item) => item.text === "底观察" && item.x === 180 && item.y === 230 && item.baseline === "middle"), "turning warnings use their collision-resolved center position");

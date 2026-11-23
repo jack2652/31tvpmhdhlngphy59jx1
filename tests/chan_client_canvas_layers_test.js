@@ -117,12 +117,12 @@ assert.match(allLayers.daily.signals.find((signal) => signal.kind === "class2_bu
 const crowdedFrame = frame();
 crowdedFrame.signals_v4 = ["class1_buy", "class2_buy", "class3_buy", "class1_sell", "class2_sell", "class3_sell"]
   .map((kind, index) => ({ signal_id: `crowded-${index}`, kind, side: kind.endsWith("buy") ? "buy" : "sell",
-    status: "invalidated", date: "2026-10-14", price: 12 }));
+    status: "candidate", date: "2026-10-14", price: 12 }));
 const crowdedView = window.OptionScopeChan.view({ ...payload, daily: crowdedFrame }, true, false, 30, null, {
   signals: true, legacySignals: false,
 });
 const crowdedSignals = crowdedView.daily.chart.signals;
-assert.equal(crowdedSignals.length, 6, "crowded historical signals must all remain in the canvas model");
+assert.equal(crowdedSignals.length, 6, "拥挤的活动信号必须全部保留且标签仍避让");
 for (let leftIndex = 0; leftIndex < crowdedSignals.length; leftIndex += 1) {
   for (let rightIndex = leftIndex + 1; rightIndex < crowdedSignals.length; rightIndex += 1) {
     const left = crowdedSignals[leftIndex], right = crowdedSignals[rightIndex];
@@ -140,9 +140,21 @@ duplicateSignalFrame.signals_v4 = [
 ];
 const duplicateSignalView = window.OptionScopeChan.view({ ...payload, daily: duplicateSignalFrame }, true, false, 30, null, { signals: true });
 assert.deepEqual(Array.from(duplicateSignalView.daily.chart.signals.map((signal) => signal.labelVisible)),
-  [true, false, true, true], "only repeated same-date rendered labels should be hidden");
+  [true, false, true, true], "历史失效标签恢复，同日同名同状态的重复文字仅显示一次");
 assert.equal(duplicateSignalView.daily.chart.signals.length, 4, "deduplicating labels must keep every signal marker");
 assert.equal(duplicateSignalView.daily.recursiveSignals.length, 4, "deduplication should not remove distinct API signal details");
+
+// 结构确认时间已到达的一类点须显示确认；观察和失效状态不能被升级。
+const classOnePhases = frame();
+classOnePhases.signals_v4 = [
+  { signal_id: "sell-observing", kind: "class1_sell", side: "sell", status: "observing", phase: "observation", date: "2026-10-13", price: 14, observed_at: "2026-10-14" },
+  { signal_id: "sell-confirmed", kind: "class1_sell", side: "sell", status: "divergence_confirmed", phase: "divergence_confirmed", date: "2026-10-13", price: 14, observed_at: "2026-10-14", confirmed_at: "2026-10-15" },
+  { signal_id: "sell-invalidated", kind: "class1_sell", side: "sell", status: "invalidated", phase: "invalidated", date: "2026-10-13", price: 14, observed_at: "2026-10-14", confirmed_at: "2026-10-15" },
+];
+const classOnePhaseView = window.OptionScopeChan.view({ ...payload, daily: classOnePhases }, true, false, 30, null, { signals: true });
+const classOneTargets = classOnePhaseView.daily.chart.structures.filter((item) => item.signalTarget);
+assert.deepEqual(Array.from(classOneTargets.map((item) => item.confirmed)), [false, true, false]);
+assert.equal(classOneTargets[1].signalStatus, "背驰已确认");
 assert.match(allLayers.daily.signals.find((signal) => signal.kind === "class1_buy").marketAndLevelLabel, /S&P 500 牛市环境 · 2026-10-15 · 环境已分类 · 下级别确认：等待下级别确认 · 跨周期确认：未提供/);
 assert.match(allLayers.daily.signals.find((signal) => signal.kind === "class1_buy").evidenceLabel, /规则证据：同级确认走势段/);
 assert.match(allLayers.daily.signals.find((signal) => signal.kind === "class1_buy").evidenceLabel, /失效边界 8.00/);
@@ -217,4 +229,118 @@ assert.doesNotMatch(waitingView.daily.recursive.emptySignalNotice, /旧字段|�
 assert.ok(!waitingView.daily.signals.some((signal) => signal.kind === "third_buy_candidate"), "waiting view must ignore deprecated pen signals");
 assert.ok(template.includes('class="chan-summary-readiness" role="status">{{ chanFrame.recursive.emptySignalNotice }}</p>'), "the structure summary must render recursive signal blockers visibly");
 
+// 2026-11-23，Codex：独立预警共用图表，但不能进入严格点计数或交易计划。
+const warningFrame = frame();
+warningFrame.structure_warnings_v4 = [
+  { signal_id: "w1", source_kind: "pen", level: 0, kind: "center_divergence_sell", side: "sell", status: "warning_confirmed", phase: "warning_confirmed", date: "2026-10-13", observed_at: "2026-10-14", confirmed_at: "2026-10-15", price: 14, invalidation_price: 14, lower_level_status: "not_required", timeframe_confirmation: { status: "not_required" }, phase_history: [{ phase: "observation", at: "2026-10-14" }, { phase: "warning_confirmed", at: "2026-10-15" }] },
+  { signal_id: "w2", source_kind: "pen", level: 0, kind: "rebound_failure_sell", side: "sell", status: "observing", phase: "observation", date: "2026-10-14", observed_at: "2026-10-15", price: 15, invalidation_price: 15, lower_level_status: "not_required", phase_history: [{ phase: "observation", at: "2026-10-15" }] },
+  { signal_id: "w3", source_kind: "pen", level: 0, kind: "pullback_hold_buy", side: "buy", status: "invalidated", phase: "invalidated", phase_at: "2026-10-16", date: "2026-10-15", observed_at: "2026-10-15", price: 8, invalidation_price: 8 },
+];
+const warningPayload = { ...payload, symbol: "ORCL", daily: warningFrame, price_coordinate: { basis: "raw", status: "available" } };
+const warningView = window.OptionScopeChan.view(warningPayload, false, false, 30, null, { signals: true });
+assert.equal(warningView.daily.chart.signals.length, chart.signals.length + 3);
+assert.equal(warningView.daily.chart.signals.find((s) => s.type === "顶背驰预警").confirmed, true);
+assert.equal(warningView.daily.chart.signals.find((s) => s.type === "反弹承压").confirmed, false);
+assert.equal(warningView.daily.chart.signals.find((s) => s.type === "回踩支撑").invalidated, true);
+assert.equal(warningView.daily.chart.structures.find((s) => s.type === "回踩支撑").confirmedAt, "", "失效阶段日期不能作为确认日期");
+assert.equal(warningView.daily.recursive.activeSignalCount, allLayers.daily.recursive.activeSignalCount);
+assert.equal(warningView.daily.recursive.invalidatedSignalCount, allLayers.daily.recursive.invalidatedSignalCount);
+assert.match(warningView.daily.recursive.readiness, /3 条独立结构预警/);
+assert.match(warningView.daily.recursiveSignals.find((s) => s.signal_id === "w1").marketAndLevelLabel, /本级独立预警/);
+assert.doesNotMatch(warningView.daily.recursiveSignals.find((s) => s.signal_id === "w1").marketAndLevelLabel, /not_required/);
+assert.deepEqual(JSON.parse(JSON.stringify(warningView.daily.plan)), JSON.parse(JSON.stringify(window.OptionScopeChan.view({ ...warningPayload, daily: { ...warningFrame, structure_warnings_v4: [] } }).daily.plan)));
+const warningOnly = window.OptionScopeChan.view({ ...warningPayload, daily: { ...warningFrame, signals_v4: [] } }, false, false, 30, null, { signals: true });
+assert.equal(warningOnly.daily.recursive.emptySignalNotice, "");
+assert.equal(warningOnly.daily.recursive.activeSignalCount, 0);
+const intradayWarnings = window.OptionScopeChan.intradayView({ ...warningPayload, frame: { ...warningFrame, period: "1h", timeframe: "1h" } }, false, null, false, 30, null, { signals: true });
+assert.ok(intradayWarnings.chart.signals.some((s) => s.type === "顶背驰预警"));
+
+// 即使旧位置中枢已不可用，触及预警端点仍须失效；以后确认不得复活。
+const noCenterPayload = { ...warningPayload, daily: { ...warningFrame, position: { center: null } } };
+const liveBroken = window.OptionScopeChan.withSpot(noCenterPayload, 15, null, { symbol: "ORCL", fetched_at: "2026-10-16T15:00:00Z" });
+assert.equal(liveBroken.daily.structure_warnings_v4[1].status, "invalidated");
+assert.equal(liveBroken.daily.structure_warnings_v4[1].phase_at, "2026-10-16");
+assert.equal(liveBroken.daily.structure_warnings_v4[0].confirmed_at, "2026-10-15");
+const laterFixedFrame = { ...warningFrame, structure_warnings_v4: warningFrame.structure_warnings_v4.map((s) => s.signal_id === "w2" ? { ...s, status: "warning_confirmed", confirmed_at: "2026-10-20" } : s) };
+const recovered = window.OptionScopeChan.withSpot({ ...warningPayload, daily: laterFixedFrame }, 10, liveBroken);
+assert.equal(recovered.daily.structure_warnings_v4[1].status, "invalidated");
+assert.equal(recovered.daily.structure_warnings_v4[1].confirmed_at, "");
+assert.equal(recovered.daily.structure_warnings_v4[1].phase_at, "2026-10-16");
+assert.equal(recovered.daily.structure_warnings_v4[1].phase_history.at(-1).phase, "invalidated");
+const newSourceFrame = { ...laterFixedFrame, structure_warnings_v4: laterFixedFrame.structure_warnings_v4.map((s) => ({ ...s, source_kind: "recursive" })) };
+assert.equal(window.OptionScopeChan.withSpot({ ...warningPayload, daily: newSourceFrame }, 10, liveBroken).daily.structure_warnings_v4[1].status, "warning_confirmed");
+const adjustedWarningPayload = { ...noCenterPayload, price_coordinate: { basis: "split_dividend_adjusted", status: "available", adjustment_factor: .5, factor_date: "2026-10-15" } };
+assert.equal(window.OptionScopeChan.withSpot(adjustedWarningPayload, 29).daily.structure_warnings_v4[1].status, "observing");
+assert.equal(window.OptionScopeChan.withSpot(adjustedWarningPayload, 30).daily.structure_warnings_v4[1].status, "invalidated");
+const buyWarningFrame = { ...warningFrame, structure_warnings_v4: [{ ...warningFrame.structure_warnings_v4[1], kind: "center_divergence_buy", side: "buy", price: 8, invalidation_price: 8 }] };
+assert.equal(window.OptionScopeChan.withSpot({ ...warningPayload, daily: buyWarningFrame }, 8).daily.structure_warnings_v4[0].status, "invalidated");
+assert.equal(window.OptionScopeChan.withSpot({ ...warningPayload, price_coordinate: { basis: "split_dividend_adjusted", status: "degraded" } }, 30).daily.structure_warnings_v4[1].status, "observing");
+// 2026-11-23，Codex：早预警保留真实观察日与持仓保护价，主图恢复为结构信号。
+const earlyFrame = { ...frame(), as_of: "2026-10-14", last_close: 12, candles: frame().candles.slice(0, 3), signals: [], signals_v4: [], structure_warnings_v4: [],
+  early_risk_warnings_v4: [{ symbol: "QQQ", signal_id: "early1", source_kind: "pen", level: 0, kind: "early_top_sell", side: "sell", status: "observing", phase: "observation", date: "2026-10-14", observed_at: "2026-10-14", pivot_date: "2026-10-13", price: 15, invalidation_price: 15, protection_price: 11, confirmed_at: "", phase_history: [{ phase: "observation", at: "2026-10-14" }] }],
+  strokes: [{ chain: 0, confirmed: true, direction: "up", start: { date: "2026-10-12", kind: "bottom", price: 9 }, end: { date: "2026-10-13", kind: "top", price: 15, confirmed_at: "2026-10-14" }, confirmed_at: "2026-10-14" }] };
+const earlyPayload = { ...payload, symbol: "QQQ", spot: 13, daily: earlyFrame, weekly: null, price_coordinate: { basis: "raw", status: "unadjusted" } };
+const earlySafe = window.OptionScopeChan.withSpot(earlyPayload, 13);
+const earlyView = window.OptionScopeChan.view(earlySafe, false, false, 30, null, { signals: true }).daily;
+assert.match(earlyView.plan.cards[1].action, /早预警/);
+assert.equal(earlyView.chart.signals.length, 0, "主图不叠加早预警");
+assert.ok(!earlyView.chart.structures.some((structure) => structure.type === "顶部早预警"));
+assert.equal(earlyView.recursiveSignals.length, 1, "早预警仍保留在完整详情列表");
+assert.equal(earlySafe.daily.early_risk_warnings_v4[0].observed_at, "2026-10-14");
+assert.equal(earlySafe.daily.early_risk_warnings_v4[0].pivot_date, "2026-10-13");
+assert.equal(earlySafe.daily.early_risk_warnings_v4[0].protection_price, 11);
+assert.equal(earlyView.recursive.activeSignalCount, 0);
+// 日期：2026-11-23；执行者：Codex。结构预警完整显示，早预警仅保留详情和持仓计划。
+const structureFrame = { ...earlyFrame, structure_warnings_v4: [{ ...earlyFrame.early_risk_warnings_v4[0],
+  signal_id: "later-warning", kind: "center_divergence_sell", date: "2026-10-13", pivot_date: undefined,
+  observed_at: "2026-10-15", confirmed_at: "2026-10-16", status: "warning_confirmed", phase: "warning_confirmed", protection_price: undefined }] };
+const structurePayload = { ...earlyPayload, daily: structureFrame };
+const structureInput = JSON.stringify(structurePayload);
+const structureView = window.OptionScopeChan.view(structurePayload, false, false, 30, null, { signals: true }).daily;
+assert.equal(structureView.chart.signals.length, 1);
+const primaryWarning = structureView.chart.signals[0];
+assert.equal(primaryWarning.type, "顶背驰预警");
+assert.equal(primaryWarning.labelVisible, true);
+assert.equal(primaryWarning.start, "2026-10-13");
+assert.equal(primaryWarning.formedAt, "2026-10-15");
+assert.equal(primaryWarning.confirmedAt, "2026-10-16");
+assert.equal(primaryWarning.confirmed, true);
+assert.ok(!structureView.chart.structures.some((s) => /早预警/.test(s.type)));
+assert.equal(structureView.recursiveSignals.length, 2, "完整详情列表保留结构预警和早预警");
+assert.deepEqual(JSON.parse(JSON.stringify(structureView.plan)), JSON.parse(JSON.stringify(earlyView.plan)));
+assert.equal(JSON.stringify(structurePayload), structureInput, "显示恢复不得修改原始信号");
+const changedStructureFrame = { ...structureFrame, structure_warnings_v4: [{ ...structureFrame.structure_warnings_v4[0], status: "invalidated", phase: "invalidated" }] };
+const invalidStructureView = window.OptionScopeChan.view({ ...structurePayload, daily: changedStructureFrame }, false, false, 30, null, { signals: true }).daily;
+assert.equal(changedStructureFrame.candles, structureFrame.candles, "复用同一行情数组验证状态更新缓存");
+assert.equal(invalidStructureView.chart.signals[0].invalidated, true);
+assert.equal(invalidStructureView.chart.signals[0].labelVisible, true, "历史失效结构预警须保留完整标签");
+assert.equal(invalidStructureView.chart.signals[0].confirmed, false);
+const strictTogether = window.OptionScopeChan.view({ ...structurePayload, daily: { ...structureFrame,
+  signals_v4: [{ ...structureFrame.structure_warnings_v4[0], kind: "class1_sell", signal_id: "strict-one" }] } }, false, false, 30, null, { signals: true }).daily;
+assert.deepEqual(Array.from(strictTogether.chart.signals.map((s) => s.type)), ["一卖", "顶背驰预警"], "严格信号和结构预警分别显示完整标签");
+assert.equal(strictTogether.recursive.activeSignalCount, 1);
+assert.deepEqual(JSON.parse(JSON.stringify(earlyView.plan.cards[0])), JSON.parse(JSON.stringify(window.OptionScopeChan.view({ ...earlyPayload, daily: { ...earlyFrame, early_risk_warnings_v4: [] } }).daily.plan.cards[0])), "提前风险不能升级或改变新仓严格入场规则");
+const earlyTouch = window.OptionScopeChan.withSpot(earlyPayload, 10, earlySafe, { symbol: "QQQ", fetched_at: "2026-10-15T15:00:00Z" });
+assert.equal(earlyTouch.daily.early_risk.touched, true);
+assert.equal(earlyTouch.daily.early_risk.touched_at, "2026-10-15");
+assert.equal(earlyTouch.daily.early_risk_warnings_v4[0].status, "observing");
+assert.match(window.OptionScopeChan.view(earlyTouch).daily.plan.cards[1].action, /保护价失守/);
+const earlyRecovery = window.OptionScopeChan.withSpot(earlyPayload, 13, earlyTouch);
+assert.equal(earlyRecovery.daily.early_risk.touched, true);
+assert.match(window.OptionScopeChan.view(earlyRecovery).daily.plan.cards[1].action, /曾失守/);
+const earlyInvalid = window.OptionScopeChan.withSpot(earlyPayload, 15, earlyTouch, { symbol: "QQQ", fetched_at: "2026-10-16T15:00:00Z" });
+assert.equal(earlyInvalid.daily.early_risk_warnings_v4[0].status, "invalidated");
+assert.equal(earlyInvalid.daily.early_risk, null);
+assert.equal(window.OptionScopeChan.withSpot(earlyPayload, 13, earlyInvalid).daily.early_risk_warnings_v4[0].status, "invalidated");
+const newEarly = { ...earlyPayload, daily: { ...earlyFrame, early_risk_warnings_v4: earlyFrame.early_risk_warnings_v4.map((s) => ({ ...s, signal_id: "early2" })) } };
+assert.equal(window.OptionScopeChan.withSpot(newEarly, 13, earlyTouch).daily.early_risk.touched, false, "新的风险事件不继承旧触及状态");
+const earlyIntradayPayload = { ...earlyPayload, daily: undefined, period: "1h", frame: { ...earlyFrame, period: "1h", timeframe: "1h" } };
+const earlyIntradayTouch = window.OptionScopeChan.withSpot(earlyIntradayPayload, 10, null, { symbol: "QQQ", fetched_at: "2026-10-15T15:00:00Z" });
+assert.equal(earlyIntradayTouch.frame.early_risk.touched, true);
+assert.equal(window.OptionScopeChan.withSpot(earlyIntradayPayload, 13, earlyIntradayTouch).frame.early_risk.touched, true);
+assert.match(window.OptionScopeChan.intradayView(earlyIntradayTouch).plan.cards[1].action, /保护价失守/);
+const triggeredPayload = { ...earlyPayload, daily: { ...earlyFrame, early_risk_warnings_v4: earlyFrame.early_risk_warnings_v4.map((s) => ({ ...s, status: "risk_triggered", phase: "risk_triggered", phase_at: "2026-10-15" })) } };
+const triggeredView = window.OptionScopeChan.view(triggeredPayload, false, false, 30, null, { signals: true }).daily;
+assert.ok(!triggeredView.chart.structures.some((s) => s.type === "顶部早预警"));
+assert.equal(triggeredView.recursive.activeSignalCount, 0, "早风险触发不能确认严格信号");
 console.log("Chan canvas layer model checks passed");

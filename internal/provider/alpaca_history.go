@@ -20,14 +20,15 @@ import (
 const (
 	alpacaHistoricalBarsPath  = "/v2/stocks/bars"
 	alpacaHistoricalBarLimit  = 10000
-	alpacaHistoryCacheTTL     = 24 * time.Hour
+	alpacaHistoryCacheTTL     = 30 * time.Second
 	alpacaHistoryCacheEntries = 4
 	alpacaHistoryBodyLimit    = 16 << 20
 )
 
 type alpacaIntradayCacheEntry struct {
-	result    HistoryResult
-	fetchedAt time.Time
+	result       HistoryResult
+	fetchedAt    time.Time
+	backfilledAt time.Time
 }
 
 type alpacaHistoricalBarsPage struct {
@@ -65,7 +66,8 @@ func (a *Alpaca) FetchIntraday(ctx context.Context, rawSymbol, interval string) 
 	}
 	cacheKey := symbol + ":" + interval
 	a.historyMu.Lock()
-	if cached, found := a.historyCache[cacheKey]; found {
+	cached, found := a.historyCache[cacheKey]
+	if found {
 		age := now.Sub(cached.fetchedAt)
 		if age >= 0 && age < alpacaHistoryCacheTTL {
 			a.historyMu.Unlock()
@@ -78,6 +80,13 @@ func (a *Alpaca) FetchIntraday(ctx context.Context, rawSymbol, interval string) 
 	}
 
 	start := now.AddDate(0, -6, 0)
+	backfilledAt := now
+	// 长历史每天补齐一次；盘中只重取最近一周并覆盖修订，避免每30秒重拉六个月。
+	warm := found && !cached.backfilledAt.IsZero() && now.Sub(cached.backfilledAt) < 24*time.Hour
+	if warm {
+		start = now.AddDate(0, 0, -7)
+		backfilledAt = cached.backfilledAt
+	}
 	bars, err := a.fetchHistoricalBars(ctx, symbol, start, now)
 	if err != nil {
 		return HistoryResult{}, err
@@ -93,12 +102,22 @@ func (a *Alpaca) FetchIntraday(ctx context.Context, rawSymbol, interval string) 
 	result := HistoryResult{
 		Symbol: symbol, Bars: normalized, FetchedAt: now.UTC(), Source: "alpaca-iex",
 	}
+	if warm {
+		result = mergeIntradayHistory(cached.result, result)
+		result.Source = "alpaca-iex"
+		minimum := now.AddDate(0, -6, 0).In(location).Format(time.DateOnly)
+		first := 0
+		for first < len(result.Bars) && result.Bars[first]["date"].(string) < minimum {
+			first++
+		}
+		result.Bars = result.Bars[first:]
+	}
 	a.markAuthSuccess()
-	a.cacheIntradayHistory(cacheKey, result, now)
+	a.cacheIntradayHistory(cacheKey, result, now, backfilledAt)
 	return result, nil
 }
 
-func (a *Alpaca) cacheIntradayHistory(key string, result HistoryResult, fetchedAt time.Time) {
+func (a *Alpaca) cacheIntradayHistory(key string, result HistoryResult, fetchedAt, backfilledAt time.Time) {
 	a.historyMu.Lock()
 	defer a.historyMu.Unlock()
 	if a.historyCache == nil {
@@ -119,7 +138,7 @@ func (a *Alpaca) cacheIntradayHistory(key string, result HistoryResult, fetchedA
 			delete(a.historyCache, oldestKey)
 		}
 	}
-	a.historyCache[key] = alpacaIntradayCacheEntry{result: result, fetchedAt: fetchedAt}
+	a.historyCache[key] = alpacaIntradayCacheEntry{result: result, fetchedAt: fetchedAt, backfilledAt: backfilledAt}
 }
 
 func (a *Alpaca) fetchHistoricalBars(ctx context.Context, symbol string, start, end time.Time) ([]alpacaHistoricalBar, error) {

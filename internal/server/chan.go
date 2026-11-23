@@ -83,7 +83,7 @@ func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, stri
 	// symbol covers them and switching periods reuses the fetch.
 	s.intradayMu.Lock()
 	memoryCached, memoryFound := s.intradayHistoryCache[symbol]
-	if memoryFound && now.Sub(memoryCached.fetchedAt) < 3*time.Minute && !intradayPostCloseRefreshNeeded(memoryCached, now) {
+	if memoryFound && now.Sub(memoryCached.fetchedAt) < 30*time.Second && !intradayPostCloseRefreshNeeded(memoryCached, now) {
 		memoryCached.lastAccess = time.Now()
 		s.intradayHistoryCache[symbol] = memoryCached
 		s.intradayMu.Unlock()
@@ -100,7 +100,7 @@ func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, stri
 					persisted = intradayCacheEntry{frame: bars, fetchedAt: fetchedAt, lastAccess: time.Now()}
 					persistedSource = "sqlite"
 				}
-				if !persisted.fetchedAt.IsZero() && now.Sub(persisted.fetchedAt) < 3*time.Minute && !intradayPostCloseRefreshNeeded(persisted, now) {
+				if !persisted.fetchedAt.IsZero() && now.Sub(persisted.fetchedAt) < 30*time.Second && !intradayPostCloseRefreshNeeded(persisted, now) {
 					s.intradayMu.Lock()
 					if s.intradayHistoryCache == nil {
 						s.intradayHistoryCache = make(map[string]intradayCacheEntry)
@@ -439,6 +439,11 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 		}
 		for index := range result.Weekly.SignalsV4 {
 			result.Weekly.SignalsV4[index].Symbol = symbol
+		}
+		for _, warnings := range [][]chananalysis.V4Signal{result.Daily.StructureWarnings, result.Weekly.StructureWarnings, result.Daily.EarlyRiskWarnings, result.Weekly.EarlyRiskWarnings} {
+			for index := range warnings {
+				warnings[index].Symbol = symbol
+			}
 		}
 		return result, nil
 	})
@@ -970,17 +975,19 @@ func attachMarketEnvironment(frame *chananalysis.Frame, series []chananalysis.Ma
 	}
 	environment := chananalysis.MarketEnvironmentAt(series, frame.AsOf)
 	frame.MarketEnvironment = &environment
-	for index := range frame.SignalsV4 {
-		observedAt := frame.SignalsV4[index].ObservedAt
-		if observedAt == "" {
-			observedAt = frame.SignalsV4[index].Date
-		}
-		signalEnvironment := chananalysis.MarketEnvironmentAt(series, observedAt)
-		frame.SignalsV4[index].MarketEnvironment = &signalEnvironment
-		frame.SignalsV4[index].MarketFilter = signalEnvironment.Status
-		if signalEnvironment.Status == "unfiltered" {
-			frame.SignalsV4[index].MarketFilter = "unfiltered"
-			frame.SignalsV4[index].Detail += "；S&P 500 环境未过滤：" + signalEnvironment.Reason
+	for _, signals := range [][]chananalysis.V4Signal{frame.SignalsV4, frame.StructureWarnings, frame.EarlyRiskWarnings} {
+		for index := range signals {
+			observedAt := signals[index].ObservedAt
+			if observedAt == "" {
+				observedAt = signals[index].Date
+			}
+			signalEnvironment := chananalysis.MarketEnvironmentAt(series, observedAt)
+			signals[index].MarketEnvironment = &signalEnvironment
+			signals[index].MarketFilter = signalEnvironment.Status
+			if signalEnvironment.Status == "unfiltered" {
+				signals[index].MarketFilter = "unfiltered"
+				signals[index].Detail += "；S&P 500 环境未过滤：" + signalEnvironment.Reason
+			}
 		}
 	}
 }

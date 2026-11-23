@@ -66,12 +66,8 @@ func analyzeWithComponents(symbol string, input []Bar, spot *float64, cutoff tim
 	result.Parameters = RecursiveParameters()
 	result.Daily = addRecursiveAnalysisWithComponents(result.Daily, result.Daily.Candles, recursiveDivergenceRatio, cached)
 	result.Weekly = addRecursiveAnalysisWithDivergenceRatio(result.Weekly, result.Weekly.Candles, recursiveDivergenceRatio)
-	for index := range result.Daily.SignalsV4 {
-		result.Daily.SignalsV4[index].Symbol = symbol
-	}
-	for index := range result.Weekly.SignalsV4 {
-		result.Weekly.SignalsV4[index].Symbol = symbol
-	}
+	setFrameSignalSymbols(&result.Daily, symbol)
+	setFrameSignalSymbols(&result.Weekly, symbol)
 	return result
 }
 
@@ -268,14 +264,10 @@ func analyzeAdjustedValidatedWithSpotMode(symbol string, input, validated []Bar,
 		dailyQuality.Status = "degraded"
 	}
 	result.Daily = addRecursiveAnalysisWithComponents(result.Daily, dailyBars, divergenceRatio, cached)
-	for index := range result.Daily.SignalsV4 {
-		result.Daily.SignalsV4[index].Symbol = symbol
-	}
+	setFrameSignalSymbols(&result.Daily, symbol)
 	result.Daily.Quality = dailyQuality
 	result.Weekly = addRecursiveAnalysisWithDivergenceRatio(result.Weekly, weeklyBars, divergenceRatio)
-	for index := range result.Weekly.SignalsV4 {
-		result.Weekly.SignalsV4[index].Symbol = symbol
-	}
+	setFrameSignalSymbols(&result.Weekly, symbol)
 	weeklyQuality := dailyQuality
 	_, partialWeeks, incompleteWeeks, inputWeeks, weeklyExclusions := weeklyBarsQualityDetailed(dailyBars, cutoff)
 	weeklyQuality = weeklyDataQuality(dailyQuality, inputWeeks, len(input), len(dailyBars), weeklyBars, incompleteWeeks, weeklyExclusions)
@@ -430,6 +422,7 @@ func AnalyzeIntraday(symbol string, input []Bar, period string, spot *float64, c
 	result.RuleVersion = RecursivePreviewVersion
 	result.Parameters = RecursiveParameters()
 	result.Daily = addRecursiveAnalysis(result.Daily, bars)
+	setFrameSignalSymbols(&result.Daily, symbol)
 	if relation, ok := timeframeRelationFor(period); ok && relation.lower != "" {
 		lowerBars, lowerQuality, lowerErr := aggregateIntradayFromSource(len(input), source, relation.lower, cutoff)
 		if lowerErr == nil && len(lowerBars) > 0 {
@@ -1877,7 +1870,7 @@ func analyzeFrame(bars []Bar, period, label string, spot *float64) Frame {
 func analyzeFrameWithComponents(bars []Bar, period, label string, spot *float64, merged []mergedBar, fractals []Fractal, histogram []float64) Frame {
 	frame := Frame{Period: period, Label: label, Status: "insufficient", BarCount: len(bars), Level: 0,
 		Direction: "unknown", Structure: "等待笔中枢形成", Candles: []Bar{}, Fractals: []Fractal{}, Strokes: []Stroke{},
-		Centers: []Center{}, Signals: []Signal{}, PenSignals: []Signal{}, Scenarios: []Scenario{}, Warnings: []string{}}
+		Centers: []Center{}, Signals: []Signal{}, PenSignals: []Signal{}, StructureWarnings: []V4Signal{}, EarlyRiskWarnings: []V4Signal{}, Scenarios: []Scenario{}, Warnings: []string{}}
 	frame.Timeframe = period
 	if len(bars) > 0 {
 		frame.AsOf, frame.LastClose = bars[len(bars)-1].Date, ptr(bars[len(bars)-1].Close)

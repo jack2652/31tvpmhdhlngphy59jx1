@@ -6,7 +6,7 @@ import "time"
 
 const RuleVersion = "strict-old-bi-v3"
 const RecursiveRuleVersion = "chan-recursive-v4.0.0"
-const RecursivePreviewVersion = "chan-recursive-v4-preview.23"
+const RecursivePreviewVersion = "chan-recursive-v4-preview.26"
 
 type Bar struct {
 	// CapturedAt keeps a daily candle fetched before its session close from
@@ -345,6 +345,8 @@ type V4Signal struct {
 	Invalidation          *float64               `json:"invalidation_price,omitempty"`
 	StrengthRatio         *float64               `json:"strength_ratio,omitempty"`
 	Price                 *float64               `json:"price,omitempty"`
+	PivotDate             string                 `json:"pivot_date,omitempty"`       // 早期风险的参考顶部；Date 仍是实际观察日。
+	ProtectionPrice       *float64               `json:"protection_price,omitempty"` // 观察K线低点，固定后不随未来走势下移。
 	MarketFilter          string                 `json:"market_filter"`
 	MarketEnvironment     *MarketEnvironment     `json:"market_environment,omitempty"`
 	LowerLevelStatus      string                 `json:"lower_level_status"`
@@ -434,6 +436,8 @@ type Frame struct {
 	StrokesV4          []Stroke            `json:"strokes_v4"`
 	Strengths          []Strength          `json:"strengths_v4"`
 	SignalsV4          []V4Signal          `json:"signals_v4"`
+	StructureWarnings  []V4Signal          `json:"structure_warnings_v4"`  // 独立结构预警，不参与严格六类点派生。
+	EarlyRiskWarnings  []V4Signal          `json:"early_risk_warnings_v4"` // 三根K线顶部风险，不能提前确认分型或严格卖点。
 	TrendState         string              `json:"trend_state_v4"`
 	TrendContext       TrendContext        `json:"trend_context_v4"`
 	MACD               []MACDPoint         `json:"macd_v4"`

@@ -489,29 +489,36 @@ func buildStrengthsFromMACD(bars []Bar, levels []LevelAnalysis, macd []MACDPoint
 			if !segment.Confirmed {
 				continue
 			}
-			start, end := barIndexAtOrAfter(bars, segment.Start), barIndexAtOrBefore(bars, segment.End)
-			if start < 0 || end < start || end >= len(macd) {
-				continue
+			if strength, ok := measureSegmentStrength(bars, macd, level, segment); ok {
+				result = append(result, strength)
 			}
-			area := 0.0
-			for index := maxInt(start, macdWarmupBars); index <= end; index++ {
-				if segment.Direction == "up" {
-					area += math.Max(0, macd[index].Histogram)
-				} else {
-					area += math.Max(0, -macd[index].Histogram)
-				}
-			}
-			duration := maxInt(1, end-start)
-			base := segment.StartPrice
-			slope, amplitude := 0.0, 0.0
-			if base > 0 {
-				slope = 100 * (segment.EndPrice/base - 1) / float64(duration)
-				amplitude = 100 * (segment.High - segment.Low) / base
-			}
-			result = append(result, Strength{Direction: segment.Direction, Level: level.Level, SourceKind: signalSourceKind(level), Start: segment.Start, End: segment.End, ConfirmedAt: segment.ConfirmedAt, MACDArea: area, MACDVersion: macdVersion, WarmupBars: macdWarmupBars, WarmupComplete: start >= macdWarmupBars, SlopePercent: slope, DurationBars: duration, Amplitude: amplitude, StartIndex: start, EndIndex: end})
 		}
 	}
 	return result
+}
+
+// 力度测量与结构确认分离，形成中结构的测量只用于明确标记的观察候选。
+func measureSegmentStrength(bars []Bar, macd []MACDPoint, level LevelAnalysis, segment Segment) (Strength, bool) {
+	start, end := barIndexAtOrAfter(bars, segment.Start), barIndexAtOrBefore(bars, segment.End)
+	if start < 0 || end < start || end >= len(macd) {
+		return Strength{}, false
+	}
+	area := 0.0
+	for index := maxInt(start, macdWarmupBars); index <= end; index++ {
+		if segment.Direction == "up" {
+			area += math.Max(0, macd[index].Histogram)
+		} else {
+			area += math.Max(0, -macd[index].Histogram)
+		}
+	}
+	duration := maxInt(1, end-start)
+	base := segment.StartPrice
+	slope, amplitude := 0.0, 0.0
+	if base > 0 {
+		slope = 100 * (segment.EndPrice/base - 1) / float64(duration)
+		amplitude = 100 * (segment.High - segment.Low) / base
+	}
+	return Strength{Direction: segment.Direction, Level: level.Level, SourceKind: signalSourceKind(level), Start: segment.Start, End: segment.End, ConfirmedAt: segment.ConfirmedAt, MACDArea: area, MACDVersion: macdVersion, WarmupBars: macdWarmupBars, WarmupComplete: start >= macdWarmupBars, SlopePercent: slope, DurationBars: duration, Amplitude: amplitude, StartIndex: start, EndIndex: end}, true
 }
 
 func barIndexAtOrAfter(bars []Bar, date string) int {
@@ -554,6 +561,8 @@ func addRecursiveAnalysisWithComponents(frame Frame, bars []Bar, divergenceRatio
 	frame.RecursiveCenters = []RecursiveCenter{}
 	frame.Strengths = []Strength{}
 	frame.SignalsV4 = []V4Signal{}
+	frame.StructureWarnings = []V4Signal{}
+	frame.EarlyRiskWarnings = []V4Signal{}
 	frame.MACD = []MACDPoint{}
 	frame.TrendState = "unknown"
 	frame.TrendContext = TrendContext{Status: "unknown", Direction: "unknown", CenterPosition: "unknown", DepartureStatus: "unknown", Reason: "尚无已确认递归走势和中枢可供判断"}
@@ -584,6 +593,8 @@ func addRecursiveAnalysisWithComponents(frame Frame, bars []Bar, divergenceRatio
 	frame.Strengths = buildStrengthsFromMACD(bars, signalLevels, macd)
 	frame.MACD = macd
 	frame.SignalsV4 = buildV4SignalsWithDivergenceRatio(frame, signalLevels, frame.Strengths, divergenceRatio)
+	frame.StructureWarnings = buildStructureWarnings(frame, signalLevels, frame.Strengths, divergenceRatio)
+	frame.EarlyRiskWarnings = buildEarlyRiskWarnings(frame, bars, merged, fractals, macd, divergenceRatio)
 	if len(frame.RecursiveLevels) > 0 {
 		frame.TrendState = frameTrendState(frame.RecursiveLevels[0])
 		frame.TrendContext = buildTrendContext(frame.RecursiveLevels[0], frame.TrendState)
@@ -728,6 +739,7 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 			result = append(result, V4Signal{Symbol: "", Level: level.Level, SourceKind: sourceKind, Kind: kind, Side: side, Status: status, Phase: phase, PhaseAt: phaseAt, PhaseHistory: phaseHistory, RuleVersion: RecursivePreviewVersion, Date: current.End, ObservedAt: observedAt, ConfirmedAt: confirmedAt, StructureRefs: []int{index - 2, index - 1, index}, StructureIDs: structureIDs, RelatedCenterID: center.CenterID, Conditions: conditions, Missing: missing, Invalidation: ptr(current.EndPrice), StrengthRatio: &ratioCopy, Price: &price, MarketFilter: "unfiltered", LowerLevelStatus: levelStatus, Detail: fmt.Sprintf("同级 %s 走势段价格创新极值而 MACD 力度减弱；失效边界 %.4f；大盘过滤状态未提供", current.Direction, current.EndPrice)})
 		}
 	}
+	result = append(result, buildCenterEntryExitSignals(frame, levels, strengths, divergenceRatio)...)
 	// De-duplicate candidates by kind, level, and structural endpoint.
 	seen := make(map[string]bool)
 	filtered := result[:0]
