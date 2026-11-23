@@ -149,4 +149,19 @@ const intradayZone = chart(frame(intradayBars, { period: "15m" })).resistanceLev
 assert.equal(intradayZone.testCount, zone.testCount, "intraday timestamps preserve independent completed-bar tests");
 assert.equal(intradayZone.confirmedAt, intradayBars[52].date);
 
+// 日期：2026-11-23；执行者：Codex。同类邻近压力共用一条区间标签，受阻证据不相加。
+const nearbyPressureBars = candles(115, [[20, 100], [35, 100.7], [50, 101.4], [65, 102.1], [80, 102.8]]);
+for (let index = 90; index < nearbyPressureBars.length; index += 1) nearbyPressureBars[index].low = 87;
+const nearbyPressureSource = frame(nearbyPressureBars);
+const nearbyPressureInput = JSON.stringify(nearbyPressureSource);
+const nearbyPressureChart = chart(nearbyPressureSource, { visibleBars: 115, endOffset: 0 });
+assert.equal(nearbyPressureChart.resistanceLevels.length, 2, "两处压力的独立受阻记录保留");
+const mergedPressure = nearbyPressureChart.keyLevels.filter((level) => level.tone === "resistance");
+assert.equal(mergedPressure.length, 1);
+assert.equal(mergedPressure[0].priceLabel, "100.00–102.80");
+assert.equal(mergedPressure[0].mergedLevels.length, 2);
+assert.deepEqual(plain(mergedPressure[0].mergedLevels.map((level) => level.testCount)), plain(nearbyPressureChart.resistanceLevels.map((level) => level.testCount)));
+assert.equal(mergedPressure[0].confirmedAt, nearbyPressureChart.resistanceLevels.map((level) => level.confirmedAt).sort().slice(-1)[0]);
+assert.equal(JSON.stringify(nearbyPressureSource), nearbyPressureInput);
+
 console.log("Resistance zones: independent tests, rejection, breakout, renewed confirmation, historical cutoffs and chains passed");

@@ -352,8 +352,48 @@
     return selected;
   }
 
-  // 标签在价格窗内错开；支撑线价格坐标不因避让而改变。
-  function layoutStructureSupports(levels, bars, firstDate, lastDate, minimum, maximum, x, y, left, right, top, bottom, mobile) {
+  // 仅合并主图显示：保留每个区域的证据、状态与真实参考价，不重算结构确认。
+  function mergeNearbyDisplayLevels(levels, history) {
+    const volatility = history?.atr?.[history.atr.length - 1] || 0;
+    const candidates = levels.map((level, order) => {
+      const low = Number(level.zoneLow ?? level.price), high = Number(level.zoneHigh ?? level.price);
+      const price = (low + high) / 2, role = level.tone || "support";
+      const matchKey = ["support", "resistance"].includes(role) && !String(level.label || "").startsWith("形成中")
+        ? role + "-" + (level.status || "active") : null;
+      return { level, order, low, high, matchKey,
+        tolerance: Math.max(price * 0.002, Math.min(price * 0.01, volatility * 0.25)) };
+    }).sort((a, b) => a.low - b.low || a.high - b.high);
+    const groups = [];
+    for (const candidate of candidates) {
+      let group = groups[groups.length - 1];
+      const tolerance = group ? Math.min(group.tolerance, candidate.tolerance) : candidate.tolerance;
+      // 同状态区域相邻才合并，并限制总跨度，避免链式连接吞并较远价位。
+      if (!group || !candidate.matchKey || candidate.matchKey !== group.matchKey
+        || candidate.low - group.high > tolerance || Math.max(group.high, candidate.high) - group.low > tolerance * 3) {
+        group = { low: candidate.low, high: candidate.high, matchKey: candidate.matchKey,
+          tolerance: candidate.tolerance, order: candidate.order, members: [] };
+        groups.push(group);
+      }
+      group.high = Math.max(group.high, candidate.high); group.tolerance = Math.min(group.tolerance, candidate.tolerance);
+      group.order = Math.min(group.order, candidate.order); group.members.push(candidate.level);
+    }
+    return groups.sort((a, b) => a.order - b.order).map((group) => {
+      if (group.members.length === 1) return { ...group.members[0] };
+      const primary = [...group.members].sort((a, b) => Number(b.kind === "reaction") - Number(a.kind === "reaction")
+        || (b.score || 0) - (a.score || 0) || String(b.confirmedAt || b.date).localeCompare(String(a.confirmedAt || a.date)))[0];
+      const latestDate = (field) => group.members.map((level) => level[field] || "").sort().slice(-1)[0];
+      const zoneLabel = money(group.low) + "–" + money(group.high);
+      return { ...primary, key: "display-zone-" + group.members.map((level) => level.key).join("-"),
+        zoneLow: group.low, zoneHigh: group.high, zoneLabel, priceLabel: zoneLabel,
+        confirmedAt: group.members.map((level) => level.confirmedAt || level.date || "").sort().slice(-1)[0], lastConfirmedAt: latestDate("lastConfirmedAt"),
+        pendingBreakAt: latestDate("pendingBreakAt"), brokenAt: latestDate("brokenAt"),
+        sources: [...new Set(group.members.flatMap((level) => (level.sources || level.label || "").split("、")))].join("、"),
+        mergedLevels: group.members };
+    });
+  }
+
+  // 标签在价格窗内错开；支撑线使用主参考价，合并区域以完整区间标注。
+  function layoutStructureSupports(levels, bars, firstDate, lastDate, minimum, maximum, x, y, left, right, top, bottom, mobile, history) {
     // 同价位的旧失守结构与新支撑只画一条，以最近确认的结构展示状态。
     const distinct = new Map();
     for (const level of levels.filter((item) => item.confirmedAt <= lastDate && item.price > minimum && item.price < maximum)) {
@@ -361,7 +401,7 @@
       const previous = distinct.get(priceKey);
       if (!previous || (level.lastConfirmedAt || level.confirmedAt) > (previous.lastConfirmedAt || previous.confirmedAt)) distinct.set(priceKey, level);
     }
-    const rows = [...distinct.values()].map((level) => {
+    const rows = mergeNearbyDisplayLevels([...distinct.values()], history).map((level) => {
       const index = bars.findIndex((bar) => bar.date >= level.confirmedAt);
       const pointIndex = bars.findIndex((bar) => bar.date === level.pointDate);
       const broken = level.brokenAt && level.brokenAt <= lastDate;
@@ -410,7 +450,16 @@
   const isStructureWarning = (signal) => Boolean(v4WarningLabels[signal.kind]);
   const displayStructureSignals = (frame) => [...(frame?.signals_v4 || []), ...(frame?.structure_warnings_v4 || []), ...(frame?.early_risk_warnings_v4 || [])];
   // 主图恢复严格买卖点与结构预警；早期风险仍保留在完整详情和持仓提示中。
-  const chartStructureSignals = (frame) => [...(frame?.signals_v4 || []), ...(frame?.structure_warnings_v4 || [])];
+  const chartStructureSignals = (frame) => {
+    const signals = frame?.signals_v4 || [];
+    const pointKey = (signal) => [signal.source_kind || "", signal.level ?? 0, signal.date, Number(signal.price)].join("\u0000");
+    // 同源同级同一低点已标一买时，只保留更具体的一买；独立底背驰仍显示。
+    const firstBuyPoints = new Set(signals.filter((signal) => signal.kind === "class1_buy" && signal.side === "buy"
+      && signal.date && Number.isFinite(Number(signal.price)) && Number(signal.price) > 0).map(pointKey));
+    const warnings = (frame?.structure_warnings_v4 || []).filter((signal) => signal.kind !== "center_divergence_buy"
+      || signal.side !== "buy" || !firstBuyPoints.has(pointKey(signal)));
+    return [...signals, ...warnings];
+  };
   const v4PhaseLabels = {
     observation: "观察中", divergence_confirmed: "背驰已确认", reversal_confirmed: "反向结构已确认", warning_confirmed: "预警结构已确认",
     first_retest: "首次回试", awaiting_first_retest: "等待首次回试", class2_confirmed: "二类点已确认",
@@ -1712,7 +1761,7 @@
     const zones = (frame.centers || []).filter((center) => center.end >= firstDate && center.start <= lastDate);
     const latest = frame.centers?.[frame.centers.length - 1];
     const visibleCenterForLevels = latestRecursiveCenter || (layers?.penCenters === true ? latest : null);
-    const structureSupports = layoutStructureSupports(supportLevels, bars, firstDate, lastDate, minimum, maximum, x, y, left, historyRight, top, priceBottom, mobile);
+    const structureSupports = layoutStructureSupports(supportLevels, bars, firstDate, lastDate, minimum, maximum, x, y, left, historyRight, top, priceBottom, mobile, priceLevelHistory);
     if (latest && latest.end < firstDate && latest.lower < maximum && latest.upper > minimum) zones.push(latest);
     // Adjacent pens share a turning point. Label the actual endpoint once;
     // clipped endpoints outside the visible candle range are not labelled.
@@ -1915,10 +1964,11 @@
           visibleCenterForLevels && Number.isFinite(centerLower) && { key: "center-lower", label: "中枢下沿", price: centerLower, date: visibleCenterForLevels.start, tone: "center" },
         ].filter((level) => level && level.price > minimum && level.price < maximum && (layers?.supportResistance !== false || level.tone === "center"));
         // 与已绘制的结构支撑共享去重集合，保留结构确认信息；不同价格不按距离误删。
-        const seen = new Set(structureSupports.map((level) => money(level.price)));
+        const seen = new Set(structureSupports.flatMap((level) => (level.mergedLevels || [level]).map((item) => money(item.price))));
         const zones = [];
         const distinct = candidates.filter((level) => {
-          const overlappingSupport = level.testCount && structureSupports.find((support) => support.price >= level.zoneLow && support.price <= level.zoneHigh);
+          const overlappingSupport = level.testCount && structureSupports.find((support) =>
+            (support.mergedLevels || [support]).some((item) => item.price >= level.zoneLow && item.price <= level.zoneHigh));
           if (overlappingSupport) { overlappingSupport.resistanceZone = level; zones.push(level); return false; }
           if (!level.testCount && level.tone === "resistance" && zones.some((zone) => level.price >= zone.zoneLow && level.price <= zone.zoneHigh)) return false;
           const priceKey = money(level.price);
@@ -1926,10 +1976,10 @@
           seen.add(priceKey);
           if (!duplicate && level.testCount) zones.push(level);
           return !duplicate;
-        }).map((level) => ({ ...level, y: y(level.price), x1: x(dateIndex(level.confirmedAt || level.date)), x2: historyRight, labelX: historyRight - 5,
-          priceLabel: money(level.price),
-          title: `${displayBarTime(level.date, frame.period)} · ${level.label} ${money(level.price)}` }));
-        return distinct;
+        });
+        return mergeNearbyDisplayLevels(distinct, priceLevelHistory).map((level) => ({ ...level, y: y(level.price), x1: x(dateIndex(level.confirmedAt || level.date)), x2: historyRight, labelX: historyRight - 5,
+          priceLabel: level.priceLabel || money(level.price),
+          title: `${displayBarTime(level.date, frame.period)} · ${level.label} ${level.priceLabel || money(level.price)}` }));
       })(),
       candles: bars.map((bar, index) => {
         const previous = frame.candles[startIndex + index - 1];

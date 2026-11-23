@@ -425,7 +425,20 @@ function bindChanChartHover(target, initialBinding) {
       .filter(({ item, distance }) => distance <= (item.area ? 0 : 8))
       .sort((left, right) => left.distance - right.distance)[0]?.item;
     if (!signalHit && !afSignalHit && supportHit) {
-      if (supportHit.tone === "resistance") {
+      if (supportHit.mergedLevels?.length > 1) {
+        const status = supportHit.tone === "resistance" ? "压力区" : supportHit.status === "broken" ? "失守区"
+          : supportHit.status === "pending-break" ? "跌破待确认区" : "支撑区";
+        structureTitle.textContent = `${status} · ${supportHit.zoneLabel}`;
+        // 每个成员单独列出证据，避免相邻区域合并后虚增反弹次数或覆盖确认时间。
+        structureBody.textContent = `包含 ${supportHit.mergedLevels.length} 个相近区域：` + supportHit.mergedLevels.map((level) => {
+          const state = level.status === "pending-break" ? ` · 首次有效收盘跌破 ${level.pendingBreakAt} · 收盘 ${level.lastCloseLabel} · 有效跌破阈值 ${level.breakThresholdLabel} · 尚需下一根完成收盘确认`
+            : level.status === "broken" ? ` · 失守 ${level.brokenAt}` : ` · 截至 ${level.lastCloseDate || "当前"} 未确认失效`;
+          const tests = level.testCount ? ` · ${level.tone === "resistance" ? "独立受阻" : "有效反弹"} ${level.testCount} 次 · 最近测试 ${level.lastTestDate}` : "";
+          const historical = level.historicalTestCount ? ` · 历史受阻 ${level.historicalTestCount} 次 · 旧压力突破 ${level.historicalBrokenAt}` : "";
+          return `${level.zoneLabel || level.priceLabel || formatMoney(level.price)} · ${level.sources || level.label} · 确认 ${level.confirmedAt || level.date}${state}${tests}${historical}`;
+        }).join("；");
+        if (supportHit.resistanceZone) structureBody.textContent += ` · 同区反弹受阻 ${supportHit.resistanceZone.testCount} 次`;
+      } else if (supportHit.tone === "resistance") {
         const historicalRetest = supportHit.kind === "historical-retest";
         structureTitle.textContent = historicalRetest ? `历史压力回测 · ${supportHit.zoneLabel}`
           : supportHit.testCount ? `反复受阻压力 · ${supportHit.zoneLabel}` : `结构前高压力 · ${supportHit.priceLabel}`;

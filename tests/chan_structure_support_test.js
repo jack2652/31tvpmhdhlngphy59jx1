@@ -227,6 +227,40 @@ assert.deepEqual(plain(crowdedReferences.map((level) => level.price)), [100, 90,
 const boundedReferences = chart(frame(candles(500, []), { strokes: [100, 100.7, 101.4, 102.1].map((price) => stroke(price)) })).structureSupportLevels;
 assert.equal(boundedReferences.length, 2, "adjacent reference prices cannot chain into an oversized band");
 assert.ok(boundedReferences.every((level) => level.zoneHigh - level.zoneLow <= 1), "the two-ATR-tolerance diameter bound holds across each merged band");
+
+// 日期：2026-11-23；执行者：Codex。近邻区域只合并主图，结构证据与收盘状态不变。
+const nearBars = candles(80, []).map((bar) => ({ ...bar, open: 115, close: 115, high: 119, low: 111 }));
+nearBars[79] = { ...nearBars[79], open: 110, close: 101.19, high: 112, low: 98 };
+const nearPrices = [99.32, 103.21, 107.07, 108.21, 109.21, 109.64];
+const nearSource = frame(nearBars, { strokes: nearPrices.map((price) => stroke(price)) });
+const nearInput = JSON.stringify(nearSource);
+const nearChart = chart(nearSource, {}, { visibleBars: 8, endOffset: 0 });
+assert.equal(nearChart.structureSupportLevels.length, 4, "底层四处结构区域仍独立保留");
+assert.equal(nearChart.structureSupports.length, 3, "主图把两处相近待确认区域合为一条");
+const nearDisplay = nearChart.structureSupports.find((level) => level.mergedLevels?.length === 2);
+assert.ok(nearDisplay);
+assert.equal(nearDisplay.priceLabel, "107.07–109.64");
+assert.equal(nearDisplay.label, "跌破待确认 107.07–109.64");
+assert.equal(nearDisplay.status, "pending-break");
+assert.deepEqual(plain(nearDisplay.mergedLevels.map((level) => level.zoneLabel)), ["107.07–108.21", "109.21–109.64"]);
+assert.ok(nearDisplay.mergedLevels.every((level) => level.pendingBreakAt === date(79)));
+assert.ok(nearChart.structureSupports.some((level) => level.priceLabel === "103.21" && level.status === "pending-break"));
+assert.ok(nearChart.structureSupports.some((level) => level.priceLabel === "99.32" && level.status === "active"));
+assert.equal(JSON.stringify(nearSource), nearInput, "显示合并不修改原始行情、结构或确认状态");
+const splitStateBars = nearBars.map((bar) => ({ ...bar })); splitStateBars[79].close = 106.5;
+const splitState = chart(frame(splitStateBars, { strokes: nearSource.strokes }), {}, { visibleBars: 8, endOffset: 0 });
+const neighboringStates = splitState.structureSupports.filter((level) => level.zoneLow >= 107 && level.zoneHigh <= 110);
+assert.equal(neighboringStates.length, 2, "有效支撑和跌破待确认即使靠近也必须分开");
+assert.deepEqual(plain(neighboringStates.map((level) => level.status).sort()), ["active", "pending-break"]);
+const displaySummary = (model) => plain(model.structureSupports.map(({ zoneLow, zoneHigh, status, mergedLevels }) =>
+  ({ zoneLow, zoneHigh, status, members: mergedLevels?.map((level) => level.key) || [] })));
+assert.deepEqual(displaySummary(chart(nearSource, {}, { visibleBars: 8, endOffset: 1 })),
+  displaySummary(chart(frame(nearBars.slice(0, -1), { strokes: nearSource.strokes }), {}, { visibleBars: 8, endOffset: 0 })), "历史合并不读取下一根行情的ATR或失守状态");
+const chainPrices = [100, 100.7, 101.4, 102.1, 102.8, 103.5];
+const chainBars = nearBars.map((bar) => ({ ...bar, open: 115, close: 115, high: 119, low: 98 }));
+const chainDisplay = chart(frame(chainBars, { strokes: chainPrices.map((price) => stroke(price)) }), {}, { visibleBars: 80, endOffset: 0 });
+assert.ok(chainDisplay.structureSupports.length > 1, "不能把一串相近区域无限连接成一条");
+assert.ok(chainDisplay.structureSupports.every((level) => level.zoneHigh - level.zoneLow <= ((level.zoneHigh + level.zoneLow) / 2) * .03));
 const sharedBoundaryBars = candles(70, []);
 for (const index of [50, 51]) sharedBoundaryBars[index] = { ...sharedBoundaryBars[index], open: 99.8, close: 99.6, high: 100.1, low: 99.4 };
 const sharedBoundary = chart(frame(sharedBoundaryBars, { strokes: [stroke(99.9), stroke(100.3)] })).structureSupportLevels;

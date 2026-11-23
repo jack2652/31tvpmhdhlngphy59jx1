@@ -181,6 +181,18 @@ assert.equal(supportDetail.children[0].textContent, "跌破待确认 · 100.00")
 assert.match(supportDetail.children[1].textContent, /首次有效收盘跌破 2026-10-13.*收盘 96.00.*有效跌破阈值 99.40.*尚需下一根完成收盘确认/);
 assert.doesNotMatch(supportDetail.children[1].textContent, /未被有效收盘跌破/);
 
+// 日期：2026-11-23；执行者：Codex。合并区悬停逐条保留原始确认和收盘跌破边界。
+const mergedPendingSupport = { ...pendingSupport, zoneLabel: "107.07–109.64", mergedLevels: [
+  { ...pendingSupport, zoneLabel: "109.21–109.64", sources: "近期反弹", confirmedAt: "2026-11-10", pendingBreakAt: "2026-11-20", lastCloseLabel: "101.19", breakThresholdLabel: "108.02" },
+  { ...support, status: "pending-break", zoneLabel: "107.07–108.21", sources: "历史中枢", confirmedAt: "2024-03-07", pendingBreakAt: "2026-11-20", lastCloseLabel: "101.19", breakThresholdLabel: "105.88" },
+] };
+directive.componentUpdated(target, { value: { ...model, structureSupports: [mergedPendingSupport], layers: { supportResistance: true } } });
+targetListeners.get("pointermove")({ clientX: 420, clientY: 150, buttons: 0, pointerType: "mouse", target: { closest: () => null } });
+assert.equal(supportDetail.children[0].textContent, "跌破待确认区 · 107.07–109.64");
+assert.match(supportDetail.children[1].textContent, /109.21–109.64.*近期反弹.*确认 2026-11-10.*阈值 108.02/);
+assert.match(supportDetail.children[1].textContent, /107.07–108.21.*历史中枢.*确认 2024-03-07.*阈值 105.88/);
+assert.doesNotMatch(supportDetail.children[1].textContent, /未确认失效/);
+
 const historicalSupport = { ...support, statusLabel: "历史结构支撑", kind: "historical", hasHistoricalStructure: true,
   historicalDate: "2025-07-02", testCount: 0, reactionAtr: null };
 directive.componentUpdated(target, { value: { ...model, structureSupports: [historicalSupport], layers: { supportResistance: true } } });

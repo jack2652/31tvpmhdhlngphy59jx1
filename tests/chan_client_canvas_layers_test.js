@@ -144,6 +144,39 @@ assert.deepEqual(Array.from(duplicateSignalView.daily.chart.signals.map((signal)
 assert.equal(duplicateSignalView.daily.chart.signals.length, 4, "deduplicating labels must keep every signal marker");
 assert.equal(duplicateSignalView.daily.recursiveSignals.length, 4, "deduplication should not remove distinct API signal details");
 
+// 日期：2026-11-23；执行者：Codex。同一低点只标一买，独立底背驰及原始详情仍保留。
+const overlapBuy = { ...frame().signals_v4[0], source_kind: "pen", level: 0, status: "invalidated", phase: "invalidated" };
+const overlapBottom = { ...overlapBuy, signal_id: "bottom-warning", kind: "center_divergence_buy" };
+const overlapFrame = { ...frame(), signals_v4: [overlapBuy], structure_warnings_v4: [overlapBottom] };
+const overlapPayload = { ...payload, daily: overlapFrame };
+const overlapInput = JSON.stringify(overlapPayload);
+const overlapView = window.OptionScopeChan.view(overlapPayload, false, false, 30, null, { signals: true }).daily;
+assert.deepEqual(Array.from(overlapView.chart.signals.map((s) => s.type)), ["一买"], "同一低点一买优先，不重复画底背驰标记");
+assert.deepEqual(Array.from(overlapView.chart.structures.filter((s) => s.signalTarget).map((s) => s.type)), ["一买"], "重复预警不保留悬停目标或占位");
+assert.equal(overlapView.chart.signals[0].labelVisible, true);
+assert.equal(overlapView.chart.signals[0].invalidated, true, "一买的原状态保持不变");
+assert.equal(overlapView.recursiveSignals.length, 2, "完整详情保留两类信号");
+assert.equal(JSON.stringify(overlapPayload), overlapInput, "显示去重不修改输入");
+const withoutBottom = window.OptionScopeChan.view({ ...overlapPayload, daily: { ...overlapFrame, structure_warnings_v4: [] } }).daily;
+assert.equal(overlapView.recursive.activeSignalCount, withoutBottom.recursive.activeSignalCount);
+assert.equal(overlapView.recursive.invalidatedSignalCount, withoutBottom.recursive.invalidatedSignalCount);
+assert.deepEqual(JSON.parse(JSON.stringify(overlapView.plan)), JSON.parse(JSON.stringify(withoutBottom.plan)));
+const bottomOnly = window.OptionScopeChan.view({ ...overlapPayload, daily: { ...overlapFrame, signals_v4: [] } }, false, false, 30, null, { signals: true }).daily;
+assert.deepEqual(Array.from(bottomOnly.chart.signals.map((s) => s.type)), ["底背驰预警"], "没有一买时底背驰仍显示");
+assert.equal(bottomOnly.chart.signals[0].labelVisible, true);
+assert.equal(bottomOnly.chart.totalPlottableSignalCount, 1);
+for (const change of [{ kind: "class2_buy" }, { source_kind: "recursive" }, { level: 1 }, { date: "2026-10-14" }, { price: 8.01 }, { price: undefined }, { price: 0 }]) {
+  const separate = window.OptionScopeChan.view({ ...overlapPayload, daily: { ...overlapFrame, signals_v4: [{ ...overlapBuy, ...change }] } }, false, false, 30, null, { signals: true }).daily;
+  assert.ok(separate.chart.signals.some((s) => s.type === "底背驰预警"), "二买、不同结构或不可绘制一买不得遮掉独立底背驰");
+}
+for (const status of ["observing", "divergence_confirmed", "confirmed", "invalidated"]) {
+  const phaseView = window.OptionScopeChan.view({ ...overlapPayload, daily: { ...overlapFrame, signals_v4: [{ ...overlapBuy, status }] } }, false, false, 30, null, { signals: true }).daily;
+  assert.deepEqual(Array.from(phaseView.chart.signals.map((s) => s.type)), ["一买"]);
+  assert.equal(phaseView.chart.signals[0].status, status);
+}
+assert.equal(bottomOnly.chart.totalPlottableSignalCount, overlapView.chart.totalPlottableSignalCount, "一买出现后替换重复预警，图表可绘制数保持一个");
+assert.notEqual(bottomOnly.chart, overlapView.chart, "复用同一行情数组增删一买时，缓存须刷新");
+
 // 结构确认时间已到达的一类点须显示确认；观察和失效状态不能被升级。
 const classOnePhases = frame();
 classOnePhases.signals_v4 = [
