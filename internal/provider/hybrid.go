@@ -687,8 +687,8 @@ func (h *Hybrid) IntradayHistory(ctx context.Context, symbol, interval string) (
 
 func mergeIntradayHistory(alpaca, yahoo HistoryResult) HistoryResult {
 	barsByTime := make(map[string]map[string]any, len(alpaca.Bars)+len(yahoo.Bars))
-	addBars := func(bars []map[string]any) {
-		for _, bar := range bars {
+	addBars := func(result HistoryResult) {
+		for _, bar := range result.Bars {
 			at, ok := bar["date"].(string)
 			if !ok || strings.TrimSpace(at) == "" {
 				continue
@@ -697,11 +697,17 @@ func mergeIntradayHistory(alpaca, yahoo HistoryResult) HistoryResult {
 			for key, value := range bar {
 				copyBar[key] = value
 			}
+			// 嵌套合并时保留逐根采集时间，整批时间只用于尚未标记的行情。
+			stamp, _ := bar["fetched_at"].(string)
+			capturedAt, err := time.Parse(time.RFC3339Nano, stamp)
+			if !result.FetchedAt.IsZero() && (err != nil || capturedAt.IsZero() || capturedAt.After(result.FetchedAt)) {
+				copyBar["fetched_at"] = result.FetchedAt.UTC().Format(time.RFC3339Nano)
+			}
 			barsByTime[at] = copyBar
 		}
 	}
-	addBars(alpaca.Bars)
-	addBars(yahoo.Bars)
+	addBars(alpaca)
+	addBars(yahoo)
 
 	times := make([]string, 0, len(barsByTime))
 	for at := range barsByTime {

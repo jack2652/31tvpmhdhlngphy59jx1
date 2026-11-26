@@ -799,6 +799,10 @@ func completedIntradayBars(input []Bar, cutoff time.Time, interval time.Duration
 			unfinished++
 			continue
 		}
+		if !bar.CapturedAt.IsZero() && bar.CapturedAt.Before(dayTime(days, endMinute)) {
+			unfinished++
+			continue
+		}
 		if math.IsNaN(bar.Volume) || math.IsInf(bar.Volume, 0) || bar.Volume < 0 {
 			rejected++
 			continue

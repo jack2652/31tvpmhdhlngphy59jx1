@@ -64,13 +64,14 @@ type Quote struct {
 }
 
 type DailyBar struct {
-	Date      string  `json:"date"`
-	Open      float64 `json:"open"`
-	High      float64 `json:"high"`
-	Low       float64 `json:"low"`
-	Close     float64 `json:"close"`
-	Volume    float64 `json:"volume"`
-	IsForming bool    `json:"is_forming"`
+	Date      string     `json:"date"`
+	Open      float64    `json:"open"`
+	High      float64    `json:"high"`
+	Low       float64    `json:"low"`
+	Close     float64    `json:"close"`
+	Volume    float64    `json:"volume"`
+	IsForming bool       `json:"is_forming"`
+	AsOf      *time.Time `json:"as_of,omitempty"`
 }
 
 type ExpirationsResponse struct {

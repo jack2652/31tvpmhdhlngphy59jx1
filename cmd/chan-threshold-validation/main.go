@@ -106,7 +106,9 @@ func buildReport(repository *store.SQLite, symbol string, barLimit int, period s
 		source := make([]chananalysis.Bar, 0, len(values))
 		for _, value := range values {
 			date, _ := value["date"].(string)
-			source = append(source, chananalysis.Bar{Date: date, Open: number(value["open"]), High: number(value["high"]), Low: number(value["low"]), Close: number(value["close"]), Volume: number(value["volume"])})
+			stamp, _ := value["fetched_at"].(string)
+			capturedAt, _ := time.Parse(time.RFC3339Nano, stamp)
+			source = append(source, chananalysis.Bar{Date: date, CapturedAt: capturedAt, Open: number(value["open"]), High: number(value["high"]), Low: number(value["low"]), Close: number(value["close"]), Volume: number(value["volume"])})
 		}
 		bars, quality, err := chananalysis.AggregateIntradayBars(source, period, time.Now())
 		if err != nil {

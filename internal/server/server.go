@@ -485,6 +485,7 @@ func (s *Service) Router() *gin.Engine {
 	api.GET("/chan/:symbol", s.chanAnalysis)
 	api.GET("/chan/:symbol/intraday", s.intradayChanAnalysis)
 	api.GET("/chan/:symbol/adjusted", s.chanAdjustedAnalysis)
+	api.GET("/chan-benchmark/:symbol", s.chanBenchmark)
 	api.GET("/status/:symbol", s.status)
 	api.POST("/cleanup", s.cleanup)
 	return router
@@ -940,7 +941,7 @@ func (s *Service) index(c *gin.Context) {
 // 指标脚本使用不可变缓存，单独更新算法时也必须改变股票页资源版本。
 func indexAssetVersion(assets fs.FS) string {
 	versionHash := sha256.New()
-	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-trendlines.js", "common/js/chan-turtle.js", "common/js/chan-granville.js", "common/js/chan-wyckoff.js", "common/js/chan-client.js", "common/js/app.js", "common/img/option-scope-mark.svg", "common/img/option-scope-favicon.svg"} {
+	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-trendlines.js", "common/js/chan-turtle.js", "common/js/chan-granville.js", "common/js/chan-wyckoff.js", "common/js/chan-vwap.js", "common/js/chan-bollinger.js", "common/js/chan-rsi-divergence.js", "common/js/chan-relative-strength.js", "common/js/chan-client.js", "common/js/app.js", "common/img/option-scope-mark.svg", "common/img/option-scope-favicon.svg"} {
 		if contents, err := fs.ReadFile(assets, asset); err == nil {
 			_, _ = versionHash.Write(contents)
 		}
@@ -960,7 +961,7 @@ func (s *Service) futuresIndex(c *gin.Context) {
 	content := strings.ReplaceAll(string(page), "__DEFAULT_FUTURE__", defaultSymbol)
 	content = strings.ReplaceAll(content, "__ACCESS_KEY_REQUIRED__", strconv.FormatBool(s.cfg.AccessKey != ""))
 	versionHash := sha256.New()
-	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-plan.js", "common/js/chan-stochz.js", "common/js/chan-trendlines.js", "common/js/chan-turtle.js", "common/js/chan-granville.js", "common/js/chan-macd-sma.js", "common/js/chan-supertrend.js", "common/js/chan-wyckoff.js", "common/js/chan-client.js", "common/js/futures.js"} {
+	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-plan.js", "common/js/chan-stochz.js", "common/js/chan-trendlines.js", "common/js/chan-turtle.js", "common/js/chan-granville.js", "common/js/chan-macd-sma.js", "common/js/chan-supertrend.js", "common/js/chan-wyckoff.js", "common/js/chan-vwap.js", "common/js/chan-bollinger.js", "common/js/chan-rsi-divergence.js", "common/js/chan-relative-strength.js", "common/js/chan-client.js", "common/js/futures.js"} {
 		if contents, err := fs.ReadFile(assets, asset); err == nil {
 			_, _ = versionHash.Write(contents)
 		}

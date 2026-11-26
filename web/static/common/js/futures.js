@@ -18,8 +18,8 @@
     { value: "sweepFvg", label: "扫流动性反转 + FVG" },
     { value: "macdSma200", label: "异同移动平均线 + 200期简单均线" },
   ];
-  const defaultLayers = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, sweepFvg: false, mfi: false };
-  const defaultSubcharts = { volume: false, macd: false, dmi: false, mfi: false };
+  const defaultLayers = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, sweepFvg: false, vwap: false, anchoredVwap: false, bollinger: false, mfi: false };
+  const defaultSubcharts = { volume: false, macd: false, dmi: false, mfi: false, rsi: false, rs: false };
   const exclusiveIndicators = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "sweepFvg"];
   const chartPreferencesKey = "option-scope-futures-chart-preferences";
   const chartPreferencesVersion = 2;
@@ -172,6 +172,7 @@
 
   const app = new Vue({
     el: "#futures-app",
+    mixins: [window.OptionScopeRelativeStrength?.benchmarkMixin(request)].filter(Boolean),
     data: {
       symbol, symbolInput: symbol, presets, periods, indicators, period: chartPreferences.period,
       chartLayers: chartPreferences.layers, subcharts: chartPreferences.subcharts,
@@ -180,6 +181,7 @@
     },
     // 已触及的早期保护价跨报价恢复保留，盘中与日周周期使用同一生命周期。
     watch: {
+      liveIndicators() { if (intradayPeriods.includes(this.period)) this.scheduleIntradayRefresh(this.period); },
       quote(quote) {
         if (!quote || quote.symbol !== this.symbol) return;
         if (this.payload) this.payload = OptionScopeChan.withSpot(this.payload, quote.price, this.payload, quote);
@@ -204,16 +206,25 @@
       activeIndicator() {
         return exclusiveIndicators.find((key) => this.chartLayers[key]) || "base";
       },
+      rsRequest() {
+        return OptionScopeRelativeStrength.benchmarkRequest(this.subcharts.rs && this.chanExpanded,
+          this.symbol, this.period, this.payload?.price_coordinate?.basis || "raw", this.rsPreference);
+      },
+      liveIndicators() {
+        const layers = this.chartLayers, panes = this.subcharts;
+        return this.chanExpanded && intradayPeriods.includes(this.period) && this.quote?.market_state === "REGULAR"
+          && (layers.vwap || layers.anchoredVwap || layers.bollinger || panes.rsi || panes.rs);
+      },
       frame() {
         const layers = this.chartLayers;
         if (intradayPeriods.includes(this.period)) {
           const payload = this.intradayPayload[this.period];
-          return payload ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.quote?.price, this.mobileChart, 50, this.viewport[this.period], layers, this.subcharts, { marketHistory: this.payload?.market_history }) : null;
+          return payload ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.quote?.price, this.mobileChart, 50, this.viewport[this.period], layers, this.subcharts, { marketHistory: this.payload?.market_history, rsBenchmark: this.rsBenchmark }) : null;
         }
         const payload = this.payload && this.quote?.symbol === this.symbol
           ? OptionScopeChan.withSpot(this.payload, this.quote.price, null, this.quote)
           : this.payload;
-        const view = payload ? OptionScopeChan.view(payload, this.chanScenariosVisible, this.mobileChart, 50, this.viewport, layers, this.subcharts) : null;
+        const view = payload ? OptionScopeChan.view(payload, this.chanScenariosVisible, this.mobileChart, 50, this.viewport, layers, this.subcharts, { period: this.period, rsBenchmark: this.rsBenchmark }) : null;
         return view ? view[this.period] : null;
       },
       guidanceTitle() { return this.frame?.guidance?.title || "等待结构形成"; },
@@ -322,7 +333,7 @@
         if (exclusiveIndicators.includes(layer)) {
           const enabled = !this.chartLayers[layer];
           this.chartLayers = { ...this.chartLayers, ...Object.fromEntries(exclusiveIndicators.map((key) => [key, enabled && key === layer])) };
-        } else if (["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "trendlines"].includes(layer)) {
+        } else if (["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "trendlines", "vwap", "anchoredVwap", "bollinger"].includes(layer)) {
           this.chartLayers = { ...this.chartLayers, [layer]: !this.chartLayers[layer] };
         } else {
           const level = Number(layer);
@@ -340,8 +351,8 @@
       isRecursiveCenterLevelVisible(level) { return OptionScopeChan.isRecursiveCenterLevelVisible(this.chartLayers, level); },
       changeViewport(action) {
         const chart = this.frame?.chart; if (!chart) return;
-        if (action === "left") this.panViewport(-Math.max(1, Math.floor(chart.visibleBars * 0.25)));
-        else if (action === "right") this.panViewport(Math.max(1, Math.floor(chart.visibleBars * 0.25)));
+        if (action === "left") this.panViewport(Math.max(1, Math.floor(chart.visibleBars * 0.25)));
+        else if (action === "right") this.panViewport(-Math.max(1, Math.floor(chart.visibleBars * 0.25)));
         else if (action === "reset") { this.viewport = { ...this.viewport, [this.period]: { visibleBars: 0, endOffset: 0 } }; }
         else this.zoomViewport(action === "zoom-in" ? 0.75 : 1.3, chart.windowStart + chart.visibleBars / 2, 0.5, chart.visibleBars);
       },
@@ -416,8 +427,11 @@
         intradayRefreshTimer = null;
         if (this.period !== value || document.hidden) return;
         const elapsed = Date.now() % (15 * 60 * 1000);
-        const delay = elapsed < intradayRefreshDelay ? intradayRefreshDelay - elapsed
+        const boundaryDelay = elapsed < intradayRefreshDelay ? intradayRefreshDelay - elapsed
           : 15 * 60 * 1000 - elapsed + intradayRefreshDelay;
+        const quoteAt = Date.parse(this.quote?.fetched_at || "");
+        const live = this.liveIndicators && Date.now() - quoteAt < 180000;
+        const delay = live ? Math.min(boundaryDelay, intradayRefreshDelay) : boundaryDelay;
         intradayRefreshTimer = window.setTimeout(() => {
           intradayRefreshTimer = null;
           if (this.period === value) this.loadIntraday(value, true);
@@ -475,7 +489,12 @@
           const queryString = spot ? `?period=${value}&spot=${encodeURIComponent(spot)}` : `?period=${value}`;
           const payload = await request(`/api/chan/${encodeURIComponent(token)}/intraday${queryString}`, { timeout: 60000 });
           if (this.symbol !== token) return;
-          if (intradayFrameReady(payload) || !intradayFrameReady(existing)) this.$set(this.intradayPayload, value, OptionScopeChan.withSpot(payload, finite(this.quote?.price), existing, this.quote));
+          if (intradayFrameReady(payload) || !intradayFrameReady(existing)) {
+            const viewport = this.viewport[value];
+            const nextViewport = OptionScopeChan.intradayViewportAfterRefresh(viewport, existing, payload);
+            if (nextViewport !== viewport) this.$set(this.viewport, value, nextViewport);
+            this.$set(this.intradayPayload, value, OptionScopeChan.withSpot(payload, finite(this.quote?.price), existing, this.quote));
+          }
           if (intradayFrameReady(payload) && !payload.refreshing) {
             window.clearTimeout(this.intradayRetryTimers[value]);
             this.$set(this.intradayRetryTimers, value, null);

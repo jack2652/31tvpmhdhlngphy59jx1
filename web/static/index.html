@@ -398,6 +398,14 @@
                     </div>
                   </div>
                 </section>
+                <section class="chan-indicator-overlays">
+                  <h4>主图叠加</h4>
+                  <div class="detail-segmented chan-layer-switches" role="group" aria-label="主图叠加指标">
+                    <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.vwap ? 'true' : 'false'" @click="toggleChanChartLayer('vwap')">VWAP</button>
+                    <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.anchoredVwap ? 'true' : 'false'" @click="toggleChanChartLayer('anchoredVwap')">锚定 VWAP</button>
+                    <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.bollinger ? 'true' : 'false'" @click="toggleChanChartLayer('bollinger')">布林带</button>
+                  </div>
+                </section>
               </div>
             </details>
             <details class="chan-subchart-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
@@ -409,7 +417,16 @@
                   <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.macd ? 'true' : 'false'" @click="toggleChanSubchart('macd')">MACD</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.dmi ? 'true' : 'false'" @click="toggleChanSubchart('dmi')">DMI</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.mfi ? 'true' : 'false'" @click="toggleChanSubchart('mfi')">MFI</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.rsi ? 'true' : 'false'" @click="toggleChanSubchart('rsi')">RSI 背离</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.rs ? 'true' : 'false'" @click="toggleChanSubchart('rs')">相对强弱 RS</button>
                 </div>
+                  <label v-if="chanSubcharts.rs" class="chan-rs-benchmark">RS 基准
+                    <select v-model="rsPreference">
+                      <option value="auto">自动</option>
+                      <option value="QQQ">QQQ</option>
+                      <option value="SPY">SPY</option>
+                    </select>
+                  </label>
                 </section>
               </div>
             </details>
@@ -419,6 +436,9 @@
             <div v-for="level in chanFrame.chart.keyLevels" :key="level.key" class="chan-key-level-chip" :class="'chan-key-level-chip-' + level.tone" role="listitem" :title="level.title"><span>{{ level.label }}</span><strong>{{ level.priceLabel }}</strong></div>
           </div>
         </div>
+        <ul v-if="chanFrame && chanFrame.chart && chanFrame.chart.indicatorStatus.length" class="chan-indicator-status" aria-label="当前图表指标">
+          <li v-for="item in chanFrame.chart.indicatorStatus" :key="item.key"><i v-if="item.key === 'vwap' || item.key === 'anchoredVwap'" class="chan-vwap-swatch" :class="{ 'chan-vwap-swatch-anchored': item.key === 'anchoredVwap' }" aria-hidden="true"></i>{{ item.text }}</li>
+        </ul>
         <div class="chan-chart" :key="chanPeriod" :class="{ 'chan-chart-mobile': chanMobileChart }" v-if="chanFrame.chart" v-chan-chart-canvas="chanCanvasBinding" v-chan-chart-hover="chanHoverBinding" v-chan-chart-interaction="chanChartInteraction" @click="dismissChanScenarioOnTouch($event)">
           <canvas class="chan-chart-canvas" aria-hidden="true"></canvas>
           <button type="button" class="chan-scenario-toggle-canvas" :style="{ left: (chanFrame.chart.historyRight - (chanMobileChart ? 25 : 19)) / chanFrame.chart.width * 100 + '%', top: (chanFrame.chart.plotBottom - (chanMobileChart ? 25 : 19)) / chanFrame.chart.height * 100 + '%', width: (chanMobileChart ? 22 : 16) / chanFrame.chart.width * 100 + '%', height: (chanMobileChart ? 22 : 16) / chanFrame.chart.height * 100 + '%' }" :aria-pressed="chanScenariosVisible ? 'true' : 'false'" :aria-label="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" :title="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" @click.stop="toggleChanScenarios" @keydown.enter.stop.prevent="toggleChanScenarios" @keydown.space.stop.prevent="toggleChanScenarios"></button>
@@ -686,6 +706,10 @@
   <script src="/static/common/js/chan-wyckoff.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-sweep-fvg.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-mfi.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-vwap.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-bollinger.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-rsi-divergence.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-relative-strength.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/app.js?v=__ASSET_VERSION__"></script>
 </body>

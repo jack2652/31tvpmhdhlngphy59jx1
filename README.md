@@ -316,6 +316,7 @@ RESOURCE_MODE=auto
 - `GET /api/levels/{symbol}?expiration=YYYY-MM-DD&spot=144.57&raw=true`（压力位/支撑位：斐波那契 + 筹码密集 + 承接位 + 所选到期日期权持仓综合，每行含「到达概率」；`spot` 为可选基准价，缺省用快照常规价。`raw=true` 只读 SQLite，并在历史与 `fast_levels` 可用时省略原始期权行）
 - `GET /api/chan/{symbol}?spot=144.57&light=true`（日线＋周线缠论结构：包含处理、严格旧笔、笔中枢、当前价相对最近中枢的位置、抄底／逃顶观察与候选、第三类位置候选和条件式走势推演；只读取已落库日线，`spot` 为可选页面现价。`light=true` 只返回趋势/价位卡片所需的市场分析，不返回日／周结构）
 - `GET /api/chan/{symbol}/adjusted?spot=144.57&compact=true`（独立复权历史上的递归算法预览；返回规则版本、价格坐标、日／周结构、质量和修订信息。`compact=true` 省略图表不使用的 fractals、MACD、strength 等字段）
+- `GET /api/chan-benchmark/{symbol}?period=1d&basis=raw` 返回 QQQ 或 SPY 已收盘基准及可用的盘中观察值。支持日线、周线和 15m／1h／2h／4h。日线和周线支持 `split_dividend_adjusted`，盘中使用原价。形成中的价格用 `source_date` 标记对应的 15 分钟行情时点。
 - `GET /api/chan/{symbol}/intraday?period=15m|1h|2h|4h&spot=144.57`（已收盘盘中 K 线的递归结构预览；1 小时、2 小时和 4 小时由 15 分钟历史合成，信号使用原始价格坐标，不与复权日线直接比较）
 - `POST /api/refresh/{symbol}?expiration=YYYY-MM-DD&max_age=60`（本地快照在 `max_age` 秒内直接返回 `skipped=true`，不再请求上游接口；`max_age=0` 表示强制刷新）
 - `GET /api/status/{symbol}`

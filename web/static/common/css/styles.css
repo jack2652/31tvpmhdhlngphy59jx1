@@ -94,6 +94,7 @@
 .chan-period-menu-panel{grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(360px,calc(100vw - 40px));left:0;right:auto}
 .chan-period-menu-panel .chan-period-switches{width:max-content;max-width:100%}
 .chan-indicator-menu-panel{grid-template-areas:"display";grid-template-columns:minmax(0,1fr);width:min(360px,calc(100vw - 40px));left:0;right:auto}
+.chan-indicator-menu-panel>.chan-indicator-overlays{grid-row:2;min-width:0}
 .chan-indicator-options{display:flex;flex-wrap:wrap;align-items:flex-start;gap:8px}
 .chan-indicator-option{flex:0 0 auto;min-width:0}
 .chan-indicator-description-body{flex:0 0 100%;min-width:0;margin-top:2px;padding-top:8px;border-top:1px solid var(--row-line)}
@@ -198,6 +199,10 @@
 .chan-control-group>span{color:var(--muted);font-size:11px;white-space:nowrap}
 .chan-control-group .detail-seg{min-height:34px;padding:5px 10px;font-size:11px;white-space:nowrap}
 .chan-layer-switches{display:flex;align-items:center;flex-wrap:nowrap;gap:0}
+.chan-indicator-status{display:flex;flex-wrap:wrap;gap:4px 16px;margin:6px 0;padding:0;list-style:none;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.chan-vwap-swatch{display:inline-block;width:15px;margin-right:6px;vertical-align:middle;border-top:2px solid var(--blue)}
+.chan-vwap-swatch-anchored{border-top-style:dashed;border-color:var(--amber)}
+.chan-indicator-readout{margin-top:5px;line-height:1.5}
 .chan-controls .chan-layer-switches.detail-segmented{flex:0 1 auto;min-width:0;max-width:100%;overflow-x:auto;overflow-y:hidden;border:1px solid var(--field-line);border-radius:4px;background:var(--field);scrollbar-width:thin}
 .chan-controls .chan-recursive-layer-switches.detail-segmented{flex-wrap:wrap;overflow:visible}
 .chan-recursive-layer-switches .chan-layer-divider{flex:0 0 1px;align-self:stretch;margin-inline:3px;background:var(--field-line)}
@@ -226,7 +231,7 @@
 .chan-chart-navigation-spacer{flex:1}
 .chan-chart-range{margin-inline:4px;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .chan-chart-gesture-help{flex-basis:100%;margin:0;color:var(--muted);font-size:10px;line-height:1.5;text-align:right}
-.chan-chart>svg:focus,.chan-chart>svg:focus-visible{outline:0!important;box-shadow:none}
+.chan-chart>svg:focus{outline:none}
 .chan-scenario-toggle-canvas{position:absolute;z-index:2;margin:0;padding:0;border:0;border-radius:2px;background:transparent;color:var(--muted);cursor:pointer}
 .chan-scenario-toggle-canvas:hover{color:var(--blue)}
 .chan-scenario-toggle-canvas:focus{outline:none}
@@ -612,7 +617,7 @@
   .chan-projection-float-card{pointer-events:auto}
 }
 
-/* MFI 副图菜单：保留副图位置，但把选项和说明整理成易读的指标面板。 */
+/* 副图开关与基准选择共用面板。 */
 .chan-subchart-menu-panel{
   width:min(368px,calc(100vw - 32px));
   padding:14px;
@@ -627,7 +632,7 @@
 }
 .chan-subchart-menu-panel .chan-subchart-switches{
   display:grid;
-  grid-template-columns:repeat(3,minmax(0,1fr)) minmax(0,1.45fr);
+  grid-template-columns:repeat(3,minmax(0,1fr));
   width:100%;
   max-width:none;
   gap:6px;
@@ -652,6 +657,9 @@
   background:color-mix(in srgb,var(--blue) 13%,var(--field));
   color:var(--blue);
 }
+.chan-rs-benchmark{display:flex;align-items:center;gap:10px;margin-top:12px;color:var(--text);font-size:12px}
+.chan-rs-benchmark select{min-height:36px;padding:4px 10px;border:1px solid var(--field-line);border-radius:5px;background:var(--field);color:var(--text);font:inherit}
+.chan-rs-benchmark select:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 .chan-subchart-menu-panel .chan-indicator-description-body{
   display:block;
   width:100%;
@@ -674,7 +682,6 @@
 }
 @media(max-width:380px){
   .chan-subchart-menu-panel .chan-subchart-switches{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .chan-subchart-menu-panel .chan-subchart-switches .detail-seg:last-child{grid-column:1/-1}
 }
 
 /* 全局涨跌配色：绿涨红跌；支撑/压力区间按操作提示使用绿/红，距现价仍按涨跌方向着色。 */

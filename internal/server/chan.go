@@ -54,7 +54,9 @@ func (s *Service) intradayChanAnalysis(c *gin.Context) {
 		spot = quote.value.Price
 	}
 	frame, source, warning, refreshing := s.intradayFrame(symbol)
-	result, analyzeErr := chananalysis.AnalyzeIntraday(symbol, intradayBars(frame), period, spot, time.Now())
+	now := time.Now()
+	bars := intradayBars(frame)
+	result, analyzeErr := chananalysis.AnalyzeIntraday(symbol, bars, period, spot, now)
 	if analyzeErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": analyzeErr.Error()})
 		return
@@ -68,13 +70,19 @@ func (s *Service) intradayChanAnalysis(c *gin.Context) {
 	}
 	result.Daily.FutureTradingDates = futureTradingDates(result.Daily, provider.IsFutureSymbol(symbol))
 	result.Weekly.FutureTradingDates = futureTradingDates(result.Weekly, provider.IsFutureSymbol(symbol))
-	c.JSON(http.StatusOK, gin.H{
+	response := gin.H{
 		"symbol": symbol, "spot": result.Spot, "period": period, "frame": result.Daily,
 		"rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion,
 		"legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters,
 		"price_coordinate": gin.H{"basis": "raw", "adjustment_type": "none", "status": "unadjusted"},
 		"warnings":         warnings, "source": publicQuoteSource(source), "fetched_at": frame.fetchedAt, "refreshing": refreshing,
-	})
+	}
+	if live := chananalysis.FormingIntradayBar(bars, period, frame.fetchedAt, now); live != nil {
+		response["live_bar"] = gin.H{"date": live.Date, "open": live.Open, "high": live.High, "low": live.Low,
+			"close": live.Close, "volume": live.Volume, "is_forming": true, "source_date": live.SourceDate,
+			"chain_id": live.IntradayChain(bars, result.Daily.Candles, period, now)}
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (s *Service) intradayFrame(symbol string) (intradayCacheEntry, string, string, bool) {
@@ -251,6 +259,10 @@ func intradayBars(entry intradayCacheEntry) []chananalysis.Bar {
 		bar.Low, _ = historyMapNumber(raw, "low")
 		bar.Close, _ = historyMapNumber(raw, "close")
 		bar.Volume, _ = historyMapNumber(raw, "volume")
+		bar.CapturedAt, _ = historyTimestamp(raw["fetched_at"])
+		if bar.CapturedAt.IsZero() {
+			bar.CapturedAt = entry.fetchedAt
+		}
 		bars = append(bars, bar)
 	}
 	return bars
@@ -370,6 +382,10 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 		bar.RawHigh, _ = historyMapNumber(raw, "raw_high")
 		bar.RawLow, _ = historyMapNumber(raw, "raw_low")
 		bar.RawClose, _ = historyMapNumber(raw, "raw_close")
+		bar.CapturedAt, _ = historyTimestamp(raw["fetched_at"])
+		if bar.CapturedAt.IsZero() {
+			bar.CapturedAt = entry.fetchedAt
+		}
 		bars = append(bars, bar)
 	}
 	var adjustedSpot *float64
@@ -457,6 +473,10 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	result.Daily.Warnings = append([]string(nil), result.Daily.Warnings...)
 	result.Weekly.Warnings = append([]string(nil), result.Weekly.Warnings...)
 	chananalysis.RebaseSpot(&result, adjustedSpot)
+	if _, supported := s.provider.(ChanAdjustedHistoryProvider); supported && !refreshing &&
+		result.Daily.AsOf < chanExpectedHistoryDay(cutoff) && cutoff.Sub(entry.fetchedAt) >= time.Minute {
+		refreshing = s.scheduleChanAdjustedRefresh(chanAdjustedCacheKey(symbol), symbol, false)
+	}
 	if warning != "" {
 		result.Warnings = append(result.Warnings, warning)
 	}
@@ -733,7 +753,11 @@ func completedChanDailyBarsForCache(input []chananalysis.Bar, cutoff time.Time) 
 		if parseErr != nil || day.After(cutoffDay) {
 			continue
 		}
-		if day.Equal(cutoffDay) && local.Hour()*60+local.Minute() < marketcalendar.RegularCloseMinute(day) {
+		closeMinute := marketcalendar.RegularCloseMinute(day)
+		if day.Equal(cutoffDay) && local.Hour()*60+local.Minute() < closeMinute {
+			continue
+		}
+		if !bar.CapturedAt.IsZero() && bar.CapturedAt.Before(day.Add(time.Duration(closeMinute)*time.Minute)) {
 			continue
 		}
 		result = append(result, bar)
@@ -1503,9 +1527,9 @@ func (s *Service) chanAnalysis(c *gin.Context) {
 	expected := chanExpectedHistoryDay(now)
 	asOf := result.Daily.AsOf
 	if light {
-		asOf = ""
-		if last := len(rawBars) - 1; last >= 0 {
-			asOf, _ = rawBars[last]["date"].(string)
+		if len(bars) > 0 {
+			// 轻量模式只需确认缓存是否覆盖最近收盘日。
+			_, asOf = chananalysis.CompletedPriceBars(bars[len(bars)-1:], "1d", now)
 		}
 	}
 	missingClose := asOf < expected

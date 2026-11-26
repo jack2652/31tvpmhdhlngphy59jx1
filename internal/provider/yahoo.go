@@ -756,6 +756,9 @@ func futureQuoteFromChartResult(symbol string, result yahooChartResult, now time
 		}
 		if high >= math.Max(open, latestPrice) && low <= math.Min(open, latestPrice) && low <= high {
 			dailyBar = &model.DailyBar{Date: date, Open: open, High: high, Low: low, Close: latestPrice, Volume: float64(volume), IsForming: state != "CLOSED"}
+			if !latestAt.IsZero() {
+				dailyBar.AsOf = &latestAt
+			}
 		}
 	}
 	var change *float64
@@ -943,7 +946,7 @@ func yahooRegularDailyBar(quote *yahooQuoteModel, now time.Time, state string) *
 	bar := &model.DailyBar{
 		Date: dateTime.In(location).Format(time.DateOnly), Open: quote.RegularMarketOpen,
 		High: quote.RegularMarketDayHigh, Low: quote.RegularMarketDayLow,
-		Close: quote.RegularMarketPrice, Volume: float64(quote.RegularMarketVolume), IsForming: forming,
+		Close: quote.RegularMarketPrice, Volume: float64(quote.RegularMarketVolume), IsForming: forming, AsOf: &dateTime,
 	}
 	if !validYahooPrice(bar.Open) || !validYahooPrice(bar.High) || !validYahooPrice(bar.Low) || !validYahooPrice(bar.Close) ||
 		bar.High < math.Max(bar.Open, bar.Close) || bar.Low > math.Min(bar.Open, bar.Close) || bar.Low > bar.High || bar.Volume < 0 {

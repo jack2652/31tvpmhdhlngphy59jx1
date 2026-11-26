@@ -67,9 +67,9 @@ let expirationCutoffCatalog = { symbol: "", values: null };
 let expirationCutoffTimer = null;
 const CHAN_CHART_PREFERENCES_VERSION = 15;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, sweepFvg: false, mfi: false };
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, sweepFvg: false, vwap: false, anchoredVwap: false, bollinger: false, mfi: false };
 const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "sweepFvg"];
-const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false, mfi: false };
+const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false, mfi: false, rsi: false, rs: false };
 function readChainViewPreference() {
   try {
     const stored = localStorage.getItem(CHAIN_VIEW_STORAGE_KEY);
@@ -153,7 +153,7 @@ function readChanChartPreferences() {
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "sweepFvg", "mfi"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "sweepFvg", "vwap", "anchoredVwap", "bollinger", "mfi"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -4100,14 +4100,18 @@ function scheduleChanIntradayBoundaryRefresh(period, symbol = state.symbol) {
   const parts = newYorkIntradayParts(date);
   const elapsedIntoQuarter = (parts.minute % 15) * 60 * 1000
     + date.getSeconds() * 1000 + date.getMilliseconds();
-  const delay = elapsedIntoQuarter < CHAN_INTRADAY_REFRESH_DELAY_MS
+  const boundaryDelay = elapsedIntoQuarter < CHAN_INTRADAY_REFRESH_DELAY_MS
     ? CHAN_INTRADAY_REFRESH_DELAY_MS - elapsedIntoQuarter
     : CHAN_INTRADAY_REFRESH_INTERVAL_MS - elapsedIntoQuarter + CHAN_INTRADAY_REFRESH_DELAY_MS;
+  const observeLive = () => window.optionScopeApp?.chanLiveIndicators
+    && quoteIsFreshForIntraday(state.lastQuote) && document.visibilityState === "visible";
+  const delay = observeLive() ? Math.min(boundaryDelay, CHAN_INTRADAY_REFRESH_DELAY_MS) : boundaryDelay;
   chanIntradayBoundaryTimer = setTimeout(() => {
     chanIntradayBoundaryTimer = null;
     if (state.symbol !== symbol || state.chanPeriod !== period) return;
     scheduleChanIntradayBoundaryRefresh(period, symbol);
-    refreshChanIntradayAtBoundary(symbol);
+    if (observeLive()) window.optionScopeApp.ensureChanIntraday(period, true);
+    else refreshChanIntradayAtBoundary(symbol);
   }, delay);
 }
 
@@ -4298,7 +4302,7 @@ function chanQuoteRenderKey(quote, spot) {
     return Number.isFinite(number) ? String(number) : String(value);
   });
   return [quote?.symbol || state.symbol, spot == null ? "" : String(spot), quote?.source || "",
-    quote?.market_state || "", easternDate, bar.date || "", ...barValues, bar.is_forming === true ? "1" : "0"].join("|");
+    quote?.market_state || "", easternDate, bar.date || "", bar.as_of || "", ...barValues, bar.is_forming === true ? "1" : "0"].join("|");
 }
 
 let pendingChanQuoteRender = null;
@@ -6569,6 +6573,7 @@ if (window.Vue) {
 }
 const optionScopeApp = new Vue({
   el: "#app",
+  mixins: [window.OptionScopeRelativeStrength.benchmarkMixin(request)],
   data: state,
   computed: {
     busy() { return this.loading; },
@@ -6584,12 +6589,26 @@ const optionScopeApp = new Vue({
       return heatmapExpiryDates(dates)
         .some((expiration) => expiration !== this.expiration);
     },
+    rsRequest() {
+      return OptionScopeRelativeStrength.benchmarkRequest(this.chanSubcharts.rs && this.chanExpanded,
+        this.symbol, this.chanPeriod, this.chanPayload?.price_coordinate?.basis || "split_dividend_adjusted", this.rsPreference);
+    },
+    chanLiveIndicators() {
+      const layers = this.chanChartLayers, panes = this.chanSubcharts;
+      return this.chanExpanded && CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)
+        && this.lastQuote?.market_state === "REGULAR"
+        && (layers.vwap || layers.anchoredVwap || layers.bollinger || panes.rsi || panes.rs);
+    },
     chanFrame() {
       if (CHAN_INTRADAY_PERIODS.includes(this.chanPeriod)) {
         const payload = this.chanIntradayPayload[this.chanPeriod];
         return payload
-          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, 30, this.chanViewports[this.chanPeriod], this.chanChartLayers, this.chanSubcharts, { marketHistory: this.chanPayload?.market_history })
+          ? OptionScopeChan.intradayView(payload, this.chanScenariosVisible, this.chanIntradaySpot, this.chanMobileChart, 30, this.chanViewports[this.chanPeriod], this.chanChartLayers, this.chanSubcharts, { marketHistory: this.chanPayload?.market_history, rsBenchmark: this.rsBenchmark })
           : OptionScopeChan.emptyFrame(({ "15m": "15分钟", "1h": "1小时", "2h": "2小时", "4h": "4小时" })[this.chanPeriod]);
+      }
+      if (this.chanSubcharts.rs && this.chanPayload?.symbol === this.symbol) {
+        return OptionScopeChan.view(this.chanPayload, this.chanScenariosVisible, this.chanMobileChart, 30,
+          this.chanViewports, this.chanChartLayers, this.chanSubcharts, { period: this.chanPeriod, rsBenchmark: this.rsBenchmark })[this.chanPeriod];
       }
       return this.view.chan[this.chanPeriod] || this.view.chan.daily;
     },
@@ -6650,6 +6669,7 @@ const optionScopeApp = new Vue({
     },
   },
   watch: {
+    chanLiveIndicators() { scheduleChanIntradayBoundaryRefresh(this.chanPeriod); },
     chanPeriod() {
       rememberChanChartPreferences(this.chanPeriod, this.chanChartLayers, this.chanSubcharts);
       this.chanHoveredScenario = null;
@@ -6842,14 +6862,12 @@ const optionScopeApp = new Vue({
       this.chanIntradayLoading = { ...this.chanIntradayLoading, [period]: true };
       request(`/api/chan/${encodeURIComponent(symbol)}/intraday${query}`, { timeout: 60000 }).then((payload) => {
         if (state.symbol !== symbol || state.loadId !== generation) return;
-        const previousBars = this.chanIntradayPayload[period]?.frame?.bar_count || 0;
+        const previous = this.chanIntradayPayload[period];
         const nextBars = payload?.frame?.bar_count || 0;
         const viewport = state.chanViewports[period];
-        if (previousBars > 0 && nextBars > previousBars && viewport?.visibleBars > 0) {
-          const addedBars = nextBars - previousBars;
-          const maxOffset = Math.max(0, nextBars - viewport.visibleBars);
-          const endOffset = Math.max(0, Math.min(maxOffset, (viewport.endOffset || 0) + (viewport.endOffset > 0 ? addedBars : 0)));
-          state.chanViewports = { ...state.chanViewports, [period]: { ...viewport, endOffset } };
+        const nextViewport = OptionScopeChan.intradayViewportAfterRefresh(viewport, previous, payload);
+        if (nextViewport !== viewport) {
+          state.chanViewports = { ...state.chanViewports, [period]: nextViewport };
         }
         const liveQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
         const liveSpot = finitePrice(activeSessionQuote(liveQuote)?.price ?? liveQuote?.price);
@@ -7003,7 +7021,7 @@ const optionScopeApp = new Vue({
           wyckoff: enabled && layer === "wyckoff",
           sweepFvg: enabled && layer === "sweepFvg",
         };
-      } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "trendlines") {
+      } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "trendlines" || layer === "vwap" || layer === "anchoredVwap" || layer === "bollinger") {
         this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };
       } else {
         const level = Number(layer);

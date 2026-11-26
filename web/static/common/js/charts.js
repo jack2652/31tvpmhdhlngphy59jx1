@@ -203,6 +203,9 @@ function bindChanChartHover(target, initialBinding) {
   volumeLabel.textContent = "成交量";
   const volumeValue = document.createElement("strong");
   volumeRow.append(volumeLabel, volumeValue);
+  const indicatorReadout = document.createElement("div");
+  indicatorReadout.className = "chart-tooltip-sub chan-indicator-readout";
+  indicatorReadout.hidden = true;
   const structureDetail = document.createElement("section");
   structureDetail.className = "chan-structure-tooltip";
   structureDetail.hidden = true;
@@ -222,6 +225,7 @@ function bindChanChartHover(target, initialBinding) {
   });
   tooltip.append(changeRow);
   tooltip.append(volumeRow);
+  tooltip.append(indicatorReadout);
   tooltip.append(structureDetail);
   const hide = () => {
     const wasActive = activeIndex != null;
@@ -370,6 +374,21 @@ function bindChanChartHover(target, initialBinding) {
         ? `${change > 0 ? "+" : ""}${change.toFixed(2)}%` : "未知";
       changeValue.className = `chan-ohlc-value ${candle.pending || !Number.isFinite(change) ? "chan-ohlc-flat" : change > 0 ? "chan-ohlc-up" : change < 0 ? "chan-ohlc-down" : "chan-ohlc-flat"}`;
       volumeValue.textContent = candle.pending ? "-" : formatVolume(candle.volume);
+      const i = candle.index;
+      const vwap = model.vwapLines?.[0]?.[i]?.value;
+      const anchored = model.vwapLines?.[1]?.[i]?.value;
+      const bandwidth = model.bollinger?.series?.[i]?.width;
+      const rsi = model.rsi?.series?.[i]?.value;
+      const rs = model.rs?.series?.[i]?.value;
+      const indicators = [
+        Number.isFinite(vwap) && `VWAP ${formatMoney(vwap)}`,
+        Number.isFinite(anchored) && `锚定 VWAP ${formatMoney(anchored)}`,
+        Number.isFinite(bandwidth) && `带宽 ${(bandwidth * 100).toFixed(2)}%`,
+        Number.isFinite(rsi) && `RSI ${rsi.toFixed(1)}`,
+        Number.isFinite(rs) && `RS ${rs.toFixed(2)}`,
+      ].filter(Boolean);
+      indicatorReadout.textContent = indicators.join(" · ");
+      indicatorReadout.hidden = candle.pending || indicators.length === 0;
       shownCandle = candle;
     }
     const distanceToSegment = (item) => {
@@ -930,6 +949,27 @@ function drawChanCanvas(target, binding) {
     if (zone.width > 34 && zone.height > 12) label("第" + (Number(zone.level) + 1) + "层", zone.x + 4, zone.y + 10, { font: "9px Inter, ui-sans-serif, system-ui, sans-serif", color });
     context.globalAlpha = 1;
   }
+  if (model.vwapLines) {
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    model.vwapLines.forEach((series, index) => {
+      if (!series) return;
+      const color = index === 0 ? colors.blue : colors.amber;
+      let previous = null;
+      for (const point of series) {
+        if (point && previous?.group === point.group) {
+          line(previous.x, previous.y, point.x, point.y, color, point.live ? [2, 2] : index === 0 ? [] : [5, 3], 1.25);
+        } else if (point) {
+          context.fillStyle = color;
+          context.fillRect(point.x - 1.5, point.y - 1.5, 3, 3);
+        }
+        previous = point;
+      }
+    });
+    context.restore();
+  }
   if (model.layers?.wyckoff === true && model.wyckoffRange) {
     const range = model.wyckoffRange;
     const phaseColors = {
@@ -968,6 +1008,39 @@ function drawChanCanvas(target, binding) {
     context.globalAlpha = 1;
     context.fillStyle = color;
     context.fillText(phaseLabel, labelX + 5, labelY - 3);
+    context.restore();
+  }
+  if (model.bollinger) {
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    for (const key of ["upperY", "middleY", "lowerY"]) {
+      let previous = null;
+      for (const point of model.bollinger.series) {
+        if (point && previous) {
+          context.globalAlpha = key === "middleY" ? 0.65 : 0.82;
+          line(previous.x, previous[key], point.x, point[key], colors.net, point.live || key === "middleY" ? [4, 3] : [], 1);
+        }
+        previous = point;
+      }
+    }
+    context.globalAlpha = 1;
+    let lastMarkerX = -Infinity;
+    for (const event of model.bollinger.events) {
+      if (event.x - lastMarkerX < 12 && event !== model.bollinger.events.at(-1)) continue;
+      const upward = event.side === "up";
+      const color = upward ? colors.up : colors.down;
+      const markerY = Math.max(model.plotTop + 5, Math.min(model.plotBottom - 5, event.y + (upward ? -7 : 7)));
+      context.beginPath();
+      context.moveTo(event.x, markerY + (upward ? -4 : 4));
+      context.lineTo(event.x - 3, markerY + (upward ? 2 : -2));
+      context.lineTo(event.x + 3, markerY + (upward ? 2 : -2));
+      context.closePath();
+      if (event.status === "watch") { context.strokeStyle = color; context.stroke(); }
+      else { context.fillStyle = color; context.fill(); }
+      lastMarkerX = event.x;
+    }
     context.restore();
   }
   // Keep each original candle body in its market color. Each merged Chan
@@ -1968,6 +2041,62 @@ function drawChanCanvas(target, binding) {
       Math.max(1, model.plotRight - model.plotLeft), header.mfi, header.mfiInterpretation,
       header.mfiCompact, header.mfiStatus, colors.text, mfiColor);
     line(model.plotLeft, model.mfiBottom, model.plotRight, model.mfiBottom, colors.axis, [], 1);
+  }
+  if (model.rsi) {
+    const rsiY = (value) => model.rsiTop + (100 - value) / 100 * (model.rsiBottom - model.rsiTop);
+    for (const value of [70, 50, 30]) {
+      const y = rsiY(value);
+      line(model.plotLeft, y, model.plotRight, y, colors.grid, [3, 4]);
+      label(String(value), model.plotLeft - 8, y + 4, { align: "right" });
+    }
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.rsiTop, model.historyRight - model.plotLeft, model.rsiBottom - model.rsiTop);
+    context.clip();
+    let previous = null;
+    for (const point of model.rsi.series) {
+      if (previous && Number.isFinite(point.value) && Number.isFinite(previous.value)) {
+        line(previous.x, rsiY(previous.value), point.x, rsiY(point.value), colors.blue, point.live ? [3, 3] : [], 1.4);
+      }
+      previous = point;
+    }
+    let lastLabelX = -Infinity;
+    for (const event of model.rsi.events) {
+      const color = event.invalidated ? colors.text : event.side === "top" ? colors.down : colors.up;
+      const y1 = rsiY(event.from.rsi), y2 = rsiY(event.to.rsi);
+      line(event.x1, y1, event.x2, y2, color, event.status === "watch" || event.invalidated ? [3, 3] : [], 1.6);
+      if (event.x - lastLabelX < (model.mobileChart ? 72 : 94) && event !== model.rsi.events.at(-1)) continue;
+      const caption = `${event.side === "top" ? "顶背离" : "底背离"}${event.status === "watch" ? " · 观察" : event.invalidated ? " · 失效" : ""}`;
+      const font = `${model.mobileChart ? 10 : 11}px Inter, ui-sans-serif, system-ui, sans-serif`;
+      const rightAligned = event.x > model.historyRight - 92;
+      const textX = rightAligned ? event.x - 2 : event.x + 2;
+      label(caption, textX, Math.max(model.rsiTop + 11, Math.min(model.rsiBottom - 3, y2 - 4)),
+        { color, align: rightAligned ? "right" : "left", font });
+      lastLabelX = event.x;
+    }
+    context.restore();
+    label("RSI (14)", model.plotLeft, model.rsiTop - 6);
+    line(model.plotLeft, model.rsiBottom, model.plotRight, model.rsiBottom, colors.axis);
+  }
+  if (model.rs) {
+    const values = model.rs.series.filter(Boolean).map((point) => point.value);
+    const range = Math.max(0.5, ...values.map((value) => Math.abs(value - 100))) * 1.08;
+    const rsY = (value) => model.rsTop + (1 - (value - 100) / range) * (model.rsBottom - model.rsTop) / 2;
+    const baseline = rsY(100);
+    line(model.plotLeft, baseline, model.plotRight, baseline, colors.axis, [4, 4]);
+    label("100", model.plotLeft - 8, baseline + 4, { align: "right" });
+    let previous = null;
+    for (const point of model.rs.series) {
+      if (point && previous) line(previous.x, rsY(previous.value), point.x, rsY(point.value), colors.blue, point.live ? [3, 3] : [], 1.5);
+      if (point && (!previous || point.changed)) {
+        context.fillStyle = point.changed ? point.state === "outperform" ? colors.up : colors.down : colors.blue;
+        const size = point.changed ? 4 : 3;
+        context.fillRect(point.x - size / 2, rsY(point.value) - size / 2, size, size);
+      }
+      previous = point;
+    }
+    label(model.rs.symbol ? `RS / ${model.rs.symbol}` : "RS", model.plotLeft, model.rsTop - 6);
+    line(model.plotLeft, model.rsBottom, model.plotRight, model.rsBottom, colors.axis);
   }
   // Bottom axis and the three visible date anchors.
   line(model.plotLeft, model.plotBottom, model.plotRight, model.plotBottom, colors.axis, [], 1);

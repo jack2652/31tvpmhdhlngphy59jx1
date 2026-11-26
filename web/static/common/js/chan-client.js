@@ -436,6 +436,10 @@
   const quoteEasternDateFormatter = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
   });
+  const easternIntradayFormatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  });
   const turningKinds = new Set(["bottom_reversal_candidate", "top_exit_candidate"]);
   const v4ClassLabels = {
     class1_buy: "一买", class1_sell: "一卖",
@@ -1136,17 +1140,38 @@
     return events.slice(first, low);
   }
 
+  function intradayViewportAfterRefresh(viewport, previous, next) {
+    if (!(viewport?.visibleBars > 0 && viewport.endOffset > 0)) return viewport;
+    const displayDates = (payload) => {
+      const dates = (payload?.frame?.candles || []).map((bar) => bar.date);
+      const liveDate = payload?.live_bar?.date;
+      if (liveDate && (!dates.length || liveDate > dates.at(-1))) dates.push(liveDate);
+      return dates;
+    };
+    const before = displayDates(previous);
+    const anchor = before[before.length - viewport.endOffset - 1];
+    if (!anchor) return viewport;
+    const after = displayDates(next);
+    const anchorIndex = after.findLastIndex((date) => date <= anchor);
+    const endOffset = Math.min(Math.max(0, after.length - viewport.visibleBars), after.length - anchorIndex - 1);
+    return endOffset === viewport.endOffset ? viewport : { ...viewport, endOffset };
+  }
+
   function chartModel(frame, spot, scenarios, showScenarios, mobile = false, mobileBars = 30, viewport = null, layers = null, ruleVersion = null, subcharts = null, liveBar = null, dataContext = null) {
     const sourceCandles = frame.candles || [];
+    const lastCandle = sourceCandles.at(-1);
     let candlesForDisplay = sourceCandles;
     let liveDisplayIndex = -1;
-    if (liveBar && ["1d", "daily"].includes(frame.period) && liveBar.date >= (sourceCandles[sourceCandles.length - 1]?.date || "")) {
+    if (liveBar && (["1d", "daily"].includes(frame.period) || isIntradayFrame(frame))
+        && (liveBar.date > (lastCandle?.date || "") || (lastCandle?.is_forming && liveBar.date === lastCandle.date))) {
       const candle = { ...liveBar };
-      const existingIndex = sourceCandles.findIndex((bar) => bar.date === candle.date);
+      if (["1d", "daily"].includes(frame.period) && frame.future_trading_dates?.[0] && candle.date > frame.future_trading_dates[0]) {
+        candle.chain_id = (lastCandle?.chain_id ?? 0) + 1;
+      }
       candlesForDisplay = sourceCandles.slice();
-      if (existingIndex >= 0) {
-        candlesForDisplay[existingIndex] = candle;
-        liveDisplayIndex = existingIndex;
+      if (candle.date === lastCandle?.date) {
+        liveDisplayIndex = candlesForDisplay.length - 1;
+        candlesForDisplay[liveDisplayIndex] = candle;
       } else {
         candlesForDisplay.push(candle);
         liveDisplayIndex = candlesForDisplay.length - 1;
@@ -1178,11 +1203,13 @@
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
     const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, layers?.turtle === true ? 1 : 0, layers?.granville === true ? 1 : 0, layers?.macdSma200 === true ? 1 : 0, layers?.supertrend === true ? 1 : 0, layers?.wyckoff === true ? 1 : 0, layers?.sweepFvg === true ? 1 : 0, layers?.mfi === true ? 1 : 0, recursiveCenterVisibility].join(":");
-    const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
+    const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi", "rsi", "rs"].map((name) => [name, subcharts?.[name] === true]));
     const mfiEnabled = layers?.mfi === true || subcharts?.mfi === true;
-    const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("") + (mfiEnabled ? "1" : "0");
+    const subchartCacheKey = Object.values(visibleSubcharts).map((visible) => visible ? 1 : 0).join("") + (mfiEnabled ? "1" : "0");
     // 标普基准数据可能在盘中图首次渲染后异步补齐；换数组时必须让布局缓存失效。
     const mfiBenchmarkCacheKey = mfiEnabled ? cacheObjectId(dataContext?.marketHistory?.daily) : "none";
+    const rsBenchmark = dataContext?.rsBenchmark;
+    const rsCacheKey = visibleSubcharts.rs ? [rsBenchmark?.symbol, rsBenchmark?.self, cacheObjectId(rsBenchmark?.history)].join(":") : "";
     // Only reserve the scenario lane when there is a path to draw. Reserving
     // it unconditionally leaves a large blank gutter on mobile charts whose
     // current structure produced no projection.
@@ -1205,7 +1232,9 @@
       signal.source_kind, signal.level, signal.kind, signal.side, signal.status, signal.phase, signal.phase_at,
       signal.date, signal.observed_at, signal.confirmed_at, signal.pivot_date, signal.price,
       signal.invalidation_price, signal.protection_price, signal.structure_refs, signal.rule_version]));
-    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${ruleVersion || ""}-${supportCacheKey}-${resistanceCacheKey}-${signalCacheKey}`;
+    const vwapKey = layers?.vwap || layers?.anchoredVwap
+      ? [Boolean(layers.vwap), Boolean(layers.anchoredVwap), frame.as_of, cacheObjectId(frame.strokes_v4), cacheObjectId(frame.strokes), cacheObjectId(frame.recursive_levels), cacheObjectId(frame.segments)].join(":") : "";
+    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${rsCacheKey}-${vwapKey}-${Boolean(layers?.bollinger)}-${ruleVersion || ""}-${supportCacheKey}-${resistanceCacheKey}-${signalCacheKey}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
@@ -1221,6 +1250,21 @@
     }
     const bars = candlesForDisplay.slice(startIndex, dataEndIndex);
     if (!bars.length) return null;
+    // 报价可补绘最新日 K，指标只在该日进入服务端收盘序列后确认。
+    let indicatorCandles = candlesForDisplay;
+    if (liveDisplayIndex >= 0 && !candlesForDisplay[liveDisplayIndex].is_forming) {
+      indicatorCandles = candlesForDisplay.slice();
+      indicatorCandles[liveDisplayIndex] = { ...indicatorCandles[liveDisplayIndex], is_forming: true };
+    }
+    const vwap = vwapKey ? window.OptionScopeVwap?.calculate(indicatorCandles, frame) : null;
+    const bollinger = layers?.bollinger ? window.OptionScopeBollinger?.calculate(indicatorCandles) : null;
+    const visibleBands = bollinger?.series.slice(startIndex, dataEndIndex);
+    const bandBreaks = visibleBands?.flatMap((point) => point?.event ? [point.event] : []);
+    const rsi = visibleSubcharts.rsi ? window.OptionScopeRsiDivergence?.calculate(indicatorCandles) : null;
+    const visibleRsi = rsi?.values.slice(startIndex, dataEndIndex);
+    const rsiEvents = rsi ? [...indexedEventWindow(rsi.events, startIndex, dataEndIndex),
+      ...indexedEventWindow(rsi.watches, startIndex, dataEndIndex)] : [];
+    const rs = visibleSubcharts.rs ? window.OptionScopeRelativeStrength?.calculate(indicatorCandles.slice(startIndex, dataEndIndex), rsBenchmark) : null;
     const afStochZ = layers?.afStochZ === true ? afStochZSeries(sourceCandles) : { events: [], series: {} };
     const trendlineResult = layers?.trendlines === true
       ? window.OptionScopeTrendlines?.calculate(sourceCandles, frame.strokes || [], cacheSegments, startIndex, endIndex) || null : null;
@@ -1293,7 +1337,7 @@
     let paneBottom = priceBottom;
     const panes = [];
     const indicatorDividers = [];
-    for (const name of ["volume", "macd", "dmi", "mfi"]) {
+    for (const name of ["volume", "macd", "dmi", "mfi", "rsi", "rs"]) {
       if (name !== "mfi" && !visibleSubcharts[name]) continue;
       if (name === "mfi" && !mfiEnabled) continue;
       const gap = panes.length ? indicatorGap : panelGap;
@@ -1318,6 +1362,8 @@
     const macdTop = paneEdge("macd", "top"), macdBottom = paneEdge("macd", "bottom");
     const dmiTop = paneEdge("dmi", "top"), dmiBottom = paneEdge("dmi", "bottom");
     const mfiTop = paneEdge("mfi", "top"), mfiBottom = paneEdge("mfi", "bottom");
+    const rsiTop = paneEdge("rsi", "top"), rsiBottom = paneEdge("rsi", "bottom");
+    const rsTop = paneEdge("rs", "top"), rsBottom = paneEdge("rs", "bottom");
     const indicatorDividerY = dividerBetween("volume", "macd");
     const dmiDividerY = dividerBetween("macd", "dmi");
     const height = paneBottom + bottom;
@@ -1864,7 +1910,7 @@
       width, height, mobileChart: mobile, plotLeft: left, plotTop: top, plotRight: width - right, plotBottom: priceBottom,
       priceBottom, volumeTop, volumeBottom, volumeMax, indicatorDividerY,
       macdTop, macdBottom, macdMin, macdMax, macdZeroY,
-      dmiTop, dmiBottom, dmiDividerY, mfiTop, mfiBottom, indicatorDividers,
+      dmiTop, dmiBottom, dmiDividerY, mfiTop, mfiBottom, rsiTop, rsiBottom, rsTop, rsBottom, indicatorDividers,
       crosshairBottom: paneBottom, interactionBottom: paneBottom, axisBottom: paneBottom,
       totalBars, visibleBars: visibleCount, windowStart: startIndex, windowEnd: endIndex, endOffset,
       maxOffset, maxFutureOffset,
@@ -1944,8 +1990,29 @@
       wyckoffRange: wyckoffRangeLayout,
       wyckoffEvents: wyckoffEventLayouts,
       sweepFvg: sweepFvgLayouts,
+      vwapLines: vwap ? [
+        layers.vwap && vwap.session.slice(startIndex, dataEndIndex),
+        layers.anchoredVwap && vwap.anchored.slice(startIndex, dataEndIndex),
+      ].map((series) => series && series.map((point, index) => point && ({
+        ...point, x: x(index), y: y(point.value), live: Boolean(indicatorCandles[startIndex + index].is_forming),
+      }))) : null,
+      bollinger: bollinger ? {
+        series: visibleBands.map((point, index) => point && ({
+          ...point, x: x(index), upperY: y(point.upper), middleY: y(point.middle), lowerY: y(point.lower),
+        })),
+        events: bandBreaks.map((event) => ({ ...event, x: x(event.index - startIndex), y: y(event.price) })),
+      } : null,
       mfiEvents: visibleMfiEvents.map((event) => ({ ...event, x: x(event.index - startIndex), y: mfiY(event.mfi), averageY: mfiY(event.average) })),
       mfiValues: visibleMfi,
+      rsi: rsi ? {
+        series: visibleRsi.map((value, index) => ({ value, x: x(index), live: Boolean(indicatorCandles[startIndex + index].is_forming) })),
+        events: rsiEvents.map(({ invalidatedIndex, invalidatedAt, ...event }) => {
+          const invalidated = invalidatedIndex !== null && invalidatedIndex < dataEndIndex;
+          return { ...event, x: x(event.index - startIndex), x1: x(event.from.rsiIndex - startIndex),
+            x2: x(event.to.rsiIndex - startIndex), invalidated, invalidatedAt: invalidated ? invalidatedAt : null };
+        }),
+      } : null,
+      rs: rs ? { symbol: rsBenchmark?.symbol, series: rs.map((point, index) => point && { ...point, x: x(index) }) } : null,
       // Count only signals that can actually be drawn. The visible signal list
       // is intentionally limited to the current chart window so panning does
       // not pull off-screen markers onto the plot edge.
@@ -2073,6 +2140,43 @@
         : "当前窗口暂无已确认的 MFI 金叉/死叉。";
       chart.description += `MFI 使用 14 周期资金流量和 9 周期均线；低于 20 为超卖，高于 80 为超买，白线为个股、淡粉线为 S&P 500，均线向上为红色、向下为绿色。形成中的 K 线只更新数值，不确认交叉事件；${eventDescription}`;
     }
+    chart.indicatorStatus = [];
+    if (vwap) {
+      const lastSession = vwap.session[dataEndIndex - 1], lastAnchor = vwap.anchored[dataEndIndex - 1];
+      const liveSuffix = indicatorCandles[dataEndIndex - 1].is_forming ? " · 形成中观察" : "";
+      if (layers.vwap) chart.indicatorStatus.push({ key: "vwap", text: lastSession
+        ? `VWAP ${money(lastSession.value)}${liveSuffix}`
+        : vwap.intraday ? "VWAP · 成交量不足" : "VWAP · 仅盘中周期可用" });
+      if (layers.anchoredVwap) chart.indicatorStatus.push({ key: "anchoredVwap", text: lastAnchor
+        ? `锚定 VWAP ${money(lastAnchor.value)} · ${lastAnchor.anchor.date} ${lastAnchor.anchor.source}端点${liveSuffix}`
+        : "锚定 VWAP · 等待已确认端点与有效成交量" });
+      chart.description += "VWAP 实线按纽约常规交易日重置，锚定 VWAP 虚线从端点计入成交量，在端点确认后呈现。";
+    }
+    if (bollinger) {
+      const latest = visibleBands[visibleBands.length - 1], event = bandBreaks[bandBreaks.length - 1];
+      const eventText = event ? `${event.status === "watch" ? "形成中观察" : "收盘确认"}${event.side === "up" ? "上破" : "下破"} · ${displayBarTime(event.date, frame.period)}` : "";
+      const state = !latest ? "等待 20 根有效 K 线"
+        : `带宽 ${(latest.width * 100).toFixed(2)}% · ${latest.threshold === null ? "收缩样本不足" : latest.squeeze ? "收缩" : "非收缩"}${latest.live ? " · 形成中" : ""}`;
+      chart.indicatorStatus.push({ key: "bollinger", text: ["布林带", state, eventText].filter(Boolean).join(" · ") });
+      chart.description += "布林带使用 20 期均线与两倍总体标准差。带宽不高于此前 120 期的第 20 百分位时为收缩，至少需要 40 个历史带宽。";
+    }
+    if (rsi) {
+      const latest = visibleRsi[visibleRsi.length - 1];
+      const event = chart.rsi.events.at(-1);
+      const eventText = event ? `${event.status === "watch" ? "形成中观察" : "收盘确认"}${event.side === "top" ? "顶背离" : "底背离"} · ${displayBarTime(event.date, frame.period)}${event.invalidated ? " · 已失效" : ""}` : "";
+      const state = Number.isFinite(latest) ? `RSI(14) ${latest.toFixed(1)}${indicatorCandles[dataEndIndex - 1].is_forming ? " · 形成中" : ""}` : "RSI(14) · 等待有效行情";
+      chart.indicatorStatus.push({ key: "rsi", text: [state, eventText].filter(Boolean).join(" · ") });
+      chart.description += "RSI 使用当前周期 Wilder 14，参考线 30、50、70。背离等价格与 RSI 枢轴确认，后续收盘 K 线越过价格枢轴极值时失效。";
+    }
+    if (rs) {
+      const latest = rs.at(-1);
+      const delta = latest ? latest.value - 100 : 0;
+      const relative = latest ? `${latest.state === "outperform" ? "跑赢" : latest.state === "underperform" ? "跑输" : "持平"} ${delta > 0 ? "+" : ""}${delta.toFixed(2)}%` : "基准数据不足";
+      const pending = !latest && rsBenchmark?.history?.refreshing ? " · 刷新中" : "";
+      chart.indicatorStatus.push({ key: "rs", text: `RS${rsBenchmark?.symbol ? " / " + rsBenchmark.symbol : ""} · ${relative}${latest?.live ? " · 形成中观察" : ""}${pending}` });
+      chart.description += "相对强弱以当前窗口第一个共同时间点为 100。数值表示相对表现，缺失行情处留空。";
+    }
+    if (chart.indicatorStatus.length) chart.description += chart.indicatorStatus.map((item) => item.text).join("。") + "。";
     if (!liveCandleVisible) {
       const layouts = cachedLayouts || new Map();
       layouts.set(cacheKey, { chart, minimum, maximum, y });
@@ -2523,7 +2627,7 @@
     };
   }
 
-  function view(payload, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null, subcharts = null) {
+  function view(payload, showScenarios = true, mobileChart = false, mobileBars = 30, viewport = null, layers = null, subcharts = null, context = null) {
     if (!payload) return empty();
     let historyTime = "--";
     if (payload.history?.fetched_at) {
@@ -2531,7 +2635,10 @@
       if (!Number.isNaN(date.getTime())) historyTime = date.toLocaleString("zh-CN", { hour12: false });
     }
     const dataContext = { priceCoordinate: payload.price_coordinate, history: payload.history, parameters: payload.parameters, marketHistory: payload.market_history };
-    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version, dataContext, subcharts, payload.live_daily_bar), weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version, dataContext, subcharts);
+    const daily = frameView(payload.daily, payload.spot, payload.weekly, showScenarios, mobileChart, mobileBars, viewport?.daily, layers, payload.rule_version,
+      { ...dataContext, rsBenchmark: context?.period === "daily" ? context.rsBenchmark : null }, subcharts, payload.live_daily_bar);
+    const weekly = frameView(payload.weekly, payload.spot, payload.daily, showScenarios, mobileChart, mobileBars, viewport?.weekly, layers, payload.rule_version,
+      { ...dataContext, rsBenchmark: context?.period === "weekly" ? context.rsBenchmark : null }, subcharts);
     const weeklyReady = Boolean(payload.weekly?.position?.center);
     const weeklyContext = weeklyReady ? `周线：${weekly.position}。` : `周线已有 ${weekly.bars} 根收盘 K 线、${weekly.confirmed} 根已确认笔，尚未形成中枢，不能给日线方向增加确认。`;
     // The view is replaced wholesale on every refresh; freezing the top level
@@ -2561,8 +2668,9 @@
       priceCoordinate: payload.price_coordinate,
       parameters: payload.parameters,
       marketHistory: context?.marketHistory || payload.market_history,
+      rsBenchmark: context?.rsBenchmark,
     };
-    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars, viewport, layers, payload.rule_version, dataContext, subcharts);
+    return frameView(payload.frame, spot, null, showScenarios, mobileChart, mobileBars, viewport, layers, payload.rule_version, dataContext, subcharts, payload.live_bar);
   }
 
   // Refresh the current price position without rebuilding historical pens.
@@ -2702,7 +2810,8 @@
       && Number.isFinite(Number(adjustedSpot)) && Number(adjustedSpot) > 0) {
       close = Number(adjustedSpot);
     }
-    return { ...previous, high: Math.max(high, close), low: Math.min(low, close), close };
+    return { ...previous, high: Math.max(high, close), low: Math.min(low, close), close,
+      source_date: close === previous.close ? previous.source_date : undefined };
   }
 
   function quoteEasternDate(quote) {
@@ -2711,6 +2820,14 @@
     const date = new Date(timestamp);
     const parts = Object.fromEntries(quoteEasternDateFormatter.formatToParts(date).map((part) => [part.type, part.value]));
     return `${parts.year}-${parts.month}-${parts.day}`;
+  }
+
+  function easternIntradaySlot(timestamp) {
+    const at = Date.parse(timestamp || "");
+    if (!Number.isFinite(at)) return undefined;
+    const parts = Object.fromEntries(easternIntradayFormatter.formatToParts(new Date(at)).map(({ type, value }) => [type, value]));
+    const minute = String(Math.floor(Number(parts.minute) / 15) * 15).padStart(2, "0");
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${minute}`;
   }
 
   function samePriceCoordinate(previousPayload, payload) {
@@ -2748,8 +2865,8 @@
       return null;
     }
     const sourceCandles = payload.daily?.candles || [];
-    const lastDate = sourceCandles[sourceCandles.length - 1]?.date;
-    if (lastDate && (source.is_forming ? source.date < lastDate : source.date <= lastDate)) return null;
+    const last = sourceCandles.at(-1);
+    if (last && (source.date < last.date || source.date === last.date && !last.is_forming)) return null;
     const open = Number(source.open) * factor;
     let close = Number(source.close) * factor;
     const forming = Boolean(source.is_forming) && (isFuture ? marketState !== "CLOSED" : marketState === "REGULAR");
@@ -2758,7 +2875,9 @@
     const low = Math.min(Number(source.low) * factor, open, close);
     const volume = Number(source.volume);
     if (![open, high, low, close, volume].every(Number.isFinite) || open <= 0 || low <= 0 || low > high || volume < 0) return null;
-    return { date: source.date, open, high, low, close, volume, is_forming: forming };
+    const sourceDate = forming && close === Number(source.close) * factor
+      ? easternIntradaySlot(source.as_of) : undefined;
+    return { date: source.date, open, high, low, close, volume, is_forming: forming, source_date: sourceDate };
   }
 
   // 单层显式选择优先；未单独设置时继承“全部级别”的显示状态。
@@ -2793,5 +2912,5 @@
     return { ...(layers || {}), segments: !visible, segmentLevels: {} };
   }
 
-  window.OptionScopeChan = { empty, view, withSpot, intradayView, emptyFrame, futureOffsetLimit, isSegmentLevelVisible, isRecursiveCenterLevelVisible, allSegmentLevelsVisible, toggleSegmentLevel, toggleAllSegmentLevels };
+  window.OptionScopeChan = { empty, view, withSpot, intradayView, intradayViewportAfterRefresh, emptyFrame, futureOffsetLimit, isSegmentLevelVisible, isRecursiveCenterLevelVisible, allSegmentLevelsVisible, toggleSegmentLevel, toggleAllSegmentLevels };
 }(window));

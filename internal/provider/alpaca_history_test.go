@@ -11,6 +11,29 @@ import (
 	"time"
 )
 
+func TestMergeIntradayHistoryPreservesEachBarCapture(t *testing.T) {
+	firstCapture := time.Date(2026, 1, 9, 15, 35, 0, 0, time.UTC)
+	nextCapture := firstCapture.Add(11 * time.Minute)
+	cached := HistoryResult{
+		Bars:      []map[string]any{{"date": "2026-01-09 10:30", "close": 100.0}},
+		FetchedAt: firstCapture,
+	}
+	fresh := HistoryResult{
+		Bars:      []map[string]any{{"date": "2026-01-09 10:45", "close": 101.0}},
+		FetchedAt: nextCapture,
+	}
+	warm := mergeIntradayHistory(cached, fresh)
+	merged := mergeIntradayHistory(warm, HistoryResult{FetchedAt: nextCapture.Add(time.Second)})
+	for index, want := range []time.Time{firstCapture, nextCapture} {
+		if got := merged.Bars[index]["fetched_at"]; got != want.Format(time.RFC3339Nano) {
+			t.Errorf("第 %d 根采集时间为 %v，预期 %s", index, got, want)
+		}
+	}
+	if _, changed := cached.Bars[0]["fetched_at"]; changed {
+		t.Fatal("合并不能修改原始缓存")
+	}
+}
+
 func TestAlpacaFetchIntradayUsesHistoricalBarsPaginationAndCache(t *testing.T) {
 	const key, secret = "test-key", "test-secret"
 	now := time.Date(2026, 10, 23, 20, 0, 0, 0, time.UTC)

@@ -117,9 +117,17 @@
                 <summary aria-label="技术指标设置">指标</summary>
                 <div class="chan-layer-menu-panel chan-indicator-menu-panel">
                   <button class="chan-layer-menu-close" type="button" aria-label="关闭指标面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
-                  <section class="chan-layer-menu-display"><h4>价格指标（同时只能启用一个）</h4><div class="chan-indicator-options">
+                  <section class="chan-layer-menu-display"><h4>价格策略（单选）</h4><div class="chan-indicator-options">
                     <div v-for="item in indicators.slice(1)" :key="item.value" class="chan-indicator-option"><button class="detail-seg" type="button" :aria-pressed="chartLayers[item.value] ? 'true' : 'false'" @click="toggleChartLayer(item.value)">{{ item.label }}</button></div>
                   </div></section>
+                  <section class="chan-indicator-overlays">
+                    <h4>主图叠加</h4>
+                    <div class="detail-segmented chan-layer-switches" role="group" aria-label="主图叠加指标">
+                      <button class="detail-seg" type="button" :aria-pressed="chartLayers.vwap ? 'true' : 'false'" @click="toggleChartLayer('vwap')">VWAP</button>
+                      <button class="detail-seg" type="button" :aria-pressed="chartLayers.anchoredVwap ? 'true' : 'false'" @click="toggleChartLayer('anchoredVwap')">锚定 VWAP</button>
+                      <button class="detail-seg" type="button" :aria-pressed="chartLayers.bollinger ? 'true' : 'false'" @click="toggleChartLayer('bollinger')">布林带</button>
+                    </div>
+                  </section>
                 </div>
               </details>
               <details class="chan-subchart-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
@@ -131,7 +139,16 @@
                     <button class="detail-seg" type="button" :aria-pressed="subcharts.macd ? 'true' : 'false'" @click="toggleSubchart('macd')">MACD</button>
                     <button class="detail-seg" type="button" :aria-pressed="subcharts.dmi ? 'true' : 'false'" @click="toggleSubchart('dmi')">DMI</button>
                     <button class="detail-seg" type="button" :aria-pressed="subcharts.mfi ? 'true' : 'false'" @click="toggleSubchart('mfi')">MFI</button>
-                  </div></section>
+                    <button class="detail-seg" type="button" :aria-pressed="subcharts.rsi ? 'true' : 'false'" @click="toggleSubchart('rsi')">RSI 背离</button>
+                    <button class="detail-seg" type="button" :aria-pressed="subcharts.rs ? 'true' : 'false'" @click="toggleSubchart('rs')">相对强弱 RS</button>
+                  </div>
+                    <label v-if="subcharts.rs" class="chan-rs-benchmark">RS 基准
+                      <select v-model="rsPreference">
+                        <option value="auto">自动</option>
+                        <option value="QQQ">QQQ</option>
+                        <option value="SPY">SPY</option>
+                      </select>
+                    </label></section>
                 </div>
               </details>
             </div></div>
@@ -140,10 +157,13 @@
             <div v-for="level in frame.chart.keyLevels" :key="level.key" class="chan-key-level-chip" :class="'chan-key-level-chip-' + level.tone" role="listitem" :title="level.title"><span>{{ level.label }}</span><strong>{{ level.priceLabel }}</strong></div>
           </div>
           </div>
+        <ul v-if="frame && frame.chart && frame.chart.indicatorStatus.length" class="chan-indicator-status" aria-label="当前图表指标">
+          <li v-for="item in frame.chart.indicatorStatus" :key="item.key"><i v-if="item.key === 'vwap' || item.key === 'anchoredVwap'" class="chan-vwap-swatch" :class="{ 'chan-vwap-swatch-anchored': item.key === 'anchoredVwap' }" aria-hidden="true"></i>{{ item.text }}</li>
+        </ul>
         <div v-if="frame && frame.chart" class="chan-chart" v-chan-chart-canvas="canvasBinding" v-chan-chart-hover="hoverBinding" v-chan-chart-interaction="interactionBinding">
           <canvas class="chan-chart-canvas" aria-hidden="true"></canvas>
           <button type="button" class="chan-scenario-toggle-canvas" :style="{ left: (frame.chart.historyRight - (mobileChart ? 25 : 19)) / frame.chart.width * 100 + '%', top: (frame.chart.plotBottom - (mobileChart ? 25 : 19)) / frame.chart.height * 100 + '%', width: (mobileChart ? 22 : 16) / frame.chart.width * 100 + '%', height: (mobileChart ? 22 : 16) / frame.chart.height * 100 + '%' }" :aria-pressed="chanScenariosVisible ? 'true' : 'false'" :aria-label="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" :title="chanScenariosVisible ? '隐藏条件情景' : '显示条件情景'" @click.stop="toggleChanScenarios" @keydown.enter.stop.prevent="toggleChanScenarios" @keydown.space.stop.prevent="toggleChanScenarios"></button>
-          <svg preserveAspectRatio="none" :view-box.camel="'0 0 ' + frame.chart.width + ' ' + frame.chart.height" role="img" :aria-label="frame.chart.title"><desc>{{ frame.chart.description }}</desc><g v-pre class="chan-crosshair-layer" aria-hidden="true" visibility="hidden"><line class="chart-crosshair"></line><line class="chart-crosshair-h chart-crosshair-price"></line><line class="chart-crosshair-h chart-crosshair-volume"></line><line class="chart-crosshair-h chart-crosshair-macd"></line><line class="chart-crosshair-h chart-crosshair-dmi"></line><line class="chart-crosshair-h chart-crosshair-mfi"></line><g class="chart-tag chart-tag-x"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-y"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-volume"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-macd"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-dmi"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-mfi"><rect rx="2" height="18"></rect><text></text></g></g></svg>
+          <svg preserveAspectRatio="none" :view-box.camel="'0 0 ' + frame.chart.width + ' ' + frame.chart.height" role="img" tabindex="0" :aria-label="frame.chart.title"><desc>{{ frame.chart.description }}</desc><g v-pre class="chan-crosshair-layer" aria-hidden="true" visibility="hidden"><line class="chart-crosshair"></line><line class="chart-crosshair-h chart-crosshair-price"></line><line class="chart-crosshair-h chart-crosshair-volume"></line><line class="chart-crosshair-h chart-crosshair-macd"></line><line class="chart-crosshair-h chart-crosshair-dmi"></line><line class="chart-crosshair-h chart-crosshair-mfi"></line><g class="chart-tag chart-tag-x"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-y"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-volume"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-macd"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-dmi"><rect rx="2" height="18"></rect><text></text></g><g class="chart-tag chart-tag-mfi"><rect rx="2" height="18"></rect><text></text></g></g></svg>
           <div v-pre class="chart-tooltip chan-chart-tooltip" hidden></div>
           <template v-if="chanScenariosVisible && frame.chart.projections">
             <article v-for="route in frame.chart.projections" v-if="chanHoveredScenario === route.key" :id="'chan-scenario-card-' + route.key" :key="route.key + '-card'" class="chan-projection-float-card" :class="'chan-projection-' + route.tone" :style="{ left: chanScenarioCardX + 'px' }" aria-live="polite">
@@ -200,6 +220,10 @@
   <script src="/static/common/js/chan-wyckoff.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-sweep-fvg.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-mfi.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-vwap.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-bollinger.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-rsi-divergence.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-relative-strength.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/futures.js?v=__ASSET_VERSION__"></script>
 </body>

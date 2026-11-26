@@ -1631,7 +1631,7 @@ func (s *SQLite) WriteIntradayHistory(symbol, interval string, bars []map[string
 	}
 	stamp := storedTimestamp(fetchedAt)
 	type preparedBar struct {
-		at                             string
+		at, capturedAt                 string
 		open, high, low, close, volume any
 	}
 	prepared := make([]preparedBar, 0, len(bars))
@@ -1672,7 +1672,13 @@ func (s *SQLite) WriteIntradayHistory(symbol, interval string, bars []map[string
 			openPresent && lowPresent && lowValue > openValue {
 			continue
 		}
-		prepared = append(prepared, preparedBar{at: rawTime, open: values[0], high: values[1], low: values[2], close: values[3], volume: values[4]})
+		capturedAt := stamp
+		if rawStamp, ok := bar["fetched_at"].(string); ok {
+			if parsed, err := time.Parse(time.RFC3339Nano, rawStamp); err == nil && !parsed.After(fetchedAt) {
+				capturedAt = storedTimestamp(parsed)
+			}
+		}
+		prepared = append(prepared, preparedBar{at: rawTime, capturedAt: capturedAt, open: values[0], high: values[1], low: values[2], close: values[3], volume: values[4]})
 	}
 	if len(prepared) == 0 {
 		return errors.New("intraday history response contains no usable closing prices")
@@ -1694,7 +1700,7 @@ WHERE excluded.fetched_at >= intraday_history.fetched_at`)
 	}
 	defer stmt.Close()
 	for _, bar := range prepared {
-		if _, err := stmt.Exec(symbol, interval, bar.at, bar.open, bar.high, bar.low, bar.close, bar.volume, stamp); err != nil {
+		if _, err := stmt.Exec(symbol, interval, bar.at, bar.open, bar.high, bar.low, bar.close, bar.volume, bar.capturedAt); err != nil {
 			return err
 		}
 	}
@@ -1725,7 +1731,7 @@ WHERE symbol=? AND interval=? AND close IS NOT NULL AND close > 0 ORDER BY bar_t
 		if err := rows.Scan(&at, &open, &high, &low, &close, &volume, &fetched); err != nil {
 			return nil, err
 		}
-		bars = append(bars, map[string]any{"date": at, "open": nullableFloat(open), "high": nullableFloat(high), "low": nullableFloat(low), "close": nullableFloat(close), "volume": nullableFloat(volume)})
+		bars = append(bars, map[string]any{"date": at, "open": nullableFloat(open), "high": nullableFloat(high), "low": nullableFloat(low), "close": nullableFloat(close), "volume": nullableFloat(volume), "fetched_at": fetched})
 		if fetched > latestFetched {
 			latestFetched = fetched
 		}

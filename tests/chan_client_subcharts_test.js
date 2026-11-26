@@ -175,13 +175,13 @@ assert.match(template, /<summary>递归买卖点/, "递归买卖点使用明确�
 assert.match(template, /<summary>笔级转折预警/, "笔级转折预警使用明确折叠标题");
 assert.match(template, /<div class="chan-layer-menu-panel chan-period-menu-panel">[\s\S]*aria-label="K 线周期"[\s\S]*>1小时<\/button>[\s\S]*>2小时<\/button>/, "点击周期按钮后显示 1 小时和 2 小时选项");
 assert.doesNotMatch(template, /chan-period-control-group/, "周期不再使用常驻分段控件");
-for (const [name, label] of [["volume", "成交量"], ["macd", "MACD"], ["dmi", "DMI"], ["mfi", "MFI"]]) {
+for (const [name, label] of [["volume", "成交量"], ["macd", "MACD"], ["dmi", "DMI"], ["mfi", "MFI"], ["rsi", "RSI 背离"]]) {
   assert.ok(template.includes(`:aria-pressed="chanSubcharts.${name} ? 'true' : 'false'"`), `${label} 按钮提供 pressed 状态`);
   assert.ok(template.includes(`@click="toggleChanSubchart('${name}')">${label}</button>`), `${label} 按钮独立切换`);
 }
-assert.match(app, /const DEFAULT_CHAN_SUBCHARTS = \{ volume: false, macd: false, dmi: false, mfi: false \}/, "副图默认全部隐藏");
+assert.match(app, /const DEFAULT_CHAN_SUBCHARTS = \{ volume: false, macd: false, dmi: false, mfi: false, rsi: false, rs: false \}/, "副图默认全部隐藏");
 assert.match(app, /toggleChanSubchart\(name\) \{[\s\S]*?rememberChanChartPreferences\(this\.chanPeriod, this\.chanChartLayers, this\.chanSubcharts\)/, "切换副图后保存到当前偏好");
-assert.match(client, /const subchartCacheKey = \["volume", "macd", "dmi"\][\s\S]*?\$\{subchartCacheKey\}/, "图表布局缓存区分副图组合");
+assert.match(client, /const subchartCacheKey = Object.values\(visibleSubcharts\)[\s\S]*?\$\{subchartCacheKey\}/, "图表布局缓存区分副图组合");
 assert.match(charts, /Array\.isArray\(model\.indicatorDividers\)[\s\S]*?for \(const dividerY of dividerPositions\)/, "画布只绘制已启用副图之间的分隔线");
 assert.match(styles, /\.chan-subchart-menu-panel\{grid-template-areas:"display";grid-template-columns:minmax\(0,1fr\);width:min\(260px,calc\(100vw - 40px\)\)/, "副图面板按内容收窄并沿用图层网格结构");
 assert.match(template, /<details class="chan-indicator-menu"[\s\S]*?<\/details>[\s\S]*?<details class="chan-subchart-menu"/, "指标入口位于副图入口左侧");

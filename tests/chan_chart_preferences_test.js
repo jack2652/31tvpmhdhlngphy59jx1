@@ -34,12 +34,12 @@ function plain(value) {
 
 const defaults = preferenceContext();
 const defaultPreferences = defaults.api.readChanChartPreferences();
-assert.deepEqual(plain(defaultPreferences.subcharts), { volume: false, macd: false, dmi: false, mfi: false }, "new preferences default all subcharts to hidden");
+assert.deepEqual(plain(defaultPreferences.subcharts), { volume: false, macd: false, dmi: false, mfi: false, rsi: false, rs: false }, "new preferences default all subcharts to hidden");
 assert.equal(defaultPreferences.layers.afStochZ, false, "new preferences default AF StochZ layer to hidden");
 assert.equal(defaultPreferences.layers.turtle, false, "new preferences default Turtle layer to hidden");
 assert.equal(defaultPreferences.layers.macdSma200, false, "new preferences default MACD + SMA200 layer to hidden");
 assert.equal(defaultPreferences.layers.mfi, false, "new preferences default MFI layer to hidden");
-assert.deepEqual(defaults.readStored().subcharts, { volume: false, macd: false, dmi: false, mfi: false }, "default subchart choices are persisted");
+assert.deepEqual(defaults.readStored().subcharts, { volume: false, macd: false, dmi: false, mfi: false, rsi: false, rs: false }, "default subchart choices are persisted");
 assert.doesNotMatch(app, /const EXCLUSIVE_CHAN_INDICATOR_LAYERS = \[.*"mfi"/, "MFI is independent from price-overlay indicator exclusivity");
 
 const toggleStart = app.indexOf("    toggleChanChartLayer(layer) {");
@@ -121,8 +121,8 @@ const versionFour = preferenceContext({
   subcharts: { volume: true, macd: false, dmi: true },
 });
 const upgradedVersionFour = versionFour.api.readChanChartPreferences();
-assert.deepEqual(plain(upgradedVersionFour.layers), previouslyCustomizedLayers, "version 4 custom layers remain unchanged after merging the price controls");
-assert.deepEqual(plain(upgradedVersionFour.subcharts), { volume: true, macd: false, dmi: true, mfi: false }, "version 4 subchart choices survive preference migration");
+assert.deepEqual(plain(upgradedVersionFour.layers), { ...previouslyCustomizedLayers, vwap: false, anchoredVwap: false, bollinger: false }, "version 4 custom layers remain unchanged after merging the price controls");
+assert.deepEqual(plain(upgradedVersionFour.subcharts), { volume: true, macd: false, dmi: true, mfi: false, rsi: false, rs: false }, "version 4 subchart choices survive preference migration");
 assert.equal(versionFour.readStored().version, 15, "version 4 preferences are upgraded to the current format");
 
 const versionThree = preferenceContext({
@@ -133,15 +133,24 @@ const versionThree = preferenceContext({
 const upgradedVersionThree = versionThree.api.readChanChartPreferences();
 assert.equal(upgradedVersionThree.layers.pens, true, "the original pre-version-4 default migration remains active");
 assert.equal(upgradedVersionThree.layers.segments, false, "the original pre-version-4 default migration keeps its current default");
-assert.deepEqual(plain(upgradedVersionThree.subcharts), { volume: false, macd: false, dmi: false, mfi: false }, "older preferences receive hidden subchart defaults");
+assert.deepEqual(plain(upgradedVersionThree.subcharts), { volume: false, macd: false, dmi: false, mfi: false, rsi: false, rs: false }, "older preferences receive hidden subchart defaults");
 
 versionFour.api.rememberChanChartPreferences("weekly", upgradedVersionFour.layers, { volume: false, macd: true, dmi: false });
 const reloaded = preferenceContext(versionFour.readStored()).api.readChanChartPreferences();
-assert.deepEqual(plain(reloaded.subcharts), { volume: false, macd: true, dmi: false, mfi: false }, "enabled subcharts persist through a page reload");
+assert.deepEqual(plain(reloaded.subcharts), { volume: false, macd: true, dmi: false, mfi: false, rsi: false, rs: false }, "enabled subcharts persist through a page reload");
 assert.equal(reloaded.layers.afStochZ, false, "AF StochZ keeps its hidden default through migration");
 assert.equal(reloaded.layers.turtle, false, "Turtle keeps its hidden default through migration");
 assert.equal(reloaded.layers.macdSma200, false, "MACD + SMA200 keeps its hidden default through migration");
 assert.equal(reloaded.period, "weekly", "chart preference persistence keeps the selected period");
+const vwapLayers = { ...reloaded.layers, turtle: true };
+const vwapState = { chanPeriod: "15m", chanChartLayers: vwapLayers, chanSubcharts: reloaded.subcharts };
+toggleContext.toggleChanChartLayer.call(vwapState, "vwap");
+toggleContext.toggleChanChartLayer.call(vwapState, "anchoredVwap");
+versionFour.api.rememberChanChartPreferences(...toggleContext.savedPreferences);
+const vwapReloaded = preferenceContext(versionFour.readStored()).api.readChanChartPreferences();
+assert.equal(vwapReloaded.layers.vwap, true);
+assert.equal(vwapReloaded.layers.anchoredVwap, true);
+assert.equal(vwapReloaded.layers.turtle, true);
 
 const legacyMfi = preferenceContext({
   version: 13,
