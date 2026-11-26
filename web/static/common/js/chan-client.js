@@ -1177,7 +1177,7 @@
       ? frame.recursive_levels.flatMap((level) => level.segments || []) : (frame.segments || []);
     const segmentLevelVisibility = [...new Set(cacheSegments.map((segment) => String(Number(segment.level) || 0)))].sort()
       .map((level) => level + "=" + (isSegmentLevelVisible(layers, level) ? 1 : 0)).join(",");
-    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, layers?.turtle === true ? 1 : 0, layers?.granville === true ? 1 : 0, layers?.macdSma200 === true ? 1 : 0, layers?.supertrend === true ? 1 : 0, layers?.wyckoff === true ? 1 : 0, layers?.mfi === true ? 1 : 0, recursiveCenterVisibility].join(":");
+    const layerCacheKey = [layers?.pens === true ? 1 : 0, layers?.legacySignals === true ? 1 : 0, layers?.penCenters === true ? 1 : 0, layers?.chanCandles === false ? 0 : 1, segmentLevelVisibility, layers?.signals === false ? 0 : 1, layers?.supportResistance === false ? 0 : 1, layers?.afStochZ === true ? 1 : 0, layers?.trendlines === true ? 1 : 0, layers?.turtle === true ? 1 : 0, layers?.granville === true ? 1 : 0, layers?.macdSma200 === true ? 1 : 0, layers?.supertrend === true ? 1 : 0, layers?.wyckoff === true ? 1 : 0, layers?.sweepFvg === true ? 1 : 0, layers?.mfi === true ? 1 : 0, recursiveCenterVisibility].join(":");
     const visibleSubcharts = Object.fromEntries(["volume", "macd", "dmi"].map((name) => [name, subcharts?.[name] === true]));
     const mfiEnabled = layers?.mfi === true || subcharts?.mfi === true;
     const subchartCacheKey = ["volume", "macd", "dmi"].map((name) => visibleSubcharts[name] ? 1 : 0).join("") + (mfiEnabled ? "1" : "0");
@@ -1194,7 +1194,7 @@
       const reference = Number.isFinite(anchor) && anchor > 0 ? anchor : spotPrice;
       return levels.some((level) => !Number.isFinite(reference) || Math.abs(level - reference) > 0.000001);
     });
-    const priceLevelCutoff = frame.candles[dataEndIndex - 1]?.date || frame.as_of;
+    const priceLevelCutoff = sourceCandles[dataEndIndex - 1]?.date || frame.as_of;
     const priceLevelHistory = layers?.supportResistance === false ? null : reactionHistory(frame, priceLevelCutoff);
     const supportLevels = layers?.supportResistance === false ? [] : structureSupportLevels(frame, priceLevelCutoff, priceLevelHistory);
     const supportCacheKey = supportLevels.map((level) => [level.key, level.zoneLow, level.zoneHigh, level.kind, level.lineAlpha, level.confirmedAt, level.brokenAt, level.lastCloseDate, level.sources].join(":")).join("|");
@@ -1245,6 +1245,10 @@
     const wyckoffResult = layers?.wyckoff === true
       ? window.OptionScopeWyckoff?.calculateWithLiveBar(sourceCandles, candlesForDisplay, liveCandleVisible ? liveDisplayIndex : -1)
         || window.OptionScopeWyckoff?.calculate(sourceCandles) || null
+      : null;
+    const sweepFvgResult = layers?.sweepFvg === true
+      ? window.OptionScopeSweepFvg?.calculateWithLiveBar(sourceCandles, candlesForDisplay, liveCandleVisible ? liveDisplayIndex : -1)
+        || window.OptionScopeSweepFvg?.calculate(sourceCandles) || null
       : null;
     const mfiResult = mfiEnabled
       ? window.OptionScopeMfi?.calculateWithLiveBar(sourceCandles, candlesForDisplay, dataContext?.marketHistory?.daily || [], liveCandleVisible ? liveDisplayIndex : -1)
@@ -1380,6 +1384,11 @@
     }
     const visibleSupertrendEvents = indexedEventWindow(supertrendResult?.events || [], startIndex, dataEndIndex);
     const visibleWyckoffEvents = indexedEventWindow(wyckoffResult?.events || [], startIndex, dataEndIndex);
+    const visibleSweepFvgSweeps = indexedEventWindow(sweepFvgResult?.sweeps || [], startIndex, dataEndIndex);
+    const visibleSweepFvgBreaks = indexedEventWindow(sweepFvgResult?.structureBreaks || [], startIndex, dataEndIndex);
+    const visibleSweepFvgEvents = indexedEventWindow(sweepFvgResult?.events || [], startIndex, dataEndIndex);
+    const visibleSweepFvgWindows = (sweepFvgResult?.entryWindows || []).filter((item) => item.endIndex >= startIndex && item.startIndex < dataEndIndex);
+    if (liveCandleVisible && sweepFvgResult?.live?.window) visibleSweepFvgWindows.push(sweepFvgResult.live.window);
     const wyckoffSnapshotIndex = Math.min(dataEndIndex - 1, sourceCandles.length - 1);
     const wyckoffWindowSnapshot = wyckoffResult?.snapshots?.[wyckoffSnapshotIndex] || null;
     const legacyRule = "strict-old-bi-v3";
@@ -1403,46 +1412,7 @@
       const price = Number(signal.price);
       if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
     });
-    visibleAFSignals.forEach((signal) => {
-      const price = Number(signal.markerPrice ?? signal.price);
-      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
-    });
-    visibleTurtleChannels.forEach((channel) => {
-      if (!channel) return;
-      for (const price of Object.values(channel)) {
-        if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
-      }
-    });
-    visibleTurtleEvents.forEach((event) => {
-      const price = Number(event.price);
-      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
-    });
-    visibleGranvilleAverage.forEach((price) => {
-      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
-    });
-    Object.values(visibleMacdSma200Averages).forEach((averages) => averages.forEach((price) => {
-      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
-    }));
-    visibleMacdSma200Events.forEach((event) => {
-      const price = Number(event.price);
-      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
-    });
-    for (const series of [visibleSupertrendUp, visibleSupertrendDown]) {
-      series.forEach((price) => {
-        if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
-      });
-    }
-    visibleSupertrendEvents.forEach((event) => {
-      const price = Number(event.price);
-      if (Number.isFinite(price) && price > 0) { minimum = Math.min(minimum, price); maximum = Math.max(maximum, price); }
-    });
-    if (wyckoffWindowSnapshot?.rangeReady === true) {
-      const rangeLow = Number(wyckoffWindowSnapshot.rangeLow), rangeHigh = Number(wyckoffWindowSnapshot.rangeHigh);
-      if (Number.isFinite(rangeLow) && Number.isFinite(rangeHigh) && rangeLow < rangeHigh) {
-        minimum = Math.min(minimum, rangeLow);
-        maximum = Math.max(maximum, rangeHigh);
-      }
-    }
+    // 主图价格坐标以K线和缠论结构为准，叠加指标超出当前价格区时由绘图区裁剪，避免压缩K线。
     // Keep the daily/weekly scale tied to bars and structure. Intraday charts
     // include the live quote because their scenario paths follow it.
     if (Number.isFinite(liveScenarioPrice) && liveScenarioPrice > 0) scenarioLevels.push(liveScenarioPrice);
@@ -1471,6 +1441,39 @@
           title: `威科夫 ${wyckoffWindowSnapshot.phase} 阶段 · ${wyckoffWindowSnapshot.bias === "accumulation" ? "吸筹区间" : "派发区间"} · ${money(wyckoffWindowSnapshot.rangeLow)}–${money(wyckoffWindowSnapshot.rangeHigh)}`,
         };
       })() : null;
+    const sweepFvgLayouts = layers?.sweepFvg === true ? {
+      sweeps: visibleSweepFvgSweeps.map((event) => ({
+        ...event, x: x(event.index - startIndex), y: y(event.price),
+        x1: x(event.pivotIndex - startIndex), x2: x(event.index - startIndex), y1: y(event.level), y2: y(event.level),
+        label: event.direction === "bearish" ? "扫高" : "扫低",
+        title: `${event.date} · ${event.direction === "bearish" ? "扫高" : "扫低"} ${money(event.level)} · 枢轴确认后收盘越过`,
+      })),
+      breaks: visibleSweepFvgBreaks.map((event) => ({
+        ...event, x: x(event.index - startIndex), x1: x(event.fromIndex - startIndex), x2: x(event.index - startIndex),
+        y: y(event.level), y1: y(event.level), y2: y(event.level),
+        title: `${event.date} · ${event.direction === "bearish" ? "向下" : "向上"}结构突破 ${money(event.level)}`,
+      })),
+      events: visibleSweepFvgEvents.map((event) => ({
+        ...event, x: x(event.index - startIndex), y: y(event.price),
+        label: event.side === "buy" ? "反转买" : "反转卖",
+        title: `${event.date} · ${event.side === "buy" ? "看涨" : "看跌"}扫流动性反转 ${money(event.price)}`,
+      })),
+      windows: visibleSweepFvgWindows.map((windowState, index) => {
+        const leftX = x(windowState.startIndex - startIndex) - slot / 2;
+        const rightX = x(windowState.endIndex - startIndex) + slot / 2;
+        const upper = y(windowState.high), lower = y(windowState.low);
+        const fvgUpper = y(windowState.fvg.top), fvgLower = y(windowState.fvg.bottom);
+        return {
+          key: `${windowState.direction}-${windowState.startIndex}-${index}`,
+          direction: windowState.direction, active: windowState.active,
+          x: leftX, y: upper, width: Math.max(1, rightX - leftX), height: Math.max(1, lower - upper),
+          fvgX: leftX, fvgY: Math.min(fvgUpper, fvgLower), fvgWidth: Math.max(1, rightX - leftX),
+          fvgHeight: Math.max(1, Math.abs(fvgLower - fvgUpper)),
+          label: windowState.direction === "bearish" ? "等待反弹" : "等待回踩",
+          title: `${windowState.date} · ${windowState.direction === "bearish" ? "看跌" : "看涨"} FVG ${money(Math.min(windowState.fvg.top, windowState.fvg.bottom))}–${money(Math.max(windowState.fvg.top, windowState.fvg.bottom))} · 入场观察 ${money(windowState.low)}–${money(windowState.high)}${windowState.active ? " · 有效窗口" : " · 历史窗口"}`,
+        };
+      }),
+    } : { sweeps: [], breaks: [], events: [], windows: [] };
     const turtleChannelLayouts = visibleTurtleChannels.map((channel, index) => channel ? ({
       x: x(index),
       entryUpperY: y(channel.entryUpper), entryLowerY: y(channel.entryLower),
@@ -1903,7 +1906,7 @@
         ...signalLayouts,
       ],
       // Canvas绘制门由已选线段决定；每级已按总开关默认与单层覆盖筛选。
-      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, mfi: mfiEnabled, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
+      layers: { pens: layers?.pens === true, legacySignals: layers?.legacySignals === true, afStochZ: layers?.afStochZ === true, trendlines: layers?.trendlines === true, turtle: layers?.turtle === true, granville: layers?.granville === true, macdSma200: layers?.macdSma200 === true, supertrend: layers?.supertrend === true, wyckoff: layers?.wyckoff === true, sweepFvg: layers?.sweepFvg === true, mfi: mfiEnabled, segments: selectedSegments.length > 0, segmentLevels: layers?.segmentLevels || {}, recursiveCenters: Object.fromEntries(recursiveCenterLevels.map((level) => [level, isRecursiveCenterLevelVisible(layers, level)])), penCenters: layers?.penCenters === true, chanCandles: layers?.chanCandles !== false, signals: layers?.signals !== false, supportResistance: layers?.supportResistance !== false },
       // Keep per-level controls stable while users pan and zoom; their options
       // should describe the loaded structure, not only the current viewport.
       availableSegmentLevels: [...new Set(allSegments.map((segment) => Number(segment.level) || 0))].sort((a, b) => a - b),
@@ -1940,6 +1943,7 @@
       supertrendEvents: supertrendEventLayouts,
       wyckoffRange: wyckoffRangeLayout,
       wyckoffEvents: wyckoffEventLayouts,
+      sweepFvg: sweepFvgLayouts,
       mfiEvents: visibleMfiEvents.map((event) => ({ ...event, x: x(event.index - startIndex), y: mfiY(event.mfi), averageY: mfiY(event.average) })),
       mfiValues: visibleMfi,
       // Count only signals that can actually be drawn. The visible signal list
@@ -2056,6 +2060,12 @@
         ? `当前窗口事件：${wyckoffEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
         : "当前窗口暂无已确认的 Wyckoff 事件。";
       chart.description += `威科夫按前序成交量、波幅、区间与收盘确认估计 A–E 阶段；自动反弹/回落之后才确认缩量窄幅二次测试，成功回测要求较探底/冲高缩量且低点抬高/高点降低；突破须有量价证据，最后支撑/供给限制回踩深度。缺量不冒充缩量，突破失败回到区间、反向破坏或阶段过期后重新识别，断链重新预热。允许没有弹簧探底/派发冲高的路径；形成中的 K 线不产生确认事件；${phaseDescription}${eventDescription}`;
+    }
+    if (layers?.sweepFvg === true) {
+      const eventDescription = sweepFvgLayouts.events.length
+        ? `当前窗口信号：${sweepFvgLayouts.events.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
+        : "当前窗口暂无扫流动性反转信号。";
+      chart.description += `扫流动性反转按已确认枢轴识别扫高/扫低，随后在 ${sweepFvgResult?.config?.maxReversalBars || 10} 根内等待结构突破；突破 K 线须有 ${sweepFvgResult?.config?.bodyAtrMultiple || 0.8} ATR 强实体及至少 ${sweepFvgResult?.config?.minFvgAtrMultiple || 0.15} ATR 的 FVG。信号仅在收盘后确认，形成中的 K 线只延展有效入场窗口；色块表示 FVG 与回踩/反弹观察区，不代表订单已成交；${eventDescription}`;
     }
     if (layers?.mfi === true) {
       const eventDescription = mfiResult?.events?.length

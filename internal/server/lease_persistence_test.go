@@ -45,6 +45,46 @@ func TestEmptyExpirationProbeSurvivesServiceRestart(t *testing.T) {
 	}
 }
 
+// 持有真实SQLite写锁时，关闭必须取消后台估值缓存写入，不等待锁释放。
+func TestServiceCloseCancelsValuationCacheWriterWait(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "valuation-close.db")
+	repository, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &blockedFirstQuoteValuationProvider{
+		testMarketProvider: &testMarketProvider{},
+		started:            make(chan struct{}, 1),
+		release:            make(chan struct{}),
+	}
+	service := NewWithProvider(config.Config{DatabasePath: path, UpstreamTimeout: time.Second}, repository, fake)
+	t.Cleanup(func() { _ = service.Close() })
+	price := 100.0
+	service.scheduleValuationWithQuote("QQQ", &model.Quote{Price: &price, Symbol: "QQQ"})
+	select {
+	case <-fake.started:
+	case <-time.After(time.Second):
+		t.Fatal("后台估值未启动")
+	}
+	releaseWriter := holdSQLiteWriter(t, path)
+	defer releaseWriter()
+	close(fake.release)
+	// 允许真实工作者进入缓存持久化；关闭时锁仍由另一连接持有。
+	time.Sleep(100 * time.Millisecond)
+	closed := make(chan error, 1)
+	go func() { closed <- service.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("关闭服务：%v", err)
+		}
+	case <-time.After(time.Second):
+		releaseWriter()
+		<-closed
+		t.Fatal("关闭服务仍等待后台缓存写锁，未响应取消")
+	}
+}
+
 // Two independent SQLite handles model separate workers. A worker must defer
 // to an existing snapshot owner, and can fetch after that owner releases it.
 func TestDurableSnapshotLeaseCoordinatesIndependentServices(t *testing.T) {

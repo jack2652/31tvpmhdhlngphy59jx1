@@ -67,8 +67,8 @@ let expirationCutoffCatalog = { symbol: "", values: null };
 let expirationCutoffTimer = null;
 const CHAN_CHART_PREFERENCES_VERSION = 15;
 const CHAN_CHART_LAYER_DEFAULTS_MIGRATION_CUTOFF = 4;
-const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
-const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
+const DEFAULT_CHAN_CHART_LAYERS = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, sweepFvg: false, mfi: false };
+const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "sweepFvg"];
 const DEFAULT_CHAN_SUBCHARTS = { volume: false, macd: false, dmi: false, mfi: false };
 function readChainViewPreference() {
   try {
@@ -153,7 +153,7 @@ function readChanChartPreferences() {
     }
     const sourceLayers = stored.layers && typeof stored.layers === "object" ? stored.layers : {};
     const layers = { ...DEFAULT_CHAN_CHART_LAYERS };
-    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "mfi"]) {
+    for (const key of ["pens", "penCenters", "legacySignals", "chanCandles", "segments", "signals", "supportResistance", "afStochZ", "trendlines", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "sweepFvg", "mfi"]) {
       if (typeof sourceLayers[key] === "boolean") layers[key] = sourceLayers[key];
     }
     for (const key of ["segmentLevels", "recursiveCenters"]) {
@@ -1601,6 +1601,10 @@ function formatGex(value, digits = 2) {
   if (absolute >= 100) return `${sign}${formatNumber(absolute / 100, digits)}亿`;
   if (absolute >= 0.01) return `${sign}${formatNumber(absolute * 100, digits)}万`;
   return `${sign}${formatNumber(absolute * 1000000, digits)}`;
+}
+function formatHeatmapGex(value, digits = 2) {
+  const formatted = formatGex(value, digits);
+  return formatted === "0" || formatted === "-0" ? "-" : formatted;
 }
 // 图表数值统一入口：GEX 走中文单位，成交量/持仓量保持千分位原样。
 // 成交量/持仓量按「万/亿」显示，不足一万保留千分位原值。
@@ -5047,22 +5051,22 @@ function renderChainHeatmapModel() {
       const isListed = state.chainFilter === "all" ? listedTypes.size > 0 : listedTypes.has(state.chainFilter);
       if (value == null || isIncomplete) return reuseCell({
         key: `${column.expiration}|${strike}`,
-        value: isListed ? "--" : "0",
+        value: isListed ? "--" : "-",
         className: `chain-heatmap-cell ${isListed ? "chain-heatmap-cell-empty chain-heatmap-cell-unavailable" : "chain-heatmap-cell-zero"}${spotClass}`,
         style: "",
         title: isListed
           ? `${column.expiration} · 行权价 ${formatMoney(strike)} · 存在对应合约，但缺少可用的 Gamma、IV 或持仓量，无法估算 GEX`
-          : `${column.expiration} · 行权价 ${formatMoney(strike)} · 该期限未挂牌此行权价的${state.chainFilter === "call" ? "看涨" : state.chainFilter === "put" ? "看跌" : "期权"}合约，GEX 按 0 计`,
+          : `${column.expiration} · 行权价 ${formatMoney(strike)} · 该期限未挂牌此行权价的${state.chainFilter === "call" ? "看涨" : state.chainFilter === "put" ? "看跌" : "期权"}合约，无对应 GEX 数值`,
       });
       // 每个到期日独立归一，刷新一列时不重染其他日期的格子。
       const columnPeak = peaksByExpiration.get(column.expiration) || 0;
       const percent = columnPeak > 0 ? Math.round(Math.sqrt(Math.min(Math.abs(value) / columnPeak, 1)) * 100) : 0;
       return reuseCell({
         key: `${column.expiration}|${strike}`,
-        value: formatGex(value / 1000000, 2),
+        value: formatHeatmapGex(value / 1000000, 2),
         className: `chain-heatmap-cell ${value > 0 ? "chain-heatmap-cell-positive" : value < 0 ? "chain-heatmap-cell-negative" : "chain-heatmap-cell-zero"}${percent >= 65 ? " chain-heatmap-cell-hot" : ""}${spotClass}`,
         style: `--heat:${percent}`,
-        title: `${column.expiration} · 行权价 ${formatMoney(strike)} · ${gexLabel} ${formatGex(value / 1000000, 2)}${column.selected ? ` · ${valuation.closeBased ? "已选期限，按正式收盘基准估算" : "已选期限，按最新行情估算"}` : ""}`,
+        title: `${column.expiration} · 行权价 ${formatMoney(strike)} · ${gexLabel} ${formatHeatmapGex(value / 1000000, 2)}${column.selected ? ` · ${valuation.closeBased ? "已选期限，按正式收盘基准估算" : "已选期限，按最新行情估算"}` : ""}`,
       });
     });
     const row = {
@@ -6997,6 +7001,7 @@ const optionScopeApp = new Vue({
           macdSma200: enabled && layer === "macdSma200",
           supertrend: enabled && layer === "supertrend",
           wyckoff: enabled && layer === "wyckoff",
+          sweepFvg: enabled && layer === "sweepFvg",
         };
       } else if (layer === "pens" || layer === "penCenters" || layer === "legacySignals" || layer === "chanCandles" || layer === "signals" || layer === "supportResistance" || layer === "trendlines") {
         this.chanChartLayers = { ...this.chanChartLayers, [layer]: !this.chanChartLayers[layer] };

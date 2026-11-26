@@ -73,22 +73,33 @@ listeners.get("pointermove")(pointer("pointermove", 1, 130, 80));
 assert.deepEqual(pans, [6], "horizontal pointer drag should pan by candle slots");
 listeners.get("pointerup")(pointer("pointerup", 1, 130, 80));
 
-// Ctrl-wheel and the macOS Meta-wheel zoom around the pointer; plain wheel is left alone.
+// 普通滚轮在K线绘图区缩放，Ctrl/Meta组合仍可使用；绘图区外保留页面滚动。
 let prevented = false;
-listeners.get("wheel")({ ctrlKey: true, metaKey: false, deltaY: -1, clientX: 150, preventDefault() { prevented = true; } });
-assert.equal(prevented, true, "modified wheel zoom should prevent page scrolling");
+listeners.get("wheel")({ ctrlKey: false, metaKey: false, deltaY: -1, clientX: 150, clientY: 80, preventDefault() { prevented = true; } });
+assert.equal(prevented, true, "plain wheel over the candlestick plot should prevent page scrolling");
 assert.equal(zooms.length, 1);
 assert.equal(zooms[0][0], 0.82);
 assert.equal(zooms[0][2], 0.5, "wheel zoom should anchor at the pointer position");
 prevented = false;
-listeners.get("wheel")({ ctrlKey: false, metaKey: true, deltaY: 1, clientX: 200, preventDefault() { prevented = true; } });
-assert.equal(prevented, true, "Meta-wheel should support macOS zoom");
+listeners.get("wheel")({ ctrlKey: true, metaKey: false, deltaY: 1, clientX: 200, clientY: 80, preventDefault() { prevented = true; } });
+assert.equal(prevented, true, "Ctrl-wheel should continue to zoom inside the candlestick plot");
 assert.equal(zooms[1][0], 1.22);
 assert.equal(zooms[1][2], 0.75);
 prevented = false;
-listeners.get("wheel")({ ctrlKey: false, metaKey: false, deltaY: -1, clientX: 150, preventDefault() { prevented = true; } });
-assert.equal(prevented, false, "unmodified wheel should keep its normal page behavior");
-assert.equal(zooms.length, 2);
+listeners.get("wheel")({ ctrlKey: false, metaKey: true, deltaY: -1, clientX: 150, clientY: 80, preventDefault() { prevented = true; } });
+assert.equal(prevented, true, "Meta-wheel should continue to zoom inside the candlestick plot");
+assert.equal(zooms[2][0], 0.82);
+prevented = false;
+listeners.get("wheel")({ deltaY: -1, clientX: 40, clientY: 80, preventDefault() { prevented = true; } });
+assert.equal(prevented, false, "wheel over the price axis should keep normal page behavior");
+listeners.get("wheel")({ deltaY: -1, clientX: 150, clientY: 190, preventDefault() { prevented = true; } });
+assert.equal(prevented, false, "wheel below the candlestick plot should keep normal page behavior");
+const candles = model.candles;
+model.candles = [];
+listeners.get("wheel")({ deltaY: -1, clientX: 150, clientY: 80, preventDefault() { prevented = true; } });
+assert.equal(prevented, false, "wheel should keep normal page behavior when there is no candle data");
+model.candles = candles;
+assert.equal(zooms.length, 3, "wheel events outside the candlestick plot must not zoom");
 
 // Two touch pointers pinch around their midpoint and keep the chart's anchor.
 const beforePinch = zooms.length;

@@ -6,6 +6,30 @@ const template = fs.readFileSync("web/static/index.html", "utf8");
 const app = fs.readFileSync("web/static/common/js/app.js", "utf8");
 const styles = fs.readFileSync("web/static/common/css/styles.css", "utf8");
 
+const formatGexSource = app.match(/function formatGex\(value, digits = 2\) \{[\s\S]*?\n\}/)?.[0] || "";
+const formatHeatmapGexSource = app.match(/function formatHeatmapGex\(value, digits = 2\) \{[\s\S]*?\n\}/)?.[0] || "";
+const gexFormatContext = {
+  formatNumber(value, digits) {
+    return new Intl.NumberFormat("en-US", { maximumFractionDigits: digits }).format(Number(value));
+  },
+};
+vm.runInNewContext(
+  `${formatGexSource}\n${formatHeatmapGexSource}\nthis.formatGex = formatGex; this.formatHeatmapGex = formatHeatmapGex;`,
+  gexFormatContext,
+);
+assert.equal(gexFormatContext.formatHeatmapGex(0, 2), "-", "heatmap exact zero must use a dash");
+assert.equal(gexFormatContext.formatHeatmapGex(0.000000000001, 2), "-", "positive GEX rounded to zero must use a dash");
+assert.equal(gexFormatContext.formatHeatmapGex(-0.000000000001, 2), "-", "negative GEX rounded to negative zero must use a dash");
+assert.equal(gexFormatContext.formatHeatmapGex(0.0001, 2), "100", "visible nonzero GEX must preserve its current formatting");
+assert.equal(gexFormatContext.formatHeatmapGex(null, 2), "--", "unavailable GEX must retain the unavailable marker");
+assert.equal(gexFormatContext.formatGex(0, 2), "0", "other GEX views must keep their existing zero formatting");
+const heatmapModelSource = app.slice(app.indexOf("function renderChainHeatmapModel()"), app.indexOf("function heatmapBasisDescription()"));
+assert.match(heatmapModelSource, /value: isListed \? "--" : "-"/, "unlisted heatmap strikes must display a dash");
+assert.match(heatmapModelSource, /value: formatHeatmapGex\(value \/ 1000000, 2\)/, "calculated heatmap cells must use the heatmap formatter");
+assert.match(heatmapModelSource, /\$\{gexLabel\} \$\{formatHeatmapGex\(value \/ 1000000, 2\)\}/, "heatmap tooltips must match the displayed value");
+assert.match(heatmapModelSource, /Math\.abs\(value\) \/ columnPeak/, "heatmap colors must continue to use the underlying GEX value");
+assert.doesNotMatch(heatmapModelSource, /GEX 按 0 计/, "an unlisted strike must not be described as a measured zero");
+
 assert.match(template, /<article v-if="!indexSymbol \|\| indexOptionsAvailable" class="metric panel">[\s\S]*?id="total-count"/, "supported indices must show the active expiry contract count");
 assert.match(template, /<article v-if="!indexSymbol \|\| indexOptionsAvailable" class="metric call-metric panel">[\s\S]*?id="call-volume"/, "supported indices must show call volume");
 assert.match(template, /<article v-if="!indexSymbol \|\| indexOptionsAvailable" class="metric put-metric panel">[\s\S]*?id="put-volume"/, "supported indices must show put volume");

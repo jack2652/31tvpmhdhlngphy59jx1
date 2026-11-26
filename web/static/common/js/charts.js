@@ -995,6 +995,78 @@ function drawChanCanvas(target, binding) {
     context.fillStyle = color; context.strokeStyle = color; context.lineWidth = 1;
     context.fillRect(candle.x - candle.bodyWidth / 2, candle.body, candle.bodyWidth, candle.bodyHeight);
   }
+  // 扫流动性反转的 FVG 与入场窗口使用独立覆盖层；所有绘制都限制在历史价格区，
+  // 不参与坐标范围计算，也不会改变 K 线高度。
+  if (model.layers?.sweepFvg === true && model.sweepFvg) {
+    const sweepFvg = model.sweepFvg;
+    context.save();
+    context.beginPath();
+    context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
+    context.clip();
+    for (const windowState of sweepFvg.windows || []) {
+      const bullish = windowState.direction === "bullish";
+      const color = bullish ? colors.up : colors.down;
+      context.globalAlpha = windowState.active ? 0.18 : 0.08;
+      context.fillStyle = color;
+      context.fillRect(windowState.fvgX, windowState.fvgY, windowState.fvgWidth, windowState.fvgHeight);
+      context.globalAlpha = windowState.active ? 0.86 : 0.46;
+      context.strokeStyle = color;
+      context.lineWidth = model.mobileChart ? 1.2 : 1;
+      context.setLineDash(windowState.active ? [4, 3] : [2, 3]);
+      context.strokeRect(windowState.fvgX, windowState.fvgY, windowState.fvgWidth, windowState.fvgHeight);
+      context.globalAlpha = windowState.active ? 0.28 : 0.13;
+      context.fillStyle = color;
+      context.fillRect(windowState.x, windowState.y, windowState.width, windowState.height);
+      context.globalAlpha = windowState.active ? 0.7 : 0.34;
+      context.strokeStyle = color;
+      context.setLineDash([3, 3]);
+      context.strokeRect(windowState.x, windowState.y, windowState.width, windowState.height);
+      context.setLineDash([]);
+      context.globalAlpha = 1;
+    }
+    const sweeps = sweepFvg.sweeps || [];
+    for (const sweep of sweeps) {
+      const color = sweep.direction === "bullish" ? colors.up : colors.down;
+      const markerRadius = model.mobileChart ? 5 : 4.5;
+      context.globalAlpha = 0.52;
+      line(sweep.x1, sweep.y1, sweep.x2, sweep.y2, color, [3, 3], model.mobileChart ? 1.2 : 1);
+      context.globalAlpha = 0.94;
+      context.beginPath();
+      context.arc(sweep.x, sweep.y, markerRadius, 0, Math.PI * 2);
+      context.fillStyle = colors.panel; context.fill();
+      context.strokeStyle = color; context.lineWidth = 1.5; context.stroke();
+      context.globalAlpha = 1;
+    }
+    for (const structureBreak of sweepFvg.breaks || []) {
+      const color = structureBreak.direction === "bullish" ? colors.up : colors.down;
+      line(structureBreak.x1, structureBreak.y, structureBreak.x2, structureBreak.y, color, [6, 3], model.mobileChart ? 1.3 : 1);
+    }
+    for (const event of sweepFvg.events || []) {
+      const color = event.side === "buy" ? colors.up : colors.down;
+      const radius = model.mobileChart ? 5 : 4.5;
+      const up = event.side === "buy";
+      context.beginPath();
+      context.moveTo(event.x, event.y + (up ? radius + 1 : -radius - 1));
+      context.lineTo(event.x - radius, event.y + (up ? -radius : radius));
+      context.lineTo(event.x + radius, event.y + (up ? -radius : radius));
+      context.closePath();
+      context.fillStyle = color; context.fill();
+      context.strokeStyle = colors.panel; context.lineWidth = 1.4; context.stroke();
+      const fontSize = model.mobileChart ? 11 : 10;
+      context.font = `700 ${fontSize}px Inter, ui-sans-serif, system-ui, sans-serif`;
+      context.textAlign = "center"; context.textBaseline = "alphabetic";
+      const labelY = Math.max(model.plotTop + fontSize + 4, Math.min(model.plotBottom - 3, event.y + (up ? 24 : -14)));
+      const labelWidth = context.measureText(event.label).width + 10;
+      const labelCenterX = Math.max(model.plotLeft + labelWidth / 2 + 2,
+        Math.min(model.historyRight - labelWidth / 2 - 2, event.x));
+      context.lineWidth = 3;
+      context.lineJoin = "round";
+      context.strokeStyle = colors.panel;
+      context.strokeText(event.label, labelCenterX, labelY);
+      context.fillStyle = color; context.fillText(event.label, labelCenterX, labelY);
+    }
+    context.restore();
+  }
   if (model.layers?.turtle === true && model.turtleChannels?.length) {
     context.save();
     context.beginPath();
@@ -2019,8 +2091,7 @@ const chanChartCanvas = {
   },
 };
 
-// Drag to pan the visible candle range. Modified wheel and two-finger pinch
-// zoom around the pointer midpoint so the price action under it stays anchored.
+// 鼠标拖动平移可见K线范围；绘图区滚轮和双指捏合围绕指针位置缩放。
 const chanInteractionControllers = new WeakMap();
 const chanInteractionBindRetries = new WeakMap();
 function bindChanChartInteraction(element, binding) {
@@ -2151,7 +2222,11 @@ function bindChanChartInteraction(element, binding) {
     state.onScenarioClick(key, event);
   };
   const onWheel = (event) => {
-    if (!(event.ctrlKey || event.metaKey) || !state.model?.candles?.length) return;
+    const point = localPoint(event);
+    const model = state.model;
+    if (!point || !model?.candles?.length
+      || point.x < model.plotLeft || point.x > model.historyRight
+      || point.y < model.plotTop || point.y > model.plotBottom) return;
     event.preventDefault();
     const ratio = plotRatio(event.clientX);
     state.onZoom?.(event.deltaY < 0 ? 0.82 : 1.22, null, ratio);
@@ -2162,8 +2237,7 @@ function bindChanChartInteraction(element, binding) {
   element.addEventListener("pointercancel", onPointerUp);
   element.addEventListener("lostpointercapture", onPointerUp);
   element.addEventListener("click", onClickCapture, true);
-  // Run before SVG overlay targets so a chart layer cannot swallow the
-  // modified wheel gesture after switching between Chan and technical modes.
+  // 在 SVG 图层前捕获滚轮，避免指标层截获缩放事件。
   element.addEventListener("wheel", onWheel, { passive: false, capture: true });
   return {
     update(value) {

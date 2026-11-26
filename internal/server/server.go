@@ -997,8 +997,7 @@ func (s *Service) quote(c *gin.Context) {
 			s.mergeCachedValuation(symbol, &quote)
 			// Keep a stale Go value visible, but allow its six-hour cache entry to
 			// refresh. Python-authoritative values are never replaced by this worker.
-			if quote.FairValue == nil || (isGoFairValueSource(quote.FairValueSource) && quote.FairValueSource != goFairValueSource) ||
-				(quote.FairValueSource == goFairValueSource && s.goValuationCacheExpired(symbol)) {
+			if s.valuationNeedsRefresh(symbol, quote) {
 				s.scheduleValuationAfterSnapshot(symbol, nil, false)
 			}
 			quote.Source = "sqlite"
@@ -1022,6 +1021,9 @@ func (s *Service) quote(c *gin.Context) {
 		if ok && cached.value.Price != nil {
 			quote := cached.value
 			s.mergeCachedValuation(symbol, &quote)
+			if s.valuationNeedsRefresh(symbol, quote) {
+				s.scheduleValuationAfterSnapshot(symbol, &quote, false)
+			}
 			quote.Source = "sqlite"
 			quote.Warning = err.Error()
 			quote = s.decorateQuote(c.Request.Context(), quote)
@@ -1035,6 +1037,9 @@ func (s *Service) quote(c *gin.Context) {
 		if ok && validMarketPrice(cached.value.Price) {
 			quote := cached.value
 			s.mergeCachedValuation(symbol, &quote)
+			if s.valuationNeedsRefresh(symbol, quote) {
+				s.scheduleValuationAfterSnapshot(symbol, &quote, false)
+			}
 			quote.Source = "sqlite"
 			quote = s.decorateQuote(c.Request.Context(), quote)
 			c.JSON(http.StatusOK, quoteAPIValue(quote))
@@ -1052,8 +1057,7 @@ func (s *Service) pendingQuoteWithCachedValuation(symbol string) map[string]any 
 		Symbol: symbol, FairValueStatus: "pending", FairValuePending: true,
 	}
 	s.mergeCachedValuation(symbol, &quote)
-	if quote.FairValue == nil || (isGoFairValueSource(quote.FairValueSource) && quote.FairValueSource != goFairValueSource) ||
-		(quote.FairValueSource == goFairValueSource && s.goValuationCacheExpired(symbol)) {
+	if s.valuationNeedsRefresh(symbol, quote) {
 		s.scheduleValuationAfterSnapshot(symbol, nil, false)
 	}
 	// A first-time quote request must not start history or benchmark
@@ -1192,6 +1196,9 @@ func (s *Service) fetchQuoteOnce(ctx context.Context, symbol string, persist, sn
 		// render. Historical trend inputs are independent and can refresh in the
 		// already-running analytics prefetch after the snapshot is saved.
 		quote = s.decorateCachedQuote(quote)
+		if s.valuationNeedsRefresh(symbol, quote) {
+			s.scheduleValuationAfterSnapshot(symbol, &quote, false)
+		}
 		if preserved, preserveErr := s.store.PreserveCachedFairValue(quote); preserveErr == nil {
 			quote = preserved
 		}
@@ -1201,6 +1208,9 @@ func (s *Service) fetchQuoteOnce(ctx context.Context, symbol string, persist, sn
 		return quote, nil
 	}
 	quote = s.decorateQuote(ctx, quote)
+	if s.valuationNeedsRefresh(symbol, quote) {
+		s.scheduleValuationAfterSnapshot(symbol, &quote, false)
+	}
 	return s.persistQuoteSnapshot(symbol, quote)
 }
 
@@ -1361,9 +1371,6 @@ func normalizeAPISymbol(raw string) (string, error) {
 func strictExpiration(raw string) (string, error) {
 	if !expirationPattern.MatchString(raw) {
 		return "", fmt.Errorf("expiration must use YYYY-MM-DD")
-	}
-	if _, err := time.Parse("2006-01-02", raw); err != nil {
-		return "", fmt.Errorf("expiration must be a valid calendar date")
 	}
 	return raw, nil
 }
@@ -1733,6 +1740,10 @@ func (s *Service) chainHistory(c *gin.Context) {
 	expiration, err := strictExpiration(expirationRaw)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
+		return
+	}
+	if _, err := time.Parse("2006-01-02", expiration); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": "expiration must be a valid calendar date"})
 		return
 	}
 	now := time.Now().UTC()
@@ -2764,6 +2775,9 @@ func (s *Service) staleRefreshResponse(ctx context.Context, symbol, requestedExp
 			quote := cached.value
 			quote.Source = "sqlite"
 			s.mergeCachedValuation(symbol, &quote)
+			if s.valuationNeedsRefresh(symbol, quote) {
+				s.scheduleValuationAfterSnapshot(symbol, &quote, false)
+			}
 			quote = s.decorateCachedQuote(quote)
 			age := float64(0)
 			if chain.FetchedAt != nil {
@@ -2781,6 +2795,9 @@ func (s *Service) staleRefreshResponse(ctx context.Context, symbol, requestedExp
 		quote := cached.value
 		quote.Source = "sqlite"
 		s.mergeCachedValuation(symbol, &quote)
+		if s.valuationNeedsRefresh(symbol, quote) {
+			s.scheduleValuationAfterSnapshot(symbol, &quote, false)
+		}
 		quote = s.decorateCachedQuote(quote)
 		age := math.Max(0, time.Since(*quote.FetchedAt).Seconds())
 		age = math.RoundToEven(age*10) / 10
@@ -4342,11 +4359,8 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 	// bar instead of skipping a second bar.
 	if marketState == "CLOSED" && previous != nil {
 		if currentDate, err := time.ParseInLocation(time.DateOnly, today, location); err == nil {
-			latestCompletedSession := currentDate
-			for searched := 0; searched < 14 && !marketcalendar.IsTradingDay(latestCompletedSession); searched++ {
-				latestCompletedSession = latestCompletedSession.AddDate(0, 0, -1)
-			}
-			if marketcalendar.IsTradingDay(latestCompletedSession) && latestDate == latestCompletedSession.Format(time.DateOnly) {
+			// 只有当前日期本身是交易日且最新 K 线就是当天时，收盘后才退回前一根。
+			if marketcalendar.IsTradingDay(currentDate) && latestDate == currentDate.Format(time.DateOnly) {
 				result["previous_close"], result["previous_close_date"] = previous["close"], previous["date"]
 				result["previous_open"], result["previous_open_date"] = previous["open"], previous["date"]
 			}

@@ -113,6 +113,15 @@
                   </div></section>
                 </div>
               </details>
+              <details class="chan-indicator-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+                <summary aria-label="技术指标设置">指标</summary>
+                <div class="chan-layer-menu-panel chan-indicator-menu-panel">
+                  <button class="chan-layer-menu-close" type="button" aria-label="关闭指标面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                  <section class="chan-layer-menu-display"><h4>价格指标（同时只能启用一个）</h4><div class="chan-indicator-options">
+                    <div v-for="item in indicators.slice(1)" :key="item.value" class="chan-indicator-option"><button class="detail-seg" type="button" :aria-pressed="chartLayers[item.value] ? 'true' : 'false'" @click="toggleChartLayer(item.value)">{{ item.label }}</button></div>
+                  </div></section>
+                </div>
+              </details>
               <details class="chan-subchart-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
                 <summary aria-label="副图设置">副图</summary>
                 <div class="chan-layer-menu-panel chan-subchart-menu-panel">
@@ -122,15 +131,6 @@
                     <button class="detail-seg" type="button" :aria-pressed="subcharts.macd ? 'true' : 'false'" @click="toggleSubchart('macd')">MACD</button>
                     <button class="detail-seg" type="button" :aria-pressed="subcharts.dmi ? 'true' : 'false'" @click="toggleSubchart('dmi')">DMI</button>
                     <button class="detail-seg" type="button" :aria-pressed="subcharts.mfi ? 'true' : 'false'" @click="toggleSubchart('mfi')">MFI</button>
-                  </div></section>
-                </div>
-              </details>
-              <details class="chan-indicator-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
-                <summary aria-label="技术指标设置">指标</summary>
-                <div class="chan-layer-menu-panel chan-indicator-menu-panel">
-                  <button class="chan-layer-menu-close" type="button" aria-label="关闭指标面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
-                  <section class="chan-layer-menu-display"><h4>价格指标（同时只能启用一个）</h4><div class="chan-indicator-options">
-                    <div v-for="item in indicators.slice(1)" :key="item.value" class="chan-indicator-option"><button class="detail-seg" type="button" :aria-pressed="chartLayers[item.value] ? 'true' : 'false'" @click="toggleChartLayer(item.value)">{{ item.label }}</button></div>
                   </div></section>
                 </div>
               </details>
@@ -198,6 +198,7 @@
   <script src="/static/common/js/chan-macd-sma.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-supertrend.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-wyckoff.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-sweep-fvg.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-mfi.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/futures.js?v=__ASSET_VERSION__"></script>

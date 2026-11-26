@@ -4,10 +4,10 @@ const vm = require("node:vm");
 
 const window = { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} };
 const context = {
-  dash: [], strokes: [], texts: [], rects: [], fills: 0, transform: [1, 0, 0, 1, 0, 0], stack: [], globalAlpha: 1,
+  dash: [], strokes: [], texts: [], strokeTexts: [], rects: [], arcs: [], fills: 0, transform: [1, 0, 0, 1, 0, 0], stack: [], globalAlpha: 1,
   setTransform(...value) { this.transform = value; }, clearRect() {}, beginPath() { this.start = null; this.end = null; }, moveTo(x, y) { this.start = [x, y]; },
   lineTo(x, y) { this.end = [x, y]; }, stroke() { this.strokes.push({ start: this.start, end: this.end, dash: [...this.dash], width: this.lineWidth, color: this.strokeStyle, alpha: this.globalAlpha, transform: [...this.transform] }); },
-  setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font, baseline: this.textBaseline, color: this.fillStyle, transform: [...this.transform] }); }, measureText(text) { return { width: Array.from(String(text)).length * 8 }; }, arc() {}, fill() { this.fills += 1; }, strokeText() {},
+  setLineDash(value) { this.dash = value; }, fillRect(x, y, width, height) { this.rects.push({ x, y, width, height, color: this.fillStyle }); }, strokeRect() {}, fillText(text, x, y) { this.texts.push({ text, x, y, font: this.font, baseline: this.textBaseline, color: this.fillStyle, transform: [...this.transform] }); }, measureText(text) { return { width: Array.from(String(text)).length * 8 }; }, arc(x, y, radius) { this.arcs.push({ x, y, radius }); }, fill() { this.fills += 1; }, strokeText(text, x, y) { this.strokeTexts.push({ text, x, y, color: this.strokeStyle, width: this.lineWidth }); },
   save() { this.stack.push({ transform: [...this.transform], globalAlpha: this.globalAlpha, font: this.font, fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, lineWidth: this.lineWidth, textAlign: this.textAlign, textBaseline: this.textBaseline }); },
   restore() { Object.assign(this, this.stack.pop()); }, translate() {}, rotate() {}, closePath() {}, rect() {}, clip() {}, arcTo() {},
 };
@@ -108,6 +108,29 @@ function renderIndicators() {
   return context;
 }
 
+function renderSweepFvg() {
+  context.strokes = [];
+  context.texts = [];
+  context.rects = [];
+  context.arcs = [];
+  window.OptionScopeCharts.renderChanCanvas(target, {
+    chart: { width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, historyRight: 940,
+      grid: [], candles: [], strokes: [], points: [], centers: [], recursiveCenters: [], keyLevels: [], signals: [], dates: [], segments: [],
+      sweepFvg: {
+        sweeps: [
+          { x: 220, y: 180, x1: 140, y1: 160, x2: 220, y2: 160, direction: "bullish", label: "扫低" },
+          { x: 240, y: 183, x1: 170, y1: 163, x2: 240, y2: 163, direction: "bullish", label: "扫低" },
+          { x: 258, y: 178, x1: 190, y1: 158, x2: 258, y2: 158, direction: "bullish", label: "扫低" },
+        ],
+        breaks: [],
+        events: [{ x: 420, y: 210, side: "buy", label: "反转买" }],
+        windows: [{ direction: "bullish", active: true, x: 400, y: 190, width: 100, height: 32, fvgX: 400, fvgY: 170, fvgWidth: 100, fvgHeight: 14 }],
+      } },
+    layers: { pens: false, penCenters: false, segments: false, recursiveCenters: {}, signals: false, sweepFvg: true },
+  });
+  return context;
+}
+
 const segments = [
   { level: 0, x1: 10, y1: 20, x2: 30, y2: 40, confirmed: true },
   { level: 0, x1: 10, y1: 20, x2: 30, y2: 40, confirmed: false, forming: true },
@@ -118,6 +141,17 @@ assert.equal(painted.length, 2, "enabled segment layer paints both confirmed and
 assert.deepEqual(painted[0].dash, [], "confirmed segment is a solid line");
 assert.deepEqual(painted[1].dash, [6, 4], "forming segment is a dashed line");
 assert.equal(painted[0].width, 2.6);
+
+const sweepRender = renderSweepFvg();
+const reversalLabel = sweepRender.texts.find((item) => item.text === "反转买");
+assert.ok(reversalLabel, "confirmed reversal labels remain painted");
+assert.match(reversalLabel.font, /10px/, "desktop reversal labels use compact readable text");
+assert.equal(sweepRender.texts.filter((item) => item.text === "扫低" || item.text === "扫高").length, 0, "sweep markers do not add repeated text over candles");
+assert.equal(sweepRender.arcs.filter((arc) => [220, 240, 258].includes(arc.x)).length, 3, "clustered sweep markers remain individually visible");
+assert.ok(sweepRender.arcs.some((arc) => arc.x === 220 && arc.radius === 4.5), "sweep marker remains visible without a text label");
+assert.ok(sweepRender.fills >= 2, "reversal marker is visibly filled");
+assert.ok(!sweepRender.strokeTexts.some((item) => item.text === "扫低" || item.text === "扫高"), "sweep markers do not draw text outlines");
+assert.ok(sweepRender.strokes.some((stroke) => stroke.dash[0] === 3 && stroke.alpha === 0.52), "sweep level lines remain subtle");
 
 const supportRender = renderStructureSupports(true);
 const activeSupportLine = supportRender.strokes.find((stroke) => stroke.start?.[0] === 80 && stroke.start?.[1] === 120 && stroke.end?.[1] === 120);

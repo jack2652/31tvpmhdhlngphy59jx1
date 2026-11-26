@@ -1941,6 +1941,16 @@ func (s *SQLite) GetAnalysisCacheEntry(cacheKey string) (any, time.Time, bool, e
 // one SQLite write transaction so concurrent workers cannot observe a partial
 // update or grow the table beyond its configured bound.
 func (s *SQLite) PutAnalysisCache(cacheKey string, payload any, maxEntries int) error {
+	return s.PutAnalysisCacheContext(context.Background(), cacheKey, payload, maxEntries)
+}
+
+// PutAnalysisCacheContext 让后台任务关闭时可以取消写锁等待，事务仍原子更新并清理缓存。
+func (s *SQLite) PutAnalysisCacheContext(ctx context.Context, cacheKey string, payload any, maxEntries int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, analysisClaimMaxWait)
+	defer cancel()
 	if maxEntries < 1 {
 		maxEntries = 1
 	}
@@ -1948,12 +1958,17 @@ func (s *SQLite) PutAnalysisCache(cacheKey string, payload any, maxEntries int) 
 	if err != nil {
 		return fmt.Errorf("encode analysis cache %q: %w", cacheKey, err)
 	}
-	conn, err := s.db.Conn(context.Background())
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+	// 复用分析任务的短忙等待与重试，避免驱动在一次长等待内忽略取消。
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout=%d", analysisClaimBusyTimeout.Milliseconds())); err != nil {
+		return err
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), "PRAGMA busy_timeout=30000") }()
+	if err := beginAnalysisImmediate(ctx, conn, true); err != nil {
 		return err
 	}
 	committed := false
@@ -1963,12 +1978,12 @@ func (s *SQLite) PutAnalysisCache(cacheKey string, payload any, maxEntries int) 
 		}
 	}()
 	createdAt := storedTimestamp(time.Now().UTC())
-	if _, err := conn.ExecContext(context.Background(), `INSERT INTO api_analysis_cache(cache_key, payload, created_at)
+	if _, err := conn.ExecContext(ctx, `INSERT INTO api_analysis_cache(cache_key, payload, created_at)
 VALUES (?, ?, ?)
 ON CONFLICT(cache_key) DO UPDATE SET payload=excluded.payload, created_at=excluded.created_at`, cacheKey, string(encoded), createdAt); err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(context.Background(), `DELETE FROM api_analysis_cache
+	if _, err := conn.ExecContext(ctx, `DELETE FROM api_analysis_cache
 WHERE cache_key IN (
  SELECT cache_key FROM api_analysis_cache
  ORDER BY created_at DESC, cache_key DESC
@@ -1976,7 +1991,7 @@ WHERE cache_key IN (
 )`, maxEntries); err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(context.Background(), "COMMIT"); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return err
 	}
 	committed = true

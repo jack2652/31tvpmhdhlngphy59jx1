@@ -48,21 +48,21 @@ const toggleSource = app.slice(toggleStart, toggleEnd).trim().replace(/,\s*$/, "
 const toggleContext = { window: {} };
 vm.runInNewContext(fs.readFileSync("web/static/common/js/chan-client.js", "utf8"), toggleContext);
 vm.runInNewContext(`
-  const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
+  const EXCLUSIVE_CHAN_INDICATOR_LAYERS = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "sweepFvg"];
   const OptionScopeChan = window.OptionScopeChan;
   const rememberChanChartPreferences = (...values) => { globalThis.savedPreferences = values; };
   globalThis.toggleChanChartLayer = ({ ${toggleSource} }).toggleChanChartLayer;
 `, toggleContext);
 const layerState = {
-  chanChartLayers: { afStochZ: true, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false },
+  chanChartLayers: { afStochZ: true, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, sweepFvg: false, mfi: false },
   chanPeriod: "daily",
   chanSubcharts: {},
   chanPayload: null,
 };
 toggleContext.toggleChanChartLayer.call(layerState, "macdSma200");
-assert.deepEqual(plain(layerState.chanChartLayers), { afStochZ: false, turtle: false, granville: false, macdSma200: true, supertrend: false, wyckoff: false, mfi: false }, "enabling MACD + SMA200 disables the previously selected exclusive indicator");
+assert.deepEqual(plain(layerState.chanChartLayers), { afStochZ: false, turtle: false, granville: false, macdSma200: true, supertrend: false, wyckoff: false, sweepFvg: false, mfi: false }, "enabling MACD + SMA200 disables the previously selected exclusive indicator");
 toggleContext.toggleChanChartLayer.call(layerState, "macdSma200");
-assert.deepEqual(plain(layerState.chanChartLayers), { afStochZ: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false }, "the selected MACD + SMA200 indicator can be disabled");
+assert.deepEqual(plain(layerState.chanChartLayers), { afStochZ: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, sweepFvg: false, mfi: false }, "the selected MACD + SMA200 indicator can be disabled");
 const supportLayerState = { chanChartLayers: { supportResistance: true } };
 toggleContext.toggleChanChartLayer.call(supportLayerState, "supportResistance");
 assert.equal(supportLayerState.chanChartLayers.supportResistance, false, "one switch disables both kinds of price levels");
@@ -111,6 +111,7 @@ const previouslyCustomizedLayers = {
   macdSma200: false,
   supertrend: false,
   wyckoff: false,
+  sweepFvg: false,
   mfi: false,
 };
 const versionFour = preferenceContext({

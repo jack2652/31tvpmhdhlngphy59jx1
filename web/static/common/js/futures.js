@@ -15,11 +15,12 @@
     { value: "base", label: "缠论结构" }, { value: "afStochZ", label: "AF StochZ" },
     { value: "turtle", label: "海龟交易法" }, { value: "granville", label: "葛兰碧法则" },
     { value: "wyckoff", label: "威科夫阶段" }, { value: "supertrend", label: "超级趋势" },
+    { value: "sweepFvg", label: "扫流动性反转 + FVG" },
     { value: "macdSma200", label: "异同移动平均线 + 200期简单均线" },
   ];
-  const defaultLayers = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, mfi: false };
+  const defaultLayers = { pens: true, penCenters: true, legacySignals: true, chanCandles: true, segments: false, segmentLevels: {}, recursiveCenters: {}, signals: true, supportResistance: true, afStochZ: false, trendlines: false, turtle: false, granville: false, macdSma200: false, supertrend: false, wyckoff: false, sweepFvg: false, mfi: false };
   const defaultSubcharts = { volume: false, macd: false, dmi: false, mfi: false };
-  const exclusiveIndicators = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff"];
+  const exclusiveIndicators = ["afStochZ", "turtle", "granville", "macdSma200", "supertrend", "wyckoff", "sweepFvg"];
   const chartPreferencesKey = "option-scope-futures-chart-preferences";
   const chartPreferencesVersion = 2;
   const scenarioVisibilityKey = "option-scope-chan-scenarios-visible";

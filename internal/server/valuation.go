@@ -793,11 +793,11 @@ func (s *Service) persistValuationCache(symbol string, payload map[string]any) {
 	}
 	// Keep terminal/retry results durable even when a prior successful value
 	// must remain visible. A ready attempt supersedes the previous status.
-	if err := s.store.PutAnalysisCache(fairValueStatusCacheKey(symbol), payload, entries); err != nil {
+	if err := s.store.PutAnalysisCacheContext(s.background, fairValueStatusCacheKey(symbol), payload, entries); err != nil {
 		return
 	}
 	if payload["value"] != nil {
-		_ = s.store.PutAnalysisCache(fairValueCacheKey(symbol), payload, entries)
+		_ = s.store.PutAnalysisCacheContext(s.background, fairValueCacheKey(symbol), payload, entries)
 	} else {
 		s.publishFairValueEvent(symbol)
 	}
@@ -952,12 +952,12 @@ func (s *Service) mergeCachedValuation(symbol string, quote *model.Quote) {
 	} else if valuePayload != nil {
 		applyValuationPayloadDiagnostics(quote, valuePayload)
 	}
-	// Python starts valuation on the first quote request and returns the market
-	// quote immediately. Preserve that behavior for uncached quotes by passing
-	// this quote into the background worker instead of requiring an SQLite row.
-	if quote.FairValue == nil || (quote.FairValueSource == goFairValueSource && s.goValuationCacheExpired(symbol)) {
-		s.scheduleValuationAfterSnapshot(symbol, quote, false)
-	}
+}
+
+func (s *Service) valuationNeedsRefresh(symbol string, quote model.Quote) bool {
+	return quote.FairValue == nil ||
+		(isGoFairValueSource(quote.FairValueSource) && quote.FairValueSource != goFairValueSource) ||
+		(quote.FairValueSource == goFairValueSource && s.goValuationCacheExpired(symbol))
 }
 
 func isInapplicableCompanyValuation(payload map[string]any) bool {

@@ -130,6 +130,11 @@
 .chan-wyckoff-legend>span{display:flex;align-items:center;gap:8px}
 .chan-wyckoff-swatch{display:inline-block;flex:0 0 20px;height:10px;border:1px solid var(--up);background:color-mix(in srgb,var(--up) 12%,transparent)}
 .chan-wyckoff-down{border-color:var(--down);background:color-mix(in srgb,var(--down) 12%,transparent)}
+.chan-sweep-fvg-legend{display:flex;flex-wrap:wrap;align-items:center;gap:7px 14px;margin-top:12px;padding-top:10px;border-top:1px solid var(--row-line);color:var(--muted);font-size:11px;line-height:1.45}
+.chan-sweep-fvg-legend>span{display:flex;align-items:center;gap:8px}
+.chan-sweep-fvg-swatch{display:inline-block;flex:0 0 20px;height:10px;border:1px solid var(--blue);background:color-mix(in srgb,var(--blue) 14%,transparent)}
+.chan-sweep-fvg-buy{border-color:var(--up);background:color-mix(in srgb,var(--up) 14%,transparent)}
+.chan-sweep-fvg-sell{border-color:var(--down);background:color-mix(in srgb,var(--down) 14%,transparent)}
 .chan-layer-menu-panel>.chan-layer-menu-close:hover{border-color:var(--blue);color:var(--blue)}
 .chan-layer-menu-panel>.chan-layer-menu-close:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 .chan-layer-menu-panel section{min-width:0}

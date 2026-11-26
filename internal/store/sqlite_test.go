@@ -1,7 +1,9 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"math"
 	"path/filepath"
 	"testing"
@@ -11,6 +13,70 @@ import (
 )
 
 func quoteTestPtr(value float64) *float64 { return &value }
+
+func TestPutAnalysisCacheContextCancelsWriterWaitAndRestoresConnection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "analysis-cache-cancel.db")
+	owner, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	writer, err := owner.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer writer.ExecContext(context.Background(), "ROLLBACK")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- owner.PutAnalysisCacheContext(ctx, "cancelled", map[string]any{"value": 1}, 4) }()
+	deadline := time.Now().Add(time.Second)
+	for owner.db.Stats().InUse < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if owner.db.Stats().InUse < 2 {
+		t.Fatal("cache write did not reach SQLite")
+	}
+	select {
+	case err := <-result:
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("cache write error=%v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cache write did not return after context cancellation")
+	}
+	var count int
+	if err := owner.db.QueryRow("SELECT COUNT(*) FROM api_analysis_cache WHERE cache_key='cancelled'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("cancelled cache write left %d rows", count)
+	}
+	conn, err := owner.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var busyTimeout int
+	if err := conn.QueryRowContext(context.Background(), "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	conn.Close()
+	if busyTimeout != 30000 {
+		t.Fatalf("busy_timeout=%dms, want restored default 30000ms", busyTimeout)
+	}
+	if _, err := writer.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.PutAnalysisCache("after-cancel", map[string]any{"value": 2}, 4); err != nil {
+		t.Fatalf("cache write after lock release: %v", err)
+	}
+}
 
 func TestChainHistoryReturnsRecentSnapshotsWithTheirPrices(t *testing.T) {
 	repository, err := Open(filepath.Join(t.TempDir(), "chain-history.db"))

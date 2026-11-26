@@ -3262,8 +3262,11 @@ func TestStatusDecoratesPersistedQuoteWithoutUpstreamAfterRestart(t *testing.T) 
 	if _, exists := statusQuote["earnings"]; exists {
 		t.Fatalf("status exposed the removed earnings field: %#v", statusQuote["earnings"])
 	}
-	if secondProvider.quoteCalls.Load() != 0 || secondProvider.fundamentalsCalls.Load() != 0 {
-		t.Fatalf("status triggered upstream calls: quote=%d fundamentals=%d", secondProvider.quoteCalls.Load(), secondProvider.fundamentalsCalls.Load())
+	second.mu.RLock()
+	valuationScheduled := second.valuationJobs["QQQ"]
+	second.mu.RUnlock()
+	if secondProvider.quoteCalls.Load() != 0 || secondProvider.fundamentalsCalls.Load() != 0 || valuationScheduled {
+		t.Fatalf("status triggered upstream work: quote=%d fundamentals=%d valuation_scheduled=%v", secondProvider.quoteCalls.Load(), secondProvider.fundamentalsCalls.Load(), valuationScheduled)
 	}
 
 	quoteAgain, err := http.Get(secondServer.URL + "/api/quote/QQQ")
@@ -3557,6 +3560,11 @@ func TestTrendMarketMatchesPythonSessionAndHistoryFallbacks(t *testing.T) {
 	post := trendMarketAt(bars, model.Quote{MarketState: "POST", TodayOpen: ptr(111)}, "2026-09-22")
 	if post["today_open"] != float64(111) || post["today_open_date"] != "2026-09-22" || post["previous_close"] != float64(120) || post["previous_open"] != float64(110) {
 		t.Fatalf("post-session fallback mismatch: %#v", post)
+	}
+
+	closedWeekend := trendMarketAt(bars, model.Quote{MarketState: "CLOSED"}, "2026-09-19")
+	if closedWeekend["previous_close"] != float64(105) || closedWeekend["previous_close_date"] != "2026-09-18" {
+		t.Fatalf("closed weekend should keep the latest completed session: %#v", closedWeekend)
 	}
 
 	staleBars := []map[string]any{{"date": "2026-09-18", "open": float64(100), "close": float64(147.61)}}
@@ -4981,13 +4989,21 @@ func TestDegradedAnalysisContracts(t *testing.T) {
 	}
 }
 
+func nextTestExpiration(now time.Time) string {
+	date := now.In(marketLocation()).AddDate(0, 0, 30)
+	for !marketcalendar.IsTradingDay(date) {
+		date = date.AddDate(0, 0, 1)
+	}
+	return date.Format("2006-01-02")
+}
+
 func TestRawLevelsMatchesPythonOptionAndEarningsFields(t *testing.T) {
 	service, ts := testService(t, "")
 	price, strike, farStrike := 100.0, 100.0, 1e9
 	last, bid, ask, iv, gammaValue := 3.0, 2.9, 3.1, 0.3, 0.02
 	volume, openInterest := int64(50), int64(200)
 	now := time.Now().UTC()
-	expiration := now.AddDate(0, 0, 30).Format("2006-01-02")
+	expiration := nextTestExpiration(now)
 	if err := service.store.SaveQuote(model.Quote{Symbol: "QQQ", Price: &price, Provider: "test", FetchedAt: &now, Sessions: map[string]any{}}); err != nil {
 		t.Fatal(err)
 	}
@@ -5068,7 +5084,7 @@ func TestRawLevelsOmitsModelGreeksWithoutSpot(t *testing.T) {
 	strike, last, bid, ask, iv, gammaValue := 100.0, 3.0, 2.9, 3.1, 0.3, 0.02
 	volume, openInterest := int64(50), int64(200)
 	now := time.Now().UTC()
-	expiration := now.AddDate(0, 0, 30).Format("2006-01-02")
+	expiration := nextTestExpiration(now)
 	if err := service.store.SaveChain(model.ChainResponse{Symbol: "QQQ", Expiration: expiration, FetchedAt: &now, Data: []model.OptionRow{{
 		ContractSymbol: "QQQ-test", Expiration: expiration, ContractType: "call", Strike: &strike,
 		LastPrice: &last, Bid: &bid, Ask: &ask, Volume: &volume, OpenInterest: &openInterest,

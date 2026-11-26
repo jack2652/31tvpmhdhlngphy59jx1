@@ -317,19 +317,6 @@
                 </div></section>
               </div>
             </details>
-            <details class="chan-subchart-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
-              <summary aria-label="副图设置">副图</summary>
-              <div class="chan-layer-menu-panel chan-subchart-menu-panel">
-                <button class="chan-layer-menu-close" type="button" aria-label="关闭副图面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
-                <section class="chan-layer-menu-display"><h4>副图显示</h4><div class="detail-segmented chan-layer-switches chan-subchart-switches" role="group" aria-label="副图显示选项">
-                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.volume ? 'true' : 'false'" @click="toggleChanSubchart('volume')">成交量</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.macd ? 'true' : 'false'" @click="toggleChanSubchart('macd')">MACD</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.dmi ? 'true' : 'false'" @click="toggleChanSubchart('dmi')">DMI</button>
-                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.mfi ? 'true' : 'false'" @click="toggleChanSubchart('mfi')">MFI</button>
-                </div>
-                </section>
-              </div>
-            </details>
             <details class="chan-indicator-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
               <summary aria-label="技术指标设置">指标</summary>
               <div class="chan-layer-menu-panel chan-indicator-menu-panel">
@@ -348,6 +335,9 @@
                     </div>
                     <div class="chan-indicator-option">
                       <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.wyckoff ? 'true' : 'false'" :aria-expanded="chanChartLayers.wyckoff ? 'true' : 'false'" aria-controls="chan-wyckoff-help" @click="toggleChanChartLayer('wyckoff')">威科夫阶段</button>
+                    </div>
+                    <div class="chan-indicator-option">
+                      <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.sweepFvg ? 'true' : 'false'" :aria-expanded="chanChartLayers.sweepFvg ? 'true' : 'false'" aria-controls="chan-sweep-fvg-help" @click="toggleChanChartLayer('sweepFvg')">扫流动性反转 + FVG</button>
                     </div>
                     <div class="chan-indicator-option">
                       <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.supertrend ? 'true' : 'false'" :aria-expanded="chanChartLayers.supertrend ? 'true' : 'false'" aria-controls="chan-supertrend-help" @click="toggleChanChartLayer('supertrend')">超级趋势</button>
@@ -398,7 +388,28 @@
                         <span role="listitem">阶段 A–E · 事件标签</span>
                       </div>
                     </div>
+                    <div id="chan-sweep-fvg-help" class="chan-indicator-description-body" role="region" aria-label="扫流动性反转和FVG说明" v-show="chanChartLayers.sweepFvg">
+                      <small>按已确认枢轴识别扫高/扫低，随后在有限窗口内等待结构突破；突破需要强实体和最小 FVG。只在收盘后确认反转信号，形成中的 K 线仅延展回踩/反弹观察窗口。</small>
+                      <div class="chan-sweep-fvg-legend" role="list" aria-label="扫流动性反转和FVG图例">
+                        <span role="listitem"><i class="chan-sweep-fvg-swatch chan-sweep-fvg-buy"></i>看涨扫低 / 反转买</span>
+                        <span role="listitem"><i class="chan-sweep-fvg-swatch chan-sweep-fvg-sell"></i>看跌扫高 / 反转卖</span>
+                        <span role="listitem"><i class="chan-sweep-fvg-swatch chan-sweep-fvg-zone"></i>FVG 与入场观察区</span>
+                      </div>
+                    </div>
                   </div>
+                </section>
+              </div>
+            </details>
+            <details class="chan-subchart-menu" @keydown.esc.stop.prevent="closeChanLayerMenu">
+              <summary aria-label="副图设置">副图</summary>
+              <div class="chan-layer-menu-panel chan-subchart-menu-panel">
+                <button class="chan-layer-menu-close" type="button" aria-label="关闭副图面板" title="关闭" @click.prevent.stop="closeChanLayerMenu">×</button>
+                <section class="chan-layer-menu-display"><h4>副图显示</h4><div class="detail-segmented chan-layer-switches chan-subchart-switches" role="group" aria-label="副图显示选项">
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.volume ? 'true' : 'false'" @click="toggleChanSubchart('volume')">成交量</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.macd ? 'true' : 'false'" @click="toggleChanSubchart('macd')">MACD</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.dmi ? 'true' : 'false'" @click="toggleChanSubchart('dmi')">DMI</button>
+                  <button class="detail-seg" type="button" :aria-pressed="chanSubcharts.mfi ? 'true' : 'false'" @click="toggleChanSubchart('mfi')">MFI</button>
+                </div>
                 </section>
               </div>
             </details>
@@ -445,7 +456,7 @@
           <button type="button" aria-label="向左移动 K 线" title="向左移动" class="chan-chart-navigation-pan" :disabled="!chanFrame.chart.canPanLeft" @click="changeChanViewport('left')">‹</button>
           <button type="button" aria-label="向右移动 K 线" title="向右移动" class="chan-chart-navigation-pan" :disabled="!chanFrame.chart.canPanRight" @click="changeChanViewport('right')">›</button>
           <button type="button" aria-label="重置 K 线范围" title="重置范围并回到最新" class="chan-chart-navigation-reset" :disabled="!chanFrame.chart.canResetViewport" @click="changeChanViewport('reset')">重置</button>
-          <p class="chan-chart-gesture-help">鼠标按住左右拖动；Ctrl 或 ⌘ + 滚轮缩放。手机单指左右拖动、双指捏合缩放。</p>
+          <p class="chan-chart-gesture-help">鼠标按住左右拖动；在 K 线区域滚动缩放。手机单指左右拖动、双指捏合缩放。</p>
         </div>
         <div v-if="!chanFrame.chart" class="levels-empty">历史行情到达后展示 K 线与多级结构</div>
         <details v-if="chanFrame.chart && chanChartLayers.supportResistance" class="chan-structure-support-details">
@@ -673,6 +684,7 @@
   <script src="/static/common/js/chan-macd-sma.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-supertrend.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-wyckoff.js?v=__ASSET_VERSION__"></script>
+  <script src="/static/common/js/chan-sweep-fvg.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-mfi.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/chan-client.js?v=__ASSET_VERSION__"></script>
   <script src="/static/common/js/app.js?v=__ASSET_VERSION__"></script>
