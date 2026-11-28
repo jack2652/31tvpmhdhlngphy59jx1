@@ -41,6 +41,7 @@ assert.match(template, /v-for="level in chanSegmentLevels"[^>]*toggleChanSegment
 assert.match(template, /\{\{ chanTurningStatus\(0\) \}\} \/ \{\{ chanTurningStatus\(1\) \}\}/, "turning status summary must use its guarded accessor instead of indexing the frame array in the template");
 assert.doesNotMatch(template, /chanFrame\.turning\[[01]\]/, "template must not directly index turning data that can be absent during initial render");
 assert.match(app, /chanTurningStatus\(index\) \{[\s\S]*?Array\.isArray\(turning\) \? turning\[index\] : null[\s\S]*?item\?\.status \|\| "等待信号"/, "turning status accessor must tolerate an absent frame array and return a fallback");
+assert.match(app, /function refreshChanAnalysis\([\s\S]*?const adjustedParams = new URLSearchParams\(\{ compact: "true", include_revisions: "false" \}\)/, "图表请求应省略审计修订");
 assert.match(app, /const recursiveCenters = this\.chanChartLayers\?\.recursiveCenters \|\| \{\};[\s\S]*?recursiveCenters, \[level\]: !OptionScopeChan\.isRecursiveCenterLevelVisible\(this\.chanChartLayers, level\)/, "recursive center toggles must tolerate a missing layer map");
 assert.match(app, /layer === "segments"[\s\S]*?toggleAllSegmentLevels\(this\.chanChartLayers, this\.chanSegmentLevels\)/, "the all-segments control must toggle all visible levels as one action");
 assert.match(template, /class="chart-tooltip chan-chart-tooltip"/, "Canvas chart must retain a dedicated structure and OHLC tooltip");

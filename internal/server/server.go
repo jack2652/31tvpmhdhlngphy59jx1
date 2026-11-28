@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
@@ -465,8 +466,8 @@ func (s *Service) Router() *gin.Engine {
 	router.HEAD("/docs", s.swaggerDocs)
 	router.GET("/redoc", s.redocDocs)
 	router.HEAD("/redoc", s.redocDocs)
-	router.GET("/", s.index)
-	router.GET("/futures", s.futuresIndex)
+	router.GET("/", s.index())
+	router.GET("/futures", s.futuresIndex())
 	staticRoot := func(c *gin.Context) { c.JSON(http.StatusNotFound, gin.H{"detail": "Not Found"}) }
 	router.GET("/static", staticRoot)
 	router.HEAD("/static", staticRoot)
@@ -567,10 +568,7 @@ func responseCompression(lowMemory bool) gin.HandlerFunc {
 	// render path are 0.5-1.5 MiB JSON, and removing 75-90% of the transfer
 	// costs far less CPU than waiting for the network. BestSpeed keeps the
 	// compressor's 32 KiB window and hash tables cheap on small machines.
-	level := gzip.DefaultCompression
-	if lowMemory {
-		level = gzip.BestSpeed
-	}
+	level := responseGzipLevel(lowMemory)
 	return func(c *gin.Context) {
 		if !acceptsGzip(c.Request.Header.Values("Accept-Encoding")) {
 			c.Next()
@@ -587,6 +585,13 @@ func responseCompression(lowMemory bool) gin.HandlerFunc {
 		c.Next()
 		writer.finish()
 	}
+}
+
+func responseGzipLevel(lowMemory bool) int {
+	if lowMemory {
+		return gzip.BestSpeed
+	}
+	return gzip.DefaultCompression
 }
 
 type gzipResponseWriter struct {
@@ -920,22 +925,12 @@ func (s *Service) accessGuard() gin.HandlerFunc {
 	}
 }
 
-func (s *Service) index(c *gin.Context) {
-	c.Header("Cache-Control", "no-store")
-	assets := web.Static()
-	page, err := fs.ReadFile(assets, "index.html")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "index.html unavailable"})
-		return
-	}
+func (s *Service) index() gin.HandlerFunc {
 	defaultSymbol := s.cfg.DefaultSymbol
 	if len(s.cfg.DefaultSymbols) > 0 && strings.TrimSpace(s.cfg.DefaultSymbols[0]) != "" {
 		defaultSymbol = s.cfg.DefaultSymbols[0]
 	}
-	content := strings.ReplaceAll(string(page), "__DEFAULT_SYMBOL__", defaultSymbol)
-	content = strings.ReplaceAll(content, "__ACCESS_KEY_REQUIRED__", strconv.FormatBool(s.cfg.AccessKey != ""))
-	content = strings.ReplaceAll(content, "__ASSET_VERSION__", indexAssetVersion(assets))
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(content))
+	return s.embeddedPage("index.html", "__DEFAULT_SYMBOL__", defaultSymbol, indexAssetVersion)
 }
 
 // 指标脚本使用不可变缓存，单独更新算法时也必须改变股票页资源版本。
@@ -949,25 +944,65 @@ func indexAssetVersion(assets fs.FS) string {
 	return hex.EncodeToString(versionHash.Sum(nil))
 }
 
-func (s *Service) futuresIndex(c *gin.Context) {
-	c.Header("Cache-Control", "no-store")
-	assets := web.Static()
-	page, err := fs.ReadFile(assets, "futures.html")
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "futures.html unavailable"})
-		return
-	}
-	defaultSymbol := "ES=F"
-	content := strings.ReplaceAll(string(page), "__DEFAULT_FUTURE__", defaultSymbol)
-	content = strings.ReplaceAll(content, "__ACCESS_KEY_REQUIRED__", strconv.FormatBool(s.cfg.AccessKey != ""))
+func (s *Service) futuresIndex() gin.HandlerFunc {
+	return s.embeddedPage("futures.html", "__DEFAULT_FUTURE__", "ES=F", futuresAssetVersion)
+}
+
+func futuresAssetVersion(assets fs.FS) string {
 	versionHash := sha256.New()
 	for _, asset := range []string{"common/css/styles.css", "common/js/request.js", "common/js/charts.js", "common/js/chan-plan.js", "common/js/chan-stochz.js", "common/js/chan-trendlines.js", "common/js/chan-turtle.js", "common/js/chan-granville.js", "common/js/chan-macd-sma.js", "common/js/chan-supertrend.js", "common/js/chan-wyckoff.js", "common/js/chan-vwap.js", "common/js/chan-bollinger.js", "common/js/chan-rsi-divergence.js", "common/js/chan-relative-strength.js", "common/js/chan-client.js", "common/js/futures.js"} {
 		if contents, err := fs.ReadFile(assets, asset); err == nil {
 			_, _ = versionHash.Write(contents)
 		}
 	}
-	content = strings.ReplaceAll(content, "__ASSET_VERSION__", hex.EncodeToString(versionHash.Sum(nil)))
-	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(content))
+	return hex.EncodeToString(versionHash.Sum(nil))
+}
+
+func (s *Service) embeddedPage(name, symbolPlaceholder, symbol string, version func(fs.FS) string) gin.HandlerFunc {
+	accessRequired := strconv.FormatBool(s.cfg.AccessKey != "")
+	level := responseGzipLevel(s.cfg.LowMemory)
+	// 页面及其资源随 Go 二进制发布，首次访问后可复用生成结果。
+	load := sync.OnceValues(func() ([]byte, error) {
+		assets := web.Static()
+		page, err := fs.ReadFile(assets, name)
+		if err != nil {
+			return nil, err
+		}
+		replacements := strings.NewReplacer(symbolPlaceholder, symbol, "__ACCESS_KEY_REQUIRED__", accessRequired, "__ASSET_VERSION__", version(assets))
+		return []byte(replacements.Replace(string(page))), nil
+	})
+	compressed := sync.OnceValue(func() []byte {
+		page, _ := load()
+		if len(page) < gzipMinimumSize {
+			return nil
+		}
+		var result bytes.Buffer
+		writer, err := gzip.NewWriterLevel(&result, level)
+		if err != nil {
+			return nil
+		}
+		_, writeErr := writer.Write(page)
+		if closeErr := writer.Close(); writeErr != nil || closeErr != nil {
+			return nil
+		}
+		return result.Bytes()
+	})
+	return func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		page, err := load()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": name + " unavailable"})
+			return
+		}
+		c.Writer.Header().Add("Vary", "Accept-Encoding")
+		if acceptsGzip(c.Request.Header.Values("Accept-Encoding")) {
+			if encoded := compressed(); encoded != nil {
+				c.Header("Content-Encoding", "gzip")
+				page = encoded
+			}
+		}
+		c.Data(http.StatusOK, "text/html; charset=utf-8", page)
+	}
 }
 
 func (s *Service) quote(c *gin.Context) {
@@ -3698,9 +3733,6 @@ func (s *Service) levels(c *gin.Context) {
 	if raw {
 		var profile map[string]any
 		var profileErr error
-		var chain model.ChainResponse
-		var chainFound bool
-		var chainErr error
 		var quote model.Quote
 		var quoteFound bool
 		var quoteErr error
@@ -3710,16 +3742,14 @@ func (s *Service) levels(c *gin.Context) {
 		var extremesErr, betaErr error
 		if s.cfg.LowMemory || s.cfg.UpstreamConcurrency <= 1 {
 			profile, profileErr = s.latestChains(symbol, 45)
-			chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration)
 			quote, quoteFound, quoteErr = s.store.LatestQuote(symbol)
 			history, historyErr = s.store.LatestHistory(symbol, 3000)
 			extremes, extremesErr = s.store.LatestPayload("price_extremes", symbol)
 			beta, betaErr = s.store.LatestPayload("beta_snapshots", symbol)
 		} else {
 			var reads sync.WaitGroup
-			reads.Add(6)
+			reads.Add(5)
 			go func() { defer reads.Done(); profile, profileErr = s.latestChains(symbol, 45) }()
-			go func() { defer reads.Done(); chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration) }()
 			go func() { defer reads.Done(); quote, quoteFound, quoteErr = s.store.LatestQuote(symbol) }()
 			go func() { defer reads.Done(); history, historyErr = s.store.LatestHistory(symbol, 3000) }()
 			go func() { defer reads.Done(); extremes, extremesErr = s.store.LatestPayload("price_extremes", symbol) }()
@@ -3731,6 +3761,7 @@ func (s *Service) levels(c *gin.Context) {
 			return
 		}
 		allRows, _ := profile["data"].([]model.OptionRow)
+		chain, chainFound, chainErr := s.levelsSelectedChain(symbol, expiration, profile)
 		if chainErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"detail": chainErr.Error()})
 			return
@@ -3739,7 +3770,7 @@ func (s *Service) levels(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"detail": quoteErr.Error()})
 			return
 		}
-		if chainFound && !containsExpiration(profile["expirations"], expiration) && len(activeExpirations([]string{expiration})) > 0 {
+		if chainFound {
 			allRows = append(append([]model.OptionRow(nil), allRows...), chain.Data...)
 		}
 		if !quoteFound {
@@ -3898,9 +3929,6 @@ func (s *Service) levels(c *gin.Context) {
 	}
 	var profile map[string]any
 	var profileErr error
-	var chain model.ChainResponse
-	var chainFound bool
-	var chainErr error
 	var quote model.Quote
 	var quoteFound bool
 	var quoteErr error
@@ -3913,26 +3941,26 @@ func (s *Service) levels(c *gin.Context) {
 	// SQLite here and let the symbol analytics prefetch refresh missing inputs.
 	var readStarted = time.Now()
 	var inputs sync.WaitGroup
-	inputs.Add(4)
+	inputs.Add(3)
 	go func() { defer inputs.Done(); profile, profileErr = s.latestChains(symbol, 45) }()
-	go func() { defer inputs.Done(); chain, chainFound, chainErr = s.store.LatestChain(symbol, expiration) }()
 	go func() { defer inputs.Done(); quote, quoteFound, quoteErr = s.store.LatestQuote(symbol) }()
 	go func() {
 		defer inputs.Done()
 		history, historyErr = s.store.LatestHistory(symbol, 3000)
 	}()
 	inputs.Wait()
-	inputReadDuration := time.Since(readStarted)
 	if profileErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": profileErr.Error()})
 		return
 	}
 	rows, _ := profile["data"].([]model.OptionRow)
+	chain, chainFound, chainErr := s.levelsSelectedChain(symbol, expiration, profile)
+	inputReadDuration := time.Since(readStarted)
 	if chainErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": chainErr.Error()})
 		return
 	}
-	if chainFound && !containsExpiration(profile["expirations"], expiration) && len(activeExpirations([]string{expiration})) > 0 {
+	if chainFound {
 		rows = append(append([]model.OptionRow(nil), rows...), chain.Data...)
 	}
 	if quoteErr != nil {
@@ -4142,6 +4170,13 @@ func levelsAnalysisCacheKey(symbol, expiration string, bars []map[string]any, ro
 	return levelsAnalysisCacheVersion + ":" + hex.EncodeToString(digest[:])
 }
 
+func (s *Service) levelsSelectedChain(symbol, expiration string, profile map[string]any) (model.ChainResponse, bool, error) {
+	if expiration == "" || containsExpiration(profile["expirations"], expiration) || len(activeExpirations([]string{expiration})) == 0 {
+		return model.ChainResponse{}, false, nil
+	}
+	return s.store.LatestChain(symbol, expiration)
+}
+
 func levelsOptionsTimestamp(profile map[string]any, selected model.ChainResponse, expiration string) any {
 	// Match Python's selected_chain path: only an active selected expiration
 	// outside the profile contributes a second committed SQLite batch timestamp.
@@ -4301,9 +4336,16 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 	}
 	result := map[string]any{"today_open": nil, "previous_open": nil, "previous_close": quote.PreviousClose,
 		"today_open_date": nil, "previous_open_date": nil, "previous_close_date": nil, "market_state": marketStateValue}
-	ordered := make([]map[string]any, 0, len(bars))
-	for _, bar := range bars {
-		if bar == nil || !validTrendBarDate(trendBarDate(bar)) {
+	type trendBar struct {
+		date        string
+		open, close any
+	}
+	var latest, previous, third trendBar
+	// 逆向读取保留稳定排序的同日优先级，只跟踪会用于会话对齐的三根日线。
+	for i := len(bars) - 1; i >= 0; i-- {
+		bar := bars[i]
+		date := trendBarDate(bar)
+		if date > today || date <= third.date || !validTrendBarDate(date) {
 			continue
 		}
 		open, openOK := trendBarValue(bar["open"])
@@ -4311,44 +4353,35 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 		if !openOK || !closeOK {
 			continue
 		}
-		ordered = append(ordered, map[string]any{"date": trendBarDate(bar), "open": open, "close": close})
-	}
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return trendBarDate(ordered[i]) < trendBarDate(ordered[j])
-	})
-	if len(ordered) > 0 && trendBarDate(ordered[len(ordered)-1]) > today {
-		aligned := ordered[:0]
-		for _, bar := range ordered {
-			if trendBarDate(bar) <= today {
-				aligned = append(aligned, bar)
-			}
+		candidate := trendBar{date: date, open: open, close: close}
+		switch {
+		case date > latest.date:
+			latest, previous, third = candidate, latest, previous
+		case date > previous.date:
+			previous, third = candidate, previous
+		default:
+			third = candidate
 		}
-		ordered = aligned
 	}
 	// A daily bar for the current calendar date may already exist in SQLite
 	// from a later fetch even when this quote snapshot was captured premarket.
 	// It is not a completed session yet, so exclude it when finding the last
 	// completed day's open and close.
-	if marketState == "PRE" && len(ordered) > 0 && trendBarDate(ordered[len(ordered)-1]) == today {
-		ordered = ordered[:len(ordered)-1]
+	if marketState == "PRE" && latest.date == today {
+		latest, previous = previous, third
 	}
-	var latest, previous map[string]any
-	if len(ordered) > 0 {
-		latest = ordered[len(ordered)-1]
-		if len(ordered) > 1 {
-			previous = ordered[len(ordered)-2]
-		}
-		result["today_open"], result["today_open_date"] = latest["open"], latest["date"]
-		result["previous_close"], result["previous_close_date"] = latest["close"], latest["date"]
-		result["previous_open"], result["previous_open_date"] = latest["open"], latest["date"]
+	if latest.date != "" {
+		result["today_open"], result["today_open_date"] = latest.open, latest.date
+		result["previous_close"], result["previous_close_date"] = latest.close, latest.date
+		result["previous_open"], result["previous_open_date"] = latest.open, latest.date
 	}
 
-	latestDate := trendBarDate(latest)
+	latestDate := latest.date
 	latestIsToday := latestDate == today && (marketState == "REGULAR" || marketState == "CLOSED")
 	if latestIsToday {
-		if previous != nil {
-			result["previous_close"], result["previous_close_date"] = previous["close"], previous["date"]
-			result["previous_open"], result["previous_open_date"] = previous["open"], previous["date"]
+		if previous.date != "" {
+			result["previous_close"], result["previous_close_date"] = previous.close, previous.date
+			result["previous_open"], result["previous_open_date"] = previous.open, previous.date
 		} else {
 			result["previous_close"], result["previous_close_date"] = quote.PreviousClose, nil
 			result["previous_open"], result["previous_open_date"] = nil, nil
@@ -4358,12 +4391,12 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 	// before the most recent completed session in the "previous session" fields.
 	// If history is already missing that latest session, keep its actual latest
 	// bar instead of skipping a second bar.
-	if marketState == "CLOSED" && previous != nil {
+	if marketState == "CLOSED" && previous.date != "" {
 		if currentDate, err := time.ParseInLocation(time.DateOnly, today, location); err == nil {
 			// 只有当前日期本身是交易日且最新 K 线就是当天时，收盘后才退回前一根。
 			if marketcalendar.IsTradingDay(currentDate) && latestDate == currentDate.Format(time.DateOnly) {
-				result["previous_close"], result["previous_close_date"] = previous["close"], previous["date"]
-				result["previous_open"], result["previous_open_date"] = previous["open"], previous["date"]
+				result["previous_close"], result["previous_close_date"] = previous.close, previous.date
+				result["previous_open"], result["previous_open_date"] = previous.open, previous.date
 			}
 		}
 	}
@@ -4392,12 +4425,12 @@ func trendMarketAt(bars []map[string]any, quote model.Quote, today string) map[s
 	quoteOpen := positiveNumeric(quote.TodayOpen)
 	if quoteOpen != nil && (marketState == "REGULAR" || marketState == "POST" || marketState == "OVERNIGHT") {
 		previousOpen := numericValue(nil)
-		if previous != nil {
-			previousOpen = numericValue(previous["open"])
+		if previous.date != "" {
+			previousOpen = numericValue(previous.open)
 		}
 		latestOpen := numericValue(nil)
-		if latest != nil {
-			latestOpen = numericValue(latest["open"])
+		if latest.date != "" {
+			latestOpen = numericValue(latest.open)
 		}
 		dailyMissingToday := latestDate != today
 		dailyOpenCopied := false

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,12 +13,145 @@ import (
 	chananalysis "option-scope-go/internal/chan"
 	"option-scope-go/internal/model"
 	"option-scope-go/internal/provider"
+	"option-scope-go/internal/store"
 )
 
 type earlyIntradayProvider struct {
 	*testMarketProvider
 	started, release chan struct{}
 	calls            atomic.Int32
+}
+
+func TestChanAdjustedHistoryReloadsWhenCacheStampAdvances(t *testing.T) {
+	service, _ := testService(t, "")
+	service.provider = &testMarketProvider{}
+	write := func(price float64, at time.Time) {
+		t.Helper()
+		row := map[string]any{"date": "2026-10-23", "adjustment_factor": 1.0, "volume": 2000.0, "raw_volume": 2000.0}
+		for _, field := range []string{"open", "high", "low", "close", "raw_open", "raw_high", "raw_low", "raw_close"} {
+			row[field] = price
+		}
+		if err := service.store.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", []map[string]any{row}, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertPrice := func(want float64) {
+		t.Helper()
+		entry, _, _, _ := service.chanAdjustedHistory("QQQ")
+		if got, ok := historyMapNumber(entry.bars[0], "close"); !ok || got != want {
+			t.Fatalf("close=%v, want %v", got, want)
+		}
+	}
+	at := time.Now().Add(-time.Hour)
+	write(100, at)
+	assertPrice(100)
+	assertPrice(100)
+	write(105, at.Add(time.Minute))
+	assertPrice(105)
+}
+
+func TestChanAdjustedCanOmitRevisionsWithoutChangingFramesOrAudit(t *testing.T) {
+	service, ts := testService(t, "")
+	service.provider = &testMarketProvider{}
+	fetchedAt := time.Now().UTC()
+	bars := []map[string]any{{
+		"date": "2026-10-16", "open": 49.0, "high": 53.0, "low": 48.0, "close": 52.0, "volume": 1000.0,
+		"raw_open": 98.0, "raw_high": 106.0, "raw_low": 96.0, "raw_close": 104.0, "raw_volume": 1000.0, "adjustment_factor": 0.5,
+	}}
+	if err := service.store.WriteChanAdjustedHistory("QQQ", "1d", "split_dividend_auto", "go-yfinance", bars, fetchedAt); err != nil {
+		t.Fatal(err)
+	}
+	for _, period := range []string{"1d", "1wk"} {
+		if _, err := service.store.RecordChanStructureSnapshot(store.ChanStructureSnapshot{
+			Symbol: "QQQ", Timeframe: period, RuleVersion: chananalysis.RecursivePreviewVersion, InputFingerprint: "old-input",
+			BarFingerprints:     map[string]string{"2026-10-16": "old-bar"},
+			ConfirmedStructures: map[string]json.RawMessage{"segment|level=0|direction=up|start=2026-10-15|end=2026-10-16": json.RawMessage(`{"confirmed":true}`)},
+			UpdatedAt:           fetchedAt,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type frames struct {
+		Daily  map[string]json.RawMessage `json:"daily"`
+		Weekly map[string]json.RawMessage `json:"weekly"`
+	}
+	get := func(query string, wantStatus int) frames {
+		t.Helper()
+		response, err := http.Get(ts.URL + "/api/chan/QQQ/adjusted?spot=110&compact=true" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != wantStatus {
+			t.Fatalf("%q 返回 %d，期望 %d", query, response.StatusCode, wantStatus)
+		}
+		var payload frames
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	const revisionsField = "structure_revisions_v4"
+	chart := get("&include_revisions=false", http.StatusOK)
+	if chart.Daily[revisionsField] != nil || chart.Weekly[revisionsField] != nil {
+		t.Fatal("图表响应仍携带修订历史")
+	}
+	service.backgroundWG.Wait()
+	for _, period := range []string{"1d", "1wk"} {
+		revisions, err := service.store.LatestChanStructureRevisions("QQQ", period, 20)
+		if err != nil || len(revisions) != 1 {
+			t.Fatalf("图表请求生成的 %s 审计记录 = %d 条，错误为 %v", period, len(revisions), err)
+		}
+	}
+
+	for _, query := range []string{"", "&include_revisions=true"} {
+		withAudit := get(query, http.StatusOK)
+		for _, frame := range []map[string]json.RawMessage{withAudit.Daily, withAudit.Weekly} {
+			var revisions []store.ChanStructureRevisionPayload
+			var changes []store.ChanStructureChange
+			if err := json.Unmarshal(frame[revisionsField], &revisions); err != nil || len(revisions) != 1 {
+				t.Fatalf("%q 未返回已存储的修订明细：%s", query, frame[revisionsField])
+			}
+			if err := json.Unmarshal(revisions[0].ChangedConfirmedItems, &changes); err != nil || len(changes) != 1 ||
+				string(changes[0].Before) != `{"confirmed":true}` || changes[0].After != nil {
+				t.Fatalf("%q 已确认结构的修订差异错误：%s", query, revisions[0].ChangedConfirmedItems)
+			}
+			delete(frame, revisionsField)
+		}
+		if !reflect.DeepEqual(chart, withAudit) {
+			t.Fatalf("%q 的日线或周线图表字段与精简响应不同", query)
+		}
+	}
+	if !reflect.DeepEqual(chart, get("&include_revisions=false", http.StatusOK)) {
+		t.Fatal("完整请求污染了后续图表响应")
+	}
+	get("&include_revisions=invalid", http.StatusUnprocessableEntity)
+
+	service.backgroundWG.Wait()
+	service.chanAnalysisMu.Lock()
+	cacheKeys := make([]string, 0, len(service.chanAnalysisCache))
+	for cacheKey := range service.chanAnalysisCache {
+		cacheKeys = append(cacheKeys, cacheKey)
+	}
+	service.chanAnalysisMu.Unlock()
+	if len(cacheKeys) == 0 {
+		t.Fatal("请求未生成分析缓存")
+	}
+	for _, cacheKey := range cacheKeys {
+		payload, ok, err := service.store.GetChanAnalysisCache(cacheKey)
+		if err != nil || !ok {
+			t.Fatalf("持久化分析缓存不可用：%v", err)
+		}
+		var cached frames
+		if err := json.Unmarshal(payload, &cached); err != nil {
+			t.Fatal(err)
+		}
+		if cached.Daily[revisionsField] != nil || cached.Weekly[revisionsField] != nil {
+			t.Fatal("持久化分析缓存保存了审计副本")
+		}
+	}
 }
 
 func (p *earlyIntradayProvider) IntradayHistory(ctx context.Context, symbol, period string) (provider.HistoryResult, error) {

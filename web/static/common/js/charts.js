@@ -1485,25 +1485,23 @@ function drawChanCanvas(target, binding) {
     }
     context.restore();
   }
-  if (model.layers?.trendlines === true && model.trendlines) {
+  if (model.layers?.trendlines === true && model.trendlines?.length) {
     context.save();
     context.beginPath();
     context.rect(model.plotLeft, model.plotTop, model.historyRight - model.plotLeft, model.plotBottom - model.plotTop);
     context.clip();
-    context.globalAlpha = 0.82;
-    for (const trendline of model.trendlines || []) {
+    for (const trendline of model.trendlines) {
       const color = trendline.side === "support" ? colors.up : colors.down;
-      const width = model.mobileChart ? 1.8 : 1.35;
+      const width = (trendline.primary ? 1.65 : 1.15) + (model.mobileChart ? 0.35 : 0);
+      context.globalAlpha = trendline.primary ? 0.9 : 0.62;
       if (trendline.solid) line(trendline.solid.x1, trendline.solid.y1, trendline.solid.x2, trendline.solid.y2, color, [], width);
-      if (trendline.extension) line(trendline.extension.x1, trendline.extension.y1, trendline.extension.x2, trendline.extension.y2, color, [4, 4], width);
-      // 端点采用很小的圆点，强化结构锚点但不遮盖 K 线实体。
-      for (const point of trendline.solid ? [
-        { x: trendline.solid.x1, y: trendline.solid.y1 },
-        { x: trendline.solid.x2, y: trendline.solid.y2 },
-      ] : []) {
+      // 裁剪边缘没有锚点，仅标记原始高低点。
+      for (const point of trendline.anchors) {
         context.beginPath(); context.fillStyle = color;
-        context.arc(point.x, point.y, model.mobileChart ? 2.4 : 1.8, 0, Math.PI * 2); context.fill();
+        context.arc(point.x, point.y, width + 0.2, 0, Math.PI * 2); context.fill();
       }
+      context.globalAlpha *= 0.75;
+      if (trendline.extension) line(trendline.extension.x1, trendline.extension.y1, trendline.extension.x2, trendline.extension.y2, color, [4, 4], width);
     }
     context.restore();
   }

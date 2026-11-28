@@ -8,6 +8,10 @@ import (
 // 比较同一中枢之前的进入段与其后的离开段，补齐盘整背驰路径。
 // 高层中枢的组成索引属于下一级输入，只在笔和基础线段层使用此索引关系。
 func buildCenterEntryExitSignals(frame Frame, levels []LevelAnalysis, strengths []Strength, divergenceRatio float64) []V4Signal {
+	return buildCenterEntryExitSignalsAtPivot(frame, levels, strengths, divergenceRatio, "")
+}
+
+func buildCenterEntryExitSignalsAtPivot(frame Frame, levels []LevelAnalysis, strengths []Strength, divergenceRatio float64, pivotDate string) []V4Signal {
 	result := []V4Signal{}
 	for _, level := range levels {
 		if level.Level != 0 {
@@ -25,12 +29,16 @@ func buildCenterEntryExitSignals(frame Frame, levels []LevelAnalysis, strengths 
 			entryCrosses := entry.Direction == "up" && priceLess(entry.StartPrice, center.Lower) && priceGreater(entry.EndPrice, center.Upper) ||
 				entry.Direction == "down" && priceGreater(entry.StartPrice, center.Upper) && priceLess(entry.EndPrice, center.Lower)
 			left := findSegmentStrength(strengths, entry, signalSourceKind(level))
-			if !entryCrosses || left == nil || !left.WarmupComplete || left.MACDArea <= 0 {
+			if !entryCrosses || left == nil || !left.WarmupComplete || left.MACDArea <= 0 || !chanSegmentRangeIsContiguous(level.Segments, entryIndex, center.StartSegment+2) {
 				continue
 			}
 			for currentIndex := center.StartSegment + 3; currentIndex < len(level.Segments); currentIndex++ {
 				current := level.Segments[currentIndex]
-				if current.Direction != entry.Direction || current.TrendKind != entry.TrendKind || current.Level != level.Level || !chanSegmentRangeIsContiguous(level.Segments, entryIndex, currentIndex) || !segmentMovesAway(current, &center) {
+				// 从同一个进入段出发，首次断链后的离开段也无法与进入段衔接。
+				if !chanSegmentsAreContiguous(level.Segments[currentIndex-1], current) {
+					break
+				}
+				if current.Direction != entry.Direction || current.TrendKind != entry.TrendKind || current.Level != level.Level || !segmentMovesAway(current, &center) {
 					continue
 				}
 				newExtreme := current.Direction == "up" && priceGreater(current.EndPrice, entry.EndPrice) || current.Direction == "down" && priceLess(current.EndPrice, entry.EndPrice)
@@ -40,6 +48,9 @@ func buildCenterEntryExitSignals(frame Frame, levels []LevelAnalysis, strengths 
 				}
 				if centerSupersededAt(level.Centers, centerIndex, currentIndex, observedAt) {
 					break
+				}
+				if pivotDate != "" && current.End != pivotDate {
+					continue
 				}
 				ready := true
 				for index := center.StartSegment; index < currentIndex; index++ {

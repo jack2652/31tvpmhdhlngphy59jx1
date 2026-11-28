@@ -483,7 +483,10 @@ func buildStrengths(bars []Bar, levels []LevelAnalysis) []Strength {
 }
 
 func buildStrengthsFromMACD(bars []Bar, levels []LevelAnalysis, macd []MACDPoint) []Strength {
-	result := []Strength{}
+	return appendStrengthsFromMACD([]Strength{}, bars, levels, macd)
+}
+
+func appendStrengthsFromMACD(result []Strength, bars []Bar, levels []LevelAnalysis, macd []MACDPoint) []Strength {
 	for _, level := range levels {
 		for _, segment := range level.Segments {
 			if !segment.Confirmed {
@@ -607,43 +610,55 @@ func buildV4Signals(frame Frame, levels []LevelAnalysis, strengths []Strength) [
 }
 
 func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, strengths []Strength, divergenceRatio float64) []V4Signal {
+	return buildV4SignalsAtPivot(frame, levels, strengths, divergenceRatio, "")
+}
+
+// 提前风险只读取指定端点的一类点。保留同端点的去重优先级，省去二、三类点的派生。
+func buildV4SignalsAtPivot(frame Frame, levels []LevelAnalysis, strengths []Strength, divergenceRatio float64, pivotDate string) []V4Signal {
 	result := []V4Signal{}
 	if len(levels) == 0 || math.IsNaN(divergenceRatio) || math.IsInf(divergenceRatio, 0) || divergenceRatio <= 0 || divergenceRatio >= 1 {
 		return result
 	}
-	byLevel := make(map[int][]Strength)
-	for _, strength := range strengths {
-		byLevel[strength.Level] = append(byLevel[strength.Level], strength)
+	var byLevel map[int][]Strength
+	if len(levels) > 1 {
+		byLevel = make(map[int][]Strength)
+		for _, strength := range strengths {
+			byLevel[strength.Level] = append(byLevel[strength.Level], strength)
+		}
 	}
 	for _, level := range levels {
 		if len(level.Centers) == 0 {
 			continue
 		}
-		centers := []RecursiveCenter{}
-		for _, center := range level.Centers {
-			if !center.Forming {
-				centers = append(centers, center)
-			}
-		}
-		if len(centers) == 0 {
-			continue
+		levelStrengths := strengths
+		if byLevel != nil {
+			levelStrengths = byLevel[level.Level]
 		}
 		// Compare two pushes in the same direction with the intervening
 		// counter-swing as a retest. Adjacent segments normally alternate, so
 		// comparing index-1 with index would make divergence unreachable.
-		for index := 2; index < len(level.Segments); index++ {
+		contiguousFrom := 0
+		for index := 1; index < len(level.Segments); index++ {
+			if !chanSegmentsAreContiguous(level.Segments[index-1], level.Segments[index]) {
+				contiguousFrom = index
+			}
+			if index < 2 || contiguousFrom > index-2 || pivotDate != "" && level.Segments[index].End != pivotDate {
+				continue
+			}
 			current, retest, previous := level.Segments[index], level.Segments[index-1], level.Segments[index-2]
-			if !current.Confirmed || !retest.Confirmed || !previous.Confirmed || current.Level != level.Level || retest.Level != level.Level || previous.Level != level.Level || current.Direction != previous.Direction || current.TrendKind != previous.TrendKind || retest.Direction == current.Direction || !chanSegmentRangeIsContiguous(level.Segments, index-2, index) {
+			if !current.Confirmed || !retest.Confirmed || !previous.Confirmed || current.Level != level.Level || retest.Level != level.Level || previous.Level != level.Level || current.Direction != previous.Direction || current.TrendKind != previous.TrendKind || retest.Direction == current.Direction {
 				continue
 			}
 			var center *RecursiveCenter
-			for i := range centers {
+			for i := len(level.Centers) - 1; i >= 0; i-- {
 				// The center must have been closed no later than the first push,
 				// and both compared pushes must occur after its final overlapping
 				// segment. The center-closing segment may itself be that first push.
-				ownerIndex := centerOwnerMoveIndex(centers[i])
-				if centers[i].Chain == current.Chain && centers[i].ConfirmedAt != "" && centers[i].ConfirmedAt <= previous.ConfirmedAt && ownerIndex <= index-2 && chanSegmentRangeIsContiguous(level.Segments, ownerIndex, index-2) {
-					center = &centers[i]
+				candidate := &level.Centers[i]
+				ownerIndex := centerOwnerMoveIndex(*candidate)
+				if !candidate.Forming && candidate.Chain == current.Chain && candidate.ConfirmedAt != "" && candidate.ConfirmedAt <= previous.ConfirmedAt && ownerIndex >= contiguousFrom && ownerIndex <= index-2 {
+					center = candidate
+					break
 				}
 			}
 			if center == nil {
@@ -658,7 +673,7 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 			if !previousMove || !currentMove || (!retestStayedOutside && !retestEnteredWithoutCrossing) {
 				continue
 			}
-			leftStrength, rightStrength := findSegmentStrength(byLevel[level.Level], previous, signalSourceKind(level)), findSegmentStrength(byLevel[level.Level], current, signalSourceKind(level))
+			leftStrength, rightStrength := findSegmentStrength(levelStrengths, previous, signalSourceKind(level)), findSegmentStrength(levelStrengths, current, signalSourceKind(level))
 			if leftStrength == nil || rightStrength == nil || !leftStrength.WarmupComplete || !rightStrength.WarmupComplete || leftStrength.MACDArea <= 0 || rightStrength.MACDArea <= 0 {
 				continue
 			}
@@ -739,7 +754,7 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 			result = append(result, V4Signal{Symbol: "", Level: level.Level, SourceKind: sourceKind, Kind: kind, Side: side, Status: status, Phase: phase, PhaseAt: phaseAt, PhaseHistory: phaseHistory, RuleVersion: RecursivePreviewVersion, Date: current.End, ObservedAt: observedAt, ConfirmedAt: confirmedAt, StructureRefs: []int{index - 2, index - 1, index}, StructureIDs: structureIDs, RelatedCenterID: center.CenterID, Conditions: conditions, Missing: missing, Invalidation: ptr(current.EndPrice), StrengthRatio: &ratioCopy, Price: &price, MarketFilter: "unfiltered", LowerLevelStatus: levelStatus, Detail: fmt.Sprintf("同级 %s 走势段价格创新极值而 MACD 力度减弱；失效边界 %.4f；大盘过滤状态未提供", current.Direction, current.EndPrice)})
 		}
 	}
-	result = append(result, buildCenterEntryExitSignals(frame, levels, strengths, divergenceRatio)...)
+	result = append(result, buildCenterEntryExitSignalsAtPivot(frame, levels, strengths, divergenceRatio, pivotDate)...)
 	// De-duplicate candidates by kind, level, and structural endpoint.
 	seen := make(map[string]bool)
 	filtered := result[:0]
@@ -752,7 +767,10 @@ func buildV4SignalsWithDivergenceRatio(frame Frame, levels []LevelAnalysis, stre
 		signal.SignalID = fmt.Sprintf("%s|%s|L%d|%s|%s", RecursivePreviewVersion, signal.SourceKind, signal.Level, signal.Kind, signal.Date)
 		filtered = append(filtered, signal)
 	}
-	combined := append(filtered, buildClass23Signals(frame, filtered, levels)...)
+	combined := filtered
+	if pivotDate == "" {
+		combined = append(combined, buildClass23Signals(frame, filtered, levels)...)
+	}
 	sort.SliceStable(combined, func(i, j int) bool {
 		if combined[i].Date != combined[j].Date {
 			return combined[i].Date < combined[j].Date

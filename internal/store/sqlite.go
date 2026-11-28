@@ -1200,21 +1200,12 @@ func (s *SQLite) LatestChains(symbol string, horizonDays int) (map[string]any, e
 	query := `SELECT current.contract_symbol, current.expiration, current.contract_type,
  current.strike, current.last_price, current.bid, current.ask, current.volume,
  current.open_interest, current.implied_volatility, current.gamma, current.in_the_money,
- current.change_percent, current.provider, current.fetched_at,
- (SELECT previous.open_interest FROM option_snapshots previous
-   WHERE previous.symbol=current.symbol AND previous.expiration=current.expiration
-     AND previous.contract_symbol=current.contract_symbol AND previous.open_interest > 0
-     AND previous.fetched_at < current.fetched_at
-   ORDER BY previous.fetched_at DESC LIMIT 1) AS fallback_oi,
- (SELECT previous.fetched_at FROM option_snapshots previous
-   WHERE previous.symbol=current.symbol AND previous.expiration=current.expiration
-     AND previous.contract_symbol=current.contract_symbol AND previous.open_interest > 0
-     AND previous.fetched_at < current.fetched_at
-   ORDER BY previous.fetched_at DESC LIMIT 1) AS fallback_at
+ current.change_percent, current.provider, current.fetched_at, previous.open_interest, previous.fetched_at
 FROM option_latest_batches latest
 JOIN option_snapshots current
   ON current.symbol=latest.symbol AND current.expiration=latest.expiration
  AND current.fetched_at=latest.fetched_at
+` + optionOIFallbackJoin + `
 WHERE latest.symbol=? AND latest.expiration BETWEEN ? AND ?
 ORDER BY current.expiration, current.strike, current.contract_type`
 	rows, err := s.db.Query(query, symbol, today, end)
@@ -1228,15 +1219,15 @@ ORDER BY current.expiration, current.strike, current.contract_type`
 	var latestFetched string
 	restored := 0
 	var fallbackAsOf string
+	var contract, expiration, side string
+	var fetched, fallbackAt, providerName sql.NullString
+	var strike, last, bid, ask, iv, gamma, change, fallbackOI sql.NullFloat64
+	var volume, oi, itm sql.NullInt64
 	for rows.Next() {
-		var row model.OptionRow
-		var fetched, fallbackAt, providerName sql.NullString
-		var strike, last, bid, ask, iv, gamma, change, fallbackOI sql.NullFloat64
-		var volume, oi sql.NullInt64
-		var itm sql.NullInt64
-		if err := rows.Scan(&row.ContractSymbol, &row.Expiration, &row.ContractType, &strike, &last, &bid, &ask, &volume, &oi, &iv, &gamma, &itm, &change, &providerName, &fetched, &fallbackOI, &fallbackAt); err != nil {
+		if err := rows.Scan(&contract, &expiration, &side, &strike, &last, &bid, &ask, &volume, &oi, &iv, &gamma, &itm, &change, &providerName, &fetched, &fallbackOI, &fallbackAt); err != nil {
 			return nil, err
 		}
+		row := model.OptionRow{ContractSymbol: contract, Expiration: expiration, ContractType: side}
 		row.Strike, row.LastPrice, row.Bid, row.Ask = nullableFloat(strike), nullableFloat(last), nullableFloat(bid), nullableFloat(ask)
 		row.Volume, row.OpenInterest = nullableInt(volume), nullableInt(oi)
 		row.ImpliedVolatility, row.Gamma, row.ChangePercent = nullableFloat(iv), nullableFloat(gamma), nullableFloat(change)
@@ -1284,6 +1275,16 @@ func nilIfEmpty(value string) any {
 	return value
 }
 
+// 只在当前持仓缺失或非正时查询历史，并从同一行读取回补值和时间。
+const optionOIFallbackJoin = `LEFT JOIN option_snapshots previous ON previous.id = CASE
+ WHEN current.open_interest IS NULL OR current.open_interest <= 0 THEN (
+  SELECT fallback.id FROM option_snapshots fallback
+  WHERE fallback.symbol=current.symbol AND fallback.expiration=current.expiration
+    AND fallback.contract_symbol=current.contract_symbol AND fallback.open_interest > 0
+    AND fallback.fetched_at < current.fetched_at
+  ORDER BY fallback.fetched_at DESC LIMIT 1
+ ) END`
+
 func (s *SQLite) LatestChainBatchTime(symbol, expiration string) (*time.Time, bool, error) {
 	var fetched string
 	err := s.db.QueryRow(`SELECT fetched_at FROM option_latest_batches WHERE symbol=? AND expiration=?`, symbol, expiration).Scan(&fetched)
@@ -1311,17 +1312,10 @@ func (s *SQLite) LatestChain(symbol, expiration string) (model.ChainResponse, bo
 	}
 	rows, err := s.db.Query(`SELECT current.contract_symbol, current.contract_type, current.strike, current.last_price, current.bid, current.ask, current.volume,
  current.open_interest, current.implied_volatility, current.gamma, current.in_the_money, current.change_percent, current.provider,
- (SELECT previous.open_interest FROM option_snapshots previous
-   WHERE previous.symbol=current.symbol AND previous.expiration=current.expiration
-     AND previous.contract_symbol=current.contract_symbol AND previous.open_interest > 0
-     AND previous.fetched_at < current.fetched_at
-   ORDER BY previous.fetched_at DESC LIMIT 1) AS fallback_oi,
- (SELECT previous.fetched_at FROM option_snapshots previous
-   WHERE previous.symbol=current.symbol AND previous.expiration=current.expiration
-     AND previous.contract_symbol=current.contract_symbol AND previous.open_interest > 0
-     AND previous.fetched_at < current.fetched_at
-   ORDER BY previous.fetched_at DESC LIMIT 1) AS fallback_at
-FROM option_snapshots current WHERE current.symbol=? AND current.expiration=? AND current.fetched_at=? ORDER BY current.strike, current.contract_type`, symbol, expiration, fetched)
+ previous.open_interest, previous.fetched_at
+FROM option_snapshots current
+`+optionOIFallbackJoin+`
+WHERE current.symbol=? AND current.expiration=? AND current.fetched_at=? ORDER BY current.strike, current.contract_type`, symbol, expiration, fetched)
 	if err != nil {
 		return model.ChainResponse{}, false, err
 	}
@@ -1329,16 +1323,16 @@ FROM option_snapshots current WHERE current.symbol=? AND current.expiration=? AN
 	data := []model.OptionRow{}
 	restoredOI := 0
 	fallbackAsOf := ""
+	var contract, side string
+	var strike, last, bid, ask, iv, gamma, change, fallbackOI sql.NullFloat64
+	var volume, oi, itm sql.NullInt64
+	var providerName, fallbackAt sql.NullString
 	for rows.Next() {
-		var row model.OptionRow
-		var strike, last, bid, ask, iv, gamma, change, fallbackOI sql.NullFloat64
-		var volume, oi sql.NullInt64
-		var providerName, fallbackAt sql.NullString
-		var itm sql.NullInt64
-		if err := rows.Scan(&row.ContractSymbol, &row.ContractType, &strike, &last, &bid, &ask, &volume, &oi, &iv, &gamma, &itm, &change, &providerName, &fallbackOI, &fallbackAt); err != nil {
+		if err := rows.Scan(&contract, &side, &strike, &last, &bid, &ask, &volume, &oi, &iv, &gamma, &itm, &change, &providerName, &fallbackOI, &fallbackAt); err != nil {
 			return model.ChainResponse{}, false, err
 		}
-		row.Expiration, row.Strike, row.LastPrice, row.Bid, row.Ask = expiration, nullableFloat(strike), nullableFloat(last), nullableFloat(bid), nullableFloat(ask)
+		row := model.OptionRow{ContractSymbol: contract, Expiration: expiration, ContractType: side}
+		row.Strike, row.LastPrice, row.Bid, row.Ask = nullableFloat(strike), nullableFloat(last), nullableFloat(bid), nullableFloat(ask)
 		row.Provider = providerName.String
 		row.Volume, row.OpenInterest, row.ImpliedVolatility, row.Gamma, row.ChangePercent = nullableInt(volume), nullableInt(oi), nullableFloat(iv), nullableFloat(gamma), nullableFloat(change)
 		row.InTheMoney = itm.Valid && itm.Int64 != 0
@@ -1500,19 +1494,21 @@ FROM chan_adjusted_history WHERE symbol=? AND timeframe=? AND adjustment_type=? 
 	defer rows.Close()
 	bars := []map[string]any{}
 	latestFetched := ""
+	var day, fetched string
+	fields := [...]string{"open", "high", "low", "close", "volume", "raw_open", "raw_high", "raw_low", "raw_close", "raw_volume", "adjustment_factor"}
+	var values [len(fields)]sql.NullFloat64
+	var args [len(fields) + 2]any
+	args[0], args[len(args)-1] = &day, &fetched
+	for index := range values {
+		args[index+1] = &values[index]
+	}
 	for rows.Next() {
-		var day, fetched string
-		values := make([]sql.NullFloat64, 11)
-		args := []any{&day}
-		for index := range values {
-			args = append(args, &values[index])
-		}
-		args = append(args, &fetched)
-		if err := rows.Scan(args...); err != nil {
+		if err := rows.Scan(args[:]...); err != nil {
 			return nil, err
 		}
-		bar := map[string]any{"date": day}
-		for index, field := range []string{"open", "high", "low", "close", "volume", "raw_open", "raw_high", "raw_low", "raw_close", "raw_volume", "adjustment_factor"} {
+		bar := make(map[string]any, len(args))
+		bar["date"] = day
+		for index, field := range fields {
 			bar[field] = nullableFloat(values[index])
 		}
 		bar["fetched_at"] = fetched
@@ -1525,6 +1521,19 @@ FROM chan_adjusted_history WHERE symbol=? AND timeframe=? AND adjustment_type=? 
 		return nil, err
 	}
 	return map[string]any{"symbol": strings.ToUpper(strings.TrimSpace(symbol)), "timeframe": timeframe, "adjustment_type": adjustmentType, "provider": providerName, "bars": bars, "fetched_at": nilIfEmpty(latestFetched), "source": "sqlite"}, nil
+}
+
+// LatestChanAdjustedHistoryStamp 返回指定 K 线窗口的版本，用于避免重新读取未变化的行情。
+func (s *SQLite) LatestChanAdjustedHistoryStamp(symbol, timeframe, adjustmentType, providerName string, limit int) (string, error) {
+	if limit < 1 || limit > 100000 {
+		limit = 1500
+	}
+	var fetched sql.NullString
+	err := s.db.QueryRow(`SELECT MAX(fetched_at) FROM (
+SELECT fetched_at FROM chan_adjusted_history WHERE symbol=? AND timeframe=? AND adjustment_type=? AND provider=?
+ORDER BY bar_date DESC LIMIT ?)`,
+		strings.ToUpper(strings.TrimSpace(symbol)), strings.TrimSpace(timeframe), strings.TrimSpace(adjustmentType), strings.TrimSpace(providerName), limit).Scan(&fetched)
+	return fetched.String, err
 }
 
 // WriteHistory transactionally inserts or replaces daily bars in the shared
@@ -1821,9 +1830,9 @@ func (s *SQLite) latestHistory(symbol string, limit int, includeTimestamps bool)
 	defer rows.Close()
 	bars := []map[string]any{}
 	latestFetched := ""
+	var day, fetched string
+	var open, high, low, close, volume sql.NullFloat64
 	for rows.Next() {
-		var day, fetched string
-		var open, high, low, close, volume sql.NullFloat64
 		if err := rows.Scan(&day, &open, &high, &low, &close, &volume, &fetched); err != nil {
 			return nil, err
 		}

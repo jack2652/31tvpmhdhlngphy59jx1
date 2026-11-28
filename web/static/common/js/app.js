@@ -4220,9 +4220,7 @@ function refreshChanAnalysis(force = false) {
   const symbol = state.symbol;
   if (!symbol) return;
   if (!state.chanExpanded) {
-    // The adjusted response is ~1.5 MiB and only feeds the collapsed chart.
-    // Keep the trend/support cards fresh with the lightweight market endpoint
-    // and fetch the chart structures when the user expands the panel.
+    // 收起图表时只刷新趋势与支撑卡片，展开后再加载完整图表历史。
     state.chanStale = true;
     state.chanLoading = false;
     refreshChanMarketAnalysis(true);
@@ -4242,7 +4240,7 @@ function refreshChanAnalysis(force = false) {
   state.chanRetryTimer = null;
   const currentQuote = state.lastQuote?.symbol === symbol ? state.lastQuote : null;
   const currentSpot = finitePrice(activeSessionQuote(currentQuote)?.price ?? currentQuote?.price);
-  const adjustedParams = new URLSearchParams({ compact: "true" });
+  const adjustedParams = new URLSearchParams({ compact: "true", include_revisions: "false" });
   if (currentSpot != null) adjustedParams.set("spot", currentSpot);
   request(`/api/chan/${encodeURIComponent(symbol)}/adjusted?${adjustedParams}`, { timeout: 60000, retry: false }).then((payload) => {
     if (state.symbol !== symbol || state.chanRequestId !== token || payload?.symbol !== symbol) return;

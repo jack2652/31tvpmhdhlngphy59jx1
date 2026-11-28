@@ -1,6 +1,7 @@
 package chananalysis
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,23 @@ func TestClassOneComparesEntryAndExitAroundSameCenter(t *testing.T) {
 				t.Fatalf("同中枢进入/离开段背驰遗漏：side=%s signals=%+v", side, got)
 			}
 		})
+	}
+}
+
+func TestClassOneAtPivotMatchesFullResult(t *testing.T) {
+	level, strengths := centerEntryExitFixture()
+	frame := Frame{AsOf: "13"}
+	levels := []LevelAnalysis{level}
+	full := buildV4SignalsWithDivergenceRatio(frame, levels, strengths, .8)
+	want := findV4Signal(full, "class1_sell")
+	if want == nil {
+		t.Fatal("测试数据缺少一卖信号")
+	}
+	if got := buildV4SignalsAtPivot(frame, levels, strengths, .8, want.Date); len(got) != 1 || !reflect.DeepEqual(got[0], *want) {
+		t.Fatalf("指定端点的一类点与全量输出不同：%+v", got)
+	}
+	if got := buildV4SignalsAtPivot(frame, levels, strengths, .8, "12"); len(got) != 0 {
+		t.Fatalf("其他端点返回了信号：%+v", got)
 	}
 }
 

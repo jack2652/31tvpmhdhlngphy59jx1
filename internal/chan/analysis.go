@@ -3,6 +3,7 @@ package chananalysis
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -1731,9 +1732,21 @@ func buildStrokes(fractals []Fractal, merged []mergedBar, bars []Bar) ([]Stroke,
 }
 
 func buildStrokesWithHistogram(fractals []Fractal, merged []mergedBar, histogram []float64) ([]Stroke, string) {
-	points := make([]Fractal, 0, len(fractals)+1)
-	confirmed := make([]string, 0, len(fractals))
-	strokes := make([]Stroke, 0, len(fractals))
+	workspace := strokeWorkspace{strokes: []Stroke{}}
+	return workspace.build(fractals, merged, histogram)
+}
+
+type strokeWorkspace struct {
+	points    []Fractal
+	confirmed []string
+	strokes   []Stroke
+}
+
+// 返回的笔由工作区持有，下一次构建会覆盖该切片。
+func (workspace *strokeWorkspace) build(fractals []Fractal, merged []mergedBar, histogram []float64) ([]Stroke, string) {
+	points := slices.Grow(workspace.points[:0], len(fractals)+1)
+	confirmed := slices.Grow(workspace.confirmed[:0], len(fractals))
+	strokes := slices.Grow(workspace.strokes[:0], len(fractals))
 	chain, sourceChain, restartCount := 0, -1, 0
 	restartedAt := ""
 	flush := func(includeForming bool) {
@@ -1814,6 +1827,7 @@ func buildStrokesWithHistogram(fractals []Fractal, merged []mergedBar, histogram
 		points = append(points, fractal)
 	}
 	flush(true)
+	workspace.points, workspace.confirmed, workspace.strokes = points, confirmed, strokes
 	return strokes, restartedAt
 }
 
@@ -1834,7 +1848,10 @@ func macdHistogram(bars []Bar) []float64 {
 }
 
 func buildCenters(strokes []Stroke) []Center {
-	centers := []Center{}
+	return appendCenters([]Center{}, strokes)
+}
+
+func appendCenters(centers []Center, strokes []Stroke) []Center {
 	for i := 0; i+2 < len(strokes); {
 		a, b, c := strokes[i], strokes[i+1], strokes[i+2]
 		if a.Chain != b.Chain || b.Chain != c.Chain || !a.Confirmed || !b.Confirmed || !c.Confirmed {

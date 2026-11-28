@@ -43,9 +43,9 @@ func TestChanAnalysisCacheKeyPreservesJSONFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(encoded)
-	want := "chan-adjusted-v2:" + hex.EncodeToString(digest[:])
+	want := "chan-adjusted-v3:" + hex.EncodeToString(digest[:])
 	if got := chanAnalysisCacheKey("QQQ", daily, intraday, market, cutoff); got != want {
-		t.Fatalf("cache key = %q, want existing JSON fingerprint %q", got, want)
+		t.Fatalf("cache key = %q, want versioned JSON fingerprint %q", got, want)
 	}
 }
 

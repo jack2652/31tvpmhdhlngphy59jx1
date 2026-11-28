@@ -59,15 +59,14 @@ func (s *Service) detectValuationRegime(ctx context.Context, symbol string, fund
 		benchmark = candidate
 	}
 	if benchmark != nil {
-		// These requests share the provider's upstream gate. Run them together
-		// so one slow benchmark cannot consume the full valuation deadline.
+		// 低内存模式逐个获取基准，其他模式在上游并发预算内并行请求。
 		var benchmarkBars [3]provider.HistoryResult
 		var benchmarkErr [3]error
 		benchmarkSymbols := []string{"^GSPC", "^VIX", "^TNX"}
 		fetch := func(index int) {
 			benchmarkBars[index], benchmarkErr[index] = benchmark.BenchmarkHistory(ctx, benchmarkSymbols[index], "6mo")
 		}
-		if s.cfg.UpstreamConcurrency <= 1 {
+		if s.cfg.LowMemory || s.cfg.UpstreamConcurrency <= 1 {
 			for index := range benchmarkSymbols {
 				fetch(index)
 			}

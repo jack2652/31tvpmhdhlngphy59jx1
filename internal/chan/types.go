@@ -404,68 +404,44 @@ type Scenario struct {
 }
 
 type Frame struct {
-	Period             string              `json:"period"`
-	Timeframe          string              `json:"timeframe"`
-	TimeframeMapping   TimeframeMapping    `json:"timeframe_mapping"`
-	Label              string              `json:"label"`
-	Status             string              `json:"status"`
-	BarCount           int                 `json:"bar_count"`
-	MergedCount        int                 `json:"merged_count"`
-	MergedCandles      []MergedCandle      `json:"merged_candles"`
-	AsOf               string              `json:"as_of"`
-	LastClose          *float64            `json:"last_close"`
-	FutureTradingDates []string            `json:"future_trading_dates,omitempty"`
-	Position           Position            `json:"position"`
-	Direction          string              `json:"direction"`
-	Structure          string              `json:"structure"`
-	Candles            []Bar               `json:"candles"`
-	Fractals           []Fractal           `json:"fractals"`
-	Strokes            []Stroke            `json:"strokes"`
-	Centers            []Center            `json:"centers"`
-	Signals            []Signal            `json:"signals"`
-	PenSignals         []Signal            `json:"pen_signals"` // 兼容字段；结构买卖点统一由 SignalsV4 提供。
-	Scenarios          []Scenario          `json:"scenarios"`
-	Warnings           []string            `json:"warnings"`
-	Quality            DataQuality         `json:"quality"`
-	MarketEnvironment  *MarketEnvironment  `json:"market_environment,omitempty"`
-	Level              int                 `json:"level"`
-	Segments           []Segment           `json:"segments"`
-	RecursiveCenters   []RecursiveCenter   `json:"recursive_centers"`
-	RecursiveLevels    []LevelAnalysis     `json:"recursive_levels"`
-	FractalsV4         []Fractal           `json:"fractals_v4"`
-	StrokesV4          []Stroke            `json:"strokes_v4"`
-	Strengths          []Strength          `json:"strengths_v4"`
-	SignalsV4          []V4Signal          `json:"signals_v4"`
-	StructureWarnings  []V4Signal          `json:"structure_warnings_v4"`  // 独立结构预警，不参与严格六类点派生。
-	EarlyRiskWarnings  []V4Signal          `json:"early_risk_warnings_v4"` // 三根K线顶部风险，不能提前确认分型或严格卖点。
-	TrendState         string              `json:"trend_state_v4"`
-	TrendContext       TrendContext        `json:"trend_context_v4"`
-	MACD               []MACDPoint         `json:"macd_v4"`
-	StructureChains    []StructureChain    `json:"structure_chains_v4"`
-	StructureRevisions []StructureRevision `json:"structure_revisions_v4,omitempty"`
-}
-
-type StructureRevision struct {
-	ID                    int64                `json:"id"`
-	RuleVersion           string               `json:"rule_version"`
-	Reason                string               `json:"reason"`
-	PreviousRuleVersion   string               `json:"previous_rule_version"`
-	InputFingerprint      string               `json:"input_fingerprint"`
-	ChangedBars           []StructureBarChange `json:"changed_bars"`
-	ChangedConfirmedItems []StructureChange    `json:"changed_confirmed_structures"`
-	CreatedAt             time.Time            `json:"created_at"`
-}
-
-type StructureBarChange struct {
-	Date           string `json:"date"`
-	OldFingerprint string `json:"old_fingerprint,omitempty"`
-	NewFingerprint string `json:"new_fingerprint,omitempty"`
-}
-
-type StructureChange struct {
-	ID     string `json:"id"`
-	Before any    `json:"before,omitempty"`
-	After  any    `json:"after,omitempty"`
+	Period             string             `json:"period"`
+	Timeframe          string             `json:"timeframe"`
+	TimeframeMapping   TimeframeMapping   `json:"timeframe_mapping"`
+	Label              string             `json:"label"`
+	Status             string             `json:"status"`
+	BarCount           int                `json:"bar_count"`
+	MergedCount        int                `json:"merged_count"`
+	MergedCandles      []MergedCandle     `json:"merged_candles"`
+	AsOf               string             `json:"as_of"`
+	LastClose          *float64           `json:"last_close"`
+	FutureTradingDates []string           `json:"future_trading_dates,omitempty"`
+	Position           Position           `json:"position"`
+	Direction          string             `json:"direction"`
+	Structure          string             `json:"structure"`
+	Candles            []Bar              `json:"candles"`
+	Fractals           []Fractal          `json:"fractals"`
+	Strokes            []Stroke           `json:"strokes"`
+	Centers            []Center           `json:"centers"`
+	Signals            []Signal           `json:"signals"`
+	PenSignals         []Signal           `json:"pen_signals"` // 兼容字段；结构买卖点统一由 SignalsV4 提供。
+	Scenarios          []Scenario         `json:"scenarios"`
+	Warnings           []string           `json:"warnings"`
+	Quality            DataQuality        `json:"quality"`
+	MarketEnvironment  *MarketEnvironment `json:"market_environment,omitempty"`
+	Level              int                `json:"level"`
+	Segments           []Segment          `json:"segments"`
+	RecursiveCenters   []RecursiveCenter  `json:"recursive_centers"`
+	RecursiveLevels    []LevelAnalysis    `json:"recursive_levels"`
+	FractalsV4         []Fractal          `json:"fractals_v4"`
+	StrokesV4          []Stroke           `json:"strokes_v4"`
+	Strengths          []Strength         `json:"strengths_v4"`
+	SignalsV4          []V4Signal         `json:"signals_v4"`
+	StructureWarnings  []V4Signal         `json:"structure_warnings_v4"`  // 独立结构预警，不参与严格六类点派生。
+	EarlyRiskWarnings  []V4Signal         `json:"early_risk_warnings_v4"` // 三根K线顶部风险，不能提前确认分型或严格卖点。
+	TrendState         string             `json:"trend_state_v4"`
+	TrendContext       TrendContext       `json:"trend_context_v4"`
+	MACD               []MACDPoint        `json:"macd_v4"`
+	StructureChains    []StructureChain   `json:"structure_chains_v4"`
 }
 
 type Summary struct {

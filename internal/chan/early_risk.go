@@ -3,7 +3,15 @@ package chananalysis
 // 早期风险只在局部假设中使用三根K线端点。严格分型、笔、六类点完全不消费它。
 func buildEarlyRiskWarnings(frame Frame, bars []Bar, merged []mergedBar, fractals []Fractal, macd []MACDPoint, threshold float64) []V4Signal {
 	result := []V4Signal{}
+	if len(merged) < 3 {
+		return result
+	}
 	histogram := histogramFromMACD(macd)
+	visible := make([]Fractal, 0, len(fractals)+1)
+	var strokeWork strokeWorkspace
+	var signalWork penSignalWorkspace
+	var fixedCenters []Center
+	var strengths []Strength
 	for index := 1; index+1 < len(merged); index++ {
 		left, middle, right := merged[index-1], merged[index], merged[index+1]
 		if left.chain != middle.chain || middle.chain != right.chain {
@@ -16,15 +24,15 @@ func buildEarlyRiskWarnings(frame Frame, bars []Bar, merged []mergedBar, fractal
 			continue
 		}
 		prefix := bars[:observedIndex+1]
-		visible := make([]Fractal, 0, len(fractals)+1)
+		visible = visible[:0]
 		for _, fractal := range fractals {
 			if fractal.ConfirmedAt <= observed.Date && fractal.MergedIndex < index {
 				visible = append(visible, fractal)
 			}
 		}
 		// 严格前缀用于验证中枢已形成，假设反向笔不能提前形成新中枢。
-		strictStrokes, _ := buildStrokesWithHistogram(visible, merged[:index+2], histogram[:observedIndex+1])
-		fixedCenters := buildCenters(strictStrokes)
+		strictStrokes, _ := strokeWork.build(visible, merged[:index+2], histogram[:observedIndex+1])
+		fixedCenters = appendCenters(fixedCenters[:0], strictStrokes)
 		if len(fixedCenters) == 0 {
 			continue
 		}
@@ -33,12 +41,16 @@ func buildEarlyRiskWarnings(frame Frame, bars []Bar, merged []mergedBar, fractal
 			RawStartIndex: middle.start, RawEndIndex: middle.end, SourceRawIndex: middle.sourceHigh,
 			SourceRawStart: middle.sourceStart, SourceRawEnd: middle.sourceEnd, Chain: middle.chain}
 		projected := Frame{Timeframe: frame.Timeframe, AsOf: observed.Date, Candles: prefix, MACD: macd[:observedIndex+1]}
-		projected.StrokesV4, _ = buildStrokesWithHistogram(append(visible, candidate), merged[:index+2], histogram[:observedIndex+1])
-		levels := buildSignalScanLevels(projected, nil)
-		strengths := buildStrengthsFromMACD(prefix, levels, projected.MACD)
-		warnings := buildStructureWarnings(projected, levels, strengths, threshold)
+		projected.StrokesV4, _ = strokeWork.build(append(visible, candidate), merged[:index+2], histogram[:observedIndex+1])
+		// 候选分型晚于所有严格分型，参与成笔时只能是最后一笔的端点。
+		if len(projected.StrokesV4) == 0 || projected.StrokesV4[len(projected.StrokesV4)-1].End.Date != candidate.Date {
+			continue
+		}
+		levels := []LevelAnalysis{signalWork.build(projected.StrokesV4)}
+		strengths = appendStrengthsFromMACD(strengths[:0], prefix, levels, projected.MACD)
+		warnings := buildStructureWarningsAtPivot(projected, levels, strengths, threshold, candidate.Date)
 		// 进入/离开中枢的盘整背驰也可提前观察，不能只覆盖局部三段背驰。
-		for _, signal := range buildV4SignalsWithDivergenceRatio(projected, levels, strengths, threshold) {
+		for _, signal := range buildV4SignalsAtPivot(projected, levels, strengths, threshold, candidate.Date) {
 			if signal.Kind == "class1_sell" {
 				warnings = append(warnings, signal)
 			}

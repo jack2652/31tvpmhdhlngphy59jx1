@@ -302,6 +302,8 @@ func TestHybridOvernightQuoteMergesPreviousPostSessionAndCachesIt(t *testing.T) 
 
 	yahoo := NewYahoo(time.Second, 2)
 	yahoo.now = func() time.Time { return frozen }
+	// 夜盘报价由本地 Alpaca 夹具提供，Yahoo 仅提供已模拟的盘后报价。
+	yahoo.optionsAuth = nil
 	yahoo.tickerFactory = func(string) (yahooTicker, error) {
 		yahooRequests.Add(1)
 		return &yahooSDKTestTicker{quoteFunc: func() (*models.Quote, error) {

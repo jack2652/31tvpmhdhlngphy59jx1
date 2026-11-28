@@ -63,7 +63,12 @@ func TestChanStructureSnapshotIgnoresAppendedObjectsAndRecordsRevisions(t *testi
 	if err != nil || len(revisions) != 2 {
 		t.Fatalf("latest revisions=%+v err=%v", revisions, err)
 	}
-	if revisions[0].Reason != "rule_version_changed" || revisions[0].PreviousRuleVersion != "preview.1" || revisions[0].RuleVersion != "preview.2" || len(revisions[0].ChangedConfirmedItems) != 2 {
+	var confirmedChanges []ChanStructureChange
+	if err := json.Unmarshal(revisions[0].ChangedConfirmedItems, &confirmedChanges); err != nil {
+		t.Fatal(err)
+	}
+	if revisions[0].Reason != "rule_version_changed" || revisions[0].PreviousRuleVersion != "preview.1" || revisions[0].RuleVersion != "preview.2" ||
+		len(confirmedChanges) != 2 || revisions[0].ChangedBars != nil {
 		t.Fatalf("rule revision=%+v", revisions[0])
 	}
 	var snapshots int
@@ -90,6 +95,26 @@ func TestChanStructureSnapshotIgnoresAppendedObjectsAndRecordsRevisions(t *testi
 	}
 	if olderRevision.PreviousRuleVersion != "preview.1" || olderRevision.RuleVersion != "preview.1" || olderRevision.Reason != "source_data_revision" {
 		t.Fatalf("older-version source revision=%+v, want an in-version source revision", olderRevision)
+	}
+}
+
+func TestChanStructureRevisionPayloadPreservesOmittedNullChanges(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "chan-structure-revision.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	_, err = repository.db.Exec(`INSERT INTO chan_structure_revisions(symbol,timeframe,previous_rule_version,rule_version,reason,input_fingerprint,changed_bars_json,changed_structures_json,created_at)
+VALUES ('QQQ','1d','preview.1','preview.2','rule_version_changed','new-input','[]','[{"id":"a","before":null,"after":{"price":100}}]','2026-11-27T12:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisions, err := repository.LatestChanStructureRevisions("QQQ", "1d", 20)
+	if err != nil || len(revisions) != 1 {
+		t.Fatalf("修订记录数=%d，错误=%v", len(revisions), err)
+	}
+	if revisions[0].ChangedBars != nil || string(revisions[0].ChangedConfirmedItems) != `[{"id":"a","after":{"price":100}}]` {
+		t.Fatalf("修订差异字段内容错误：%+v", revisions[0])
 	}
 }
 

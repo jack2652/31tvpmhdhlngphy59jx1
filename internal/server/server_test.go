@@ -1722,7 +1722,7 @@ func TestRefreshRequestsCoalesceForSymbol(t *testing.T) {
 		t.Fatal(err)
 	}
 	price := 100.0
-	fake := &testMarketProvider{quoteDelay: 50 * time.Millisecond, expirations: []string{time.Now().AddDate(0, 0, 8).Format("2006-01-02")}, quote: model.Quote{Price: &price, Currency: "USD", Provider: "test", Sessions: map[string]any{}}}
+	fake := &testMarketProvider{quoteDelay: 50 * time.Millisecond, expirations: []string{nextTestExpiration(time.Now())}, quote: model.Quote{Price: &price, Currency: "USD", Provider: "test", Sessions: map[string]any{}}}
 	service := NewWithProvider(cfg, repository, fake)
 	defer service.Close()
 	start := make(chan struct{})
@@ -1760,7 +1760,7 @@ func TestRefreshSnapshotFetchesQuoteAndExpirationCatalogConcurrentlyWithinLowMem
 	price := 100.0
 	fake := &testMarketProvider{
 		quote:             model.Quote{Price: &price, Currency: "USD", Provider: "test", Sessions: map[string]any{}},
-		expirations:       []string{time.Now().AddDate(0, 0, 8).Format("2006-01-02")},
+		expirations:       []string{nextTestExpiration(time.Now())},
 		quoteStarted:      make(chan struct{}, 1),
 		quoteRelease:      make(chan struct{}),
 		expirationStarted: make(chan struct{}, 1),
@@ -1919,7 +1919,7 @@ func TestQuoteEndpointFetchCoalescesWithSnapshotRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer repository.Close()
-	expiration := time.Now().AddDate(0, 0, 8).Format("2006-01-02")
+	expiration := nextTestExpiration(time.Now())
 	price := 100.0
 	fake := &testMarketProvider{
 		quoteStarted: make(chan struct{}, 2), quoteRelease: make(chan struct{}), expirations: []string{expiration},
@@ -1994,8 +1994,9 @@ func TestConcurrentRefreshesForDifferentExpirationsDoNotCoalesce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer repository.Close()
-	first := time.Now().AddDate(0, 0, 8).Format("2006-01-02")
-	second := time.Now().AddDate(0, 0, 15).Format("2006-01-02")
+	now := time.Now()
+	first := nextTestExpiration(now)
+	second := nextTestExpiration(now.AddDate(0, 0, 7))
 	price := 100.0
 	fake := &testMarketProvider{
 		quoteStarted: make(chan struct{}, 4),
@@ -2092,8 +2093,9 @@ func TestConcurrentDifferentExpirationRefreshesReachProviderTogether(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := time.Now().AddDate(0, 0, 8).Format("2006-01-02")
-	second := time.Now().AddDate(0, 0, 15).Format("2006-01-02")
+	now := time.Now()
+	first := nextTestExpiration(now)
+	second := nextTestExpiration(now.AddDate(0, 0, 7))
 	price := 100.0
 	provider := &chainBarrierProvider{
 		testMarketProvider: &testMarketProvider{
@@ -2147,7 +2149,7 @@ func TestConcurrentRefreshesForDifferentSymbolsReachProviderTogether(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	expiration := time.Now().AddDate(0, 0, 8).Format("2006-01-02")
+	expiration := nextTestExpiration(time.Now())
 	price := 100.0
 	provider := &chainBarrierProvider{
 		testMarketProvider: &testMarketProvider{
@@ -2980,8 +2982,9 @@ func TestUnavailableExpirationFinishesRefreshRunAsFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	price := 100.0
-	available := time.Now().AddDate(0, 0, 15).Format("2006-01-02")
-	requested := time.Now().AddDate(0, 0, 8).Format("2006-01-02")
+	now := time.Now()
+	available := nextTestExpiration(now.AddDate(0, 0, 7))
+	requested := nextTestExpiration(now)
 	fake := &testMarketProvider{
 		expirations: []string{available},
 		quote:       model.Quote{Price: &price, Provider: "test", Sessions: map[string]any{}},
@@ -3542,6 +3545,24 @@ func TestCachedTrendMatchesPythonWindowContract(t *testing.T) {
 	}
 	if _, ok := recent["rsi"].(map[string]any); !ok {
 		t.Fatalf("trend should include RSI metadata: %#v", recent)
+	}
+}
+
+func TestTrendMarketKeepsLastSameDayBarInStableInputOrder(t *testing.T) {
+	bars := []map[string]any{
+		{"date": "2026-09-21", "open": 100.0, "close": 101.0},
+		{"date": "2026-09-23", "open": 300.0, "close": 301.0},
+		{"date": "2026-09-18", "open": 90.0, "close": 91.0},
+		{"date": "2026-09-21T16:00:00", "open": 110.0, "close": 111.0},
+		{"date": "2026-09-21", "open": "invalid", "close": 201.0},
+	}
+	regular := trendMarketAt(bars, model.Quote{MarketState: "REGULAR"}, "2026-09-21")
+	if regular["today_open"] != 110.0 || regular["previous_close"] != 101.0 {
+		t.Fatalf("regular session: %#v", regular)
+	}
+	premarket := trendMarketAt(bars, model.Quote{MarketState: "PRE"}, "2026-09-21")
+	if premarket["today_open"] != 100.0 || premarket["previous_close"] != 101.0 {
+		t.Fatalf("premarket: %#v", premarket)
 	}
 }
 
@@ -5354,7 +5375,7 @@ func TestSubscriptionQuoteRefreshRunsDuringSnapshotBackoff(t *testing.T) {
 	price := 100.0
 	fake := &testMarketProvider{
 		quote:       model.Quote{Price: &price, Currency: "USD", Provider: "test", Sessions: map[string]any{}},
-		expirations: []string{time.Now().AddDate(0, 0, 8).Format("2006-01-02")},
+		expirations: []string{nextTestExpiration(time.Now())},
 	}
 	service := NewWithProvider(cfg, repository, fake)
 	defer service.Close()

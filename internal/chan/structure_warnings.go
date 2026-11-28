@@ -8,6 +8,10 @@ import (
 
 // 预警只消费本级可见结构，独立于严格六类点及其下级确认和派生。
 func buildStructureWarnings(frame Frame, levels []LevelAnalysis, strengths []Strength, divergenceRatio float64) []V4Signal {
+	return buildStructureWarningsAtPivot(frame, levels, strengths, divergenceRatio, "")
+}
+
+func buildStructureWarningsAtPivot(frame Frame, levels []LevelAnalysis, strengths []Strength, divergenceRatio float64, pivotDate string) []V4Signal {
 	result := []V4Signal{}
 	if math.IsNaN(divergenceRatio) || math.IsInf(divergenceRatio, 0) || divergenceRatio <= 0 || divergenceRatio >= 1 {
 		return result
@@ -18,6 +22,9 @@ func buildStructureWarnings(frame Frame, levels []LevelAnalysis, strengths []Str
 			continue
 		}
 		for index := 2; index < len(level.Segments); index++ {
+			if pivotDate != "" && level.Segments[index].End != pivotDate {
+				continue
+			}
 			previous, retest, current := level.Segments[index-2], level.Segments[index-1], level.Segments[index]
 			observedAt := entryExitObservationAt(frame, level, current, index)
 			if observedAt == "" || observedAt < current.End || frame.AsOf != "" && observedAt > frame.AsOf || current.Direction != previous.Direction || current.Direction == retest.Direction || current.TrendKind != previous.TrendKind || !chanSegmentRangeIsContiguous(level.Segments, index-2, index) {

@@ -37,6 +37,30 @@ function render(segments, enabled) {
   return context.strokes.filter((stroke) => stroke.start && stroke.end && stroke.start[0] === 10 && stroke.start[1] === 20 && stroke.end[0] === 30 && stroke.end[1] === 40);
 }
 
+const trendlineChart = {
+  width: 960, height: 340, plotLeft: 50, plotRight: 940, plotTop: 10, plotBottom: 300, historyRight: 940,
+  candles: [], trendlines: [
+    { side: "resistance", primary: true, solid: { x1: 50, y1: 35, x2: 100, y2: 60 },
+      extension: { x1: 100, y1: 60, x2: 140, y2: 80 }, anchors: [{ x: 100, y: 60 }] },
+    { side: "support", primary: false, solid: null,
+      extension: { x1: 50, y1: 240, x2: 140, y2: 200 }, anchors: [] },
+  ],
+};
+const drawTrendlines = (enabled) => {
+  context.strokes = [];
+  context.arcs = [];
+  window.OptionScopeCharts.renderChanCanvas(target, { chart: trendlineChart, layers: { trendlines: enabled } });
+  return context.strokes.filter((stroke) => stroke.start?.[1] === 35 || stroke.start?.[1] === 60 || stroke.start?.[1] === 240);
+};
+assert.equal(drawTrendlines(false).length, 0, "关闭图层后不绘制趋势线");
+const [primarySolid, primaryExtension, secondaryExtension] = drawTrendlines(true);
+assert.deepEqual(primarySolid.dash, []);
+assert.deepEqual(primaryExtension.dash, [4, 4]);
+assert.deepEqual(secondaryExtension.dash, [4, 4]);
+assert.ok(primarySolid.alpha > primaryExtension.alpha);
+assert.ok(primaryExtension.alpha > secondaryExtension.alpha && primaryExtension.width > secondaryExtension.width);
+assert.deepEqual(context.arcs.map(({ x, y }) => [x, y]), [[100, 60]], "只标记视口内的真实锚点");
+
 function renderScenarios(visible) {
   context.strokes = [];
   context.texts = [];

@@ -12,6 +12,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,8 +71,12 @@ func (s *Service) intradayChanAnalysis(c *gin.Context) {
 	}
 	result.Daily.FutureTradingDates = futureTradingDates(result.Daily, provider.IsFutureSymbol(symbol))
 	result.Weekly.FutureTradingDates = futureTradingDates(result.Weekly, provider.IsFutureSymbol(symbol))
+	responseFrame := chanResponseFrame{Frame: result.Daily}
+	if s.store != nil {
+		responseFrame.StructureRevisions = loadChanStructureRevisions(s.store, symbol, period, &responseFrame.Frame)
+	}
 	response := gin.H{
-		"symbol": symbol, "spot": result.Spot, "period": period, "frame": result.Daily,
+		"symbol": symbol, "spot": result.Spot, "period": period, "frame": responseFrame,
 		"rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion,
 		"legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters,
 		"price_coordinate": gin.H{"basis": "raw", "adjustment_type": "none", "status": "unadjusted"},
@@ -325,7 +330,7 @@ func (s *Service) intradayDailyBarFallback(symbol string, quote model.Quote) *mo
 // chanAdjustedAnalysis serves the independent adjusted daily history used by
 // recursive Chan analysis. Existing /chan and quote paths remain raw-price.
 func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
-	if !s.validateQuery(c, positiveFloatQueryRule("spot"), boolQueryRule("compact")) {
+	if !s.validateQuery(c, positiveFloatQueryRule("spot"), boolQueryRule("compact"), boolQueryRule("include_revisions")) {
 		return
 	}
 	symbol, err := normalizeAPISymbol(c.Param("symbol"))
@@ -338,6 +343,7 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"detail": err.Error()})
 		return
 	}
+	includeRevisions, _ := queryBool(c, "include_revisions", true)
 	entry, source, warning, refreshing := s.chanAdjustedHistory(symbol)
 	if len(entry.bars) == 0 {
 		_, supportsHistory := s.provider.(ChanAdjustedHistoryProvider)
@@ -500,11 +506,17 @@ func (s *Service) chanAdjustedAnalysis(c *gin.Context) {
 	}
 	c.Header("X-Chan-Analysis-Cache", analysisCache)
 	response := gin.H{"symbol": symbol, "ready": true, "analysis_cache": analysisCache, "rule_version": result.RuleVersion, "target_rule_version": chananalysis.RecursiveRuleVersion, "legacy_rule_version": result.LegacyRuleVersion, "parameters": result.Parameters, "rules": result.Rules, "algorithm_comparison": result.AlgorithmComparison, "market_environment": latestMarketEnvironment(marketSeries, result.Daily.AsOf), "market_history": gin.H{"symbol": mfiSymbol, "source": publicQuoteSource(mfiSource), "fetched_at": mfiFetchedAt, "refreshing": mfiRefreshing, "daily": compactMfiHistoryBars(mfiHistory.bars)}, "price_coordinate": priceCoordinate, "summary": result.Summary, "warnings": result.Warnings, "history": gin.H{"source": publicQuoteSource(source), "timeframe": "1d", "adjustment_type": "split_dividend_auto", "fetched_at": entry.fetchedAt, "refreshing": refreshing}}
+	daily := chanResponseFrame{Frame: result.Daily}
+	weekly := chanResponseFrame{Frame: result.Weekly}
+	if includeRevisions && s.store != nil {
+		daily.StructureRevisions = loadChanStructureRevisions(s.store, symbol, "1d", &daily.Frame)
+		weekly.StructureRevisions = loadChanStructureRevisions(s.store, symbol, "1wk", &weekly.Frame)
+	}
 	if compact {
-		response["daily"] = compactChanFrame{Frame: result.Daily}
-		response["weekly"] = compactChanFrame{Frame: result.Weekly}
+		response["daily"] = compactChanFrame{chanResponseFrame: daily}
+		response["weekly"] = compactChanFrame{chanResponseFrame: weekly}
 	} else {
-		response["daily"], response["weekly"] = result.Daily, result.Weekly
+		response["daily"], response["weekly"] = daily, weekly
 	}
 	c.JSON(http.StatusOK, response)
 }
@@ -651,10 +663,15 @@ func futureSessionCloseMinute(days int, isFuture bool) int {
 	return marketcalendar.RegularCloseMinuteOrdinal(days)
 }
 
-// compactChanFrame omits heavy fields the browser chart does not read. The
-// embedded Frame keeps every field the chart and signal panels consume.
-type compactChanFrame struct {
+// chanResponseFrame 仅在 API 响应中附加修订明细。
+type chanResponseFrame struct {
 	chananalysis.Frame
+	StructureRevisions []store.ChanStructureRevisionPayload `json:"structure_revisions_v4,omitempty"`
+}
+
+// compactChanFrame 省略图表未读取的结构和指标字段。
+type compactChanFrame struct {
+	chanResponseFrame
 	Fractals     []chananalysis.Fractal     `json:"fractals,omitempty"`
 	FractalsV4   []chananalysis.Fractal     `json:"fractals_v4,omitempty"`
 	StrokesV4    []chananalysis.Stroke      `json:"strokes_v4,omitempty"`
@@ -695,7 +712,8 @@ func chanAnalysisCacheKey(symbol string, daily, intraday, market []chananalysis.
 	_ = state.encoder.Encode(payload)
 	var digest [sha256.Size]byte
 	digestBytes := state.digest.Sum(digest[:0])
-	key := "chan-adjusted-v2:" + hex.EncodeToString(digestBytes)
+	// 第三版分析缓存只保存结构结果，修订历史从审计表读取。
+	key := "chan-adjusted-v3:" + hex.EncodeToString(digestBytes)
 	chanAnalysisHashPool.Put(state)
 	return key
 }
@@ -1053,24 +1071,32 @@ func (s *Service) chanMfiHistory(indexHistory chanAdjustedHistoryCacheEntry, sou
 	return history, historySource, fetchedAt, symbol, refreshing, warning
 }
 
+const chanStructureAuditWarning = "已确认缠论结构修订记录暂不可用"
+
 func recordChanStructureFrame(repository *store.SQLite, symbol, timeframe, ruleVersion string, bars []chananalysis.Bar, frame *chananalysis.Frame) {
 	snapshot := chanStructureSnapshot(symbol, timeframe, ruleVersion, bars, *frame)
 	revision, err := repository.RecordChanStructureSnapshot(snapshot)
 	if err != nil {
 		log.Printf("Chan structure snapshot failed symbol=%s timeframe=%s: %v", symbol, timeframe, err)
-		frame.Warnings = append(frame.Warnings, "已确认缠论结构修订记录暂不可用")
+		frame.Warnings = append(frame.Warnings, chanStructureAuditWarning)
 		return
 	}
 	if revision != nil {
 		log.Printf("Chan confirmed structure revision symbol=%s timeframe=%s reason=%s id=%d", symbol, timeframe, revision.Reason, revision.ID)
 	}
+}
+
+func loadChanStructureRevisions(repository *store.SQLite, symbol, timeframe string, frame *chananalysis.Frame) []store.ChanStructureRevisionPayload {
+	if slices.Contains(frame.Warnings, chanStructureAuditWarning) {
+		return nil
+	}
 	revisions, err := repository.LatestChanStructureRevisions(symbol, timeframe, 20)
 	if err != nil {
 		log.Printf("Chan structure revision history failed symbol=%s timeframe=%s: %v", symbol, timeframe, err)
-		frame.Warnings = append(frame.Warnings, "已确认缠论结构修订记录暂不可用")
-		return
+		frame.Warnings = append(frame.Warnings, chanStructureAuditWarning)
+		return nil
 	}
-	frame.StructureRevisions = chanStructureRevisionOutput(revisions)
+	return revisions
 }
 
 type chanSnapshotBar struct {
@@ -1142,28 +1168,6 @@ func chanStructureSnapshot(symbol, timeframe, ruleVersion string, bars []chanana
 
 func stableFractal(fractal chananalysis.Fractal) map[string]any {
 	return map[string]any{"kind": fractal.Kind, "date": fractal.Date, "price": fractal.Price, "level": fractal.Level, "confirmed_at": fractal.ConfirmedAt}
-}
-
-func chanStructureRevisionOutput(revisions []store.ChanStructureRevision) []chananalysis.StructureRevision {
-	output := make([]chananalysis.StructureRevision, 0, len(revisions))
-	for _, revision := range revisions {
-		item := chananalysis.StructureRevision{ID: revision.ID, RuleVersion: revision.RuleVersion, PreviousRuleVersion: revision.PreviousRuleVersion, Reason: revision.Reason, InputFingerprint: revision.InputFingerprint, CreatedAt: revision.CreatedAt}
-		for _, bar := range revision.ChangedBars {
-			item.ChangedBars = append(item.ChangedBars, chananalysis.StructureBarChange{Date: bar.Date, OldFingerprint: bar.Old, NewFingerprint: bar.New})
-		}
-		for _, change := range revision.ChangedConfirmedItems {
-			var before, after any
-			if len(change.Before) > 0 {
-				_ = json.Unmarshal(change.Before, &before)
-			}
-			if len(change.After) > 0 {
-				_ = json.Unmarshal(change.After, &after)
-			}
-			item.ChangedConfirmedItems = append(item.ChangedConfirmedItems, chananalysis.StructureChange{ID: change.ID, Before: before, After: after})
-		}
-		output = append(output, item)
-	}
-	return output
 }
 
 func validAdjustedHistoryRow(bar map[string]any) bool {
@@ -1247,8 +1251,16 @@ func (s *Service) chanAdjustedHistory(symbol string) (chanAdjustedHistoryCacheEn
 	}
 	s.chanAdjustedMu.Unlock()
 	coverageOK, _, _ := chanAdjustedHistoryCoverage(entry.bars)
-	if !found || !coverageOK || time.Since(entry.fetchedAt) >= chanAdjustedHistoryFreshness {
-		if cached, err := s.store.LatestChanAdjustedHistory(symbol, timeframe, adjustmentType, "go-yfinance", chanAdjustedHistoryBarLimit); err == nil {
+	const historyProvider = "go-yfinance"
+	readHistory := !found
+	if found && (!coverageOK || time.Since(entry.fetchedAt) >= chanAdjustedHistoryFreshness) {
+		if stamp, err := s.store.LatestChanAdjustedHistoryStamp(symbol, timeframe, adjustmentType, historyProvider, chanAdjustedHistoryBarLimit); err == nil {
+			fetchedAt, _ := historyTimestamp(stamp)
+			readHistory = fetchedAt.After(entry.fetchedAt)
+		}
+	}
+	if readHistory {
+		if cached, err := s.store.LatestChanAdjustedHistory(symbol, timeframe, adjustmentType, historyProvider, chanAdjustedHistoryBarLimit); err == nil {
 			if bars, _ := cached["bars"].([]map[string]any); len(bars) > 0 {
 				fetchedAt, _ := historyTimestamp(cached["fetched_at"])
 				if !found || fetchedAt.After(entry.fetchedAt) {

@@ -291,7 +291,7 @@
                 <section class="chan-layer-menu-display"><h4>价格图层</h4><div class="detail-segmented chan-layer-switches" role="group" aria-label="价格图层">
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.chanCandles ? 'true' : 'false'" @click="toggleChanChartLayer('chanCandles')">缠论K线</button>
                   <button class="detail-seg" type="button" :aria-pressed="chanChartLayers.supportResistance ? 'true' : 'false'" aria-describedby="chan-structure-support-help" @click="toggleChanChartLayer('supportResistance')">支撑/压力线</button>
-                  <button class="detail-seg" type="button" title="按已确认的笔与线段高低点绘制支撑和压力趋势线；收盘破位后结束" :aria-pressed="chanChartLayers.trendlines ? 'true' : 'false'" @click="toggleChanChartLayer('trendlines')">结构趋势线</button>
+                  <button class="detail-seg" type="button" title="用已收盘 K 线的高低转折定锚，拖动缩放时锚点固定，虚线有限延伸" :aria-pressed="chanChartLayers.trendlines ? 'true' : 'false'" @click="toggleChanChartLayer('trendlines')">结构趋势线</button>
                 </div>
                 <small class="chan-layer-support-help" id="chan-structure-support-help">支撑包含历史结构参考与近期反弹确认，相近区域只画一次。蓝色为支撑，历史参考稍淡；灰虚线为失守，红虚线为压力。历史结构不因未近期回踩而删除，两根收盘有效跌破才标失守；悬浮查看来源与实际反弹记录。</small>
                 </section>

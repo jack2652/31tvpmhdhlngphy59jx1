@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -29,17 +30,28 @@ type ChanStructureChange struct {
 	After  json.RawMessage `json:"after,omitempty"`
 }
 
+type chanStructureRevisionHeader struct {
+	ID                  int64     `json:"id"`
+	PreviousRuleVersion string    `json:"previous_rule_version"`
+	RuleVersion         string    `json:"rule_version"`
+	Reason              string    `json:"reason"`
+	InputFingerprint    string    `json:"input_fingerprint"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
 type ChanStructureRevision struct {
-	ID                    int64                 `json:"id"`
+	chanStructureRevisionHeader
 	Symbol                string                `json:"symbol"`
 	Timeframe             string                `json:"timeframe"`
-	PreviousRuleVersion   string                `json:"previous_rule_version"`
-	RuleVersion           string                `json:"rule_version"`
-	Reason                string                `json:"reason"`
-	InputFingerprint      string                `json:"input_fingerprint"`
 	ChangedBars           []ChanBarChange       `json:"changed_bars"`
 	ChangedConfirmedItems []ChanStructureChange `json:"changed_confirmed_structures"`
-	CreatedAt             time.Time             `json:"created_at"`
+}
+
+// ChanStructureRevisionPayload 保留已存储的差异数组，供 API 直接序列化。
+type ChanStructureRevisionPayload struct {
+	chanStructureRevisionHeader
+	ChangedBars           json.RawMessage `json:"changed_bars"`
+	ChangedConfirmedItems json.RawMessage `json:"changed_confirmed_structures"`
 }
 
 type ChanBarChange struct {
@@ -99,6 +111,10 @@ ORDER BY CASE WHEN rule_version=? THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`, s
 	}
 	var revision *ChanStructureRevision
 	if err == nil {
+		// 相同快照直接复用，避免对未变化的历史重新解码。
+		if previousRule == snapshot.RuleVersion && previousInput == snapshot.InputFingerprint && previousBarsJSON == string(barJSON) && previousStructuresJSON == string(structureJSON) {
+			return nil, nil
+		}
 		previous := chanStoredSnapshot{BarFingerprints: map[string]string{}, ConfirmedStructures: map[string]json.RawMessage{}}
 		if decodeErr := json.Unmarshal([]byte(previousBarsJSON), &previous.BarFingerprints); decodeErr != nil {
 			return nil, fmt.Errorf("decode previous Chan bar fingerprints: %w", decodeErr)
@@ -107,15 +123,17 @@ ORDER BY CASE WHEN rule_version=? THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`, s
 			return nil, fmt.Errorf("decode previous confirmed Chan structures: %w", decodeErr)
 		}
 		previous.InputFingerprint = previousInput
-		if previousRule == snapshot.RuleVersion && previousInput == snapshot.InputFingerprint && previousBarsJSON == string(barJSON) && previousStructuresJSON == string(structureJSON) {
-			return nil, nil
-		}
 		changedBars := compareChanBars(previous.BarFingerprints, snapshot.BarFingerprints, earliestChanBarDate(snapshot.BarFingerprints))
 		includeNewStructures := previousRule != snapshot.RuleVersion || len(changedBars) > 0
 		changedStructures := compareChanStructures(previous.ConfirmedStructures, snapshot.ConfirmedStructures, includeNewStructures, earliestChanBarDate(snapshot.BarFingerprints))
 		if len(changedStructures) > 0 {
 			reason := chanRevisionReason(previousRule, snapshot.RuleVersion, changedBars, previousInput != snapshot.InputFingerprint)
-			revision = &ChanStructureRevision{Symbol: snapshot.Symbol, Timeframe: snapshot.Timeframe, PreviousRuleVersion: previousRule, RuleVersion: snapshot.RuleVersion, Reason: reason, InputFingerprint: snapshot.InputFingerprint, ChangedBars: changedBars, ChangedConfirmedItems: changedStructures, CreatedAt: snapshot.UpdatedAt.UTC()}
+			revision = &ChanStructureRevision{
+				chanStructureRevisionHeader: chanStructureRevisionHeader{
+					PreviousRuleVersion: previousRule, RuleVersion: snapshot.RuleVersion, Reason: reason, InputFingerprint: snapshot.InputFingerprint, CreatedAt: snapshot.UpdatedAt.UTC(),
+				},
+				Symbol: snapshot.Symbol, Timeframe: snapshot.Timeframe, ChangedBars: changedBars, ChangedConfirmedItems: changedStructures,
+			}
 			changedBarsJSON, marshalErr := json.Marshal(changedBars)
 			if marshalErr != nil {
 				return nil, marshalErr
@@ -147,33 +165,62 @@ VALUES (?,?,?,?,?,?,?) ON CONFLICT(symbol,timeframe,rule_version) DO UPDATE SET 
 	return revision, nil
 }
 
-func (s *SQLite) LatestChanStructureRevisions(symbol, timeframe string, limit int) ([]ChanStructureRevision, error) {
+func (s *SQLite) LatestChanStructureRevisions(symbol, timeframe string, limit int) ([]ChanStructureRevisionPayload, error) {
 	if limit < 1 || limit > 100 {
 		limit = 20
 	}
-	rows, err := s.db.Query(`SELECT id,symbol,timeframe,previous_rule_version,rule_version,reason,input_fingerprint,changed_bars_json,changed_structures_json,created_at
+	rows, err := s.db.Query(`SELECT id,previous_rule_version,rule_version,reason,input_fingerprint,changed_bars_json,changed_structures_json,created_at
 FROM chan_structure_revisions WHERE symbol=? AND timeframe=? ORDER BY id DESC LIMIT ?`, strings.ToUpper(strings.TrimSpace(symbol)), strings.TrimSpace(timeframe), limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	revisions := []ChanStructureRevision{}
+	var revisions []ChanStructureRevisionPayload
 	for rows.Next() {
-		var item ChanStructureRevision
-		var barsJSON, structuresJSON, createdAt string
-		if err := rows.Scan(&item.ID, &item.Symbol, &item.Timeframe, &item.PreviousRuleVersion, &item.RuleVersion, &item.Reason, &item.InputFingerprint, &barsJSON, &structuresJSON, &createdAt); err != nil {
+		var item ChanStructureRevisionPayload
+		var barsJSON, structuresJSON []byte
+		var createdAt string
+		if err := rows.Scan(&item.ID, &item.PreviousRuleVersion, &item.RuleVersion, &item.Reason, &item.InputFingerprint, &barsJSON, &structuresJSON, &createdAt); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(barsJSON), &item.ChangedBars); err != nil {
-			return nil, err
+		item.ChangedBars = barsJSON
+		item.ChangedConfirmedItems = structuresJSON
+		if !validChanChangeArray(item.ChangedBars) || !validChanChangeArray(item.ChangedConfirmedItems) {
+			return nil, fmt.Errorf("invalid Chan revision changes for id %d", item.ID)
 		}
-		if err := json.Unmarshal([]byte(structuresJSON), &item.ChangedConfirmedItems); err != nil {
-			return nil, err
+		// 完整 API 将空差异数组表示为 null，并省略 before/after 空值。
+		if bytes.Equal(item.ChangedBars, []byte("[]")) {
+			item.ChangedBars = nil
+		}
+		if bytes.Equal(item.ChangedConfirmedItems, []byte("[]")) {
+			item.ChangedConfirmedItems = nil
+		} else if bytes.Contains(item.ChangedConfirmedItems, []byte(`"before":null`)) ||
+			bytes.Contains(item.ChangedConfirmedItems, []byte(`"after":null`)) {
+			var changes []ChanStructureChange
+			if err := json.Unmarshal(item.ChangedConfirmedItems, &changes); err != nil {
+				return nil, err
+			}
+			for index := range changes {
+				if bytes.Equal(changes[index].Before, []byte("null")) {
+					changes[index].Before = nil
+				}
+				if bytes.Equal(changes[index].After, []byte("null")) {
+					changes[index].After = nil
+				}
+			}
+			item.ChangedConfirmedItems, err = json.Marshal(changes)
+			if err != nil {
+				return nil, err
+			}
 		}
 		item.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 		revisions = append(revisions, item)
 	}
 	return revisions, rows.Err()
+}
+
+func validChanChangeArray(value json.RawMessage) bool {
+	return bytes.Equal(value, []byte("null")) || (len(value) > 0 && value[0] == '[' && json.Valid(value))
 }
 
 func compareChanBars(previous, current map[string]string, earliestCurrentDate string) []ChanBarChange {

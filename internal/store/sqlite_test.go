@@ -652,6 +652,56 @@ func TestSaveChainPreservesCboeProvider(t *testing.T) {
 	}
 }
 
+func TestLatestChainsRestoreMissingOpenInterestFromSameContract(t *testing.T) {
+	repository, err := Open(filepath.Join(t.TempDir(), "option-interest.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	now := time.Now().UTC().Truncate(time.Second)
+	expiration := now.AddDate(0, 0, 5).Format(time.DateOnly)
+	old, latest, positive, zero := int64(91), int64(105), int64(12), int64(0)
+	for _, snapshot := range []struct {
+		at       time.Time
+		interest []*int64
+	}{
+		{now.Add(-3 * time.Minute), []*int64{&old, &old, &old, nil}},
+		{now.Add(-2 * time.Minute), []*int64{&latest, nil, &latest, nil}},
+		{now.Add(-time.Minute), []*int64{&zero, &zero, &zero, nil}},
+		{now, []*int64{&positive, nil, &zero, nil}},
+	} {
+		rows := make([]model.OptionRow, 0, len(snapshot.interest))
+		for i, contract := range []string{"positive", "missing", "zero", "unavailable"} {
+			strike := float64(400 + i)
+			rows = append(rows, model.OptionRow{ContractSymbol: contract, ContractType: "call", Strike: &strike, OpenInterest: snapshot.interest[i]})
+		}
+		if err := repository.SaveChain(model.ChainResponse{Symbol: "QQQ", Expiration: expiration, FetchedAt: &snapshot.at, Data: rows}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chain, found, err := repository.LatestChain("QQQ", expiration)
+	if err != nil || !found {
+		t.Fatalf("LatestChain found=%v err=%v", found, err)
+	}
+	profile, err := repository.LatestChains("QQQ", 45)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertInterest := func(rows []model.OptionRow, fallback map[string]any) {
+		t.Helper()
+		if len(rows) != 4 || rows[0].OpenInterest == nil || *rows[0].OpenInterest != positive ||
+			rows[1].OpenInterest == nil || *rows[1].OpenInterest != old ||
+			rows[2].OpenInterest == nil || *rows[2].OpenInterest != latest || rows[3].OpenInterest != nil {
+			t.Fatalf("unexpected open interest: %#v", rows)
+		}
+		if fallback["restored"] != 2 || fallback["as_of"] != storedTimestamp(now.Add(-2*time.Minute)) {
+			t.Fatalf("unexpected fallback metadata: %#v", fallback)
+		}
+	}
+	assertInterest(chain.Data, chain.OIFallback)
+	assertInterest(profile["data"].([]model.OptionRow), profile["oi_fallback"].(map[string]any))
+}
+
 func TestOptionFlowUsesAdjacentSnapshots(t *testing.T) {
 	repository, err := Open(filepath.Join(t.TempDir(), "options.db"))
 	if err != nil {

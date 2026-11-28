@@ -1234,7 +1234,9 @@
       signal.invalidation_price, signal.protection_price, signal.structure_refs, signal.rule_version]));
     const vwapKey = layers?.vwap || layers?.anchoredVwap
       ? [Boolean(layers.vwap), Boolean(layers.anchoredVwap), frame.as_of, cacheObjectId(frame.strokes_v4), cacheObjectId(frame.strokes), cacheObjectId(frame.recursive_levels), cacheObjectId(frame.segments)].join(":") : "";
-    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${rsCacheKey}-${vwapKey}-${Boolean(layers?.bollinger)}-${ruleVersion || ""}-${supportCacheKey}-${resistanceCacheKey}-${signalCacheKey}`;
+    const trendlineResult = layers?.trendlines === true ? window.OptionScopeTrendlines?.calculate(frame) : null;
+    const trendlineKey = cacheObjectId(trendlineResult);
+    const cacheKey = `${scenarioLane ? "scenarios" : "history"}-${mobile ? "mobile" : "desktop"}-${startIndex}-${endIndex}-${layerCacheKey}-${subchartCacheKey}-${mfiBenchmarkCacheKey}-${rsCacheKey}-${vwapKey}-${Boolean(layers?.bollinger)}-${trendlineKey}-${ruleVersion || ""}-${supportCacheKey}-${resistanceCacheKey}-${signalCacheKey}`;
     const cached = cachedLayouts?.get(cacheKey);
     const currentSpot = Number(spot);
     const liveScenarioPrice = isIntradayFrame(frame) ? currentSpot : NaN;
@@ -1266,8 +1268,6 @@
       ...indexedEventWindow(rsi.watches, startIndex, dataEndIndex)] : [];
     const rs = visibleSubcharts.rs ? window.OptionScopeRelativeStrength?.calculate(indicatorCandles.slice(startIndex, dataEndIndex), rsBenchmark) : null;
     const afStochZ = layers?.afStochZ === true ? afStochZSeries(sourceCandles) : { events: [], series: {} };
-    const trendlineResult = layers?.trendlines === true
-      ? window.OptionScopeTrendlines?.calculate(sourceCandles, frame.strokes || [], cacheSegments, startIndex, endIndex) || null : null;
     const turtleEnabled = layers?.turtle === true;
     const dmiValues = turtleEnabled ? dmiSeries(sourceCandles) : null;
     const turtleResult = turtleEnabled
@@ -1730,21 +1730,21 @@
     const wyckoffEventLayouts = indicatorEventLayouts.filter((event) => event.indicator === "wyckoff");
     const trendlineLayouts = (() => {
       if (!trendlineResult?.length) return null;
-      const toX = (rawIndex) => left + (rawIndex - startIndex + 0.5) * slot;
-      return trendlineResult.filter((trendline) => trendline.endIndex >= startIndex && trendline.startIndex < endIndex).map((trendline) => {
-        const yAt = (index) => y(trendline.startPrice + trendline.slope * (index - trendline.startIndex));
-        const reachesLatestData = trendline.endIndex >= dataEndIndex - 1;
-        const displayEnd = reachesLatestData ? endIndex - 1 : Math.min(trendline.endIndex, endIndex - 1);
-        const solidEnd = Math.min(trendline.solidEndIndex, displayEnd);
-        const extension = trendline.solidEndIndex < displayEnd ? {
-          x1: toX(trendline.solidEndIndex), y1: yAt(trendline.solidEndIndex),
-          x2: displayEnd === endIndex - 1 ? historyRight : toX(displayEnd), y2: yAt(displayEnd),
-        } : null;
-        return {
-          side: trendline.side,
-          solid: { x1: toX(trendline.startIndex), y1: yAt(trendline.startIndex), x2: toX(solidEnd), y2: yAt(solidEnd) },
-          extension,
+      return trendlineResult.flatMap((line) => {
+        if (line.confirmedIndex >= dataEndIndex) return [];
+        const toX = (index) => x(index - startIndex);
+        const toY = (index) => y(line.startPrice + line.slope * (index - line.startIndex));
+        // 绘图区边缘在 K 线中心之间，横纵坐标使用同一个裁剪位置。
+        const clip = (from, to) => {
+          const first = Math.max(startIndex - 0.5, from), last = Math.min(endIndex - 0.5, to);
+          return first < last ? { x1: toX(first), y1: toY(first), x2: toX(last), y2: toY(last) } : null;
         };
+        const solid = clip(line.startIndex, line.solidEndIndex);
+        const extension = clip(line.solidEndIndex, line.endIndex);
+        if (!solid && !extension) return [];
+        const anchors = [line.startIndex, line.solidEndIndex].filter((index) => index >= startIndex && index < dataEndIndex)
+          .map((index) => ({ x: toX(index), y: y(index === line.startIndex ? line.startPrice : line.endPrice) }));
+        return [{ key: line.key, side: line.side, primary: line.primary, solid, extension, anchors }];
       });
     })();
     let volumeMax = 0;
@@ -2094,7 +2094,7 @@
         .map((index) => { const displayDate = displayBarTime(bars[index].date, frame.period); return { x: x(index), y: height - 12, label: mobile ? axisDateLabel(displayDate).slice(-5) : axisDateLabel(displayDate) }; }),
     };
     if (layers?.supportResistance !== false) chart.description += "支撑包含历史结构参考与近期反弹区域，相近价位按ATR(14)合并去重。已确认笔、线段低点和中枢下沿保留为历史结构支撑，近期性只影响排序及线条强度，不因长期未回踩而删除；中枢上沿仍须站上后真实回踩反弹。近期支撑按最近252根完成行情验证，需两次独立反弹，或结构与一次实际反弹，126根无新反弹时仅近期反应证据过期。历史结构使用完整连续行情检查两根收盘有效跌破，旧位不因价格回升自动复活；新结构源点或两次新反弹可重新确认。最多显示3个近期支撑（含跌破待确认）、4个历史结构参考（含跌破待确认）、2个近期失守、3个近期压力区域及2个历史压力回测。历史压力须曾有两次独立受阻，突破后出现新受阻才能重新显示，历史次数与本轮回测分开记录；无新受阻不恢复。重复区间只画一次。蓝色实线表示支撑，历史参考稍淡，金色虚线表示首次有效收盘跌破、待下一根确认，灰色虚线表示连续两根收盘确认失守，红色虚线表示压力。待确认按合并区域下沿及ATR容差判断；下一根不再有效跌破时恢复支撑展示，已确认失守不会因价格回升自动恢复。悬浮价位可查看来源、确认日期和实际反弹记录；历史结构参考不代表近期已回踩确认。盘中价格不改变确认状态，证据可在图下列表查看。";
-    if (trendlineLayouts?.length) chart.description += "结构趋势线由已确认的笔与线段端点拟合，实线连接结构点，虚线延伸至当前窗口；收盘价有效穿越后不再显示。";
+    if (layers?.trendlines === true) chart.description += "结构趋势线取自近期已收盘 K 线的高低转折，已确认的笔和线段为辅助依据。实线连接锚点，虚线按原斜率有限延伸。平移和缩放只裁剪图形，收盘有效穿越后移除该线。";
     if (layers?.turtle === true) {
       const eventDescription = turtleEventLayouts.length
         ? `当前窗口信号：${turtleEventLayouts.slice(-8).map((event) => `${displayBarTime(event.date, frame.period)} ${event.label} ${money(event.price)}`).join("；")}。`
